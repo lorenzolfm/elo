@@ -1,0 +1,14 @@
+[package]
+name = "elo"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+
+# Dependencies are a decision, not a convenience. See CLAUDE.md.
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }

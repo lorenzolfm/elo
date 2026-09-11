@@ -1,0 +1,58 @@
+# Roadmap
+
+The ladder to the first main goal. One line per pull request; tick it in the
+pull request that completes it.
+
+A step is done when its box is checked and its tests pass. A *milestone* is done
+when the gate passes — and the gates are deliberately external, answered by
+Bitcoin Core rather than by our own assertions.
+
+## Step 0 — Real bytes
+
+- [ ] Throwaway capture tooling: hand-build a minimal `version`, connect to a
+      local `bitcoind -regtest`, hexdump everything Core sends back. Commit the
+      captures to `tests/fixtures/` with provenance.
+
+Lives outside `src/`. It exists so that every codec test below is anchored to
+bytes Core produced, not bytes we produced.
+
+## M1 — Handshake
+
+- [ ] 1. The message envelope: network magic, 12-byte NUL-padded command, LE
+      payload length, `sha256d` checksum truncated to four bytes — and the
+      length bound that stops a peer from making us allocate four gigabytes.
+- [ ] 2. `CompactSize` and the primitive codec. The 0xfc / 0xfd / 0xfe / 0xff
+      boundaries, and what to do about non-canonical encodings.
+- [ ] 3. `version` and `verack` payloads.
+- [ ] 4. The live loop: connect, `version`, `verack`, answer `ping` with `pong`,
+      ignore what we do not understand.
+
+**Gate:** `bitcoin-cli getpeerinfo` on the homelab node lists elo by its
+subversion string.
+
+## M2 — Headers to tip
+
+- [ ] 5. The 80-byte block header, and `sha256d` over it. Genesis must print
+      `000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f` while
+      the bytes on the wire run the other way.
+- [ ] 6. `getheaders` and `headers`, including the vestigial zero
+      transaction-count byte that follows each header on the wire.
+- [ ] 7. The block locator: ten recent hashes, then exponential backoff — and
+      why that shape finds a fork point fast.
+- [ ] 8. The in-memory chain and the sync loop, capped at a couple of batches.
+- [ ] 9. Proof of work: decoding `nBits` to a 256-bit target, and the
+      comparison.
+- [ ] 10. Difficulty retargeting across the 2016-block boundary. The timespan
+      off-by-one, and the 4× clamps.
+- [ ] 11. Median time past.
+- [ ] 12. The full run from genesis.
+
+**Gate:** our tip hash equals the homelab node's `getbestblockhash`, and our
+height equals its `getblockcount`.
+
+## After
+
+Not designed for, not planned, listed only so nobody mistakes their absence for
+an oversight: block download, a block store, chainstate and the UTXO set,
+script and transaction validation, reorg handling, multi-peer, DNS seeding,
+mempool, RPC.
