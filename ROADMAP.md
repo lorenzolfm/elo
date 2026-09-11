@@ -9,9 +9,9 @@ Bitcoin Core rather than by our own assertions.
 
 ## Step 0 — Real bytes
 
-- [ ] Throwaway capture tooling: hand-build a minimal `version`, connect to a
-      local `bitcoind -regtest`, hexdump everything Core sends back. Commit the
-      captures to `tests/fixtures/` with provenance.
+- [x] Throwaway capture tooling: proxy between two regtest nodes, record both
+      directions of a real sync, commit the captures to `tests/fixtures/` with
+      provenance.
 
 Lives outside `src/`. It exists so that every codec test below is anchored to
 bytes Core produced, not bytes we produced.
