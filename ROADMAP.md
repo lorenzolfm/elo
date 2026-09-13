@@ -17,7 +17,7 @@ Captured Core bytes are added by the step that first needs them.
 - [x] 2. The handshake: our `version` out, the peer's `version` and `verack`
       in, our `verack` back. Proven against a spawned `bitcoind -regtest`
       that lists us in `getpeerinfo`.
-- [ ] 3. `ping` → `pong`. The first message we answer after the handshake.
+- [x] 3. `ping` → `pong`. The first message we answer after the handshake.
 - [ ] 4. Reading the peer's `version`: `CompactSize`, the user agent, the
       height it claims.
       Parse inside the transition, not after it: `handshake::run` moves to
