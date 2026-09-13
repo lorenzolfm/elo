@@ -87,6 +87,7 @@ impl std::fmt::Display for Command {
     }
 }
 
+#[derive(Debug)]
 pub struct Frame {
     pub command: Command,
     pub payload: Vec<u8>,

@@ -57,32 +57,37 @@ impl From<crate::message::Error> for Error {
 }
 
 /// Runs the handshake over `stream`. On `Ok`, both sides have sent `version`
-/// and `verack`. On `Err`, the stream is in an unknown state and the caller
+/// and `verack`, and every frame the peer sent, up to and including its
+/// `verack`, comes back in order for the caller to report: at most
+/// `MESSAGES_BEFORE_VERACK_MAX` of them, each already bounded by
+/// `message::read`. On `Err`, the stream is in an unknown state and the caller
 /// must drop it.
 pub fn run(
     stream: &mut (impl std::io::Read + std::io::Write),
     network: crate::message::Network,
     our_version: &[u8],
-) -> Result<(), Error> {
+) -> Result<Vec<crate::message::Frame>, Error> {
     crate::message::write(stream, network, VERSION, our_version)?;
-    println!("-> version ({} bytes)", our_version.len());
 
+    let mut seen = Vec::with_capacity(MESSAGES_BEFORE_VERACK_MAX);
     let mut version_received = false;
-    for _ in 0..MESSAGES_BEFORE_VERACK_MAX {
+    while seen.len() < MESSAGES_BEFORE_VERACK_MAX {
         let frame = crate::message::read(stream, network)?;
-        println!("<- {} ({} bytes)", frame.command, frame.payload.len());
         match frame.command {
             VERSION if !version_received => {
                 version_received = true;
                 crate::message::write(stream, network, VERACK, &[])?;
-                println!("-> verack");
             }
-            VERACK if version_received => return Ok(()),
+            VERACK if version_received => {
+                seen.push(frame);
+                return Ok(seen);
+            }
             VERACK => return Err(Error::VerackBeforeVersion),
             // Feature negotiation we do not speak yet, and a second `version`,
             // which Core also drops (`net_processing.cpp:3586`).
             _ => {}
         }
+        seen.push(frame);
     }
     Err(Error::NoVerackAfter)
 }
@@ -141,14 +146,22 @@ mod tests {
         }
     }
 
-    fn run(stream: &mut Duplex) -> Result<(), super::Error> {
+    fn run(stream: &mut Duplex) -> Result<Vec<crate::message::Frame>, super::Error> {
         super::run(stream, crate::message::Network::Regtest, OUR_VERSION)
     }
 
     #[test]
     fn completes_against_core_bytes() {
         let mut stream = Duplex::peer_sends(&[VERSION, WTXIDRELAY, SENDADDRV2, VERACK, SENDCMPCT]);
-        run(&mut stream).unwrap();
+        let seen = run(&mut stream).unwrap();
+
+        let commands: Vec<String> = seen.iter().map(|f| f.command.to_string()).collect();
+        assert_eq!(
+            commands,
+            ["version", "wtxidrelay", "sendaddrv2", "verack"],
+            "every frame up to verack comes back, in order"
+        );
+        assert_eq!(seen[0].payload.len(), 102, "Core's version payload");
 
         let sent = &stream.to_peer;
         assert_eq!(
@@ -171,7 +184,7 @@ mod tests {
             fixture(SENDCMPCT).len(),
             "stops at verack; sendcmpct is left for the caller"
         );
-        println!("sent version and verack, read version, wtxidrelay, sendaddrv2, verack");
+        println!("sent version and verack; saw {}", commands.join(", "));
     }
 
     #[test]

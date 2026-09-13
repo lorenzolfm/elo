@@ -1,5 +1,7 @@
 //! Spawns a `bitcoind -regtest`, points elo at it, and asks Core whether the
 //! handshake happened: `getpeerinfo` must list a peer with our `subver`.
+//! Then again, with the reader of elo's stdout gone after one line: elo must
+//! finish the handshake and its linger as if nobody had left, and exit 0.
 //!
 //! Fails when `bitcoind` or `bitcoin-cli` is not on `PATH`, unless
 //! `ELO_NO_BITCOIND` is set; then it skips, and says so past the harness's
@@ -8,6 +10,13 @@
 // This whole file is a test. Clippy's `allow-unwrap-in-tests` only sees
 // `#[test]` functions and `#[cfg(test)]` items, not the helpers here.
 #![allow(clippy::unwrap_used)]
+
+/// Ports are picked by binding and releasing, because `bitcoind` cannot bind
+/// port 0. Between the release and Core's own bind, another test picking the
+/// same way can be handed the same ports, and the datadir is named after one
+/// of them. Picking and starting under this lock closes the window: the next
+/// spawn picks only once this node holds its ports.
+static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct Node {
     child: std::process::Child,
@@ -24,6 +33,11 @@ impl Node {
                 .output()
                 .ok()?;
         }
+        // A test that panicked while starting poisons the lock; the ports it
+        // was after are free again, so the next spawn goes ahead regardless.
+        let _spawning = SPAWN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (p2p_port, rpc_port) = free_ports();
         let datadir = std::env::temp_dir().join(format!("elo-handshake-{p2p_port}"));
         std::fs::create_dir_all(&datadir).unwrap();
@@ -89,9 +103,11 @@ fn free_ports() -> (u16, u16) {
     (port(&a), port(&b))
 }
 
-#[test]
-fn core_lists_us_in_getpeerinfo() {
-    let Some(node) = Node::spawn() else {
+/// The node, or `None` with the skip announced, or a panic saying what to
+/// install.
+fn node_or_skip(test: &str) -> Option<Node> {
+    let node = Node::spawn();
+    if node.is_none() {
         assert!(
             std::env::var_os("ELO_NO_BITCOIND").is_some(),
             "bitcoind or bitcoin-cli is not on PATH; set ELO_NO_BITCOIND=1 to skip this test"
@@ -99,9 +115,16 @@ fn core_lists_us_in_getpeerinfo() {
         // The harness captures `eprintln!`, not the raw handle.
         std::io::Write::write_all(
             &mut std::io::stderr(),
-            b"SKIPPED core_lists_us_in_getpeerinfo: ELO_NO_BITCOIND is set\n",
+            format!("SKIPPED {test}: ELO_NO_BITCOIND is set\n").as_bytes(),
         )
         .unwrap();
+    }
+    node
+}
+
+#[test]
+fn core_lists_us_in_getpeerinfo() {
+    let Some(node) = node_or_skip("core_lists_us_in_getpeerinfo") else {
         return;
     };
     let mut elo = std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
@@ -144,4 +167,51 @@ fn core_lists_us_in_getpeerinfo() {
         peers.contains("\"relaytxes\": false"),
         "relay=false must turn transaction relay off"
     );
+}
+
+/// `elo <peer> | head -1`. Rust ignores `SIGPIPE`, so the next line elo
+/// writes after `head` exits fails with `EPIPE` instead of killing the
+/// process; `println!` turned that into a panic and exit code 101 (#5).
+/// Now, like bitcoind, elo drops the line and keeps working.
+#[test]
+fn keeps_working_after_its_reader_leaves() {
+    let Some(node) = node_or_skip("keeps_working_after_its_reader_leaves") else {
+        return;
+    };
+    let mut elo = std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
+        .arg(format!("127.0.0.1:{}", node.p2p_port))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // `head -1`: read one line, then close our end of the pipe.
+    let mut first_line = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(elo.stdout.take().unwrap()),
+        &mut first_line,
+    )
+    .unwrap();
+    println!("--- elo, first line ---\n{first_line}--- pipe closed ---");
+    assert!(first_line.starts_with("connecting to "), "{first_line}");
+
+    // Nobody is reading; the handshake must complete anyway.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let peers = loop {
+        let peers = node.cli(&["getpeerinfo"]).unwrap();
+        if peers.contains("/elo:") || std::time::Instant::now() > deadline {
+            break peers;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let subver = format!("\"subver\": \"/elo:{}/\"", env!("CARGO_PKG_VERSION"));
+    assert!(peers.contains(&subver), "Core does not list us:\n{peers}");
+    println!("Core lists {subver} with the pipe closed");
+
+    // Reading stderr to EOF is the wait; a panic message would land here.
+    let stderr = std::io::read_to_string(elo.stderr.take().unwrap()).unwrap();
+    let status = elo.wait().unwrap();
+    println!("elo exited with {status}, stderr: {stderr:?}");
+    assert!(status.success(), "elo exited with {status}: {stderr}");
+    assert!(stderr.is_empty(), "nothing went wrong, so nothing to say");
 }
