@@ -1,9 +1,6 @@
 //! What a frame means. The envelope (`message.rs`) checks magic, length and
 //! checksum and hands over a command and a payload; this module turns that
 //! pair into a value, and a value back into the pair.
-//!
-//! `decode` is pure: no socket, no clock. It checks each payload's size once,
-//! here, so nothing downstream handles a length.
 
 const VERSION: crate::message::Command = crate::message::Command::from_static("version");
 const VERACK: crate::message::Command = crate::message::Command::from_static("verack");
@@ -54,8 +51,6 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Message {
-    /// Takes the frame by value: an unknown payload passes through
-    /// untouched, and a known one is moved, not copied.
     pub fn decode(frame: crate::message::Frame) -> Result<Message, Error> {
         match frame.command {
             VERSION => Ok(Message::Version(frame.payload)),
