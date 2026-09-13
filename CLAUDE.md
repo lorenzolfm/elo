@@ -89,10 +89,10 @@ actually been felt, not before.
 
 Three oracles, each doing what it is good at.
 
-1. **Committed fixtures**, in `tests/fixtures/`, every one captured from Bitcoin
-   Core and carrying a note saying where it came from. Codec tests assert
-   against these bytes. A test that round-trips our encoder through our decoder
-   proves nothing — both halves can be wrong together.
+1. **Captured bytes**, every one written by Bitcoin Core, as a `const` beside
+   the test that reads it, with a comment saying where it came from. Codec
+   tests assert against these bytes. A test that round-trips our encoder
+   through our decoder proves nothing — both halves can be wrong together.
 2. **A spawned `bitcoind -regtest`** when a test needs a conversation or a chain
    shape we control (reorgs, a chain of known height).
 3. **The homelab node** as the milestone gate. Not a test; a demonstration.
