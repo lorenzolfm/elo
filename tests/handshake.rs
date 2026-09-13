@@ -11,6 +11,13 @@
 // `#[test]` functions and `#[cfg(test)]` items, not the helpers here.
 #![allow(clippy::unwrap_used)]
 
+/// Ports are picked by binding and releasing, because `bitcoind` cannot bind
+/// port 0. Between the release and Core's own bind, another test picking the
+/// same way can be handed the same ports, and the datadir is named after one
+/// of them. Picking and starting under this lock closes the window: the next
+/// spawn picks only once this node holds its ports.
+static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Node {
     child: std::process::Child,
     datadir: std::path::PathBuf,
@@ -26,6 +33,11 @@ impl Node {
                 .output()
                 .ok()?;
         }
+        // A test that panicked while starting poisons the lock; the ports it
+        // was after are free again, so the next spawn goes ahead regardless.
+        let _spawning = SPAWN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (p2p_port, rpc_port) = free_ports();
         let datadir = std::env::temp_dir().join(format!("elo-handshake-{p2p_port}"));
         std::fs::create_dir_all(&datadir).unwrap();
