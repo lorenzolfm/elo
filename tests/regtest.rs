@@ -1,7 +1,5 @@
-//! Spawns a `bitcoind -regtest`, points elo at it, and asks Core whether the
-//! handshake happened: `getpeerinfo` must list a peer with our `subver`.
-//! Then again, with the reader of elo's stdout gone after one line: elo must
-//! finish the handshake and its linger as if nobody had left, and exit 0.
+//! Spawns a `bitcoind -regtest`, points elo at it, and asks Core what it saw:
+//! `getpeerinfo` is the oracle for every claim here.
 //!
 //! Fails when `bitcoind` or `bitcoin-cli` is not on `PATH`, unless
 //! `ELO_NO_BITCOIND` is set; then it skips, and says so past the harness's
@@ -122,11 +120,17 @@ fn node_or_skip(test: &str) -> Option<Node> {
     node
 }
 
-#[test]
-fn core_lists_us_in_getpeerinfo() {
-    let Some(node) = node_or_skip("core_lists_us_in_getpeerinfo") else {
-        return;
-    };
+/// What Core saw and what elo printed, once `done` holds for `getpeerinfo`
+/// or ten seconds have passed. `None` when there is no `bitcoind` and
+/// `ELO_NO_BITCOIND` says that is fine.
+struct Run {
+    peers: String,
+    transcript: String,
+    status: std::process::ExitStatus,
+}
+
+fn run_elo_until(test: &str, done: fn(&str) -> bool) -> Option<Run> {
+    let node = node_or_skip(test)?;
     let mut elo = std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
         .arg(format!("127.0.0.1:{}", node.p2p_port))
         .stdout(std::process::Stdio::piped())
@@ -137,7 +141,7 @@ fn core_lists_us_in_getpeerinfo() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let peers = loop {
         let peers = node.cli(&["getpeerinfo"]).unwrap();
-        if peers.contains("/elo:") || std::time::Instant::now() > deadline {
+        if done(&peers) || std::time::Instant::now() > deadline {
             break peers;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -148,24 +152,73 @@ fn core_lists_us_in_getpeerinfo() {
     let status = elo.wait().unwrap();
     println!("--- elo ---\n{transcript}");
     let interesting = |line: &&str| {
-        ["subver", "\"version\"", "inbound", "addrlocal", "relaytxes"]
-            .iter()
-            .any(|key| line.contains(key))
+        [
+            "subver",
+            "\"version\"",
+            "inbound",
+            "addrlocal",
+            "relaytxes",
+            "pingtime",
+            "minping",
+            "pingwait",
+        ]
+        .iter()
+        .any(|key| line.contains(key))
     };
     println!("--- bitcoin-cli getpeerinfo ---");
     peers
         .lines()
         .filter(interesting)
         .for_each(|line| println!("{line}"));
+    Some(Run {
+        peers,
+        transcript,
+        status,
+    })
+}
 
-    assert!(status.success(), "elo exited with {status}");
-    assert!(transcript.contains("handshake complete"), "{transcript}");
-    let subver = format!("\"subver\": \"/elo:{}/\"", env!("CARGO_PKG_VERSION"));
-    assert!(peers.contains(&subver), "Core does not list us:\n{peers}");
-    assert!(peers.contains("\"inbound\": true"));
+#[test]
+fn core_lists_us_in_getpeerinfo() {
+    let Some(run) = run_elo_until("core_lists_us_in_getpeerinfo", |peers| {
+        peers.contains("/elo:")
+    }) else {
+        return;
+    };
+    assert!(run.status.success(), "elo exited with {}", run.status);
     assert!(
-        peers.contains("\"relaytxes\": false"),
+        run.transcript.contains("handshake complete"),
+        "{}",
+        run.transcript
+    );
+    let subver = format!("\"subver\": \"/elo:{}/\"", env!("CARGO_PKG_VERSION"));
+    assert!(
+        run.peers.contains(&subver),
+        "Core does not list us:\n{}",
+        run.peers
+    );
+    assert!(run.peers.contains("\"inbound\": true"));
+    assert!(
+        run.peers.contains("\"relaytxes\": false"),
         "relay=false must turn transaction relay off"
+    );
+}
+
+/// Core pings a new peer as soon as the handshake is done, and reports
+/// `pingtime` only once a `pong` with the matching nonce came back
+/// (`../bitcoin/src/rpc/net.cpp:254` at v31.1).
+#[test]
+fn core_measures_our_pong() {
+    let Some(run) = run_elo_until("core_measures_our_pong", |peers| {
+        peers.contains("\"pingtime\"")
+    }) else {
+        return;
+    };
+    assert!(run.status.success(), "elo exited with {}", run.status);
+    assert!(run.transcript.contains("-> pong"), "{}", run.transcript);
+    assert!(
+        run.peers.contains("\"pingtime\""),
+        "Core never got our pong:\n{}",
+        run.peers
     );
 }
 

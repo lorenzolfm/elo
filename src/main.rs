@@ -3,6 +3,7 @@
 mod handshake;
 mod message;
 mod version;
+mod wire;
 
 use std::hash::BuildHasher;
 
@@ -21,7 +22,7 @@ const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// After the handshake: how long we stay connected before we hang up, from
 /// the moment `verack` arrives, whatever the peer sends, unless the peer hangs
 /// up first. Long enough for Core's post-`verack` burst and for
-/// `tests/handshake.rs` to ask Core about us; short enough that `cargo test`
+/// `tests/regtest.rs` to ask Core about us; short enough that `cargo test`
 /// stays quick.
 const LINGER: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -87,11 +88,32 @@ fn run(peer: &str, out: &mut Log<impl std::io::Write>) -> Result<(), Box<dyn std
     while remaining > std::time::Duration::ZERO {
         stream.set_read_timeout(Some(remaining))?;
         match message::read(&mut stream, NETWORK) {
-            Ok(frame) => out.line(format_args!(
-                "<- {} ({} bytes) ignored",
-                frame.command,
-                frame.payload.len()
-            )),
+            Ok(frame) => match wire::Message::decode(frame)? {
+                // Core pings right after the handshake and every two minutes
+                // (`net_processing.cpp:5507`), and drops a peer whose pong is
+                // twenty minutes late (`:5495`, `TIMEOUT_INTERVAL` in
+                // `net.h:59`).
+                wire::Message::Ping(nonce) => {
+                    let pong = wire::Message::Pong(nonce).encode();
+                    match message::write(&mut stream, NETWORK, pong.command, &pong.payload) {
+                        Ok(()) => out.line(format_args!("<- ping {nonce:#018x}\n-> pong")),
+                        // The peer closed between its ping and our pong. Its
+                        // right, as below; a write sees it as a broken pipe.
+                        Err(message::Error::Io(e))
+                            if matches!(
+                                e.kind(),
+                                std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                            ) =>
+                        {
+                            out.line(format_args!("peer hung up"));
+                            return Ok(());
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                other => out.line(format_args!("<- {other} ignored")),
+            },
             Err(message::Error::Io(e))
                 if matches!(
                     e.kind(),
