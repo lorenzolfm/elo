@@ -1,5 +1,7 @@
 //! Spawns a `bitcoind -regtest`, points elo at it, and asks Core whether the
 //! handshake happened: `getpeerinfo` must list a peer with our `subver`.
+//! Then again, with the reader of elo's stdout walking away after one line:
+//! elo must exit 0 and say nothing, not panic.
 //!
 //! Fails when `bitcoind` or `bitcoin-cli` is not on `PATH`, unless
 //! `ELO_NO_BITCOIND` is set; then it skips, and says so past the harness's
@@ -89,9 +91,11 @@ fn free_ports() -> (u16, u16) {
     (port(&a), port(&b))
 }
 
-#[test]
-fn core_lists_us_in_getpeerinfo() {
-    let Some(node) = Node::spawn() else {
+/// The node, or `None` with the skip announced, or a panic saying what to
+/// install.
+fn node_or_skip(test: &str) -> Option<Node> {
+    let node = Node::spawn();
+    if node.is_none() {
         assert!(
             std::env::var_os("ELO_NO_BITCOIND").is_some(),
             "bitcoind or bitcoin-cli is not on PATH; set ELO_NO_BITCOIND=1 to skip this test"
@@ -99,9 +103,16 @@ fn core_lists_us_in_getpeerinfo() {
         // The harness captures `eprintln!`, not the raw handle.
         std::io::Write::write_all(
             &mut std::io::stderr(),
-            b"SKIPPED core_lists_us_in_getpeerinfo: ELO_NO_BITCOIND is set\n",
+            format!("SKIPPED {test}: ELO_NO_BITCOIND is set\n").as_bytes(),
         )
         .unwrap();
+    }
+    node
+}
+
+#[test]
+fn core_lists_us_in_getpeerinfo() {
+    let Some(node) = node_or_skip("core_lists_us_in_getpeerinfo") else {
         return;
     };
     let mut elo = std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
@@ -144,4 +155,38 @@ fn core_lists_us_in_getpeerinfo() {
         peers.contains("\"relaytxes\": false"),
         "relay=false must turn transaction relay off"
     );
+}
+
+/// `elo <peer> | head -1`. Rust ignores `SIGPIPE`, so the second line elo
+/// writes after `head` exits fails with `EPIPE` instead of killing the
+/// process; `println!` turned that into a panic and exit code 101 (#5).
+#[test]
+fn exits_quietly_when_stdout_closes() {
+    let Some(node) = node_or_skip("exits_quietly_when_stdout_closes") else {
+        return;
+    };
+    let mut elo = std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
+        .arg(format!("127.0.0.1:{}", node.p2p_port))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // `head -1`: read one line, then close our end of the pipe.
+    let mut first_line = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(elo.stdout.take().unwrap()),
+        &mut first_line,
+    )
+    .unwrap();
+    println!("--- elo, first line ---\n{first_line}--- pipe closed ---");
+
+    // Reading stderr to EOF is the wait; a panic message would land here.
+    let stderr = std::io::read_to_string(elo.stderr.take().unwrap()).unwrap();
+    let status = elo.wait().unwrap();
+    println!("elo exited with {status}, stderr: {stderr:?}");
+
+    assert!(first_line.starts_with("connecting to "), "{first_line}");
+    assert!(status.success(), "elo exited with {status}: {stderr}");
+    assert!(stderr.is_empty(), "nobody is listening, so nothing to say");
 }
