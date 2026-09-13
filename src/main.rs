@@ -1,6 +1,10 @@
 //! elo — a Bitcoin node, built one reviewable step at a time.
 //!
-//! Nothing here yet. `ROADMAP.md` says what comes next.
+//! Nothing runs yet. `ROADMAP.md` says what comes next.
+
+// Read and written by the handshake in step 2; only the tests use it here.
+#[allow(dead_code)]
+mod message;
 
 fn main() {
     println!("elo {}", env!("CARGO_PKG_VERSION"));

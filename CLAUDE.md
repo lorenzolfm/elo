@@ -30,8 +30,8 @@ If a protocol fact is load-bearing, cite where it came from (BIP number and
 section, or a file and line in `../bitcoin` at v31.1). Guesses are labelled as
 guesses.
 
-`docs/decisions/NNNN-*.md` gets a record only when a decision reaches past its
-own pull request — a new dependency, a wire invariant, an on-disk format.
+The pull request is the only decision log. There is no `docs/` directory;
+`git log` finds the reasoning.
 
 ## Scope
 
@@ -52,8 +52,7 @@ Everything Bitcoin-shaped is ours: the message envelope, `CompactSize`, the
 The `bitcoin` crate is not a dependency and must not become one — its decoders
 already enforce the invariants this project exists to discover.
 
-Adding a dependency is a decision record and a conversation, not a line in
-`Cargo.toml`.
+Adding a dependency is a conversation, not a line in `Cargo.toml`.
 
 ## The clean room
 
@@ -77,7 +76,11 @@ actually been felt, not before.
 - Idiomatic Rust. No TigerStyle ceremony.
 - **Every value read from the wire is explicitly bounded** before it is used to
   allocate, index, or loop. A length field is attacker-controlled input.
-- Invariants get an assertion, not a comment.
+- Invariants get an assertion, not a comment. An invariant is a fact about
+  *our* state. Anything a peer can influence gets an error, never an
+  assertion: a panic is the node going down.
+- No `unwrap` or `expect` outside tests, no `as` casts anywhere; clippy
+  enforces both.
 - Hand-rolled error enums with `Display`. No `thiserror`, no `anyhow`.
 - `#![forbid(unsafe_code)]`.
 - `clippy::pedantic` in CI, `cargo fmt` clean.
@@ -86,10 +89,10 @@ actually been felt, not before.
 
 Three oracles, each doing what it is good at.
 
-1. **Committed fixtures**, in `tests/fixtures/`, every one captured from Bitcoin
-   Core and carrying a note saying where it came from. Codec tests assert
-   against these bytes. A test that round-trips our encoder through our decoder
-   proves nothing — both halves can be wrong together.
+1. **Captured bytes**, every one written by Bitcoin Core, as a `const` beside
+   the test that reads it, with a comment saying where it came from. Codec
+   tests assert against these bytes. A test that round-trips our encoder
+   through our decoder proves nothing — both halves can be wrong together.
 2. **A spawned `bitcoind -regtest`** when a test needs a conversation or a chain
    shape we control (reorgs, a chain of known height).
 3. **The homelab node** as the milestone gate. Not a test; a demonstration.

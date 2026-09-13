@@ -7,25 +7,19 @@ A step is done when its box is checked and its tests pass. A *milestone* is done
 when the gate passes — and the gates are deliberately external, answered by
 Bitcoin Core rather than by our own assertions.
 
-## Step 0 — Real bytes
-
-- [ ] Throwaway capture tooling: hand-build a minimal `version`, connect to a
-      local `bitcoind -regtest`, hexdump everything Core sends back. Commit the
-      captures to `tests/fixtures/` with provenance.
-
-Lives outside `src/`. It exists so that every codec test below is anchored to
-bytes Core produced, not bytes we produced.
+Captured Core bytes are added by the step that first needs them.
 
 ## M1 — Handshake
 
-- [ ] 1. The message envelope: network magic, 12-byte NUL-padded command, LE
+- [x] 1. The message envelope: network magic, 12-byte NUL-padded command, LE
       payload length, `sha256d` checksum truncated to four bytes — and the
       length bound that stops a peer from making us allocate four gigabytes.
-- [ ] 2. `CompactSize` and the primitive codec. The 0xfc / 0xfd / 0xfe / 0xff
-      boundaries, and what to do about non-canonical encodings.
-- [ ] 3. `version` and `verack` payloads.
-- [ ] 4. The live loop: connect, `version`, `verack`, answer `ping` with `pong`,
-      ignore what we do not understand.
+- [ ] 2. The handshake: our `version` out, the peer's `version` and `verack`
+      in, our `verack` back. Proven against a spawned `bitcoind -regtest`
+      that lists us in `getpeerinfo`.
+- [ ] 3. `ping` → `pong`. The first message we answer after the handshake.
+- [ ] 4. Reading the peer's `version`: `CompactSize`, the user agent, the
+      height it claims.
 
 **Gate:** `bitcoin-cli getpeerinfo` on the homelab node lists elo by its
 subversion string.
