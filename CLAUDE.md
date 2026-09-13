@@ -77,7 +77,11 @@ actually been felt, not before.
 - Idiomatic Rust. No TigerStyle ceremony.
 - **Every value read from the wire is explicitly bounded** before it is used to
   allocate, index, or loop. A length field is attacker-controlled input.
-- Invariants get an assertion, not a comment.
+- Invariants get an assertion, not a comment. An invariant is a fact about
+  *our* state. Anything a peer can influence gets an error, never an
+  assertion: a panic is the node going down.
+- No `unwrap` or `expect` outside tests, no `as` casts anywhere; clippy
+  enforces both.
 - Hand-rolled error enums with `Display`. No `thiserror`, no `anyhow`.
 - `#![forbid(unsafe_code)]`.
 - `clippy::pedantic` in CI, `cargo fmt` clean.
