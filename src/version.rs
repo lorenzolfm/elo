@@ -52,10 +52,10 @@ pub fn build(peer: std::net::SocketAddr, timestamp: i64, nonce: u64) -> Vec<u8> 
 }
 
 /// What the peer said about itself: the fields Core keeps from the message
-/// (`net_processing.cpp:3661` to `:3678`), minus three it keeps for features
+/// (`net_processing.cpp:3668` to `:3679`), minus three it keeps for features
 /// we do not have. The timestamp feeds Core's clock-skew warning (`:3793`);
-/// the address is where the peer sees us (`:3672`); the nonce catches a
-/// connection to ourself, which only the inbound side checks (`:3650`).
+/// the address is where the peer sees us (`:3674`); the nonce catches a
+/// connection to ourself, which only the inbound side checks (`:3649`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Received {
     pub protocol: i32,
