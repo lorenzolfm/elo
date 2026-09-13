@@ -30,8 +30,8 @@ If a protocol fact is load-bearing, cite where it came from (BIP number and
 section, or a file and line in `../bitcoin` at v31.1). Guesses are labelled as
 guesses.
 
-`docs/decisions/NNNN-*.md` gets a record only when a decision reaches past its
-own pull request — a new dependency, a wire invariant, an on-disk format.
+The pull request is the only decision log. There is no `docs/` directory;
+`git log` finds the reasoning.
 
 ## Scope
 
@@ -52,8 +52,7 @@ Everything Bitcoin-shaped is ours: the message envelope, `CompactSize`, the
 The `bitcoin` crate is not a dependency and must not become one — its decoders
 already enforce the invariants this project exists to discover.
 
-Adding a dependency is a decision record and a conversation, not a line in
-`Cargo.toml`.
+Adding a dependency is a conversation, not a line in `Cargo.toml`.
 
 ## The clean room
 
