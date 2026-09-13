@@ -38,6 +38,9 @@ impl Node {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (p2p_port, rpc_port) = free_ports();
         let datadir = std::env::temp_dir().join(format!("elo-handshake-{p2p_port}"));
+        // A run that was killed leaves its datadir behind, and a later run
+        // that draws the same port would inherit its chain.
+        let _ = std::fs::remove_dir_all(&datadir);
         std::fs::create_dir_all(&datadir).unwrap();
         let child = std::process::Command::new("bitcoind")
             .arg("-regtest")
@@ -193,6 +196,10 @@ fn core_tells_us_its_height() {
         return;
     };
     node.cli(&["generatetoaddress", "7", UNSPENDABLE]).unwrap();
+    // `m_best_height` is set by `UpdatedBlockTip` (`net_processing.cpp:2162`)
+    // on the scheduler thread, after `generatetoaddress` has returned. Wait
+    // for it, or the `version` can still say 6.
+    node.cli(&["syncwithvalidationinterfacequeue"]).unwrap();
     let height = node.cli(&["getblockcount"]).unwrap();
     let height = height.trim();
     assert_eq!(height, "7");
