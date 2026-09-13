@@ -14,7 +14,7 @@ Captured Core bytes are added by the step that first needs them.
 - [x] 1. The message envelope: network magic, 12-byte NUL-padded command, LE
       payload length, `sha256d` checksum truncated to four bytes — and the
       length bound that stops a peer from making us allocate four gigabytes.
-- [ ] 2. The handshake: our `version` out, the peer's `version` and `verack`
+- [x] 2. The handshake: our `version` out, the peer's `version` and `verack`
       in, our `verack` back. Proven against a spawned `bitcoind -regtest`
       that lists us in `getpeerinfo`.
 - [ ] 3. `ping` → `pong`. The first message we answer after the handshake.
