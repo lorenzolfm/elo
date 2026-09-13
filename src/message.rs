@@ -10,6 +10,8 @@ const _: () = assert!(4 + COMMAND_BYTES + 4 + 4 == HEADER_BYTES);
 // The length field is a `u32`. `read` converts it to `usize` and treats failure as unreachable; this is why it is.
 const _: () = assert!(usize::BITS >= 32);
 
+// Only regtest is dialled today. The homelab, on mainnet, is a later step.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Network {
     Mainnet,
