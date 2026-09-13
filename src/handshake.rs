@@ -86,3 +86,126 @@ pub fn run(
     }
     Err(Error::NoVerackAfter)
 }
+
+#[cfg(test)]
+mod tests {
+    // Every frame below was sent by Bitcoin Core v31.1.0, `bitcoind -regtest`,
+    // on 2026-09-13, in this order, in answer to a `version` that a throwaway
+    // Python script sent over a raw TCP socket. `sendcmpct` came after the
+    // script's `verack`.
+    const VERSION: &str = "fabfb5da76657273696f6e000000000066000000da70f6db80110100090c00000000000028b0a66a000000000000000000000000000000000000000000000000000000000000090c000000000000000000000000000000000000000000000000d07dc58995aa90bc102f5361746f7368693a33312e312e302f0000000001";
+    const WTXIDRELAY: &str = "fabfb5da777478696472656c61790000000000005df6e0e2";
+    const SENDADDRV2: &str = "fabfb5da73656e646164647276320000000000005df6e0e2";
+    const VERACK: &str = "fabfb5da76657261636b000000000000000000005df6e0e2";
+    const SENDCMPCT: &str = "fabfb5da73656e64636d70637400000009000000e92f5ef8000200000000000000";
+
+    const OUR_VERSION: &[u8] = b"a version payload the peer does not read";
+
+    fn fixture(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    /// A socket stand-in: the peer's bytes on one side, ours collected on the
+    /// other.
+    struct Duplex {
+        from_peer: std::io::Cursor<Vec<u8>>,
+        to_peer: Vec<u8>,
+    }
+
+    impl Duplex {
+        fn peer_sends(frames: &[&str]) -> Self {
+            let bytes = frames.iter().flat_map(|hex| fixture(hex)).collect();
+            Duplex {
+                from_peer: std::io::Cursor::new(bytes),
+                to_peer: Vec::new(),
+            }
+        }
+    }
+
+    impl std::io::Read for Duplex {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::io::Read::read(&mut self.from_peer, buf)
+        }
+    }
+
+    impl std::io::Write for Duplex {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::io::Write::write(&mut self.to_peer, buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn run(stream: &mut Duplex) -> Result<(), super::Error> {
+        super::run(stream, crate::message::Network::Regtest, OUR_VERSION)
+    }
+
+    #[test]
+    fn completes_against_core_bytes() {
+        let mut stream = Duplex::peer_sends(&[VERSION, WTXIDRELAY, SENDADDRV2, VERACK, SENDCMPCT]);
+        run(&mut stream).unwrap();
+
+        let sent = &stream.to_peer;
+        assert_eq!(
+            &sent[..16],
+            b"\xfa\xbf\xb5\xdaversion\0\0\0\0\0",
+            "BIP324 v1 prefix"
+        );
+        let our_version_frame_len = 24 + OUR_VERSION.len();
+        assert_eq!(
+            &sent[our_version_frame_len..],
+            fixture(VERACK),
+            "our verack is Core's verack"
+        );
+        assert_eq!(sent.len(), our_version_frame_len + 24, "nothing else");
+
+        let unread = stream.from_peer.get_ref().len()
+            - usize::try_from(stream.from_peer.position()).unwrap();
+        assert_eq!(
+            unread,
+            fixture(SENDCMPCT).len(),
+            "stops at verack; sendcmpct is left for the caller"
+        );
+        println!("sent version and verack, read version, wtxidrelay, sendaddrv2, verack");
+    }
+
+    #[test]
+    fn rejects_verack_before_version() {
+        let mut stream = Duplex::peer_sends(&[VERACK, VERSION]);
+        let err = run(&mut stream).unwrap_err();
+        assert!(matches!(err, super::Error::VerackBeforeVersion), "{err}");
+        assert_eq!(
+            stream.to_peer.len(),
+            24 + OUR_VERSION.len(),
+            "no verack from us"
+        );
+        println!("{err}");
+    }
+
+    #[test]
+    fn gives_up_without_verack() {
+        let mut frames = vec![VERSION];
+        frames.resize(super::MESSAGES_BEFORE_VERACK_MAX, WTXIDRELAY);
+        frames.push(VERACK);
+        let mut stream = Duplex::peer_sends(&frames);
+        let err = run(&mut stream).unwrap_err();
+        assert!(matches!(err, super::Error::NoVerackAfter), "{err}");
+        println!("{err}; the verack that followed was never read");
+    }
+
+    #[test]
+    fn reports_a_peer_that_hangs_up_mid_handshake() {
+        let mut stream = Duplex::peer_sends(&[VERSION]);
+        let err = run(&mut stream).unwrap_err();
+        let super::Error::Message(crate::message::Error::Io(io)) = err else {
+            panic!("expected io, got {err}");
+        };
+        assert_eq!(io.kind(), std::io::ErrorKind::UnexpectedEof);
+        println!("peer sent version then closed: {io}");
+    }
+}
