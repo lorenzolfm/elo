@@ -160,14 +160,18 @@ mod tests {
         let Message::Version(payload) = &messages[0] else {
             panic!("{}", messages[0]);
         };
-        assert_eq!(payload, &fixture(VERSION)[24..], "payload kept as it came");
+        assert_eq!(
+            payload,
+            &fixture(VERSION)[crate::message::HEADER_BYTES..],
+            "payload kept as it came"
+        );
         assert_eq!(messages[3], Message::Verack);
         let Message::Ping(nonce) = messages[5] else {
             panic!("{}", messages[5]);
         };
         assert_eq!(
             nonce.to_le_bytes(),
-            fixture(PING)[24..],
+            fixture(PING)[crate::message::HEADER_BYTES..],
             "the nonce is little-endian on the wire"
         );
         assert_eq!(
