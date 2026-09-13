@@ -4,6 +4,12 @@ const MAX_PAYLOAD_BYTES: usize = 4_000_000;
 const HEADER_BYTES: usize = 24;
 const COMMAND_BYTES: usize = 12;
 
+// The header is magic, command, length, checksum.
+const _: () = assert!(4 + COMMAND_BYTES + 4 + 4 == HEADER_BYTES);
+
+// The length field is a `u32`. `read` converts it to `usize` and treats failure as unreachable; this is why it is.
+const _: () = assert!(usize::BITS >= 32);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Network {
     Mainnet,
@@ -26,21 +32,26 @@ impl Network {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Command([u8; COMMAND_BYTES]);
 
+/// Core's `IsMessageTypeValid`, `src/protocol.cpp:26` at v31.1: the name is printable ASCII, `0x20` to `0x7e`.
+const fn is_printable(byte: u8) -> bool {
+    byte >= b' ' && byte <= b'~'
+}
+
 impl Command {
     pub const fn from_static(name: &'static str) -> Self {
         let bytes = name.as_bytes();
-        assert!(!bytes.is_empty() && bytes.len() <= COMMAND_BYTES);
+        assert!(!bytes.is_empty());
+        assert!(bytes.len() <= COMMAND_BYTES);
         let mut raw = [0u8; COMMAND_BYTES];
         let mut i = 0;
         while i < bytes.len() {
-            assert!(bytes[i] >= b' ' && bytes[i] <= b'~');
+            assert!(is_printable(bytes[i]));
             raw[i] = bytes[i];
             i += 1;
         }
         Self(raw)
     }
 
-    /// The field as it sits on the wire, padding included.
     pub fn as_bytes(&self) -> &[u8; COMMAND_BYTES] {
         &self.0
     }
@@ -51,9 +62,14 @@ impl TryFrom<[u8; COMMAND_BYTES]> for Command {
 
     fn try_from(raw: [u8; COMMAND_BYTES]) -> Result<Self, Error> {
         let name_len = raw.iter().position(|&b| b == 0).unwrap_or(COMMAND_BYTES);
-        let (name, pad) = raw.split_at(name_len);
-        let printable = name.iter().all(|b| (b' '..=b'~').contains(b));
-        if !printable || pad.iter().any(|&b| b != 0) {
+        let (name, padding) = raw.split_at(name_len);
+        if name.is_empty() {
+            return Err(Error::BadCommand(raw));
+        }
+        if !name.iter().all(|&byte| is_printable(byte)) {
+            return Err(Error::BadCommand(raw));
+        }
+        if padding.iter().any(|&byte| byte != 0) {
             return Err(Error::BadCommand(raw));
         }
         Ok(Self(raw))
@@ -79,19 +95,24 @@ pub enum Error {
     Io(std::io::Error),
     BadMagic([u8; 4]),
     BadCommand([u8; COMMAND_BYTES]),
-    TooLong(usize),
-    BadChecksum { expected: [u8; 4], actual: [u8; 4] },
+    PayloadTooLong(usize),
+    BadChecksum { claimed: [u8; 4], computed: [u8; 4] },
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Io(e) => write!(f, "io: {e}"),
-            Error::BadMagic(m) => write!(f, "bad magic {m:02x?}"),
-            Error::BadCommand(c) => write!(f, "bad command {c:02x?}"),
-            Error::TooLong(n) => write!(f, "payload length {n} exceeds {MAX_PAYLOAD_BYTES}"),
-            Error::BadChecksum { expected, actual } => {
-                write!(f, "checksum {actual:02x?}, expected {expected:02x?}")
+            Error::Io(io) => write!(f, "io: {io}"),
+            Error::BadMagic(magic) => write!(f, "bad magic {magic:02x?}"),
+            Error::BadCommand(command) => write!(f, "bad command {command:02x?}"),
+            Error::PayloadTooLong(len) => {
+                write!(f, "payload length {len} exceeds {MAX_PAYLOAD_BYTES}")
+            }
+            Error::BadChecksum { claimed, computed } => {
+                write!(
+                    f,
+                    "checksum claimed {claimed:02x?}, computed {computed:02x?}"
+                )
             }
         }
     }
@@ -100,8 +121,8 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Error::Io(e)
+    fn from(io: std::io::Error) -> Self {
+        Error::Io(io)
     }
 }
 
@@ -111,14 +132,14 @@ fn checksum(payload: &[u8]) -> [u8; 4] {
 }
 
 pub fn write(
-    w: &mut impl std::io::Write,
+    writer: &mut impl std::io::Write,
     network: Network,
     command: Command,
     payload: &[u8],
 ) -> Result<(), Error> {
     let len = match u32::try_from(payload.len()) {
         Ok(len) if payload.len() <= MAX_PAYLOAD_BYTES => len,
-        _ => return Err(Error::TooLong(payload.len())),
+        _ => return Err(Error::PayloadTooLong(payload.len())),
     };
 
     let mut header = [0u8; HEADER_BYTES];
@@ -127,24 +148,24 @@ pub fn write(
     header[16..20].copy_from_slice(&len.to_le_bytes());
     header[20..].copy_from_slice(&checksum(payload));
 
-    w.write_all(&header)?;
-    w.write_all(payload)?;
+    writer.write_all(&header)?;
+    writer.write_all(payload)?;
 
     Ok(())
 }
 
-pub fn read(r: &mut impl std::io::Read, network: Network) -> Result<Frame, Error> {
+pub fn read(reader: &mut impl std::io::Read, network: Network) -> Result<Frame, Error> {
     let mut header = [0u8; HEADER_BYTES];
-    r.read_exact(&mut header)?;
+    reader.read_exact(&mut header)?;
 
     let [m0, m1, m2, m3, rest @ ..] = header;
     let [raw_command @ .., l0, l1, l2, l3, k0, k1, k2, k3] = rest;
-    let recv_magic = [m0, m1, m2, m3];
+    let received_magic = [m0, m1, m2, m3];
     let raw_len = [l0, l1, l2, l3];
-    let recv_checksum = [k0, k1, k2, k3];
+    let received_checksum = [k0, k1, k2, k3];
 
-    if recv_magic != network.magic() {
-        return Err(Error::BadMagic(recv_magic));
+    if received_magic != network.magic() {
+        return Err(Error::BadMagic(received_magic));
     }
 
     let command = Command::try_from(raw_command)?;
@@ -154,18 +175,21 @@ pub fn read(r: &mut impl std::io::Read, network: Network) -> Result<Frame, Error
     };
 
     if len > MAX_PAYLOAD_BYTES {
-        return Err(Error::TooLong(len));
+        return Err(Error::PayloadTooLong(len));
     }
 
+    // A fresh allocation per frame, up to 4 MB. With one peer and blocking
+    // I/O the cost is not felt. When it is, the caller owns one buffer and
+    // `read` fills it; `Frame` changes with it.
     let mut payload = vec![0u8; len];
 
-    r.read_exact(&mut payload)?;
+    reader.read_exact(&mut payload)?;
 
-    let actual_checksum = checksum(&payload);
-    if actual_checksum != recv_checksum {
+    let computed_checksum = checksum(&payload);
+    if computed_checksum != received_checksum {
         return Err(Error::BadChecksum {
-            expected: recv_checksum,
-            actual: actual_checksum,
+            claimed: received_checksum,
+            computed: computed_checksum,
         });
     }
 
@@ -176,8 +200,11 @@ pub fn read(r: &mut impl std::io::Read, network: Network) -> Result<Frame, Error
 mod tests {
     use super::{Command, Network};
 
+    // Both frames were sent by Bitcoin Core v31.1.0, `bitcoind -regtest`, on
+    // 2026-09-13. A throwaway Python script sent `version` and `verack` over a
+    // raw TCP socket and hex-dumped everything Core answered.
     const VERACK: &str = "fabfb5da76657261636b000000000000000000005df6e0e2";
-    const PING: &str = "fabfb5da70696e67000000000000000008000000335f19f0358313d39039497c";
+    const PING: &str = "fabfb5da70696e670000000000000000080000008626b8926616846538060637";
 
     fn fixture(hex: &str) -> Vec<u8> {
         (0..hex.len())
@@ -257,7 +284,10 @@ mod tests {
         let mut bytes = fixture(PING);
         bytes[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
         let err = read_err(&bytes, Network::Regtest);
-        assert!(matches!(err, super::Error::TooLong(0xffff_ffff)), "{err}");
+        assert!(
+            matches!(err, super::Error::PayloadTooLong(0xffff_ffff)),
+            "{err}"
+        );
         println!("length field says 4 GiB: {err}");
     }
 
@@ -269,7 +299,10 @@ mod tests {
         let Err(err) = super::write(&mut sink, Network::Regtest, command, &payload) else {
             panic!("expected an error");
         };
-        assert!(matches!(err, super::Error::TooLong(4_000_001)), "{err}");
+        assert!(
+            matches!(err, super::Error::PayloadTooLong(4_000_001)),
+            "{err}"
+        );
         assert!(sink.is_empty(), "nothing reaches the wire");
         println!("one byte over the limit: {err}");
     }
@@ -314,15 +347,12 @@ mod tests {
     }
 
     #[test]
-    fn accepts_an_all_nul_command_as_core_does() {
+    fn rejects_an_all_nul_command() {
         let mut bytes = fixture(VERACK);
         bytes[4..16].fill(0);
-        let frame = super::read(&mut &bytes[..], Network::Regtest).unwrap();
-        assert_eq!(frame.command.to_string(), "");
-        println!(
-            "twelve NUL bytes: command {:?}, Core's IsMessageTypeValid says yes too",
-            frame.command.to_string()
-        );
+        let err = read_err(&bytes, Network::Regtest);
+        assert!(matches!(err, super::Error::BadCommand(_)), "{err}");
+        println!("twelve NUL bytes, which Core would accept: {err}");
     }
 
     #[test]
