@@ -5,6 +5,9 @@
 // Read and written by the handshake in step 2; only the tests use it here.
 #[allow(dead_code)]
 mod message;
+// Sent by the handshake; until then only the tests use it.
+#[allow(dead_code)]
+mod version;
 
 fn main() {
     println!("elo {}", env!("CARGO_PKG_VERSION"));
