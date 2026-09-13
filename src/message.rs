@@ -198,8 +198,6 @@ pub fn read(reader: &mut impl std::io::Read, network: Network) -> Result<Frame, 
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, Network};
-
     // Both frames were sent by Bitcoin Core v31.1.0, `bitcoind -regtest`, on
     // 2026-09-13. A throwaway Python script sent `version` and `verack` over a
     // raw TCP socket and hex-dumped everything Core answered.
@@ -213,7 +211,7 @@ mod tests {
             .collect()
     }
 
-    fn read_err(bytes: &[u8], network: Network) -> super::Error {
+    fn read_err(bytes: &[u8], network: super::Network) -> super::Error {
         match super::read(&mut &bytes[..], network) {
             Err(e) => e,
             Ok(_) => panic!("expected an error"),
@@ -223,8 +221,8 @@ mod tests {
     #[test]
     fn reads_core_verack() {
         let bytes = fixture(VERACK);
-        let frame = super::read(&mut &bytes[..], Network::Regtest).unwrap();
-        assert_eq!(frame.command, Command::from_static("verack"));
+        let frame = super::read(&mut &bytes[..], super::Network::Regtest).unwrap();
+        assert_eq!(frame.command, super::Command::from_static("verack"));
         assert!(frame.payload.is_empty());
         println!(
             "verack: {} bytes, checksum of nothing is {:02x?}",
@@ -236,8 +234,8 @@ mod tests {
     #[test]
     fn reads_core_ping() {
         let bytes = fixture(PING);
-        let frame = super::read(&mut &bytes[..], Network::Regtest).unwrap();
-        assert_eq!(frame.command, Command::from_static("ping"));
+        let frame = super::read(&mut &bytes[..], super::Network::Regtest).unwrap();
+        assert_eq!(frame.command, super::Command::from_static("ping"));
         assert_eq!(frame.payload.len(), 8);
         println!("ping nonce (LE bytes): {:02x?}", frame.payload);
     }
@@ -247,10 +245,10 @@ mod tests {
         for (name, hex) in [("verack", VERACK), ("ping", PING)] {
             let core = fixture(hex);
             let mut ours = Vec::new();
-            let command = Command::from_static(name);
+            let command = super::Command::from_static(name);
             super::write(
                 &mut ours,
-                Network::Regtest,
+                super::Network::Regtest,
                 command,
                 &core[super::HEADER_BYTES..],
             )
@@ -265,7 +263,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_magic() {
-        let err = read_err(&fixture(VERACK), Network::Mainnet);
+        let err = read_err(&fixture(VERACK), super::Network::Mainnet);
         assert!(matches!(err, super::Error::BadMagic(_)), "{err}");
         println!("mainnet reader on regtest bytes: {err}");
     }
@@ -274,7 +272,7 @@ mod tests {
     fn rejects_corrupted_payload() {
         let mut bytes = fixture(PING);
         bytes[24] ^= 1;
-        let err = read_err(&bytes, Network::Regtest);
+        let err = read_err(&bytes, super::Network::Regtest);
         assert!(matches!(err, super::Error::BadChecksum { .. }), "{err}");
         println!("one bit flipped in the nonce: {err}");
     }
@@ -283,7 +281,7 @@ mod tests {
     fn rejects_oversized_length_before_allocating() {
         let mut bytes = fixture(PING);
         bytes[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
-        let err = read_err(&bytes, Network::Regtest);
+        let err = read_err(&bytes, super::Network::Regtest);
         assert!(
             matches!(err, super::Error::PayloadTooLong(0xffff_ffff)),
             "{err}"
@@ -295,8 +293,8 @@ mod tests {
     fn refuses_to_write_oversized_payload() {
         let payload = vec![0u8; super::MAX_PAYLOAD_BYTES + 1];
         let mut sink = Vec::new();
-        let command = Command::from_static("block");
-        let Err(err) = super::write(&mut sink, Network::Regtest, command, &payload) else {
+        let command = super::Command::from_static("block");
+        let Err(err) = super::write(&mut sink, super::Network::Regtest, command, &payload) else {
             panic!("expected an error");
         };
         assert!(
@@ -309,11 +307,11 @@ mod tests {
 
     #[test]
     fn round_trips_a_twelve_byte_command() {
-        const GETCFCHECKPT: Command = Command::from_static("getcfcheckpt");
+        const GETCFCHECKPT: super::Command = super::Command::from_static("getcfcheckpt");
         let mut bytes = Vec::new();
-        super::write(&mut bytes, Network::Regtest, GETCFCHECKPT, &[]).unwrap();
+        super::write(&mut bytes, super::Network::Regtest, GETCFCHECKPT, &[]).unwrap();
         assert_eq!(&bytes[4..16], b"getcfcheckpt");
-        let frame = super::read(&mut &bytes[..], Network::Regtest).unwrap();
+        let frame = super::read(&mut &bytes[..], super::Network::Regtest).unwrap();
         assert_eq!(frame.command, GETCFCHECKPT);
         println!("command field full, no NUL: {}", frame.command);
     }
@@ -322,7 +320,7 @@ mod tests {
     fn rejects_unprintable_command_byte() {
         let mut bytes = fixture(PING);
         bytes[4] = 0x7f;
-        let err = read_err(&bytes, Network::Regtest);
+        let err = read_err(&bytes, super::Network::Regtest);
         assert!(matches!(err, super::Error::BadCommand(_)), "{err}");
         println!("DEL in the command: {err}");
     }
@@ -330,7 +328,7 @@ mod tests {
     #[test]
     fn reports_a_truncated_payload_as_io() {
         let bytes = fixture(PING);
-        let err = read_err(&bytes[..bytes.len() - 1], Network::Regtest);
+        let err = read_err(&bytes[..bytes.len() - 1], super::Network::Regtest);
         let super::Error::Io(io) = err else {
             panic!("expected io, got {err}");
         };
@@ -342,7 +340,7 @@ mod tests {
     fn rejects_padding_that_is_not_nul() {
         let mut bytes = fixture(VERACK);
         bytes[15] = b'x';
-        let err = read_err(&bytes, Network::Regtest);
+        let err = read_err(&bytes, super::Network::Regtest);
         assert!(matches!(err, super::Error::BadCommand(_)), "{err}");
     }
 
@@ -350,7 +348,7 @@ mod tests {
     fn rejects_an_all_nul_command() {
         let mut bytes = fixture(VERACK);
         bytes[4..16].fill(0);
-        let err = read_err(&bytes, Network::Regtest);
+        let err = read_err(&bytes, super::Network::Regtest);
         assert!(matches!(err, super::Error::BadCommand(_)), "{err}");
         println!("twelve NUL bytes, which Core would accept: {err}");
     }
@@ -358,9 +356,15 @@ mod tests {
     #[test]
     fn a_read_command_can_always_be_written_back() {
         let bytes = fixture(PING);
-        let frame = super::read(&mut &bytes[..], Network::Regtest).unwrap();
+        let frame = super::read(&mut &bytes[..], super::Network::Regtest).unwrap();
         let mut again = Vec::new();
-        super::write(&mut again, Network::Regtest, frame.command, &frame.payload).unwrap();
+        super::write(
+            &mut again,
+            super::Network::Regtest,
+            frame.command,
+            &frame.payload,
+        )
+        .unwrap();
         assert_eq!(again, bytes);
         println!("read then write: {} bytes, unchanged", again.len());
     }
@@ -368,10 +372,10 @@ mod tests {
     #[test]
     fn magic_matches_chainparams() {
         for (network, hex) in [
-            (Network::Mainnet, "f9beb4d9"),
-            (Network::Testnet3, "0b110907"),
-            (Network::Testnet4, "1c163f28"),
-            (Network::Regtest, "fabfb5da"),
+            (super::Network::Mainnet, "f9beb4d9"),
+            (super::Network::Testnet3, "0b110907"),
+            (super::Network::Testnet4, "1c163f28"),
+            (super::Network::Regtest, "fabfb5da"),
         ] {
             assert_eq!(network.magic().to_vec(), fixture(hex), "{network:?}");
         }

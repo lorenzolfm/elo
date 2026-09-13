@@ -74,6 +74,8 @@ actually been felt, not before.
 ## Conventions
 
 - Idiomatic Rust. No TigerStyle ceremony.
+- Fully qualified paths at the point of use (`std::net::TcpStream::connect`),
+  not `use` imports. Traits are the exception: `use std::io::Read;` is fine.
 - **Every value read from the wire is explicitly bounded** before it is used to
   allocate, index, or loop. A length field is attacker-controlled input.
 - Invariants get an assertion, not a comment. An invariant is a fact about
