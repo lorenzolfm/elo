@@ -111,15 +111,17 @@ mod tests {
             "Core repeats its services in addr_from"
         );
         assert_eq!(&ours[72..80], &0x0123_4567_89ab_cdefu64.to_le_bytes());
-        assert_eq!(ours[80], 11, "agent length");
-        assert_eq!(&ours[81..92], b"/elo:0.1.0/");
+        let agent = super::USER_AGENT.as_bytes();
+        let agent_end = 81 + agent.len();
+        assert_eq!(usize::from(ours[80]), agent.len(), "agent length");
+        assert_eq!(&ours[81..agent_end], agent);
         assert_eq!(core[80], 16);
         assert_eq!(&core[81..97], b"/Satoshi:31.1.0/");
-        assert_eq!(&ours[92..96], &[0; 4], "our height");
+        assert_eq!(&ours[agent_end..agent_end + 4], &[0; 4], "our height");
         assert_eq!(&core[97..101], &[0; 4], "Core's height: fresh regtest");
-        assert_eq!(ours[96], 0, "relay: false");
+        assert_eq!(ours[agent_end + 4], 0, "relay: false");
         assert_eq!(core[101], 1, "Core: relay true");
-        assert_eq!(ours.len(), 97);
+        assert_eq!(ours.len(), agent_end + 5);
         assert_eq!(core.len(), 102);
 
         println!("ours ({} bytes): {:02x?}", ours.len(), ours);
