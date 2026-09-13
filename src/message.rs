@@ -1,7 +1,7 @@
 /// Core's `MAX_PROTOCOL_MESSAGE_LENGTH`, `src/net.h:65` at v31.1.
 const MAX_PAYLOAD_BYTES: usize = 4_000_000;
 
-const HEADER_BYTES: usize = 24;
+pub const HEADER_BYTES: usize = 24;
 const COMMAND_BYTES: usize = 12;
 
 // The header is magic, command, length, checksum.

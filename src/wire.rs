@@ -31,8 +31,8 @@ pub enum Error {
     /// A command we know, with a payload of a size it cannot have.
     BadLength {
         command: crate::message::Command,
-        len: usize,
-        expected: usize,
+        len_actual: usize,
+        len_expected: usize,
     },
 }
 
@@ -41,9 +41,12 @@ impl std::fmt::Display for Error {
         match self {
             Error::BadLength {
                 command,
-                len,
-                expected,
-            } => write!(f, "{command} payload is {len} bytes, expected {expected}"),
+                len_actual,
+                len_expected,
+            } => write!(
+                f,
+                "{command} payload is {len_actual} bytes, expected {len_expected}"
+            ),
         }
     }
 }
@@ -88,11 +91,11 @@ impl std::fmt::Display for Message {
     }
 }
 
-fn bad_length(frame: &crate::message::Frame, expected: usize) -> Error {
+fn bad_length(frame: &crate::message::Frame, len_expected: usize) -> Error {
     Error::BadLength {
         command: frame.command,
-        len: frame.payload.len(),
-        expected,
+        len_actual: frame.payload.len(),
+        len_expected,
     }
 }
 
@@ -160,14 +163,18 @@ mod tests {
         let Message::Version(payload) = &messages[0] else {
             panic!("{}", messages[0]);
         };
-        assert_eq!(payload, &fixture(VERSION)[24..], "payload kept as it came");
+        assert_eq!(
+            payload,
+            &fixture(VERSION)[crate::message::HEADER_BYTES..],
+            "payload kept as it came"
+        );
         assert_eq!(messages[3], Message::Verack);
         let Message::Ping(nonce) = messages[5] else {
             panic!("{}", messages[5]);
         };
         assert_eq!(
             nonce.to_le_bytes(),
-            fixture(PING)[24..],
+            fixture(PING)[crate::message::HEADER_BYTES..],
             "the nonce is little-endian on the wire"
         );
         assert_eq!(
@@ -233,7 +240,13 @@ mod tests {
         for (command, len) in [("ping", 7), ("ping", 9), ("pong", 0)] {
             let err = malformed(command, len);
             assert!(
-                matches!(err, super::Error::BadLength { expected: 8, .. }),
+                matches!(
+                    err,
+                    super::Error::BadLength {
+                        len_expected: 8,
+                        ..
+                    }
+                ),
                 "{err}"
             );
             println!("{err}");
@@ -248,8 +261,8 @@ mod tests {
             matches!(
                 err,
                 super::Error::BadLength {
-                    len: 1,
-                    expected: 0,
+                    len_actual: 1,
+                    len_expected: 0,
                     ..
                 }
             ),

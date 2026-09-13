@@ -52,33 +52,7 @@ fn main() -> std::process::ExitCode {
 /// Connects to `peer`, shakes hands, lingers, and narrates it all to `out`,
 /// the one place in elo that writes anything a person reads.
 fn run(peer: &str, out: &mut Log<impl std::io::Write>) -> Result<(), Box<dyn std::error::Error>> {
-    let peer: std::net::SocketAddr = peer.parse()?;
-    out.line(format_args!(
-        "connecting to {peer} as {}",
-        version::USER_AGENT
-    ));
-    let mut stream = std::net::TcpStream::connect_timeout(&peer, TIMEOUT)?;
-    stream.set_read_timeout(Some(TIMEOUT))?;
-
-    let since_epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
-    let timestamp = i64::try_from(since_epoch.as_secs())?;
-    // The nonce lets the peer notice a connection to itself
-    // (`../bitcoin/src/net.cpp:353`). std's per-process random seed is enough.
-    let nonce = std::hash::RandomState::new().hash_one(0u8);
-    let our_version = version::build(peer, timestamp, nonce);
-
-    let started = std::time::Instant::now();
-    out.line(format_args!("-> version ({} bytes)", our_version.len()));
-    let seen = handshake::run(&mut stream, NETWORK, &our_version)?;
-    let elapsed = started.elapsed();
-    for frame in &seen {
-        out.line(format_args!(
-            "<- {} ({} bytes)",
-            frame.command,
-            frame.payload.len()
-        ));
-    }
-    out.line(format_args!("handshake complete in {elapsed:?}"));
+    let mut stream = connect(peer, out)?;
 
     // Each read gets only what is left of `LINGER`, so a peer that keeps
     // talking cannot keep us here; the loop ends when the clock does. A zero
@@ -88,6 +62,10 @@ fn run(peer: &str, out: &mut Log<impl std::io::Write>) -> Result<(), Box<dyn std
     while remaining > std::time::Duration::ZERO {
         stream.set_read_timeout(Some(remaining))?;
         match message::read(&mut stream, NETWORK) {
+            // Stricter than Core, which ignores the tail of a long `ping` and
+            // only logs a short one (`net_processing.cpp:5283`), staying
+            // connected either way. A known command with a length it cannot
+            // have is a peer we do not want, so the `?` ends the session.
             Ok(frame) => match wire::Message::decode(frame)? {
                 // Core pings right after the handshake and every two minutes
                 // (`net_processing.cpp:5507`), and drops a peer whose pong is
@@ -97,15 +75,8 @@ fn run(peer: &str, out: &mut Log<impl std::io::Write>) -> Result<(), Box<dyn std
                     let pong = wire::Message::Pong(nonce).encode();
                     match message::write(&mut stream, NETWORK, pong.command, &pong.payload) {
                         Ok(()) => out.line(format_args!("<- ping {nonce:#018x}\n-> pong")),
-                        // The peer closed between its ping and our pong. Its
-                        // right, as below; a write sees it as a broken pipe.
-                        Err(message::Error::Io(e))
-                            if matches!(
-                                e.kind(),
-                                std::io::ErrorKind::BrokenPipe
-                                    | std::io::ErrorKind::ConnectionReset
-                            ) =>
-                        {
+                        // The peer closed between its ping and our pong.
+                        Err(message::Error::Io(e)) if peer_hung_up(&e) => {
                             out.line(format_args!("peer hung up"));
                             return Ok(());
                         }
@@ -122,13 +93,7 @@ fn run(peer: &str, out: &mut Log<impl std::io::Write>) -> Result<(), Box<dyn std
             {
                 break;
             }
-            // The peer closing first is its right, not our fault.
-            Err(message::Error::Io(e))
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-                ) =>
-            {
+            Err(message::Error::Io(e)) if peer_hung_up(&e) => {
                 out.line(format_args!("peer hung up"));
                 return Ok(());
             }
@@ -138,6 +103,55 @@ fn run(peer: &str, out: &mut Log<impl std::io::Write>) -> Result<(), Box<dyn std
     }
     out.line(format_args!("{LINGER:?} after the handshake, hanging up"));
     Ok(())
+}
+
+/// The peer closing first is its right, not our fault. A read sees it as an
+/// early end of stream; a write, as a broken pipe; either, as a reset. One
+/// predicate for both paths, so they cannot disagree about what a hang-up is.
+fn peer_hung_up(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+    )
+}
+
+/// Connects, runs the handshake and prints its transcript. Everything before
+/// the first message we answer; `run` keeps the decisions.
+fn connect(
+    peer: &str,
+    out: &mut Log<impl std::io::Write>,
+) -> Result<std::net::TcpStream, Box<dyn std::error::Error>> {
+    let peer: std::net::SocketAddr = peer.parse()?;
+    out.line(format_args!(
+        "connecting to {peer} as {}",
+        version::USER_AGENT
+    ));
+    let mut stream = std::net::TcpStream::connect_timeout(&peer, TIMEOUT)?;
+    stream.set_read_timeout(Some(TIMEOUT))?;
+
+    let since_epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let timestamp = i64::try_from(since_epoch.as_secs())?;
+    // Not the `ping` nonce: this one lets the peer notice a connection to
+    // itself (`../bitcoin/src/net.cpp:353`). std's per-process random seed is
+    // enough.
+    let version_nonce = std::hash::RandomState::new().hash_one(0u8);
+    let our_version = version::build(peer, timestamp, version_nonce);
+
+    let started = std::time::Instant::now();
+    out.line(format_args!("-> version ({} bytes)", our_version.len()));
+    let seen = handshake::run(&mut stream, NETWORK, &our_version)?;
+    let elapsed = started.elapsed();
+    for frame in &seen {
+        out.line(format_args!(
+            "<- {} ({} bytes)",
+            frame.command,
+            frame.payload.len()
+        ));
+    }
+    out.line(format_args!("handshake complete in {elapsed:?}"));
+    Ok(stream)
 }
 
 #[cfg(test)]
