@@ -1,0 +1,211 @@
+//! The `version`/`verack` exchange, from the side that opened the connection.
+//!
+//! We send `version` first, whole, before we read anything. A Core with
+//! BIP324 on decides v1 or v2 from the first 16 bytes on the socket: the
+//! magic and `"version\0\0\0\0\0"` (`../bitcoin/src/net.cpp:1090` at v31.1).
+//! Anything else starts a v2 key exchange.
+//!
+//! The peer's `version` earns our `verack`. The peer's `verack` completes the
+//! handshake. Core, as the responder, sends both in that order, with feature
+//! negotiation in between (`net_processing.cpp:3664`, `:3716`, `:3725`,
+//! `:3744`).
+
+const VERSION: crate::message::Command = crate::message::Command::from_static("version");
+const VERACK: crate::message::Command = crate::message::Command::from_static("verack");
+
+/// How many messages we read before we give up waiting for `verack`. Core
+/// sends at most four before it: `version`, `wtxidrelay`, `sendaddrv2` and
+/// `sendtxrcncl`. A peer that sends many more is not shaking hands; Core
+/// bounds the same wait with a 60 s timer instead.
+///
+/// Known gap: this bounds messages, not time. The socket's read timeout is
+/// per syscall, so a peer that drips one byte at a time holds `read` open
+/// for as long as it likes and this counter never advances. Accepted for
+/// now with one trusted peer; the wall-clock bound is issue #4.
+const MESSAGES_BEFORE_VERACK_MAX: usize = 16;
+
+#[derive(Debug)]
+pub enum Error {
+    Message(crate::message::Error),
+    /// The peer acknowledged our `version` before it sent its own. Core drops
+    /// every message that arrives before `version`
+    /// (`net_processing.cpp:3815`); with one peer we have nothing to keep, so
+    /// we hang up instead.
+    VerackBeforeVersion,
+    /// `MESSAGES_BEFORE_VERACK_MAX` frames came in and none was `verack`.
+    NoVerackAfter,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Message(e) => write!(f, "{e}"),
+            Error::VerackBeforeVersion => write!(f, "verack before version"),
+            Error::NoVerackAfter => {
+                write!(f, "no verack after {MESSAGES_BEFORE_VERACK_MAX} messages")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<crate::message::Error> for Error {
+    fn from(e: crate::message::Error) -> Self {
+        Error::Message(e)
+    }
+}
+
+/// Runs the handshake over `stream`. On `Ok`, both sides have sent `version`
+/// and `verack`. On `Err`, the stream is in an unknown state and the caller
+/// must drop it.
+pub fn run(
+    stream: &mut (impl std::io::Read + std::io::Write),
+    network: crate::message::Network,
+    our_version: &[u8],
+) -> Result<(), Error> {
+    crate::message::write(stream, network, VERSION, our_version)?;
+    println!("-> version ({} bytes)", our_version.len());
+
+    let mut version_received = false;
+    for _ in 0..MESSAGES_BEFORE_VERACK_MAX {
+        let frame = crate::message::read(stream, network)?;
+        println!("<- {} ({} bytes)", frame.command, frame.payload.len());
+        match frame.command {
+            VERSION if !version_received => {
+                version_received = true;
+                crate::message::write(stream, network, VERACK, &[])?;
+                println!("-> verack");
+            }
+            VERACK if version_received => return Ok(()),
+            VERACK => return Err(Error::VerackBeforeVersion),
+            // Feature negotiation we do not speak yet, and a second `version`,
+            // which Core also drops (`net_processing.cpp:3586`).
+            _ => {}
+        }
+    }
+    Err(Error::NoVerackAfter)
+}
+
+#[cfg(test)]
+mod tests {
+    // Every frame below was sent by Bitcoin Core v31.1.0, `bitcoind -regtest`,
+    // on 2026-09-13, in this order, in answer to a `version` that a throwaway
+    // Python script sent over a raw TCP socket. `sendcmpct` came after the
+    // script's `verack`.
+    const VERSION: &str = "fabfb5da76657273696f6e000000000066000000da70f6db80110100090c00000000000028b0a66a000000000000000000000000000000000000000000000000000000000000090c000000000000000000000000000000000000000000000000d07dc58995aa90bc102f5361746f7368693a33312e312e302f0000000001";
+    const WTXIDRELAY: &str = "fabfb5da777478696472656c61790000000000005df6e0e2";
+    const SENDADDRV2: &str = "fabfb5da73656e646164647276320000000000005df6e0e2";
+    const VERACK: &str = "fabfb5da76657261636b000000000000000000005df6e0e2";
+    const SENDCMPCT: &str = "fabfb5da73656e64636d70637400000009000000e92f5ef8000200000000000000";
+
+    const OUR_VERSION: &[u8] = b"a version payload the peer does not read";
+
+    fn fixture(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    /// A socket stand-in: the peer's bytes on one side, ours collected on the
+    /// other.
+    struct Duplex {
+        from_peer: std::io::Cursor<Vec<u8>>,
+        to_peer: Vec<u8>,
+    }
+
+    impl Duplex {
+        fn peer_sends(frames: &[&str]) -> Self {
+            let bytes = frames.iter().flat_map(|hex| fixture(hex)).collect();
+            Duplex {
+                from_peer: std::io::Cursor::new(bytes),
+                to_peer: Vec::new(),
+            }
+        }
+    }
+
+    impl std::io::Read for Duplex {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::io::Read::read(&mut self.from_peer, buf)
+        }
+    }
+
+    impl std::io::Write for Duplex {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::io::Write::write(&mut self.to_peer, buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn run(stream: &mut Duplex) -> Result<(), super::Error> {
+        super::run(stream, crate::message::Network::Regtest, OUR_VERSION)
+    }
+
+    #[test]
+    fn completes_against_core_bytes() {
+        let mut stream = Duplex::peer_sends(&[VERSION, WTXIDRELAY, SENDADDRV2, VERACK, SENDCMPCT]);
+        run(&mut stream).unwrap();
+
+        let sent = &stream.to_peer;
+        assert_eq!(
+            &sent[..16],
+            b"\xfa\xbf\xb5\xdaversion\0\0\0\0\0",
+            "BIP324 v1 prefix"
+        );
+        let our_version_frame_len = 24 + OUR_VERSION.len();
+        assert_eq!(
+            &sent[our_version_frame_len..],
+            fixture(VERACK),
+            "our verack is Core's verack"
+        );
+        assert_eq!(sent.len(), our_version_frame_len + 24, "nothing else");
+
+        let unread = stream.from_peer.get_ref().len()
+            - usize::try_from(stream.from_peer.position()).unwrap();
+        assert_eq!(
+            unread,
+            fixture(SENDCMPCT).len(),
+            "stops at verack; sendcmpct is left for the caller"
+        );
+        println!("sent version and verack, read version, wtxidrelay, sendaddrv2, verack");
+    }
+
+    #[test]
+    fn rejects_verack_before_version() {
+        let mut stream = Duplex::peer_sends(&[VERACK, VERSION]);
+        let err = run(&mut stream).unwrap_err();
+        assert!(matches!(err, super::Error::VerackBeforeVersion), "{err}");
+        assert_eq!(
+            stream.to_peer.len(),
+            24 + OUR_VERSION.len(),
+            "no verack from us"
+        );
+        println!("{err}");
+    }
+
+    #[test]
+    fn gives_up_without_verack() {
+        let mut frames = vec![VERSION];
+        frames.resize(super::MESSAGES_BEFORE_VERACK_MAX, WTXIDRELAY);
+        frames.push(VERACK);
+        let mut stream = Duplex::peer_sends(&frames);
+        let err = run(&mut stream).unwrap_err();
+        assert!(matches!(err, super::Error::NoVerackAfter), "{err}");
+        println!("{err}; the verack that followed was never read");
+    }
+
+    #[test]
+    fn reports_a_peer_that_hangs_up_mid_handshake() {
+        let mut stream = Duplex::peer_sends(&[VERSION]);
+        let err = run(&mut stream).unwrap_err();
+        let super::Error::Message(crate::message::Error::Io(io)) = err else {
+            panic!("expected io, got {err}");
+        };
+        assert_eq!(io.kind(), std::io::ErrorKind::UnexpectedEof);
+        println!("peer sent version then closed: {io}");
+    }
+}

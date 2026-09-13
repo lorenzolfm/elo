@@ -14,12 +14,20 @@ Captured Core bytes are added by the step that first needs them.
 - [x] 1. The message envelope: network magic, 12-byte NUL-padded command, LE
       payload length, `sha256d` checksum truncated to four bytes — and the
       length bound that stops a peer from making us allocate four gigabytes.
-- [ ] 2. The handshake: our `version` out, the peer's `version` and `verack`
+- [x] 2. The handshake: our `version` out, the peer's `version` and `verack`
       in, our `verack` back. Proven against a spawned `bitcoind -regtest`
       that lists us in `getpeerinfo`.
 - [ ] 3. `ping` → `pong`. The first message we answer after the handshake.
 - [ ] 4. Reading the peer's `version`: `CompactSize`, the user agent, the
       height it claims.
+      Parse inside the transition, not after it: `handshake::run` moves to
+      "awaiting verack" only once the payload has parsed, and the parsed
+      value lives in that state, so "verack sent, version never parsed" is
+      unrepresentable. `run` then returns the parsed peer instead of `()`.
+      While the signature moves anyway: take the stream by value and hand it
+      back on `Ok`, so "stream reused after `Err`" is unrepresentable too
+      (today a doc comment holds that rule; the mock in the unit tests must
+      keep its own handle on the written bytes).
 
 **Gate:** `bitcoin-cli getpeerinfo` on the homelab node lists elo by its
 subversion string.
@@ -34,6 +42,9 @@ subversion string.
 - [ ] 7. The block locator: ten recent hashes, then exponential backoff — and
       why that shape finds a fork point fast.
 - [ ] 8. The in-memory chain and the sync loop, capped at a couple of batches.
+      When the peer/connection struct appears, `Network` goes in it and the
+      per-call argument to `message::read`/`write` goes away: one stream
+      with two magics is representable today, with no writer.
 - [ ] 9. Proof of work: decoding `nBits` to a 256-bit target, and the
       comparison.
 - [ ] 10. Difficulty retargeting across the 2016-block boundary. The timespan
