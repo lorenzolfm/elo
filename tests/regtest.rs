@@ -130,7 +130,10 @@ struct Run {
 }
 
 fn run_elo_until(test: &str, done: fn(&str) -> bool) -> Option<Run> {
-    let node = node_or_skip(test)?;
+    Some(run_elo(&node_or_skip(test)?, done))
+}
+
+fn run_elo(node: &Node, done: fn(&str) -> bool) -> Run {
     let mut elo = std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
         .arg(format!("127.0.0.1:{}", node.p2p_port))
         .stdout(std::process::Stdio::piped())
@@ -170,11 +173,43 @@ fn run_elo_until(test: &str, done: fn(&str) -> bool) -> Option<Run> {
         .lines()
         .filter(interesting)
         .for_each(|line| println!("{line}"));
-    Some(Run {
+    Run {
         peers,
         transcript,
         status,
-    })
+    }
+}
+
+/// `ADDRESS_BCRT1_UNSPENDABLE`, `../bitcoin/test/functional/test_framework/address.py:35`:
+/// a witness program of all zeros, so `generatetoaddress` needs no wallet.
+const UNSPENDABLE: &str = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq3xueyj";
+
+/// Core puts its chain height in `version`: `my_height = m_best_height`,
+/// `../bitcoin/src/net_processing.cpp:1572` at v31.1. Mine a few blocks first so the number is not zero, then check the
+/// one elo prints against `getblockcount`.
+#[test]
+fn core_tells_us_its_height() {
+    let Some(node) = node_or_skip("core_tells_us_its_height") else {
+        return;
+    };
+    node.cli(&["generatetoaddress", "7", UNSPENDABLE]).unwrap();
+    let height = node.cli(&["getblockcount"]).unwrap();
+    let height = height.trim();
+    assert_eq!(height, "7");
+
+    let run = run_elo(&node, |peers| peers.contains("/elo:"));
+    assert!(run.status.success(), "elo exited with {}", run.status);
+    let peer_line = run
+        .transcript
+        .lines()
+        .find(|line| line.starts_with("peer is "))
+        .unwrap_or_else(|| panic!("no peer line:\n{}", run.transcript));
+    assert!(peer_line.contains("/Satoshi:"), "{peer_line}");
+    assert!(
+        peer_line.contains(&format!(" height {height} ")),
+        "getblockcount says {height}: {peer_line}"
+    );
+    println!("getblockcount {height}; {peer_line}");
 }
 
 #[test]

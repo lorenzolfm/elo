@@ -14,8 +14,9 @@ const NONCE_BYTES: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
-    /// The payload as it came. Reading the fields is step 4; until then the
-    /// handshake needs only to recognise the command.
+    /// The payload as it came. The one `version` that counts is parsed inside
+    /// the handshake; any other is a redundant one, which Core drops before it
+    /// reads a field (`net_processing.cpp:3586`), and so do we.
     Version(Vec<u8>),
     Verack,
     Ping(u64),
