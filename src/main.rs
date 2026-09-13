@@ -19,9 +19,10 @@ const PEER: &str = "127.0.0.1:18444";
 /// `handshake::MESSAGES_BEFORE_VERACK_MAX` and issue #4.
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// After the handshake: how long we stay connected before we hang up, from
-/// the moment `verack` arrives, whatever the peer sends. Long enough for
-/// Core's post-`verack` burst and for `tests/handshake.rs` to ask Core about
-/// us; short enough that `cargo test` stays quick.
+/// the moment `verack` arrives, whatever the peer sends, unless the peer hangs
+/// up first. Long enough for Core's post-`verack` burst and for
+/// `tests/handshake.rs` to ask Core about us; short enough that `cargo test`
+/// stays quick.
 const LINGER: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn main() -> std::process::ExitCode {
@@ -72,6 +73,16 @@ fn run(peer: &str) -> Result<(), Box<dyn std::error::Error>> {
                 ) =>
             {
                 break;
+            }
+            // The peer closing first is its right, not our fault.
+            Err(message::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                println!("peer hung up");
+                return Ok(());
             }
             Err(e) => return Err(e.into()),
         }
