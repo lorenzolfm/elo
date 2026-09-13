@@ -75,16 +75,8 @@ fn run(peer: &str, out: &mut Log<impl std::io::Write>) -> Result<(), Box<dyn std
                     let pong = wire::Message::Pong(nonce).encode();
                     match message::write(&mut stream, NETWORK, pong.command, &pong.payload) {
                         Ok(()) => out.line(format_args!("<- ping {nonce:#018x}\n-> pong")),
-                        // The peer closed between its ping and our pong. That
-                        // is its right (see the read path below); a write sees
-                        // it as a broken pipe.
-                        Err(message::Error::Io(e))
-                            if matches!(
-                                e.kind(),
-                                std::io::ErrorKind::BrokenPipe
-                                    | std::io::ErrorKind::ConnectionReset
-                            ) =>
-                        {
+                        // The peer closed between its ping and our pong.
+                        Err(message::Error::Io(e)) if peer_hung_up(&e) => {
                             out.line(format_args!("peer hung up"));
                             return Ok(());
                         }
@@ -101,13 +93,7 @@ fn run(peer: &str, out: &mut Log<impl std::io::Write>) -> Result<(), Box<dyn std
             {
                 break;
             }
-            // The peer closing first is its right, not our fault.
-            Err(message::Error::Io(e))
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-                ) =>
-            {
+            Err(message::Error::Io(e)) if peer_hung_up(&e) => {
                 out.line(format_args!("peer hung up"));
                 return Ok(());
             }
@@ -117,6 +103,18 @@ fn run(peer: &str, out: &mut Log<impl std::io::Write>) -> Result<(), Box<dyn std
     }
     out.line(format_args!("{LINGER:?} after the handshake, hanging up"));
     Ok(())
+}
+
+/// The peer closing first is its right, not our fault. A read sees it as an
+/// early end of stream; a write, as a broken pipe; either, as a reset. One
+/// predicate for both paths, so they cannot disagree about what a hang-up is.
+fn peer_hung_up(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+    )
 }
 
 /// Connects, runs the handshake and prints its transcript. Everything before
