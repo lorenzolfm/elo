@@ -1,7 +1,9 @@
 //! Spawns a `bitcoind -regtest`, points elo at it, and asks Core whether the
 //! handshake happened: `getpeerinfo` must list a peer with our `subver`.
 //!
-//! Skips, loudly, when `bitcoind` or `bitcoin-cli` is not on `PATH`.
+//! Fails when `bitcoind` or `bitcoin-cli` is not on `PATH`, unless
+//! `ELO_NO_BITCOIND` is set; then it skips, and says so past the harness's
+//! output capture. CI sets the variable; a developer should not have to.
 
 // This whole file is a test. Clippy's `allow-unwrap-in-tests` only sees
 // `#[test]` functions and `#[cfg(test)]` items, not the helpers here.
@@ -22,7 +24,7 @@ impl Node {
                 .output()
                 .ok()?;
         }
-        let (p2p_port, rpc_port) = (free_port(), free_port());
+        let (p2p_port, rpc_port) = free_ports();
         let datadir = std::env::temp_dir().join(format!("elo-handshake-{p2p_port}"));
         std::fs::create_dir_all(&datadir).unwrap();
         let child = std::process::Command::new("bitcoind")
@@ -79,18 +81,27 @@ impl Drop for Node {
     }
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// Two distinct ports: both listeners are alive when the second one binds.
+fn free_ports() -> (u16, u16) {
+    let bind = || std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let (a, b) = (bind(), bind());
+    let port = |l: &std::net::TcpListener| l.local_addr().unwrap().port();
+    (port(&a), port(&b))
 }
 
 #[test]
 fn core_lists_us_in_getpeerinfo() {
     let Some(node) = Node::spawn() else {
-        eprintln!("SKIPPED: bitcoind or bitcoin-cli not found on PATH");
+        assert!(
+            std::env::var_os("ELO_NO_BITCOIND").is_some(),
+            "bitcoind or bitcoin-cli is not on PATH; set ELO_NO_BITCOIND=1 to skip this test"
+        );
+        // The harness captures `eprintln!`, not the raw handle.
+        std::io::Write::write_all(
+            &mut std::io::stderr(),
+            b"SKIPPED core_lists_us_in_getpeerinfo: ELO_NO_BITCOIND is set\n",
+        )
+        .unwrap();
         return;
     };
     let mut elo = std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
@@ -126,10 +137,8 @@ fn core_lists_us_in_getpeerinfo() {
 
     assert!(status.success(), "elo exited with {status}");
     assert!(transcript.contains("handshake complete"), "{transcript}");
-    assert!(
-        peers.contains("\"subver\": \"/elo:0.1.0/\""),
-        "Core does not list us:\n{peers}"
-    );
+    let subver = format!("\"subver\": \"/elo:{}/\"", env!("CARGO_PKG_VERSION"));
+    assert!(peers.contains(&subver), "Core does not list us:\n{peers}");
     assert!(peers.contains("\"inbound\": true"));
     assert!(
         peers.contains("\"relaytxes\": false"),
