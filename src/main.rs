@@ -128,7 +128,7 @@ fn connect(
         "connecting to {peer} as {}",
         version::USER_AGENT
     ));
-    let mut stream = std::net::TcpStream::connect_timeout(&peer, TIMEOUT)?;
+    let stream = std::net::TcpStream::connect_timeout(&peer, TIMEOUT)?;
     stream.set_read_timeout(Some(TIMEOUT))?;
 
     let since_epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
@@ -141,7 +141,7 @@ fn connect(
 
     let started = std::time::Instant::now();
     out.line(format_args!("-> version ({} bytes)", our_version.len()));
-    let seen = handshake::run(&mut stream, NETWORK, &our_version)?;
+    let handshake::Complete { stream, seen } = handshake::run(stream, NETWORK, &our_version)?;
     let elapsed = started.elapsed();
     for frame in &seen {
         out.line(format_args!(

@@ -56,37 +56,52 @@ impl From<crate::message::Error> for Error {
     }
 }
 
-/// Runs the handshake over `stream`. On `Ok`, both sides have sent `version`
-/// and `verack`, and every frame the peer sent, up to and including its
-/// `verack`, comes back in order for the caller to report: at most
-/// `MESSAGES_BEFORE_VERACK_MAX` of them, each already bounded by
-/// `message::read`. On `Err`, the stream is in an unknown state and the caller
-/// must drop it.
-pub fn run(
-    stream: &mut (impl std::io::Read + std::io::Write),
+/// A handshake that finished: both sides have sent `version` and `verack`.
+#[derive(Debug)]
+pub struct Complete<S> {
+    /// The stream, positioned after the peer's `verack`.
+    pub stream: S,
+    /// Every frame the peer sent, up to and including its `verack`, in order,
+    /// for the caller to report: at most `MESSAGES_BEFORE_VERACK_MAX`, each
+    /// already bounded by `message::read`.
+    pub seen: Vec<crate::message::Frame>,
+}
+
+/// Where we are between our `version` and the peer's `verack`. Step 4 parses
+/// the peer's `version` on the way into `AwaitingVerack` and keeps it there.
+enum State {
+    AwaitingVersion,
+    AwaitingVerack,
+}
+
+/// Runs the handshake over `stream`, which comes back inside `Complete` on
+/// `Ok`. On `Err` it is gone: the peer left it in a state we cannot name, and
+/// dropping it is the hang-up.
+pub fn run<S: std::io::Read + std::io::Write>(
+    mut stream: S,
     network: crate::message::Network,
     our_version: &[u8],
-) -> Result<Vec<crate::message::Frame>, Error> {
-    crate::message::write(stream, network, VERSION, our_version)?;
+) -> Result<Complete<S>, Error> {
+    crate::message::write(&mut stream, network, VERSION, our_version)?;
 
     let mut seen = Vec::with_capacity(MESSAGES_BEFORE_VERACK_MAX);
-    let mut version_received = false;
+    let mut state = State::AwaitingVersion;
     while seen.len() < MESSAGES_BEFORE_VERACK_MAX {
-        let frame = crate::message::read(stream, network)?;
-        match frame.command {
-            VERSION if !version_received => {
-                version_received = true;
-                crate::message::write(stream, network, VERACK, &[])?;
+        let frame = crate::message::read(&mut stream, network)?;
+        state = match (state, frame.command) {
+            (State::AwaitingVersion, VERSION) => {
+                crate::message::write(&mut stream, network, VERACK, &[])?;
+                State::AwaitingVerack
             }
-            VERACK if version_received => {
+            (State::AwaitingVersion, VERACK) => return Err(Error::VerackBeforeVersion),
+            (State::AwaitingVerack, VERACK) => {
                 seen.push(frame);
-                return Ok(seen);
+                return Ok(Complete { stream, seen });
             }
-            VERACK => return Err(Error::VerackBeforeVersion),
             // Feature negotiation we do not speak yet, and a second `version`,
             // which Core also drops (`net_processing.cpp:3586`).
-            _ => {}
-        }
+            (state, _) => state,
+        };
         seen.push(frame);
     }
     Err(Error::NoVerackAfter)
@@ -114,31 +129,38 @@ mod tests {
     }
 
     /// A socket stand-in: the peer's bytes on one side, ours collected on the
-    /// other.
-    struct Duplex {
+    /// other. `run` takes the stream by value and keeps it only on `Ok`, so
+    /// the written bytes live outside: a test that expects `Err` still gets
+    /// to read them, once the borrow ends with the dropped stream.
+    #[derive(Debug)]
+    struct Duplex<'a> {
         from_peer: std::io::Cursor<Vec<u8>>,
-        to_peer: Vec<u8>,
+        to_peer: &'a mut Vec<u8>,
     }
 
-    impl Duplex {
-        fn peer_sends(frames: &[&str]) -> Self {
+    impl<'a> Duplex<'a> {
+        fn peer_sends(frames: &[&str], to_peer: &'a mut Vec<u8>) -> Self {
             let bytes = frames.iter().flat_map(|hex| fixture(hex)).collect();
             Duplex {
                 from_peer: std::io::Cursor::new(bytes),
-                to_peer: Vec::new(),
+                to_peer,
             }
+        }
+
+        fn unread(&self) -> usize {
+            self.from_peer.get_ref().len() - usize::try_from(self.from_peer.position()).unwrap()
         }
     }
 
-    impl std::io::Read for Duplex {
+    impl std::io::Read for Duplex<'_> {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             std::io::Read::read(&mut self.from_peer, buf)
         }
     }
 
-    impl std::io::Write for Duplex {
+    impl std::io::Write for Duplex<'_> {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            std::io::Write::write(&mut self.to_peer, buf)
+            std::io::Write::write(self.to_peer, buf)
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
@@ -146,41 +168,50 @@ mod tests {
         }
     }
 
-    fn run(stream: &mut Duplex) -> Result<Vec<crate::message::Frame>, super::Error> {
+    fn run<'a>(
+        frames: &[&str],
+        sent: &'a mut Vec<u8>,
+    ) -> Result<super::Complete<Duplex<'a>>, super::Error> {
+        let stream = Duplex::peer_sends(frames, sent);
         super::run(stream, crate::message::Network::Regtest, OUR_VERSION)
     }
 
     #[test]
     fn completes_against_core_bytes() {
-        let mut stream = Duplex::peer_sends(&[VERSION, WTXIDRELAY, SENDADDRV2, VERACK, SENDCMPCT]);
-        let seen = run(&mut stream).unwrap();
+        let mut sent = Vec::new();
+        let done = run(
+            &[VERSION, WTXIDRELAY, SENDADDRV2, VERACK, SENDCMPCT],
+            &mut sent,
+        )
+        .unwrap();
 
-        let commands: Vec<String> = seen.iter().map(|f| f.command.to_string()).collect();
+        let commands: Vec<String> = done.seen.iter().map(|f| f.command.to_string()).collect();
         assert_eq!(
             commands,
             ["version", "wtxidrelay", "sendaddrv2", "verack"],
             "every frame up to verack comes back, in order"
         );
-        assert_eq!(seen[0].payload.len(), 102, "Core's version payload");
+        assert_eq!(done.seen[0].payload.len(), 102, "Core's version payload");
 
-        let sent = &stream.to_peer;
+        let to_peer = &*done.stream.to_peer;
         assert_eq!(
-            &sent[..16],
+            &to_peer[..16],
             b"\xfa\xbf\xb5\xdaversion\0\0\0\0\0",
             "BIP324 v1 prefix"
         );
-        let our_version_frame_len = 24 + OUR_VERSION.len();
+        let our_version_frame_len = crate::message::HEADER_BYTES + OUR_VERSION.len();
         assert_eq!(
-            &sent[our_version_frame_len..],
+            &to_peer[our_version_frame_len..],
             fixture(VERACK),
             "our verack is Core's verack"
         );
-        assert_eq!(sent.len(), our_version_frame_len + 24, "nothing else");
-
-        let unread = stream.from_peer.get_ref().len()
-            - usize::try_from(stream.from_peer.position()).unwrap();
         assert_eq!(
-            unread,
+            to_peer.len(),
+            our_version_frame_len + crate::message::HEADER_BYTES,
+            "nothing else"
+        );
+        assert_eq!(
+            done.stream.unread(),
             fixture(SENDCMPCT).len(),
             "stops at verack; sendcmpct is left for the caller"
         );
@@ -189,12 +220,12 @@ mod tests {
 
     #[test]
     fn rejects_verack_before_version() {
-        let mut stream = Duplex::peer_sends(&[VERACK, VERSION]);
-        let err = run(&mut stream).unwrap_err();
+        let mut sent = Vec::new();
+        let err = run(&[VERACK, VERSION], &mut sent).unwrap_err();
         assert!(matches!(err, super::Error::VerackBeforeVersion), "{err}");
         assert_eq!(
-            stream.to_peer.len(),
-            24 + OUR_VERSION.len(),
+            sent.len(),
+            crate::message::HEADER_BYTES + OUR_VERSION.len(),
             "no verack from us"
         );
         println!("{err}");
@@ -205,16 +236,16 @@ mod tests {
         let mut frames = vec![VERSION];
         frames.resize(super::MESSAGES_BEFORE_VERACK_MAX, WTXIDRELAY);
         frames.push(VERACK);
-        let mut stream = Duplex::peer_sends(&frames);
-        let err = run(&mut stream).unwrap_err();
+        let mut sent = Vec::new();
+        let err = run(&frames, &mut sent).unwrap_err();
         assert!(matches!(err, super::Error::NoVerackAfter), "{err}");
         println!("{err}; the verack that followed was never read");
     }
 
     #[test]
     fn reports_a_peer_that_hangs_up_mid_handshake() {
-        let mut stream = Duplex::peer_sends(&[VERSION]);
-        let err = run(&mut stream).unwrap_err();
+        let mut sent = Vec::new();
+        let err = run(&[VERSION], &mut sent).unwrap_err();
         let super::Error::Message(crate::message::Error::Io(io)) = err else {
             panic!("expected io, got {err}");
         };
