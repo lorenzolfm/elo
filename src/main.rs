@@ -3,6 +3,7 @@
 mod handshake;
 mod message;
 mod version;
+mod wire;
 
 use std::hash::BuildHasher;
 
@@ -87,11 +88,18 @@ fn run(peer: &str, out: &mut Log<impl std::io::Write>) -> Result<(), Box<dyn std
     while remaining > std::time::Duration::ZERO {
         stream.set_read_timeout(Some(remaining))?;
         match message::read(&mut stream, NETWORK) {
-            Ok(frame) => out.line(format_args!(
-                "<- {} ({} bytes) ignored",
-                frame.command,
-                frame.payload.len()
-            )),
+            Ok(frame) => match wire::Message::decode(frame)? {
+                // Core pings right after the handshake and every two minutes
+                // (`net_processing.cpp:5507`), and drops a peer whose pong is
+                // twenty minutes late (`:5495`, `TIMEOUT_INTERVAL` in
+                // `net.h:59`).
+                wire::Message::Ping(nonce) => {
+                    let pong = wire::Message::Pong(nonce).encode();
+                    message::write(&mut stream, NETWORK, pong.command, &pong.payload)?;
+                    out.line(format_args!("<- ping {nonce:#018x}\n-> pong"));
+                }
+                other => out.line(format_args!("<- {other} ignored")),
+            },
             Err(message::Error::Io(e))
                 if matches!(
                     e.kind(),
