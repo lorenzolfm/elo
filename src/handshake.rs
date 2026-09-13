@@ -62,9 +62,6 @@ impl From<crate::message::Error> for Error {
 /// `MESSAGES_BEFORE_VERACK_MAX` of them, each already bounded by
 /// `message::read`. On `Err`, the stream is in an unknown state and the caller
 /// must drop it.
-///
-/// Nothing here prints. A closed stdout must not take the node down, so
-/// `main` is the only writer and the only place that can answer for one.
 pub fn run(
     stream: &mut (impl std::io::Read + std::io::Write),
     network: crate::message::Network,

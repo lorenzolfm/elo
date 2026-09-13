@@ -25,12 +25,6 @@ const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// stays quick.
 const LINGER: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Where the transcript goes. A line that cannot be written is dropped and
-/// the node goes on: stdout is a log, not the job. Core does the same,
-/// `fwrite` to stdout with the result ignored (`../bitcoin/src/logging.cpp:491`
-/// at v31.1), having ignored `SIGPIPE` at startup (`init.cpp:909`). Rust
-/// ignores `SIGPIPE` in every binary, so a reader that went away reaches us
-/// as `EPIPE` from `write`, which `println!` turns into a panic (#5).
 struct Log<W: std::io::Write>(W);
 
 impl<W: std::io::Write> Log<W> {
