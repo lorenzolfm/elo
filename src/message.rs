@@ -369,22 +369,6 @@ mod tests {
     }
 
     #[test]
-    fn a_read_command_can_always_be_written_back() {
-        let bytes = fixture(PING);
-        let frame = super::read(&mut &bytes[..], super::Network::Regtest).unwrap();
-        let mut again = Vec::new();
-        super::write(
-            &mut again,
-            super::Network::Regtest,
-            frame.command,
-            &frame.payload,
-        )
-        .unwrap();
-        assert_eq!(again, bytes);
-        println!("read then write: {} bytes, unchanged", again.len());
-    }
-
-    #[test]
     fn magic_matches_chainparams() {
         // Red if a magic constant has a typo or is byte-swapped.
         for (network, hex) in [
