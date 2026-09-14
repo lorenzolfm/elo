@@ -427,6 +427,7 @@ mod tests {
         bytes[15] = b'x';
         let err = read_err(&bytes, super::Network::Regtest);
         assert!(matches!(err, super::Error::BadCommand(_)), "{err}");
+        println!("`x` after the NUL padding of verack: {err}");
     }
 
     #[test]
