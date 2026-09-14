@@ -11,7 +11,7 @@ pub const PROTOCOL_VERSION: i32 = 70016;
 
 /// `MIN_PEER_PROTO_VERSION`, `protocol_version.h:18`. Core disconnects a
 /// peer below it (`net_processing.cpp:3623`); so do we.
-const MIN_PEER_PROTOCOL_VERSION: i32 = 31800;
+const PEER_PROTOCOL_VERSION_MIN: i32 = 31800;
 
 /// `MAX_SUBVERSION_LENGTH`, `../bitcoin/src/net.h:67`. Core rejects a longer
 /// user agent before it reads it (`net_processing.cpp:3640`, `serialize.h:621`).
@@ -101,7 +101,7 @@ impl std::fmt::Display for Error {
             Error::Obsolete(protocol) => {
                 write!(
                     f,
-                    "protocol {protocol} is below {MIN_PEER_PROTOCOL_VERSION}"
+                    "protocol {protocol} is below {PEER_PROTOCOL_VERSION_MIN}"
                 )
             }
             Error::UserAgentTooLong(len) => {
@@ -145,7 +145,7 @@ impl From<crate::compact_size::Error> for Error {
 pub fn parse(payload: &[u8]) -> Result<Received, Error> {
     let (protocol, rest) = take::<4>(payload)?;
     let protocol = i32::from_le_bytes(*protocol);
-    if protocol < MIN_PEER_PROTOCOL_VERSION {
+    if protocol < PEER_PROTOCOL_VERSION_MIN {
         return Err(Error::Obsolete(protocol));
     }
     let (services, rest) = take::<8>(rest)?;
@@ -165,7 +165,7 @@ pub fn parse(payload: &[u8]) -> Result<Received, Error> {
     // A serialized `bool` is one byte, nonzero for true (`serialize.h:277`).
     let relay = rest.first().is_none_or(|&byte| byte != 0);
     // What the guards above promised, restated where the value is kept.
-    assert!(protocol >= MIN_PEER_PROTOCOL_VERSION);
+    assert!(protocol >= PEER_PROTOCOL_VERSION_MIN);
     assert!(user_agent.len() <= USER_AGENT_BYTES_MAX);
     Ok(Received {
         protocol,

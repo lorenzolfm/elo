@@ -49,9 +49,9 @@ pub fn read(bytes: &[u8]) -> Result<(u64, &[u8]), Error> {
         return Err(Error::Truncated);
     }
     let (raw, rest) = rest.split_at(width);
-    let mut le = [0u8; 8];
-    le[..width].copy_from_slice(raw);
-    let value = u64::from_le_bytes(le);
+    let mut value_bytes = [0u8; 8];
+    value_bytes[..width].copy_from_slice(raw);
+    let value = u64::from_le_bytes(value_bytes);
     if value < floor {
         return Err(Error::NonCanonical(value));
     }
