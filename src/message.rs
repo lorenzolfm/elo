@@ -223,6 +223,7 @@ mod tests {
 
     #[test]
     fn reads_core_verack() {
+        // Red if `read` demands at least one payload byte.
         let bytes = fixture(VERACK);
         let frame = super::read(&mut &bytes[..], super::Network::Regtest).unwrap();
         assert_eq!(frame.command, super::Command::from_static("verack"));
@@ -236,6 +237,7 @@ mod tests {
 
     #[test]
     fn reads_core_ping() {
+        // Red if the length field is read big-endian.
         let bytes = fixture(PING);
         let frame = super::read(&mut &bytes[..], super::Network::Regtest).unwrap();
         assert_eq!(frame.command, super::Command::from_static("ping"));
@@ -245,6 +247,7 @@ mod tests {
 
     #[test]
     fn writes_bytes_identical_to_core() {
+        // Red if `write` puts the length before the command, or writes it big-endian.
         for (name, hex) in [("verack", VERACK), ("ping", PING)] {
             let core = fixture(hex);
             let mut ours = Vec::new();
@@ -266,6 +269,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_magic() {
+        // Red if the magic check is missing.
         let err = read_err(&fixture(VERACK), super::Network::Mainnet);
         assert!(matches!(err, super::Error::BadMagic(_)), "{err}");
         println!("mainnet reader on regtest bytes: {err}");
@@ -273,6 +277,7 @@ mod tests {
 
     #[test]
     fn rejects_corrupted_payload() {
+        // Red if the checksum check is missing.
         let mut bytes = fixture(PING);
         bytes[24] ^= 1;
         let err = read_err(&bytes, super::Network::Regtest);
@@ -282,6 +287,7 @@ mod tests {
 
     #[test]
     fn rejects_oversized_length_before_allocating() {
+        // Red if the length check is missing.
         let mut bytes = fixture(PING);
         bytes[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
         let err = read_err(&bytes, super::Network::Regtest);
@@ -294,6 +300,7 @@ mod tests {
 
     #[test]
     fn refuses_to_write_oversized_payload() {
+        // Red if `write` does not bound the payload, or writes the header before it checks.
         let payload = vec![0u8; super::MAX_PAYLOAD_BYTES + 1];
         let mut sink = Vec::new();
         let command = super::Command::from_static("block");
@@ -310,6 +317,7 @@ mod tests {
 
     #[test]
     fn round_trips_a_twelve_byte_command() {
+        // Red if `write` truncates the command to leave room for a NUL.
         const GETCFCHECKPT: super::Command = super::Command::from_static("getcfcheckpt");
         let mut bytes = Vec::new();
         super::write(&mut bytes, super::Network::Regtest, GETCFCHECKPT, &[]).unwrap();
@@ -321,6 +329,7 @@ mod tests {
 
     #[test]
     fn rejects_unprintable_command_byte() {
+        // Red if `is_printable` drops the upper bound.
         let mut bytes = fixture(PING);
         bytes[4] = 0x7f;
         let err = read_err(&bytes, super::Network::Regtest);
@@ -330,6 +339,7 @@ mod tests {
 
     #[test]
     fn reports_a_truncated_payload_as_io() {
+        // Red if `read` accepts a short payload instead of demanding every byte.
         let bytes = fixture(PING);
         let err = read_err(&bytes[..bytes.len() - 1], super::Network::Regtest);
         let super::Error::Io(io) = err else {
@@ -341,6 +351,7 @@ mod tests {
 
     #[test]
     fn rejects_padding_that_is_not_nul() {
+        // Red if the padding check is missing.
         let mut bytes = fixture(VERACK);
         bytes[15] = b'x';
         let err = read_err(&bytes, super::Network::Regtest);
@@ -349,6 +360,7 @@ mod tests {
 
     #[test]
     fn rejects_an_all_nul_command() {
+        // Red if the empty-name check is missing.
         let mut bytes = fixture(VERACK);
         bytes[4..16].fill(0);
         let err = read_err(&bytes, super::Network::Regtest);
@@ -374,6 +386,7 @@ mod tests {
 
     #[test]
     fn magic_matches_chainparams() {
+        // Red if a magic constant has a typo or is byte-swapped.
         for (network, hex) in [
             (super::Network::Mainnet, "f9beb4d9"),
             (super::Network::Testnet3, "0b110907"),
