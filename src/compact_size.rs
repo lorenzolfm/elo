@@ -2,9 +2,6 @@
 //! wire: one byte below 0xfd, else a marker byte and 2, 4 or 8 little-endian
 //! bytes. Core's `ReadCompactSize`, `../bitcoin/src/serialize.h:330` at v31.1.
 //!
-//! Only the decoder lives here. Every `CompactSize` we send today is below
-//! 0xfd and is written as its one byte by the caller (`version::build`).
-//!
 //! `read` returns the value unbounded: `u64::MAX` is a valid encoding, and a
 //! `CompactSize` is not always a length. `read_len` is for one that is: it
 //! takes the limit of the field it prefixes and returns a `usize` that is
