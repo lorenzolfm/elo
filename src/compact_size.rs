@@ -5,8 +5,10 @@
 //! Only the decoder lives here. Every `CompactSize` we send today is below
 //! 0xfd and is written as its one byte by the caller (`version::build`).
 //!
-//! The value comes back unbounded: `u64::MAX` is a valid encoding. The caller
-//! bounds it against the limit of the field it prefixes before it allocates.
+//! `read` returns the value unbounded: `u64::MAX` is a valid encoding, and a
+//! `CompactSize` is not always a length. `read_len` is for one that is: it
+//! takes the limit of the field it prefixes and returns a `usize` that is
+//! already under it, so the caller cannot allocate or slice before the bound.
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Error {
@@ -15,6 +17,8 @@ pub enum Error {
     /// A value in more bytes than it needs, which Core rejects
     /// (`serialize.h:342`, `:348`, `:353`). One value, one encoding.
     NonCanonical(u64),
+    /// A well-formed value above the limit of the field it prefixes.
+    TooLarge { value: u64, max: usize },
 }
 
 impl std::fmt::Display for Error {
@@ -22,6 +26,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::Truncated => write!(f, "compact size truncated"),
             Error::NonCanonical(value) => write!(f, "compact size {value} is not canonical"),
+            Error::TooLarge { value, max } => write!(f, "length {value} exceeds {max}"),
         }
     }
 }
@@ -51,6 +56,16 @@ pub fn read(bytes: &[u8]) -> Result<(u64, &[u8]), Error> {
         return Err(Error::NonCanonical(value));
     }
     Ok((value, rest))
+}
+
+/// Decodes the `CompactSize` at the front of `bytes` as a length of at most
+/// `max`. A value that does not fit `usize` is above `max` by definition.
+pub fn read_len(bytes: &[u8], max: usize) -> Result<(usize, &[u8]), Error> {
+    let (value, rest) = read(bytes)?;
+    match usize::try_from(value) {
+        Ok(len) if len <= max => Ok((len, rest)),
+        _ => Err(Error::TooLarge { value, max }),
+    }
 }
 
 #[cfg(test)]
@@ -139,5 +154,36 @@ mod tests {
             assert_eq!(err, super::Error::Truncated, "{bytes:02x?}");
         }
         println!("five prefixes cut short, five errors, nothing read past the end");
+    }
+
+    #[test]
+    fn a_length_is_bounded_before_it_is_a_usize() {
+        let bytes = fixture(THREE_HUNDRED_HEADERS);
+        let (count, _) = super::read_len(&bytes, 300).unwrap();
+        assert_eq!(count, 300);
+        let err = super::read_len(&bytes, 299).unwrap_err();
+        assert_eq!(
+            err,
+            super::Error::TooLarge {
+                value: 300,
+                max: 299
+            }
+        );
+        println!("{THREE_HUNDRED_HEADERS} under 300: {count}; under 299: {err}");
+
+        // The biggest value there is, against the smallest bound: no `usize`
+        // conversion is asked to hold it.
+        let err = super::read_len(&[0xff; 9], 0).unwrap_err();
+        assert_eq!(
+            err,
+            super::Error::TooLarge {
+                value: u64::MAX,
+                max: 0
+            }
+        );
+        println!("{err}");
+
+        let (zero, rest) = super::read_len(&[0, 7], 0).unwrap();
+        assert_eq!((zero, rest), (0, &[7][..]), "the bound is inclusive");
     }
 }

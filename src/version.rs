@@ -15,7 +15,7 @@ const MIN_PEER_PROTOCOL_VERSION: i32 = 31800;
 
 /// `MAX_SUBVERSION_LENGTH`, `../bitcoin/src/net.h:67`. Core rejects a longer
 /// user agent before it reads it (`net_processing.cpp:3640`, `serialize.h:621`).
-const USER_AGENT_BYTES_MAX: u64 = 256;
+const USER_AGENT_BYTES_MAX: usize = 256;
 
 pub const USER_AGENT: &str = concat!("/elo:", env!("CARGO_PKG_VERSION"), "/");
 
@@ -63,7 +63,10 @@ pub struct Received {
     /// Raw bytes. BIP14 says what a user agent should look like; a peer says
     /// what it likes, so `Display` escapes anything outside printable ASCII.
     pub user_agent: Vec<u8>,
-    pub start_height: i32,
+    /// Core reads a signed height and keeps `-1` for "not sent"
+    /// (`net_processing.cpp:3597`). We require the field, so the sentinel has
+    /// no meaning here, and a height below zero is not a height.
+    pub start_height: u32,
     pub relay: bool,
 }
 
@@ -87,7 +90,8 @@ pub enum Error {
     Truncated,
     Obsolete(i32),
     UserAgentTooLong(u64),
-    CompactSize(crate::compact_size::Error),
+    NonCanonicalUserAgentLength(u64),
+    NegativeHeight(i32),
 }
 
 impl std::fmt::Display for Error {
@@ -106,7 +110,10 @@ impl std::fmt::Display for Error {
                     "user agent of {len} bytes exceeds {USER_AGENT_BYTES_MAX}"
                 )
             }
-            Error::CompactSize(e) => write!(f, "user agent length: {e}"),
+            Error::NonCanonicalUserAgentLength(len) => {
+                write!(f, "user agent length {len} is not canonical")
+            }
+            Error::NegativeHeight(height) => write!(f, "height {height} is negative"),
         }
     }
 }
@@ -114,13 +121,16 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl From<crate::compact_size::Error> for Error {
-    /// A length prefix cut short is the payload cut short: one error, not two.
+    /// The one `CompactSize` in a `version` is the user agent's length, so
+    /// each of its errors is an error about that field. A prefix cut short
+    /// is the payload cut short: one error, not two.
     fn from(e: crate::compact_size::Error) -> Self {
         match e {
             crate::compact_size::Error::Truncated => Error::Truncated,
-            non_canonical @ crate::compact_size::Error::NonCanonical(_) => {
-                Error::CompactSize(non_canonical)
+            crate::compact_size::Error::NonCanonical(len) => {
+                Error::NonCanonicalUserAgentLength(len)
             }
+            crate::compact_size::Error::TooLarge { value, .. } => Error::UserAgentTooLong(value),
         }
     }
 }
@@ -143,25 +153,22 @@ pub fn parse(payload: &[u8]) -> Result<Received, Error> {
     let (_addr_recv, rest) = take::<NET_ADDR_BYTES>(rest)?;
     let (_addr_from, rest) = take::<NET_ADDR_BYTES>(rest)?;
     let (_nonce, rest) = take::<8>(rest)?;
-    let (agent_len, rest) = crate::compact_size::read(rest)?;
-    if agent_len > USER_AGENT_BYTES_MAX {
-        return Err(Error::UserAgentTooLong(agent_len));
-    }
-    let Ok(agent_len) = usize::try_from(agent_len) else {
-        unreachable!("bounded by USER_AGENT_BYTES_MAX above")
-    };
+    let (agent_len, rest) = crate::compact_size::read_len(rest, USER_AGENT_BYTES_MAX)?;
     if rest.len() < agent_len {
         return Err(Error::Truncated);
     }
     let (user_agent, rest) = rest.split_at(agent_len);
     let (start_height, rest) = take::<4>(rest)?;
+    let start_height = i32::from_le_bytes(*start_height);
+    let start_height =
+        u32::try_from(start_height).map_err(|_| Error::NegativeHeight(start_height))?;
     // A serialized `bool` is one byte, nonzero for true (`serialize.h:277`).
     let relay = rest.first().is_none_or(|&byte| byte != 0);
     Ok(Received {
         protocol,
         services: u64::from_le_bytes(*services),
         user_agent: user_agent.to_vec(),
-        start_height: i32::from_le_bytes(*start_height),
+        start_height,
         relay,
     })
 }
@@ -372,10 +379,19 @@ mod tests {
         let mut payload = with_user_agent(&[b'x'; 253]);
         payload[80..83].copy_from_slice(&[0xfd, 16, 0]);
         let err = super::parse(&payload).unwrap_err();
-        assert_eq!(
-            err,
-            super::Error::CompactSize(crate::compact_size::Error::NonCanonical(16))
-        );
+        assert_eq!(err, super::Error::NonCanonicalUserAgentLength(16));
         println!("{err}");
+    }
+
+    #[test]
+    fn a_height_below_zero_is_not_a_height() {
+        let mut payload = fixture(CORE);
+        payload[97..101].copy_from_slice(&(-1i32).to_le_bytes());
+        let err = super::parse(&payload).unwrap_err();
+        assert_eq!(err, super::Error::NegativeHeight(-1));
+        println!("{err}; Core's own 'not sent' sentinel, which we never need");
+        payload[97..101].copy_from_slice(&i32::MAX.to_le_bytes());
+        let tallest = super::parse(&payload).unwrap();
+        assert_eq!(tallest.start_height, 2_147_483_647, "the wire's ceiling");
     }
 }
