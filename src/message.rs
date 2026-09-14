@@ -349,14 +349,32 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_a_twelve_byte_command() {
+    fn writes_a_twelve_byte_command() {
         // Red if `write` truncates the command to leave room for a NUL.
         const GETCFCHECKPT: super::Command = super::Command::from_static("getcfcheckpt");
         let mut bytes = Vec::new();
         super::write(&mut bytes, super::Network::Regtest, GETCFCHECKPT, &[]).unwrap();
         assert_eq!(&bytes[4..16], b"getcfcheckpt");
+        println!("command field full, no NUL: {:02x?}", &bytes[4..16]);
+    }
+
+    #[test]
+    fn reads_a_twelve_byte_command() {
+        // Red if `Command::try_from` requires a NUL terminator.
+        //
+        // No captured frame fills the command field, so the header is built by
+        // hand. Core reads the name up to the first NUL or byte 12, whichever
+        // comes first (`CMessageHeader::GetMessageType`, `src/protocol.cpp:21`
+        // at v31.1). The checksum of the empty payload is taken from the
+        // captured `VERACK` frame.
+        let verack = fixture(VERACK);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&super::Network::Regtest.magic());
+        bytes.extend_from_slice(b"getcfcheckpt");
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&verack[20..]);
         let frame = super::read(&mut &bytes[..], super::Network::Regtest).unwrap();
-        assert_eq!(frame.command, GETCFCHECKPT);
+        assert_eq!(frame.command, super::Command::from_static("getcfcheckpt"));
         println!("command field full, no NUL: {}", frame.command);
     }
 
