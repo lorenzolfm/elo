@@ -109,6 +109,7 @@ pub fn run<S: std::io::Read + std::io::Write>(
             (State::AwaitingVersion, VERACK) => return Err(Error::VerackBeforeVersion),
             (State::AwaitingVerack(peer), VERACK) => {
                 seen.push(frame);
+                assert!(seen.len() <= MESSAGES_BEFORE_VERACK_MAX);
                 return Ok(Complete { stream, peer, seen });
             }
             // Feature negotiation we do not speak yet, and a second `version`,
@@ -117,6 +118,7 @@ pub fn run<S: std::io::Read + std::io::Write>(
         };
         seen.push(frame);
     }
+    assert_eq!(seen.len(), MESSAGES_BEFORE_VERACK_MAX);
     Err(Error::NoVerackAfter)
 }
 

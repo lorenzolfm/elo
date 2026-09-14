@@ -164,6 +164,9 @@ pub fn parse(payload: &[u8]) -> Result<Received, Error> {
         u32::try_from(start_height).map_err(|_| Error::NegativeHeight(start_height))?;
     // A serialized `bool` is one byte, nonzero for true (`serialize.h:277`).
     let relay = rest.first().is_none_or(|&byte| byte != 0);
+    // What the guards above promised, restated where the value is kept.
+    assert!(protocol >= MIN_PEER_PROTOCOL_VERSION);
+    assert!(user_agent.len() <= USER_AGENT_BYTES_MAX);
     Ok(Received {
         protocol,
         services: u64::from_le_bytes(*services),
