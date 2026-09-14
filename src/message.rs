@@ -362,12 +362,32 @@ mod tests {
 
     #[test]
     fn rejects_unprintable_command_byte() {
-        // Red if `is_printable` drops the upper bound.
-        let mut bytes = fixture(PING);
-        bytes[4] = 0x7f;
-        let err = read_err(&bytes, super::Network::Regtest);
-        assert!(matches!(err, super::Error::BadCommand(_)), "{err}");
-        println!("DEL in the command: {err}");
+        // Red if `is_printable` drops either bound.
+        for (name, byte) in [("US", 0x1f), ("DEL", 0x7f)] {
+            let mut bytes = fixture(PING);
+            bytes[4] = byte;
+            let err = read_err(&bytes, super::Network::Regtest);
+            assert!(matches!(err, super::Error::BadCommand(_)), "{err}");
+            println!("{name} in the command: {err}");
+        }
+    }
+
+    #[test]
+    fn accepts_command_bytes_at_the_printable_bounds() {
+        // Red if `is_printable` is `>` instead of `>=`, or `<` instead of `<=`.
+        //
+        // Core's `IsMessageTypeValid`, `src/protocol.cpp:26` at v31.1, accepts
+        // `0x20` to `0x7e` inclusive.
+        for byte in [0x20, 0x7e] {
+            let mut bytes = fixture(PING);
+            bytes[4] = byte;
+            let frame = super::read(&mut &bytes[..], super::Network::Regtest).unwrap();
+            assert_eq!(frame.command.as_bytes()[0], byte);
+            println!(
+                "first command byte {byte:#04x}: read as `{}`",
+                frame.command
+            );
+        }
     }
 
     #[test]
