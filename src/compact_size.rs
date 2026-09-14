@@ -7,7 +7,7 @@
 //! takes the limit of the field it prefixes and returns a `usize` that is
 //! already under it, so the caller cannot allocate or slice before the bound.
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Error {
     /// The marker promised more bytes than the payload holds.
     Truncated,
@@ -132,7 +132,10 @@ mod tests {
             (vec![0xff, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0], 0xffff_ffff),
         ] {
             let err = super::read(&bytes).unwrap_err();
-            assert_eq!(err, super::Error::NonCanonical(value), "{bytes:02x?}");
+            assert!(
+                matches!(err, super::Error::NonCanonical(got) if got == value),
+                "{bytes:02x?}: {err}"
+            );
             println!("{bytes:02x?}: {err}");
         }
         println!("Core throws 'non-canonical ReadCompactSize()' for each");
@@ -148,7 +151,10 @@ mod tests {
             &[0xff, 1, 2, 3, 4, 5, 6, 7],
         ] {
             let err = super::read(bytes).unwrap_err();
-            assert_eq!(err, super::Error::Truncated, "{bytes:02x?}");
+            assert!(
+                matches!(err, super::Error::Truncated),
+                "{bytes:02x?}: {err}"
+            );
         }
         println!("five prefixes cut short, five errors, nothing read past the end");
     }
@@ -159,24 +165,30 @@ mod tests {
         let (count, _) = super::read_len(&bytes, 300).unwrap();
         assert_eq!(count, 300);
         let err = super::read_len(&bytes, 299).unwrap_err();
-        assert_eq!(
-            err,
-            super::Error::TooLarge {
-                value: 300,
-                max: 299
-            }
+        assert!(
+            matches!(
+                err,
+                super::Error::TooLarge {
+                    value: 300,
+                    max: 299
+                }
+            ),
+            "{err}"
         );
         println!("{THREE_HUNDRED_HEADERS} under 300: {count}; under 299: {err}");
 
         // The biggest value there is, against the smallest bound: no `usize`
         // conversion is asked to hold it.
         let err = super::read_len(&[0xff; 9], 0).unwrap_err();
-        assert_eq!(
-            err,
-            super::Error::TooLarge {
-                value: u64::MAX,
-                max: 0
-            }
+        assert!(
+            matches!(
+                err,
+                super::Error::TooLarge {
+                    value: u64::MAX,
+                    max: 0
+                }
+            ),
+            "{err}"
         );
         println!("{err}");
 

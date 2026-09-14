@@ -56,7 +56,7 @@ pub fn build(peer: std::net::SocketAddr, timestamp: i64, nonce: u64) -> Vec<u8> 
 /// we do not have. The timestamp feeds Core's clock-skew warning (`:3793`);
 /// the address is where the peer sees us (`:3674`); the nonce catches a
 /// connection to ourself, which only the inbound side checks (`:3649`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Peer {
     pub protocol: i32,
     pub services: u64,
@@ -84,7 +84,7 @@ impl std::fmt::Display for Peer {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Error {
     /// A required field runs past the end of the payload.
     Truncated,
@@ -282,16 +282,11 @@ mod tests {
     #[test]
     fn reads_core_field_by_field() {
         let received = super::parse(&fixture(CORE)).unwrap();
-        assert_eq!(
-            received,
-            super::Peer {
-                protocol: 70016,
-                services: 0x0c09,
-                user_agent: b"/Satoshi:31.1.0/".to_vec(),
-                start_height: 0,
-                relay: true,
-            }
-        );
+        assert_eq!(received.protocol, 70016);
+        assert_eq!(received.services, 0x0c09);
+        assert_eq!(received.user_agent, b"/Satoshi:31.1.0/");
+        assert_eq!(received.start_height, 0);
+        assert!(received.relay);
         let at_300 = super::parse(&fixture(CORE_AT_300)).unwrap();
         assert_eq!(at_300.start_height, 300, "the height it claims");
         println!("{received}");
@@ -304,7 +299,7 @@ mod tests {
         let last_required = core.len() - 1;
         for len in 0..last_required {
             let err = super::parse(&core[..len]).unwrap_err();
-            assert_eq!(err, super::Error::Truncated, "{len} bytes");
+            assert!(matches!(err, super::Error::Truncated), "{len} bytes: {err}");
         }
         let without_relay = super::parse(&core[..last_required]).unwrap();
         assert!(without_relay.relay, "absent relay is true, as in Core");
@@ -325,7 +320,7 @@ mod tests {
         let mut payload = fixture(CORE);
         payload[..4].copy_from_slice(&31799i32.to_le_bytes());
         let err = super::parse(&payload).unwrap_err();
-        assert_eq!(err, super::Error::Obsolete(31799));
+        assert!(matches!(err, super::Error::Obsolete(31799)), "{err}");
         println!("{err}");
         payload[..4].copy_from_slice(&31800i32.to_le_bytes());
         assert_eq!(super::parse(&payload).unwrap().protocol, 31800);
@@ -353,17 +348,15 @@ mod tests {
         let longest = super::parse(&with_user_agent(&[b'x'; 256])).unwrap();
         assert_eq!(longest.user_agent.len(), 256);
         let err = super::parse(&with_user_agent(&[b'x'; 257])).unwrap_err();
-        assert_eq!(err, super::Error::UserAgentTooLong(257));
+        assert!(matches!(err, super::Error::UserAgentTooLong(257)), "{err}");
         println!("256 bytes: read; 257: {err}");
 
         // A length that promises more than the payload holds, well under the
         // limit: truncated, not allocated.
         let mut promised = with_user_agent(b"/short/");
         promised[80] = 200;
-        assert_eq!(
-            super::parse(&promised).unwrap_err(),
-            super::Error::Truncated
-        );
+        let err = super::parse(&promised).unwrap_err();
+        assert!(matches!(err, super::Error::Truncated), "{err}");
 
         let empty = super::parse(&with_user_agent(b"")).unwrap();
         assert!(empty.user_agent.is_empty(), "no user agent is a user agent");
@@ -382,7 +375,10 @@ mod tests {
         let mut payload = with_user_agent(&[b'x'; 253]);
         payload[80..83].copy_from_slice(&[0xfd, 16, 0]);
         let err = super::parse(&payload).unwrap_err();
-        assert_eq!(err, super::Error::NonCanonicalUserAgentLength(16));
+        assert!(
+            matches!(err, super::Error::NonCanonicalUserAgentLength(16)),
+            "{err}"
+        );
         println!("{err}");
     }
 
@@ -391,7 +387,7 @@ mod tests {
         let mut payload = fixture(CORE);
         payload[97..101].copy_from_slice(&(-1i32).to_le_bytes());
         let err = super::parse(&payload).unwrap_err();
-        assert_eq!(err, super::Error::NegativeHeight(-1));
+        assert!(matches!(err, super::Error::NegativeHeight(-1)), "{err}");
         println!("{err}; Core's own 'not sent' sentinel, which we never need");
         payload[97..101].copy_from_slice(&i32::MAX.to_le_bytes());
         let tallest = super::parse(&payload).unwrap();

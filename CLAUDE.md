@@ -42,6 +42,8 @@ Always ask before adding.
 - No `unwrap` or `expect` outside tests, no `as` casts anywhere; clippy
   enforces both.
 - Hand-rolled error enums with `Display`. No `thiserror`, no `anyhow`.
+- Derive only what non-test code uses. No `PartialEq`, `Eq`, `Clone` or
+  `Copy` for the sake of a test; a test uses `matches!` or compares fields.
 - `#![forbid(unsafe_code)]`.
 - `clippy::pedantic` in CI, `cargo fmt` clean.
 
