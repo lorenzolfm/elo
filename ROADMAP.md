@@ -18,16 +18,8 @@ Captured Core bytes are added by the step that first needs them.
       in, our `verack` back. Proven against a spawned `bitcoind -regtest`
       that lists us in `getpeerinfo`.
 - [x] 3. `ping` → `pong`. The first message we answer after the handshake.
-- [ ] 4. Reading the peer's `version`: `CompactSize`, the user agent, the
+- [x] 4. Reading the peer's `version`: `CompactSize`, the user agent, the
       height it claims.
-      Parse inside the transition, not after it: `handshake::run` moves to
-      "awaiting verack" only once the payload has parsed, and the parsed
-      value lives in that state, so "verack sent, version never parsed" is
-      unrepresentable. `run` then returns the parsed peer instead of `()`.
-      While the signature moves anyway: take the stream by value and hand it
-      back on `Ok`, so "stream reused after `Err`" is unrepresentable too
-      (today a doc comment holds that rule; the mock in the unit tests must
-      keep its own handle on the written bytes).
 
 **Gate:** `bitcoin-cli getpeerinfo` on the homelab node lists elo by its
 subversion string.

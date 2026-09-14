@@ -12,7 +12,7 @@ const _: () = assert!(usize::BITS >= 32);
 
 // Only regtest is dialled today. The homelab, on mainnet, is a later step.
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub enum Network {
     Mainnet,
     Testnet3,
@@ -87,7 +87,7 @@ impl std::fmt::Display for Command {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Frame {
     pub command: Command,
     pub payload: Vec<u8>,

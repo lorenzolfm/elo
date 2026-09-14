@@ -1,5 +1,6 @@
 //! elo — a Bitcoin node.
 
+mod compact_size;
 mod handshake;
 mod message;
 mod version;
@@ -141,7 +142,7 @@ fn connect(
 
     let started = std::time::Instant::now();
     out.line(format_args!("-> version ({} bytes)", our_version.len()));
-    let handshake::Complete { stream, seen } = handshake::run(stream, NETWORK, &our_version)?;
+    let handshake::Complete { stream, peer, seen } = handshake::run(stream, NETWORK, &our_version)?;
     let elapsed = started.elapsed();
     for frame in &seen {
         out.line(format_args!(
@@ -151,6 +152,7 @@ fn connect(
         ));
     }
     out.line(format_args!("handshake complete in {elapsed:?}"));
+    out.line(format_args!("peer is {peer}"));
     Ok(stream)
 }
 

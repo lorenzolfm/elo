@@ -12,10 +12,11 @@ const PONG: crate::message::Command = crate::message::Command::from_static("pong
 /// and echoes it in the `pong` (`:4985`).
 const NONCE_BYTES: usize = 8;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum Message {
-    /// The payload as it came. Reading the fields is step 4; until then the
-    /// handshake needs only to recognise the command.
+    /// The payload as it came. The one `version` that counts is parsed inside
+    /// the handshake; any other is a redundant one, which Core drops before it
+    /// reads a field (`net_processing.cpp:3586`), and so do we.
     Version(Vec<u8>),
     Verack,
     Ping(u64),
@@ -168,7 +169,7 @@ mod tests {
             &fixture(VERSION)[crate::message::HEADER_BYTES..],
             "payload kept as it came"
         );
-        assert_eq!(messages[3], Message::Verack);
+        assert!(matches!(messages[3], Message::Verack), "{}", messages[3]);
         let Message::Ping(nonce) = messages[5] else {
             panic!("{}", messages[5]);
         };
@@ -177,10 +178,10 @@ mod tests {
             fixture(PING)[crate::message::HEADER_BYTES..],
             "the nonce is little-endian on the wire"
         );
-        assert_eq!(
-            messages[7],
-            Message::Pong(OUR_NONCE),
-            "Core echoed our nonce"
+        assert!(
+            matches!(messages[7], Message::Pong(OUR_NONCE)),
+            "Core echoed our nonce: {}",
+            messages[7]
         );
         for (i, name) in [
             (1, "wtxidrelay"),
@@ -222,8 +223,9 @@ mod tests {
     #[test]
     fn unknown_passes_through_unchanged() {
         let original = frame(SENDCMPCT);
-        let message = super::Message::decode(original.clone()).unwrap();
-        assert_eq!(message.encode(), original);
+        let again = super::Message::decode(frame(SENDCMPCT)).unwrap().encode();
+        assert_eq!(again.command, original.command);
+        assert_eq!(again.payload, original.payload);
         println!("sendcmpct: decode then encode is the identity");
     }
 
