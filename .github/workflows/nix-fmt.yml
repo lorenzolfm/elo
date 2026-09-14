@@ -1,24 +1,27 @@
-name: ci
+name: nix-fmt
+# The `nix-fmt` gate reads only `*.nix` files (see `flake.nix`), so it runs
+# only when one of them, or this workflow, changes.
 on:
   push:
     branches: [main]
+    paths:
+      - "**.nix"
+      - .github/workflows/nix-fmt.yml
   pull_request:
     branches: [main]
+    paths:
+      - "**.nix"
+      - .github/workflows/nix-fmt.yml
 permissions:
   contents: read
 concurrency:
-  group: ci-${{ github.ref }}
+  group: nix-fmt-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
-  gate:
-    name: ${{ matrix.gate }}
+  nix-fmt:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        gate: [elo, elo-clippy, elo-test, elo-fmt]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
-      - run: nix build --print-build-logs ".#${{ matrix.gate }}"
+      - run: nix build --print-build-logs ".#nix-fmt"
