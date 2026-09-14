@@ -286,16 +286,49 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversized_length_before_allocating() {
-        // Red if the length check is missing.
+    fn rejects_oversized_length() {
+        // Red if the length check is missing, or allows one byte over.
         let mut bytes = fixture(PING);
-        bytes[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[16..20].copy_from_slice(&4_000_001u32.to_le_bytes());
         let err = read_err(&bytes, super::Network::Regtest);
         assert!(
-            matches!(err, super::Error::PayloadTooLong(0xffff_ffff)),
+            matches!(err, super::Error::PayloadTooLong(4_000_001)),
             "{err}"
         );
-        println!("length field says 4 GiB: {err}");
+        println!("length field one over the limit: {err}");
+    }
+
+    #[test]
+    fn reads_and_writes_a_payload_at_the_limit() {
+        // Red if the length check is `>=` instead of `>`, in `read` or `write`.
+        //
+        // No captured frame carries 4,000,000 bytes, so the header is built by
+        // hand: Core's `MAX_PROTOCOL_MESSAGE_LENGTH`, `src/net.h:65` at v31.1,
+        // is the last length Core accepts. The checksum comes from
+        // `super::checksum`, which `writes_bytes_identical_to_core` already
+        // pins to Core's bytes.
+        let payload = vec![0u8; super::MAX_PAYLOAD_BYTES];
+        let command = super::Command::from_static("block");
+        let mut header = [0u8; super::HEADER_BYTES];
+        header[..4].copy_from_slice(&super::Network::Regtest.magic());
+        header[4..16].copy_from_slice(command.as_bytes());
+        header[16..20].copy_from_slice(&4_000_000u32.to_le_bytes());
+        header[20..].copy_from_slice(&super::checksum(&payload));
+
+        let mut reader = std::io::Read::chain(&header[..], &payload[..]);
+        let frame = super::read(&mut reader, super::Network::Regtest).unwrap();
+        assert_eq!(frame.command, command);
+        assert_eq!(frame.payload.len(), super::MAX_PAYLOAD_BYTES);
+
+        let mut ours = Vec::new();
+        super::write(&mut ours, super::Network::Regtest, command, &payload).unwrap();
+        assert_eq!(&ours[..super::HEADER_BYTES], &header);
+        assert_eq!(ours.len(), super::HEADER_BYTES + super::MAX_PAYLOAD_BYTES);
+        println!(
+            "{} payload bytes: read and written, checksum {:02x?}",
+            frame.payload.len(),
+            &header[20..]
+        );
     }
 
     #[test]
