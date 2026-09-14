@@ -71,7 +71,7 @@ impl From<crate::version::Error> for Error {
 pub struct Complete<S> {
     /// The stream, positioned after the peer's `verack`.
     pub stream: S,
-    pub peer: crate::version::Received,
+    pub peer: crate::version::Peer,
     /// Every frame the peer sent, up to and including its `verack`, in order,
     /// for the caller to report: at most `MESSAGES_BEFORE_VERACK_MAX`, each
     /// already bounded by `message::read`.
@@ -83,7 +83,7 @@ pub struct Complete<S> {
 /// send is one that a parsed `version` earned.
 enum State {
     AwaitingVersion,
-    AwaitingVerack(crate::version::Received),
+    AwaitingVerack(crate::version::Peer),
 }
 
 /// Runs the handshake over `stream`, which comes back inside `Complete` on

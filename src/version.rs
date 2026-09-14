@@ -1,7 +1,7 @@
 //! The `version` payload we send. The field order is the argument order of
 //! `PushNodeVersion`, `../bitcoin/src/net_processing.cpp:1576` at v31.1.
 //!
-//! `Received` is the peer's `version`, read the way Core reads ours
+//! `Peer` is the peer as its `version` describes it, read the way Core reads ours
 //! (`net_processing.cpp:3585`).
 
 /// `PROTOCOL_VERSION`, `../bitcoin/src/node/protocol_version.h:12` at v31.1.
@@ -57,7 +57,7 @@ pub fn build(peer: std::net::SocketAddr, timestamp: i64, nonce: u64) -> Vec<u8> 
 /// the address is where the peer sees us (`:3674`); the nonce catches a
 /// connection to ourself, which only the inbound side checks (`:3649`).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Received {
+pub struct Peer {
     pub protocol: i32,
     pub services: u64,
     /// Raw bytes. BIP14 says what a user agent should look like; a peer says
@@ -70,7 +70,7 @@ pub struct Received {
     pub relay: bool,
 }
 
-impl std::fmt::Display for Received {
+impl std::fmt::Display for Peer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -142,7 +142,7 @@ impl From<crate::compact_size::Error> for Error {
 /// the ones it disconnects at `:3623`. We require every field through the
 /// height. `relay` alone stays optional: BIP37 added it, and Core takes an
 /// absent one as `true`. Bytes after it are ignored, as Core ignores them.
-pub fn parse(payload: &[u8]) -> Result<Received, Error> {
+pub fn parse(payload: &[u8]) -> Result<Peer, Error> {
     let (protocol, rest) = take::<4>(payload)?;
     let protocol = i32::from_le_bytes(*protocol);
     if protocol < PEER_PROTOCOL_VERSION_MIN {
@@ -167,7 +167,7 @@ pub fn parse(payload: &[u8]) -> Result<Received, Error> {
     // What the guards above promised, restated where the value is kept.
     assert!(protocol >= PEER_PROTOCOL_VERSION_MIN);
     assert!(user_agent.len() <= USER_AGENT_BYTES_MAX);
-    Ok(Received {
+    Ok(Peer {
         protocol,
         services: u64::from_le_bytes(*services),
         user_agent: user_agent.to_vec(),
@@ -284,7 +284,7 @@ mod tests {
         let received = super::parse(&fixture(CORE)).unwrap();
         assert_eq!(
             received,
-            super::Received {
+            super::Peer {
                 protocol: 70016,
                 services: 0x0c09,
                 user_agent: b"/Satoshi:31.1.0/".to_vec(),
