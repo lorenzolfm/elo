@@ -39,8 +39,16 @@ impl Node {
         let (p2p_port, rpc_port) = free_ports();
         let datadir = std::env::temp_dir().join(format!("elo-handshake-{p2p_port}"));
         // A run that was killed leaves its datadir behind, and a later run
-        // that draws the same port would inherit its chain.
-        let _ = std::fs::remove_dir_all(&datadir);
+        // that draws the same port would inherit its chain. No datadir is
+        // the normal case; any other failure is this run's problem.
+        if let Err(e) = std::fs::remove_dir_all(&datadir) {
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::NotFound,
+                "{}: {e}",
+                datadir.display()
+            );
+        }
         std::fs::create_dir_all(&datadir).unwrap();
         let child = std::process::Command::new("bitcoind")
             .arg("-regtest")
