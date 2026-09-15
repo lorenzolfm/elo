@@ -1,17 +1,8 @@
 //! elo — a Bitcoin node.
 
-// Nothing reads a header until step 6, `getheaders`.
-#[expect(dead_code)]
-mod block_header;
-mod compact_size;
-mod handshake;
-mod message;
-mod version;
-mod wire;
-
 use std::hash::BuildHasher;
 
-const NETWORK: message::Network = message::Network::Regtest;
+const NETWORK: elo::message::Network = elo::message::Network::Regtest;
 /// A local `bitcoind -regtest`. The first argument overrides it.
 const PEER: &str = "127.0.0.1:18444";
 /// For the connect, and for each read during the handshake. Core gives a
@@ -21,7 +12,7 @@ const PEER: &str = "127.0.0.1:18444";
 ///
 /// Known gap: a read timeout bounds one syscall, not one message. Neither
 /// this nor `LINGER` bounds how long a dripping peer can hold us; see
-/// `handshake::MESSAGES_BEFORE_VERACK_MAX` and issue #4.
+/// `elo::handshake::MESSAGES_BEFORE_VERACK_MAX` and issue #4.
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// After the handshake: how long we stay connected before we hang up, from
 /// the moment `verack` arrives, whatever the peer sends, unless the peer hangs
@@ -65,22 +56,22 @@ fn run(peer: &str, out: &mut Log<impl std::io::Write>) -> Result<(), Box<dyn std
     let mut remaining = LINGER;
     while remaining > std::time::Duration::ZERO {
         stream.set_read_timeout(Some(remaining))?;
-        match message::read(&mut stream, NETWORK) {
+        match elo::message::read(&mut stream, NETWORK) {
             // Stricter than Core, which ignores the tail of a long `ping` and
             // only logs a short one (`net_processing.cpp:5283`), staying
             // connected either way. A known command with a length it cannot
             // have is a peer we do not want, so the `?` ends the session.
-            Ok(frame) => match wire::Message::decode(frame)? {
+            Ok(frame) => match elo::wire::Message::decode(frame)? {
                 // Core pings right after the handshake and every two minutes
                 // (`net_processing.cpp:5507`), and drops a peer whose pong is
                 // twenty minutes late (`:5495`, `TIMEOUT_INTERVAL` in
                 // `net.h:59`).
-                wire::Message::Ping(nonce) => {
-                    let pong = wire::Message::Pong(nonce).encode();
-                    match message::write(&mut stream, NETWORK, pong.command, &pong.payload) {
+                elo::wire::Message::Ping(nonce) => {
+                    let pong = elo::wire::Message::Pong(nonce).encode();
+                    match elo::message::write(&mut stream, NETWORK, pong.command, &pong.payload) {
                         Ok(()) => out.line(format_args!("<- ping {nonce:#018x}\n-> pong")),
                         // The peer closed between its ping and our pong.
-                        Err(message::Error::Io(e)) if peer_hung_up(&e) => {
+                        Err(elo::message::Error::Io(e)) if peer_hung_up(&e) => {
                             out.line(format_args!("peer hung up"));
                             return Ok(());
                         }
@@ -89,7 +80,7 @@ fn run(peer: &str, out: &mut Log<impl std::io::Write>) -> Result<(), Box<dyn std
                 }
                 other => out.line(format_args!("<- {other} ignored")),
             },
-            Err(message::Error::Io(e))
+            Err(elo::message::Error::Io(e))
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
@@ -97,7 +88,7 @@ fn run(peer: &str, out: &mut Log<impl std::io::Write>) -> Result<(), Box<dyn std
             {
                 break;
             }
-            Err(message::Error::Io(e)) if peer_hung_up(&e) => {
+            Err(elo::message::Error::Io(e)) if peer_hung_up(&e) => {
                 out.line(format_args!("peer hung up"));
                 return Ok(());
             }
@@ -130,7 +121,7 @@ fn connect(
     let peer: std::net::SocketAddr = peer.parse()?;
     out.line(format_args!(
         "connecting to {peer} as {}",
-        version::USER_AGENT
+        elo::version::USER_AGENT
     ));
     let stream = std::net::TcpStream::connect_timeout(&peer, TIMEOUT)?;
     stream.set_read_timeout(Some(TIMEOUT))?;
@@ -141,11 +132,12 @@ fn connect(
     // itself (`../bitcoin/src/net.cpp:353`). std's per-process random seed is
     // enough.
     let version_nonce = std::hash::RandomState::new().hash_one(0u8);
-    let our_version = version::build(peer, timestamp, version_nonce);
+    let our_version = elo::version::build(peer, timestamp, version_nonce);
 
     let started = std::time::Instant::now();
     out.line(format_args!("-> version ({} bytes)", our_version.len()));
-    let handshake::Complete { stream, peer, seen } = handshake::run(stream, NETWORK, &our_version)?;
+    let elo::handshake::Complete { stream, peer, seen } =
+        elo::handshake::run(stream, NETWORK, &our_version)?;
     let elapsed = started.elapsed();
     for frame in &seen {
         out.line(format_args!(
