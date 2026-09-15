@@ -240,6 +240,7 @@ mod tests {
 
     #[test]
     fn reads_core_verack() {
+        // Red if `read` demands at least one payload byte.
         let bytes = fixture(VERACK);
         let frame = super::read(&mut &bytes[..], super::Network::Regtest).unwrap();
         assert_eq!(frame.command, super::Command::from_static("verack"));
@@ -253,6 +254,7 @@ mod tests {
 
     #[test]
     fn reads_core_ping() {
+        // Red if the length field is read big-endian.
         let bytes = fixture(PING);
         let frame = super::read(&mut &bytes[..], super::Network::Regtest).unwrap();
         assert_eq!(frame.command, super::Command::from_static("ping"));
@@ -262,6 +264,7 @@ mod tests {
 
     #[test]
     fn writes_bytes_identical_to_core() {
+        // Red if `write` puts the length before the command, or writes it big-endian.
         for (name, hex) in [("verack", VERACK), ("ping", PING)] {
             let core = fixture(hex);
             let mut ours = Vec::new();
@@ -283,6 +286,7 @@ mod tests {
 
     #[test]
     fn rejects_wrong_magic() {
+        // Red if the magic check is missing.
         let err = read_err(&fixture(VERACK), super::Network::Mainnet);
         assert!(matches!(err, super::Error::BadMagic(_)), "{err}");
         println!("mainnet reader on regtest bytes: {err}");
@@ -290,6 +294,7 @@ mod tests {
 
     #[test]
     fn rejects_corrupted_payload() {
+        // Red if the checksum check is missing.
         let mut bytes = fixture(PING);
         bytes[24] ^= 1;
         let err = read_err(&bytes, super::Network::Regtest);
@@ -298,19 +303,54 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversized_length_before_allocating() {
+    fn rejects_oversized_length() {
+        // Red if the length check is missing, or allows one byte over.
         let mut bytes = fixture(PING);
-        bytes[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[16..20].copy_from_slice(&4_000_001u32.to_le_bytes());
         let err = read_err(&bytes, super::Network::Regtest);
         assert!(
-            matches!(err, super::Error::PayloadTooLong(0xffff_ffff)),
+            matches!(err, super::Error::PayloadTooLong(4_000_001)),
             "{err}"
         );
-        println!("length field says 4 GiB: {err}");
+        println!("length field one over the limit: {err}");
+    }
+
+    #[test]
+    fn reads_and_writes_a_payload_at_the_limit() {
+        // Red if the length check is `>=` instead of `>`, in `read` or `write`.
+        //
+        // No captured frame carries 4,000,000 bytes, so the header is built by
+        // hand: Core's `MAX_PROTOCOL_MESSAGE_LENGTH`, `src/net.h:65` at v31.1,
+        // is the last length Core accepts. The checksum comes from
+        // `super::checksum`, which `writes_bytes_identical_to_core` already
+        // pins to Core's bytes.
+        let payload = vec![0u8; super::MAX_PAYLOAD_BYTES];
+        let command = super::Command::from_static("block");
+        let mut header = [0u8; super::HEADER_BYTES];
+        header[..4].copy_from_slice(&super::Network::Regtest.magic());
+        header[4..16].copy_from_slice(command.as_bytes());
+        header[16..20].copy_from_slice(&4_000_000u32.to_le_bytes());
+        header[20..].copy_from_slice(&super::checksum(&payload));
+
+        let mut reader = std::io::Read::chain(&header[..], &payload[..]);
+        let frame = super::read(&mut reader, super::Network::Regtest).unwrap();
+        assert_eq!(frame.command, command);
+        assert_eq!(frame.payload.len(), super::MAX_PAYLOAD_BYTES);
+
+        let mut ours = Vec::new();
+        super::write(&mut ours, super::Network::Regtest, command, &payload).unwrap();
+        assert_eq!(&ours[..super::HEADER_BYTES], &header);
+        assert_eq!(ours.len(), super::HEADER_BYTES + super::MAX_PAYLOAD_BYTES);
+        println!(
+            "{} payload bytes: read and written, checksum {:02x?}",
+            frame.payload.len(),
+            &header[20..]
+        );
     }
 
     #[test]
     fn refuses_to_write_oversized_payload() {
+        // Red if `write` does not bound the payload, or writes the header before it checks.
         let payload = vec![0u8; super::MAX_PAYLOAD_BYTES + 1];
         let mut sink = Vec::new();
         let command = super::Command::from_static("block");
@@ -326,27 +366,68 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_a_twelve_byte_command() {
+    fn writes_a_twelve_byte_command() {
+        // Red if `write` truncates the command to leave room for a NUL.
         const GETCFCHECKPT: super::Command = super::Command::from_static("getcfcheckpt");
         let mut bytes = Vec::new();
         super::write(&mut bytes, super::Network::Regtest, GETCFCHECKPT, &[]).unwrap();
         assert_eq!(&bytes[4..16], b"getcfcheckpt");
+        println!("command field full, no NUL: {:02x?}", &bytes[4..16]);
+    }
+
+    #[test]
+    fn reads_a_twelve_byte_command() {
+        // Red if `Command::try_from` requires a NUL terminator.
+        //
+        // No captured frame fills the command field, so the header is built by
+        // hand. Core reads the name up to the first NUL or byte 12, whichever
+        // comes first (`CMessageHeader::GetMessageType`, `src/protocol.cpp:21`
+        // at v31.1). The checksum of the empty payload is taken from the
+        // captured `VERACK` frame.
+        let verack = fixture(VERACK);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&super::Network::Regtest.magic());
+        bytes.extend_from_slice(b"getcfcheckpt");
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&verack[20..]);
         let frame = super::read(&mut &bytes[..], super::Network::Regtest).unwrap();
-        assert_eq!(frame.command, GETCFCHECKPT);
+        assert_eq!(frame.command, super::Command::from_static("getcfcheckpt"));
         println!("command field full, no NUL: {}", frame.command);
     }
 
     #[test]
     fn rejects_unprintable_command_byte() {
-        let mut bytes = fixture(PING);
-        bytes[4] = 0x7f;
-        let err = read_err(&bytes, super::Network::Regtest);
-        assert!(matches!(err, super::Error::BadCommand(_)), "{err}");
-        println!("DEL in the command: {err}");
+        // Red if `is_printable` drops either bound.
+        for (name, byte) in [("US", 0x1f), ("DEL", 0x7f)] {
+            let mut bytes = fixture(PING);
+            bytes[4] = byte;
+            let err = read_err(&bytes, super::Network::Regtest);
+            assert!(matches!(err, super::Error::BadCommand(_)), "{err}");
+            println!("{name} in the command: {err}");
+        }
+    }
+
+    #[test]
+    fn accepts_command_bytes_at_the_printable_bounds() {
+        // Red if `is_printable` is `>` instead of `>=`, or `<` instead of `<=`.
+        //
+        // Core's `IsMessageTypeValid`, `src/protocol.cpp:26` at v31.1, accepts
+        // `0x20` to `0x7e` inclusive.
+        for byte in [0x20, 0x7e] {
+            let mut bytes = fixture(PING);
+            bytes[4] = byte;
+            let frame = super::read(&mut &bytes[..], super::Network::Regtest).unwrap();
+            assert_eq!(frame.command.as_bytes()[0], byte);
+            println!(
+                "first command byte {byte:#04x}: read as `{}`",
+                frame.command
+            );
+        }
     }
 
     #[test]
     fn reports_a_truncated_payload_as_io() {
+        // Red if `read` accepts a short payload instead of demanding every byte.
         let bytes = fixture(PING);
         let err = read_err(&bytes[..bytes.len() - 1], super::Network::Regtest);
         let super::Error::Io(io) = err else {
@@ -358,14 +439,17 @@ mod tests {
 
     #[test]
     fn rejects_padding_that_is_not_nul() {
+        // Red if the padding check is missing.
         let mut bytes = fixture(VERACK);
         bytes[15] = b'x';
         let err = read_err(&bytes, super::Network::Regtest);
         assert!(matches!(err, super::Error::BadCommand(_)), "{err}");
+        println!("`x` after the NUL padding of verack: {err}");
     }
 
     #[test]
     fn rejects_an_all_nul_command() {
+        // Red if the empty-name check is missing.
         let mut bytes = fixture(VERACK);
         bytes[4..16].fill(0);
         let err = read_err(&bytes, super::Network::Regtest);
@@ -374,23 +458,8 @@ mod tests {
     }
 
     #[test]
-    fn a_read_command_can_always_be_written_back() {
-        let bytes = fixture(PING);
-        let frame = super::read(&mut &bytes[..], super::Network::Regtest).unwrap();
-        let mut again = Vec::new();
-        super::write(
-            &mut again,
-            super::Network::Regtest,
-            frame.command,
-            &frame.payload,
-        )
-        .unwrap();
-        assert_eq!(again, bytes);
-        println!("read then write: {} bytes, unchanged", again.len());
-    }
-
-    #[test]
     fn magic_matches_chainparams() {
+        // Red if a magic constant has a typo or is byte-swapped.
         for (network, hex) in [
             (super::Network::Mainnet, "f9beb4d9"),
             (super::Network::Testnet3, "0b110907"),
