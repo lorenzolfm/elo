@@ -1,5 +1,6 @@
-//! Spawns a `bitcoind -regtest`, points elo at it, and asks Core what it saw:
-//! `getpeerinfo` is the oracle for every claim here.
+//! Spawns a `bitcoind -regtest`, points elo at it, and asks Core what it saw.
+//! `getpeerinfo` is the oracle for every claim about the binary; for the
+//! library over its own socket, the chain RPCs are.
 //!
 //! Fails when `bitcoind` or `bitcoin-cli` is not on `PATH`, unless
 //! `ELO_NO_BITCOIND` is set; then it skips, and says so past the harness's
@@ -317,4 +318,88 @@ fn keeps_working_after_its_reader_leaves() {
     println!("elo exited with {status}, stderr: {stderr:?}");
     assert!(status.success(), "elo exited with {status}: {stderr}");
     assert!(stderr.is_empty(), "nothing went wrong, so nothing to say");
+}
+
+/// `getblockheader <hash> false`, as bytes.
+fn header_bytes(hex: &str) -> [u8; elo::block_header::BYTES] {
+    let mut out = [0u8; elo::block_header::BYTES];
+    assert_eq!(hex.len(), 2 * out.len(), "one header: {hex}");
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap();
+    }
+    out
+}
+
+/// Core answers `getheaders` with the headers after the first locator hash
+/// it knows, up to 2000 (`../bitcoin/src/net_processing.cpp:4441` and
+/// `:4453` at v31.1). A locator of genesis alone on a chain of seven must
+/// bring back seven, and the last must hash to `getbestblockhash`.
+#[test]
+fn core_serves_the_headers_after_genesis() {
+    // Red if the transaction-count byte is not skipped between headers, or
+    // the hash covers anything but the 80 bytes.
+    let Some(node) = node_or_skip("core_serves_the_headers_after_genesis") else {
+        return;
+    };
+    node.cli(&["generatetoaddress", "7", UNSPENDABLE]).unwrap();
+    let genesis_hash = node.cli(&["getblockhash", "0"]).unwrap();
+    let genesis_hash = genesis_hash.trim();
+    let genesis = node
+        .cli(&["getblockheader", genesis_hash, "false"])
+        .unwrap();
+    let genesis = elo::block_header::Header::parse(&header_bytes(genesis.trim()));
+    assert_eq!(genesis.hash().to_string(), genesis_hash);
+    let best = node.cli(&["getbestblockhash"]).unwrap();
+    let best = best.trim();
+
+    let peer: std::net::SocketAddr = format!("127.0.0.1:{}", node.p2p_port).parse().unwrap();
+    let stream = std::net::TcpStream::connect(peer).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let our_version = elo::version::build(peer, i64::try_from(now.as_secs()).unwrap(), 0);
+    let network = elo::message::Network::Regtest;
+    let elo::handshake::Complete { mut stream, .. } =
+        elo::handshake::run(stream, network, &our_version).unwrap();
+
+    let request = elo::wire::Message::GetHeaders(elo::headers::GetHeaders {
+        locator: vec![genesis.hash()],
+        stop: None,
+    });
+    println!("-> {request}");
+    let request = request.encode();
+    elo::message::write(&mut stream, network, request.command, &request.payload).unwrap();
+
+    // Core's post-verack burst comes first: `sendcmpct`, `ping`, `feefilter`.
+    let headers = (0..8)
+        .find_map(|_| {
+            let frame = elo::message::read(&mut stream, network).unwrap();
+            match elo::wire::Message::decode(frame).unwrap() {
+                elo::wire::Message::Headers(headers) => Some(headers),
+                other => {
+                    println!("<- {other} skipped");
+                    None
+                }
+            }
+        })
+        .unwrap_or_else(|| panic!("no headers in eight frames"));
+
+    assert_eq!(headers.len(), 7, "getblockcount is 7");
+    assert_eq!(headers[0].previous_block.to_string(), genesis_hash);
+    for pair in headers.windows(2) {
+        assert_eq!(
+            pair[1].previous_block.to_string(),
+            pair[0].hash().to_string(),
+            "each header names the one before"
+        );
+    }
+    let tip = headers.last().unwrap().hash();
+    assert_eq!(tip.to_string(), best, "getbestblockhash");
+    println!(
+        "<- headers ({}), tip {tip} = getbestblockhash",
+        headers.len()
+    );
 }
