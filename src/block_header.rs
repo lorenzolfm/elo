@@ -153,3 +153,119 @@ fn encode_field<const N: usize>(bytes: &mut [u8]) -> (&mut [u8; N], &mut [u8]) {
     };
     split
 }
+
+#[cfg(test)]
+mod tests {
+    // The genesis headers as Core serves them: `getblockheader <hash> false`
+    // on Bitcoin Core v31.1.0, 2026-09-14, from a `bitcoind -connect=0
+    // -listen=0` for mainnet and a `bitcoind -regtest` for regtest. The
+    // values behind them are `CreateGenesisBlock(nTime, nNonce, nBits,
+    // nVersion, ..)` at `../bitcoin/src/kernel/chainparams.cpp:134` and
+    // `:634`; the two chains share everything but time, bits and nonce.
+    const MAINNET_GENESIS: &str = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c";
+    const REGTEST_GENESIS: &str = "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4adae5494dffff7f2002000000";
+
+    // What `getblockhash 0` printed on each node, and what
+    // `chainparams.cpp:136` and `:636` assert.
+    const MAINNET_GENESIS_HASH: &str =
+        "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
+    const REGTEST_GENESIS_HASH: &str =
+        "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206";
+
+    fn fixture(hex: &str) -> [u8; super::BYTES] {
+        let mut out = [0u8; super::BYTES];
+        assert_eq!(hex.len(), 2 * out.len(), "a fixture is one header");
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).expect("hex");
+        }
+        out
+    }
+
+    #[test]
+    fn genesis_hashes_to_the_number_everyone_knows() {
+        let header = super::Header::parse(&fixture(MAINNET_GENESIS));
+        let hash = header.hash();
+        assert_eq!(hash.to_string(), MAINNET_GENESIS_HASH);
+        // The wire order is the same bytes the other way round: the zeros
+        // proof of work put in front are at the back.
+        assert_eq!(&hash.as_bytes()[28..], &[0, 0, 0, 0]);
+        assert_eq!(hash.as_bytes()[0], 0x6f);
+        println!(
+            "genesis is {hash}; on the wire it ends {:02x?}",
+            &hash.as_bytes()[28..]
+        );
+    }
+
+    #[test]
+    fn genesis_fields_match_chainparams() {
+        let header = super::Header::parse(&fixture(MAINNET_GENESIS));
+        assert_eq!(header.version, 1);
+        assert_eq!(
+            header.previous_block.as_bytes(),
+            &[0; 32],
+            "nothing before genesis"
+        );
+        assert_eq!(
+            header.merkle_root.to_string(),
+            "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b",
+            "chainparams.cpp:137 prints the root reversed like a hash"
+        );
+        assert_eq!(
+            header.merkle_root.as_bytes()[0],
+            0x3b,
+            "and the wire order starts where the print ends"
+        );
+        assert_eq!(header.time, 1_231_006_505, "2009-01-03 18:15:05 UTC");
+        assert_eq!(header.bits, 0x1d00_ffff);
+        assert_eq!(header.nonce, 2_083_236_893);
+        println!("{header:?}");
+    }
+
+    #[test]
+    fn regtest_genesis_matches_getblockhash_zero() {
+        let header = super::Header::parse(&fixture(REGTEST_GENESIS));
+        assert_eq!(header.time, 1_296_688_602);
+        assert_eq!(header.bits, 0x207f_ffff, "the easiest target there is");
+        assert_eq!(header.nonce, 2, "found on the second try");
+        assert_eq!(header.hash().to_string(), REGTEST_GENESIS_HASH);
+        println!("regtest genesis is {}", header.hash());
+    }
+
+    #[test]
+    fn encode_is_the_inverse_of_parse() {
+        for hex in [MAINNET_GENESIS, REGTEST_GENESIS] {
+            let bytes = fixture(hex);
+            assert_eq!(super::Header::parse(&bytes).encode(), bytes);
+        }
+        println!("both genesis headers survive a round trip");
+    }
+
+    #[test]
+    fn display_reverses_the_bytes() {
+        let mut bytes = [0u8; 32];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::try_from(i).unwrap();
+        }
+        let hash = super::BlockHash(bytes);
+        let printed = hash.to_string();
+        assert_eq!(printed.len(), 64);
+        assert!(printed.starts_with("1f1e1d1c"), "{printed}");
+        assert!(printed.ends_with("03020100"), "{printed}");
+        assert_eq!(format!("{hash:?}"), printed, "Debug shows the same view");
+        let root = super::MerkleRoot(bytes);
+        assert_eq!(root.to_string(), printed, "a root prints like a hash");
+        assert_eq!(format!("{root:?}"), printed);
+        println!("{printed}");
+    }
+
+    #[test]
+    fn a_hash_covers_every_byte() {
+        let mut bytes = fixture(MAINNET_GENESIS);
+        let before = super::Header::parse(&bytes).hash().to_string();
+        bytes[super::BYTES - 1] ^= 1;
+        let after = super::Header::parse(&bytes).hash().to_string();
+        assert_ne!(before, after, "the last byte of the nonce is hashed");
+        assert!(!after.starts_with("0000"), "and the work is gone: {after}");
+        println!("nonce off by one: {after}");
+    }
+}
