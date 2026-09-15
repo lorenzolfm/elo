@@ -29,7 +29,7 @@ subversion string.
 - [x] 5. The 80-byte block header, and `sha256d` over it. Genesis must print
       `000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f` while
       the bytes on the wire run the other way.
-- [ ] 6. `getheaders` and `headers`, including the vestigial zero
+- [x] 6. `getheaders` and `headers`, including the vestigial zero
       transaction-count byte that follows each header on the wire.
 - [ ] 7. The block locator: ten recent hashes, then exponential backoff — and
       why that shape finds a fork point fast.
