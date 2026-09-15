@@ -34,9 +34,8 @@ subversion string.
 - [ ] 7. The block locator: ten recent hashes, then exponential backoff — and
       why that shape finds a fork point fast.
 - [ ] 8. The in-memory chain and the sync loop, capped at a couple of batches.
-      When the peer/connection struct appears, `Network` goes in it and the
-      per-call argument to `message::read`/`write` goes away: one stream
-      with two magics is representable today, with no writer.
+      `Connection` already holds the `Link` and the `Network` (T3); the loop
+      reads and waits through it, never through the socket or the clock.
 - [ ] 9. Proof of work: decoding `nBits` to a 256-bit target, and the
       comparison.
 - [ ] 10. Difficulty retargeting across the 2016-block boundary. The timespan
