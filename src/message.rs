@@ -1,7 +1,7 @@
 /// Core's `MAX_PROTOCOL_MESSAGE_LENGTH`, `src/net.h:65` at v31.1.
 const MAX_PAYLOAD_BYTES: usize = 4_000_000;
 
-pub const HEADER_BYTES: usize = 24;
+pub(crate) const HEADER_BYTES: usize = 24;
 const COMMAND_BYTES: usize = 12;
 
 // The header is magic, command, length, checksum.
@@ -21,7 +21,7 @@ pub enum Network {
 }
 
 impl Network {
-    pub fn magic(self) -> [u8; 4] {
+    fn magic(self) -> [u8; 4] {
         match self {
             Network::Mainnet => [0xf9, 0xbe, 0xb4, 0xd9],
             Network::Testnet3 => [0x0b, 0x11, 0x09, 0x07],
@@ -40,7 +40,7 @@ const fn is_printable(byte: u8) -> bool {
 }
 
 impl Command {
-    pub const fn from_static(name: &'static str) -> Self {
+    pub(crate) const fn from_static(name: &'static str) -> Self {
         let bytes = name.as_bytes();
         assert!(!bytes.is_empty());
         assert!(bytes.len() <= COMMAND_BYTES);
@@ -54,7 +54,7 @@ impl Command {
         Self(raw)
     }
 
-    pub fn as_bytes(&self) -> &[u8; COMMAND_BYTES] {
+    fn as_bytes(&self) -> &[u8; COMMAND_BYTES] {
         &self.0
     }
 }
