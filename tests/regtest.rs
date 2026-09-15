@@ -388,6 +388,7 @@ fn core_serves_the_headers_after_genesis() {
         .unwrap_or_else(|| panic!("no headers in eight frames"));
 
     assert_eq!(headers.len(), 7, "getblockcount is 7");
+    let headers = headers.as_slice();
     assert_eq!(headers[0].previous_block.to_string(), genesis_hash);
     for pair in headers.windows(2) {
         assert_eq!(

@@ -24,9 +24,7 @@ pub enum Message {
     Ping(u64),
     Pong(u64),
     GetHeaders(crate::headers::GetHeaders),
-    /// At most `headers::HEADERS_MAX`, in the order the peer sent them.
-    /// Whether they chain is the chain's question, not the decoder's.
-    Headers(Vec<crate::block_header::Header>),
+    Headers(crate::headers::Headers),
     /// A command we do not speak. Core logs it and carries on
     /// (`net_processing.cpp:5167`); a newer peer must not cost us the
     /// connection.
@@ -84,7 +82,7 @@ impl Message {
             GETHEADERS => crate::headers::GetHeaders::parse(&frame.payload)
                 .map(Message::GetHeaders)
                 .map_err(|error| bad_payload(&frame, error)),
-            HEADERS => crate::headers::parse_headers(&frame.payload)
+            HEADERS => crate::headers::Headers::parse(&frame.payload)
                 .map(Message::Headers)
                 .map_err(|error| bad_payload(&frame, error)),
             _ => Ok(Message::Unknown(frame)),
@@ -99,7 +97,7 @@ impl Message {
             Message::Ping(nonce) => (PING, nonce.to_le_bytes().to_vec()),
             Message::Pong(nonce) => (PONG, nonce.to_le_bytes().to_vec()),
             Message::GetHeaders(request) => (GETHEADERS, request.encode()),
-            Message::Headers(headers) => (HEADERS, crate::headers::encode_headers(&headers)),
+            Message::Headers(headers) => (HEADERS, headers.encode()),
             Message::Unknown(frame) => return frame,
         };
         crate::message::Frame { command, payload }

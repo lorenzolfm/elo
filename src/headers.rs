@@ -136,50 +136,64 @@ impl GetHeaders {
     }
 }
 
-/// Reads a `headers` payload: a count, then that many headers, each followed
-/// by the transaction count of a block that carries none (`:4446`). Core
-/// reads it the same way (`:4827` to `:4836`), but accepts any transaction
-/// count; we accept the one byte a count of zero takes.
-pub(crate) fn parse_headers(payload: &[u8]) -> Result<Vec<crate::block_header::Header>, Error> {
-    let (count, mut rest) = crate::compact_size::read_len(payload, HEADERS_MAX)?;
-    let mut headers = Vec::with_capacity(count);
-    for _ in 0..count {
-        let (header, after) = take::<HEADER_BYTES>(rest)?;
-        let (&transactions, after) = after.split_first().ok_or(Error::Truncated)?;
-        if transactions != 0 {
-            return Err(Error::TransactionCount(transactions));
-        }
-        headers.push(crate::block_header::Header::parse(header));
-        rest = after;
-    }
-    if !rest.is_empty() {
-        return Err(Error::TrailingBytes(rest.len()));
-    }
-    assert!(headers.len() <= HEADERS_MAX);
-    Ok(headers)
-}
+/// A `headers` payload as one peer sent it: at most `HEADERS_MAX`, in the
+/// peer's order. Only `parse` builds one, so the bound holds by construction
+/// and `encode` has nothing to assert.
+#[derive(Debug)]
+pub struct Headers(Vec<crate::block_header::Header>);
 
-/// The payload Core writes at `:4469`: each header as a `CBlock` with no
-/// transactions, which is the header and one zero byte.
-///
-/// # Panics
-///
-/// If `headers` holds more than `HEADERS_MAX`. Core would penalize the peer
-/// we sent it to, so a longer list is our bug, not a message to send.
-#[must_use]
-pub(crate) fn encode_headers(headers: &[crate::block_header::Header]) -> Vec<u8> {
-    assert!(
-        headers.len() <= HEADERS_MAX,
-        "{} headers; Core takes {HEADERS_MAX}",
-        headers.len()
-    );
-    let mut out = Vec::with_capacity(3 + headers.len() * (HEADER_BYTES + 1));
-    crate::compact_size::write_len(&mut out, headers.len());
-    for header in headers {
-        out.extend_from_slice(&header.encode());
-        out.push(0);
+impl Headers {
+    /// Reads a `headers` payload: a count, then that many headers, each
+    /// followed by the transaction count of a block that carries none
+    /// (`:4446`). Core reads it the same way (`:4827` to `:4836`), but
+    /// accepts any transaction count; we accept the one byte a count of zero
+    /// takes.
+    pub(crate) fn parse(payload: &[u8]) -> Result<Headers, Error> {
+        let (count, mut rest) = crate::compact_size::read_len(payload, HEADERS_MAX)?;
+        let mut headers = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (header, after) = take::<HEADER_BYTES>(rest)?;
+            let (&transactions, after) = after.split_first().ok_or(Error::Truncated)?;
+            if transactions != 0 {
+                return Err(Error::TransactionCount(transactions));
+            }
+            headers.push(crate::block_header::Header::parse(header));
+            rest = after;
+        }
+        if !rest.is_empty() {
+            return Err(Error::TrailingBytes(rest.len()));
+        }
+        assert!(headers.len() <= HEADERS_MAX);
+        Ok(Headers(headers))
     }
-    out
+
+    /// The payload Core writes at `:4469`: each header as a `CBlock` with no
+    /// transactions, which is the header and one zero byte.
+    #[must_use]
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(3 + self.0.len() * (HEADER_BYTES + 1));
+        crate::compact_size::write_len(&mut out, self.0.len());
+        for header in &self.0 {
+            out.extend_from_slice(&header.encode());
+            out.push(0);
+        }
+        out
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[crate::block_header::Header] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// The next `N` bytes, and the rest.
@@ -237,8 +251,9 @@ mod tests {
     fn reads_core_headers_after_genesis() {
         // Red if the transaction-count byte is not skipped: header 2 then
         // starts one byte late and hashes to nothing on the chain.
-        let headers = super::parse_headers(&fixture(FROM_GENESIS)).unwrap();
-        assert_eq!(hashes(&headers), [BLOCK_1, BLOCK_2, BLOCK_3]);
+        let headers = super::Headers::parse(&fixture(FROM_GENESIS)).unwrap();
+        let headers = headers.as_slice();
+        assert_eq!(hashes(headers), [BLOCK_1, BLOCK_2, BLOCK_3]);
         assert_eq!(headers[0].previous_block.to_string(), GENESIS);
         for pair in headers.windows(2) {
             assert_eq!(
@@ -247,7 +262,7 @@ mod tests {
                 "each header names the one before"
             );
         }
-        for header in &headers {
+        for header in headers {
             println!("{}", header.hash());
         }
     }
@@ -256,7 +271,7 @@ mod tests {
     fn reads_an_empty_headers() {
         // Red if a count of zero is refused, or a header is read before the
         // count is.
-        let headers = super::parse_headers(&fixture(FROM_TIP)).unwrap();
+        let headers = super::Headers::parse(&fixture(FROM_TIP)).unwrap();
         assert!(headers.is_empty());
         println!("a peer at our tip sends {FROM_TIP}: no headers, no error");
     }
@@ -293,8 +308,10 @@ mod tests {
         // Red if `stop` is written before the locator, or a `Some` stop is
         // written as zeros. Core answered these exact bytes with block 2
         // alone, so the request is proven by its reply.
-        let [answer] = <[_; 1]>::try_from(super::parse_headers(&fixture(STOP_AT_TWO)).unwrap())
-            .unwrap_or_else(|got| panic!("{} headers", got.len()));
+        let answer = super::Headers::parse(&fixture(STOP_AT_TWO)).unwrap();
+        let [answer] = answer.as_slice() else {
+            panic!("{} headers", answer.len());
+        };
         assert_eq!(answer.hash().to_string(), BLOCK_2);
         let ours = super::GetHeaders {
             locator: Vec::new(),
@@ -325,9 +342,10 @@ mod tests {
         // Red if the zero transaction-count byte is not written after each
         // header, or an empty list is not the one byte `00`.
         let core = fixture(FROM_GENESIS);
-        let headers = super::parse_headers(&core).unwrap();
-        assert_eq!(super::encode_headers(&headers), core);
-        assert_eq!(super::encode_headers(&[]), fixture(FROM_TIP));
+        let headers = super::Headers::parse(&core).unwrap();
+        assert_eq!(headers.encode(), core);
+        let none = super::Headers::parse(&fixture(FROM_TIP)).unwrap();
+        assert_eq!(none.encode(), fixture(FROM_TIP));
         println!(
             "{} headers re-encode to Core's {} bytes",
             headers.len(),
@@ -347,7 +365,7 @@ mod tests {
     #[test]
     fn rejects_more_headers_than_core_sends() {
         // Red if the bound on the count is missing, or off by one either way.
-        let err = super::parse_headers(&with_count(2001)).unwrap_err();
+        let err = super::Headers::parse(&with_count(2001)).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -361,7 +379,7 @@ mod tests {
         println!("2001: {err}");
         // The last count Core accepts passes the bound; the payload behind it
         // is then too short, which is a different error.
-        let err = super::parse_headers(&with_count(2000)).unwrap_err();
+        let err = super::Headers::parse(&with_count(2000)).unwrap_err();
         assert!(matches!(err, super::Error::Truncated), "{err}");
         println!("2000 on a payload of three: {err}");
     }
@@ -369,7 +387,7 @@ mod tests {
     #[test]
     fn rejects_a_non_canonical_count() {
         // Red if the count's shortest-form check is missing.
-        let err = super::parse_headers(&with_count(3)).unwrap_err();
+        let err = super::Headers::parse(&with_count(3)).unwrap_err();
         assert!(matches!(err, super::Error::NonCanonicalCount(3)), "{err}");
         println!("fd 03 00: {err}");
     }
@@ -379,7 +397,7 @@ mod tests {
         // Red if the byte after a header is skipped without being read.
         let mut payload = fixture(FROM_GENESIS);
         payload[1 + super::HEADER_BYTES] = 1;
-        let err = super::parse_headers(&payload).unwrap_err();
+        let err = super::Headers::parse(&payload).unwrap_err();
         assert!(matches!(err, super::Error::TransactionCount(1)), "{err}");
         println!("{err}; Core reads the count and ignores it (net_processing.cpp:4835)");
     }
@@ -389,7 +407,7 @@ mod tests {
         // Red if a short payload is padded, or the last header is optional.
         let core = fixture(FROM_GENESIS);
         for len in 0..core.len() {
-            let err = super::parse_headers(&core[..len]).unwrap_err();
+            let err = super::Headers::parse(&core[..len]).unwrap_err();
             assert!(matches!(err, super::Error::Truncated), "{len} bytes: {err}");
         }
         println!("{} prefixes cut short, {} errors", core.len(), core.len());
@@ -400,7 +418,7 @@ mod tests {
         // Red if bytes after the count's worth of headers are ignored.
         let mut payload = fixture(FROM_GENESIS);
         payload.push(0);
-        let err = super::parse_headers(&payload).unwrap_err();
+        let err = super::Headers::parse(&payload).unwrap_err();
         assert!(matches!(err, super::Error::TrailingBytes(1)), "{err}");
         println!("{err}");
     }
@@ -460,16 +478,5 @@ mod tests {
             stop: None,
         }
         .encode();
-    }
-
-    #[test]
-    #[should_panic(expected = "2001 headers")]
-    fn refuses_to_encode_more_headers_than_core_takes() {
-        // Red if the assertion is missing: the peer would penalize us.
-        let payload = fixture(STOP_AT_TWO);
-        let headers: Vec<_> = (0..2001)
-            .flat_map(|_| super::parse_headers(&payload).unwrap())
-            .collect();
-        let _ = super::encode_headers(&headers);
     }
 }
