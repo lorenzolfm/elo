@@ -134,6 +134,12 @@ fn checksum(payload: &[u8]) -> [u8; 4] {
     [hash[0], hash[1], hash[2], hash[3]]
 }
 
+/// Writes one frame: the header, then `payload`.
+///
+/// # Errors
+///
+/// `PayloadTooLong` if `payload` is longer than `MAX_PAYLOAD_BYTES`; nothing
+/// reaches `writer`. `Io` if `writer` fails.
 pub fn write(
     writer: &mut impl std::io::Write,
     network: Network,
@@ -157,6 +163,19 @@ pub fn write(
     Ok(())
 }
 
+/// Reads one frame. The length field is bounded by `MAX_PAYLOAD_BYTES`
+/// before the payload is allocated.
+///
+/// # Errors
+///
+/// `Io` if `reader` fails or ends early. `BadMagic`, `BadCommand`,
+/// `PayloadTooLong` and `BadChecksum` name the header field Core would
+/// reject.
+///
+/// # Panics
+///
+/// If `usize` is narrower than `u32`. The compile-time assertion beside
+/// `HEADER_BYTES` rules that out on every target elo builds for.
 pub fn read(reader: &mut impl std::io::Read, network: Network) -> Result<Frame, Error> {
     let mut header = [0u8; HEADER_BYTES];
     reader.read_exact(&mut header)?;

@@ -32,6 +32,13 @@ const FIXED_BYTES: usize = 4 + 8 + 8 + NET_ADDR_BYTES + NET_ADDR_BYTES + 8 + 1 +
 const NET_ADDR_BYTES: usize = 8 + 16 + 2;
 
 /// Builds the payload that announces us to `peer`.
+///
+/// # Panics
+///
+/// If `USER_AGENT` is 0xfd bytes or longer, or the payload does not come to
+/// `FIXED_BYTES + USER_AGENT.len()`. Both are facts about elo, fixed at
+/// compile time; a peer cannot reach them.
+#[must_use]
 pub fn build(peer: std::net::SocketAddr, timestamp: i64, nonce: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(FIXED_BYTES + USER_AGENT.len());
     out.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
