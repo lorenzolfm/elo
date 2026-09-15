@@ -4,6 +4,7 @@
 
 pub mod block_header;
 mod compact_size;
+pub mod connection;
 pub mod handshake;
 pub mod headers;
 pub mod link;
