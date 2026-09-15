@@ -7,7 +7,7 @@
 /// `PROTOCOL_VERSION`, `../bitcoin/src/node/protocol_version.h:12` at v31.1.
 /// Announcing 70016 is what makes Core send `wtxidrelay` and `sendaddrv2`
 /// before its `verack` (`net_processing.cpp:3716` and `:3725`).
-pub const PROTOCOL_VERSION: i32 = 70016;
+const PROTOCOL_VERSION: i32 = 70016;
 
 /// `MIN_PEER_PROTO_VERSION`, `protocol_version.h:18`. Core disconnects a
 /// peer below it (`net_processing.cpp:3623`); so do we.
@@ -32,6 +32,13 @@ const FIXED_BYTES: usize = 4 + 8 + 8 + NET_ADDR_BYTES + NET_ADDR_BYTES + 8 + 1 +
 const NET_ADDR_BYTES: usize = 8 + 16 + 2;
 
 /// Builds the payload that announces us to `peer`.
+///
+/// # Panics
+///
+/// If `USER_AGENT` is 0xfd bytes or longer, or the payload does not come to
+/// `FIXED_BYTES + USER_AGENT.len()`. Both are facts about elo, fixed at
+/// compile time; a peer cannot reach them.
+#[must_use]
 pub fn build(peer: std::net::SocketAddr, timestamp: i64, nonce: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(FIXED_BYTES + USER_AGENT.len());
     out.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
@@ -58,16 +65,16 @@ pub fn build(peer: std::net::SocketAddr, timestamp: i64, nonce: u64) -> Vec<u8> 
 /// connection to ourself, which only the inbound side checks (`:3649`).
 #[derive(Debug)]
 pub struct Peer {
-    pub protocol: i32,
-    pub services: u64,
+    pub(crate) protocol: i32,
+    pub(crate) services: u64,
     /// Raw bytes. BIP14 says what a user agent should look like; a peer says
     /// what it likes, so `Display` escapes anything outside printable ASCII.
-    pub user_agent: Vec<u8>,
+    pub(crate) user_agent: Vec<u8>,
     /// Core reads a signed height and keeps `-1` for "not sent"
     /// (`net_processing.cpp:3597`). We require the field, so the sentinel has
     /// no meaning here, and a height below zero is not a height.
-    pub start_height: u32,
-    pub relay: bool,
+    pub(crate) start_height: u32,
+    pub(crate) relay: bool,
 }
 
 impl std::fmt::Display for Peer {
@@ -142,7 +149,7 @@ impl From<crate::compact_size::Error> for Error {
 /// the ones it disconnects at `:3623`. We require every field through the
 /// height. `relay` alone stays optional: BIP37 added it, and Core takes an
 /// absent one as `true`. Bytes after it are ignored, as Core ignores them.
-pub fn parse(payload: &[u8]) -> Result<Peer, Error> {
+pub(crate) fn parse(payload: &[u8]) -> Result<Peer, Error> {
     let (protocol, rest) = take::<4>(payload)?;
     let protocol = i32::from_le_bytes(*protocol);
     if protocol < PEER_PROTOCOL_VERSION_MIN {

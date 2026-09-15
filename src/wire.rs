@@ -55,6 +55,12 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Message {
+    /// Turns a frame into the message it carries.
+    ///
+    /// # Errors
+    ///
+    /// `BadLength` if a command we know carries a payload of a size it
+    /// cannot have.
     pub fn decode(frame: crate::message::Frame) -> Result<Message, Error> {
         match frame.command {
             VERSION => Ok(Message::Version(frame.payload)),
@@ -66,6 +72,7 @@ impl Message {
         }
     }
 
+    #[must_use]
     pub fn encode(self) -> crate::message::Frame {
         let (command, payload) = match self {
             Message::Version(payload) => (VERSION, payload),

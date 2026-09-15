@@ -89,6 +89,18 @@ enum State {
 /// Runs the handshake over `stream`, which comes back inside `Complete` on
 /// `Ok`. On `Err` it is gone: the peer left it in a state we cannot name, and
 /// dropping it is the hang-up.
+///
+/// # Errors
+///
+/// `Message` if a frame cannot be read or written. `Version` if the peer's
+/// `version` does not parse or is too old. `VerackBeforeVersion` and
+/// `NoVerackAfter` if the peer's messages come in an order or a number no
+/// handshake has.
+///
+/// # Panics
+///
+/// If `seen` outgrows `MESSAGES_BEFORE_VERACK_MAX`. The loop condition rules
+/// that out; the assertions restate it where a frame is kept.
 pub fn run<S: std::io::Read + std::io::Write>(
     mut stream: S,
     network: crate::message::Network,

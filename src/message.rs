@@ -1,7 +1,7 @@
 /// Core's `MAX_PROTOCOL_MESSAGE_LENGTH`, `src/net.h:65` at v31.1.
 const MAX_PAYLOAD_BYTES: usize = 4_000_000;
 
-pub const HEADER_BYTES: usize = 24;
+pub(crate) const HEADER_BYTES: usize = 24;
 const COMMAND_BYTES: usize = 12;
 
 // The header is magic, command, length, checksum.
@@ -10,8 +10,6 @@ const _: () = assert!(4 + COMMAND_BYTES + 4 + 4 == HEADER_BYTES);
 // The length field is a `u32`. `read` converts it to `usize` and treats failure as unreachable; this is why it is.
 const _: () = assert!(usize::BITS >= 32);
 
-// Only regtest is dialled today. The homelab, on mainnet, is a later step.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub enum Network {
     Mainnet,
@@ -21,7 +19,7 @@ pub enum Network {
 }
 
 impl Network {
-    pub fn magic(self) -> [u8; 4] {
+    fn magic(self) -> [u8; 4] {
         match self {
             Network::Mainnet => [0xf9, 0xbe, 0xb4, 0xd9],
             Network::Testnet3 => [0x0b, 0x11, 0x09, 0x07],
@@ -40,7 +38,7 @@ const fn is_printable(byte: u8) -> bool {
 }
 
 impl Command {
-    pub const fn from_static(name: &'static str) -> Self {
+    pub(crate) const fn from_static(name: &'static str) -> Self {
         let bytes = name.as_bytes();
         assert!(!bytes.is_empty());
         assert!(bytes.len() <= COMMAND_BYTES);
@@ -54,7 +52,7 @@ impl Command {
         Self(raw)
     }
 
-    pub fn as_bytes(&self) -> &[u8; COMMAND_BYTES] {
+    fn as_bytes(&self) -> &[u8; COMMAND_BYTES] {
         &self.0
     }
 }
@@ -134,6 +132,12 @@ fn checksum(payload: &[u8]) -> [u8; 4] {
     [hash[0], hash[1], hash[2], hash[3]]
 }
 
+/// Writes one frame: the header, then `payload`.
+///
+/// # Errors
+///
+/// `PayloadTooLong` if `payload` is longer than `MAX_PAYLOAD_BYTES`; nothing
+/// reaches `writer`. `Io` if `writer` fails.
 pub fn write(
     writer: &mut impl std::io::Write,
     network: Network,
@@ -157,6 +161,19 @@ pub fn write(
     Ok(())
 }
 
+/// Reads one frame. The length field is bounded by `MAX_PAYLOAD_BYTES`
+/// before the payload is allocated.
+///
+/// # Errors
+///
+/// `Io` if `reader` fails or ends early. `BadMagic`, `BadCommand`,
+/// `PayloadTooLong` and `BadChecksum` name the header field Core would
+/// reject.
+///
+/// # Panics
+///
+/// If `usize` is narrower than `u32`. The compile-time assertion beside
+/// `HEADER_BYTES` rules that out on every target elo builds for.
 pub fn read(reader: &mut impl std::io::Read, network: Network) -> Result<Frame, Error> {
     let mut header = [0u8; HEADER_BYTES];
     reader.read_exact(&mut header)?;
