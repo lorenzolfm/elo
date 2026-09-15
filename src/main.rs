@@ -1,5 +1,8 @@
 //! elo — a Bitcoin node.
 
+// Nothing reads a header until step 6, `getheaders`.
+#[expect(dead_code)]
+mod block_header;
 mod compact_size;
 mod handshake;
 mod message;
