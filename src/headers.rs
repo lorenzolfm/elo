@@ -11,6 +11,10 @@
 /// locator is longer (`:4399`).
 pub(crate) const LOCATOR_HASHES_MAX: usize = 101;
 
+// A locator count always fits one `CompactSize` byte; `GetHeaders::encode`
+// sizes its buffer on that.
+const _: () = assert!(LOCATOR_HASHES_MAX < 0xfd);
+
 /// `MAX_HEADERS_RESULTS`, `net_processing.h:51`. Core sends at most this many
 /// in one `headers` (`:4453`) and penalizes a peer that sends more (`:4829`).
 pub(crate) const HEADERS_MAX: usize = 2000;
@@ -53,6 +57,10 @@ pub enum Error {
     TransactionCount(u8),
     /// Bytes after the last field.
     TrailingBytes(usize),
+    /// The header at `index` does not name the one before it. Core penalizes
+    /// the peer for this before it looks at its chain
+    /// (`CheckHeadersAreContinuous`, `:2673`, from `CheckHeadersPoW`, `:2628`).
+    NotContinuous { index: usize },
 }
 
 impl std::fmt::Display for Error {
@@ -65,6 +73,12 @@ impl std::fmt::Display for Error {
                 write!(f, "transaction count {count} after a header, expected 0")
             }
             Error::TrailingBytes(len) => write!(f, "{len} bytes after the last field"),
+            Error::NotContinuous { index } => {
+                write!(
+                    f,
+                    "header at index {index} does not name the header before it"
+                )
+            }
         }
     }
 }
@@ -102,6 +116,7 @@ impl GetHeaders {
         if !rest.is_empty() {
             return Err(Error::TrailingBytes(rest.len()));
         }
+        assert_eq!(locator.len(), count);
         assert!(locator.len() <= LOCATOR_HASHES_MAX);
         let stop =
             (*stop != [0; HASH_BYTES]).then(|| crate::block_header::BlockHash::from_bytes(*stop));
@@ -122,7 +137,10 @@ impl GetHeaders {
             "a locator of {} hashes; Core takes {LOCATOR_HASHES_MAX}",
             self.locator.len()
         );
-        let mut out = Vec::with_capacity(4 + 1 + HASH_BYTES * (self.locator.len() + 1));
+        // The version, a one-byte count (the `const` assertion beside
+        // `LOCATOR_HASHES_MAX`), the hashes, and the stop hash.
+        let size = 4 + 1 + HASH_BYTES * (self.locator.len() + 1);
+        let mut out = Vec::with_capacity(size);
         out.extend_from_slice(&LOCATOR_VERSION.to_le_bytes());
         crate::compact_size::write_len(&mut out, self.locator.len());
         for hash in &self.locator {
@@ -132,13 +150,20 @@ impl GetHeaders {
             Some(hash) => out.extend_from_slice(hash.as_bytes()),
             None => out.extend_from_slice(&[0; HASH_BYTES]),
         }
+        assert_eq!(out.len(), size);
         out
     }
 }
 
-/// A `headers` payload as one peer sent it: at most `HEADERS_MAX`, in the
-/// peer's order. Only `parse` builds one, so the bound holds by construction
-/// and `encode` has nothing to assert.
+/// A `headers` payload as one peer sent it: at most `HEADERS_MAX`, each
+/// naming the one before it. Only `parse` builds one, so both facts hold by
+/// construction, and the chain checks one join, the first header against
+/// what it has, not one per header. `encode` asserts the bound again, so a
+/// second constructor cannot break it in silence; continuity costs a
+/// `sha256d` per header to re-check and is not asserted twice.
+///
+/// Whether the first header names a block we know, and whether each header
+/// has the work it claims (step 9), are questions for the chain.
 #[derive(Debug)]
 pub struct Headers(Vec<crate::block_header::Header>);
 
@@ -147,22 +172,32 @@ impl Headers {
     /// followed by the transaction count of a block that carries none
     /// (`:4446`). Core reads it the same way (`:4827` to `:4836`), but
     /// accepts any transaction count; we accept the one byte a count of zero
-    /// takes.
+    /// takes. Then each header must name the one before it, as Core requires
+    /// once it has the list (`:2673`); here a gap is refused as it is read.
     pub(crate) fn parse(payload: &[u8]) -> Result<Headers, Error> {
         let (count, mut rest) = crate::compact_size::read_len(payload, HEADERS_MAX)?;
-        let mut headers = Vec::with_capacity(count);
-        for _ in 0..count {
+        let mut headers: Vec<crate::block_header::Header> = Vec::with_capacity(count);
+        for index in 0..count {
             let (header, after) = take::<HEADER_BYTES>(rest)?;
-            let (&transactions, after) = after.split_first().ok_or(Error::Truncated)?;
-            if transactions != 0 {
-                return Err(Error::TransactionCount(transactions));
+            let (&transaction_count, after) = after.split_first().ok_or(Error::Truncated)?;
+            if transaction_count != 0 {
+                return Err(Error::TransactionCount(transaction_count));
             }
-            headers.push(crate::block_header::Header::parse(header));
+            let header = crate::block_header::Header::parse(header);
+            // The first header has nothing before it to name.
+            let names_the_last = headers
+                .last()
+                .is_none_or(|last| header.previous_block.as_bytes() == last.hash().as_bytes());
+            if !names_the_last {
+                return Err(Error::NotContinuous { index });
+            }
+            headers.push(header);
             rest = after;
         }
         if !rest.is_empty() {
             return Err(Error::TrailingBytes(rest.len()));
         }
+        assert_eq!(headers.len(), count);
         assert!(headers.len() <= HEADERS_MAX);
         Ok(Headers(headers))
     }
@@ -171,6 +206,9 @@ impl Headers {
     /// transactions, which is the header and one zero byte.
     #[must_use]
     pub(crate) fn encode(&self) -> Vec<u8> {
+        assert!(self.0.len() <= HEADERS_MAX);
+        // Room for the count in its `fd` form, which a count below 0xfd
+        // does not need: two bytes over for a short run, never short.
         let mut out = Vec::with_capacity(3 + self.0.len() * (HEADER_BYTES + 1));
         crate::compact_size::write_len(&mut out, self.0.len());
         for header in &self.0 {
@@ -400,6 +438,35 @@ mod tests {
         let err = super::Headers::parse(&payload).unwrap_err();
         assert!(matches!(err, super::Error::TransactionCount(1)), "{err}");
         println!("{err}; Core reads the count and ignores it (net_processing.cpp:4835)");
+    }
+
+    #[test]
+    fn rejects_a_header_that_does_not_name_the_one_before() {
+        // Red if the continuity check is missing, compares the wrong pair, or
+        // reports the wrong index. One bit in the `previous_block` of header
+        // 2 (index 1): headers 1 and 3 are untouched, and 3 still names 2, so
+        // only index 1 is a gap.
+        let mut payload = fixture(FROM_GENESIS);
+        payload[1 + (super::HEADER_BYTES + 1) + 4] ^= 1;
+        let err = super::Headers::parse(&payload).unwrap_err();
+        assert!(
+            matches!(err, super::Error::NotContinuous { index: 1 }),
+            "{err}"
+        );
+        println!(
+            "{err}; Core: Misbehaving, 'non-continuous headers sequence' (net_processing.cpp:2629)"
+        );
+        // The same bit in the only header of a run: nothing before it to
+        // name, so the run is continuous and the chain will be the one to
+        // refuse it.
+        let mut payload = fixture(STOP_AT_TWO);
+        payload[1 + 4] ^= 1;
+        let headers = super::Headers::parse(&payload).unwrap();
+        assert_ne!(
+            headers.as_slice()[0].previous_block.to_string(),
+            BLOCK_1,
+            "the first header names nothing we know, and that is not the parser's call"
+        );
     }
 
     #[test]
