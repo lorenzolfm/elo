@@ -6,6 +6,8 @@ const VERSION: crate::message::Command = crate::message::Command::from_static("v
 const VERACK: crate::message::Command = crate::message::Command::from_static("verack");
 const PING: crate::message::Command = crate::message::Command::from_static("ping");
 const PONG: crate::message::Command = crate::message::Command::from_static("pong");
+const GETHEADERS: crate::message::Command = crate::message::Command::from_static("getheaders");
+const HEADERS: crate::message::Command = crate::message::Command::from_static("headers");
 
 /// `ping` and `pong` carry one `u64` nonce since BIP31. Core reads exactly
 /// that from a `ping` (`../bitcoin/src/net_processing.cpp:4973` at v31.1)
@@ -21,6 +23,8 @@ pub enum Message {
     Verack,
     Ping(u64),
     Pong(u64),
+    GetHeaders(crate::headers::GetHeaders),
+    Headers(crate::headers::Headers),
     /// A command we do not speak. Core logs it and carries on
     /// (`net_processing.cpp:5167`); a newer peer must not cost us the
     /// connection.
@@ -35,6 +39,11 @@ pub enum Error {
         len_actual: usize,
         len_expected: usize,
     },
+    /// A command we know, with a payload that does not parse.
+    BadPayload {
+        command: crate::message::Command,
+        error: crate::headers::Error,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -48,6 +57,7 @@ impl std::fmt::Display for Error {
                 f,
                 "{command} payload is {len_actual} bytes, expected {len_expected}"
             ),
+            Error::BadPayload { command, error } => write!(f, "{command} payload: {error}"),
         }
     }
 }
@@ -60,7 +70,8 @@ impl Message {
     /// # Errors
     ///
     /// `BadLength` if a command we know carries a payload of a size it
-    /// cannot have.
+    /// cannot have. `BadPayload` if a `getheaders` or `headers` payload does
+    /// not parse.
     pub fn decode(frame: crate::message::Frame) -> Result<Message, Error> {
         match frame.command {
             VERSION => Ok(Message::Version(frame.payload)),
@@ -68,6 +79,12 @@ impl Message {
             VERACK => Err(bad_length(&frame, 0)),
             PING => Ok(Message::Ping(nonce(&frame)?)),
             PONG => Ok(Message::Pong(nonce(&frame)?)),
+            GETHEADERS => crate::headers::GetHeaders::parse(&frame.payload)
+                .map(Message::GetHeaders)
+                .map_err(|error| bad_payload(&frame, error)),
+            HEADERS => crate::headers::Headers::parse(&frame.payload)
+                .map(Message::Headers)
+                .map_err(|error| bad_payload(&frame, error)),
             _ => Ok(Message::Unknown(frame)),
         }
     }
@@ -79,6 +96,8 @@ impl Message {
             Message::Verack => (VERACK, Vec::new()),
             Message::Ping(nonce) => (PING, nonce.to_le_bytes().to_vec()),
             Message::Pong(nonce) => (PONG, nonce.to_le_bytes().to_vec()),
+            Message::GetHeaders(request) => (GETHEADERS, request.encode()),
+            Message::Headers(headers) => (HEADERS, headers.encode()),
             Message::Unknown(frame) => return frame,
         };
         crate::message::Frame { command, payload }
@@ -92,6 +111,10 @@ impl std::fmt::Display for Message {
             Message::Verack => write!(f, "verack"),
             Message::Ping(nonce) => write!(f, "ping {nonce:#018x}"),
             Message::Pong(nonce) => write!(f, "pong {nonce:#018x}"),
+            Message::GetHeaders(request) => {
+                write!(f, "getheaders ({} locator hashes)", request.locator.len())
+            }
+            Message::Headers(headers) => write!(f, "headers ({})", headers.len()),
             Message::Unknown(frame) => {
                 write!(f, "{} ({} bytes)", frame.command, frame.payload.len())
             }
@@ -104,6 +127,13 @@ fn bad_length(frame: &crate::message::Frame, len_expected: usize) -> Error {
         command: frame.command,
         len_actual: frame.payload.len(),
         len_expected,
+    }
+}
+
+fn bad_payload(frame: &crate::message::Frame, error: crate::headers::Error) -> Error {
+    Error::BadPayload {
+        command: frame.command,
+        error,
     }
 }
 
@@ -128,6 +158,12 @@ mod tests {
     const PING: &str = "fabfb5da70696e670000000000000000080000000518a0f806d2e2149c8064fd";
     const FEEFILTER: &str = "fabfb5da66656566696c746572000000080000000a19f7997a9e970000000000";
     const PONG: &str = "fabfb5da706f6e6700000000000000000800000033bc15e5efcdab8967452301";
+    // Two more, from `bitcoind -regtest` after `generatetoaddress 3` on
+    // 2026-09-15: Core's `getheaders` to a listening script that claimed
+    // `NODE_NETWORK`, and Core's `headers` to a script that asked from
+    // genesis. `headers.rs` has the chain and the capture.
+    const GETHEADERS: &str = "fabfb5da676574686561646572730000850000008c4a998480110100030e6ddccc471aeeb899ff667f7d55da0443769850872e6d44924d32d610f24c2834cf96da8f1b387300eaa047d30955fbaf1b0bb6f261f22425454a6b43b7b23306226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f0000000000000000000000000000000000000000000000000000000000000000";
+    const HEADERS: &str = "fabfb5da686561646572730000000000f40000002f52e50d030000002006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910fce25a9ef6a61909eadcc696fb71eb4d3216de17cc3731ecdd321a030e9213a1226cda96affff7f2000000000000000002034cf96da8f1b387300eaa047d30955fbaf1b0bb6f261f22425454a6b43b7b233650b72ea7da500a8429598a02571115bf2b6ee26da96be0378ff7cba4c98780e27cda96affff7f200300000000000000200e6ddccc471aeeb899ff667f7d55da0443769850872e6d44924d32d610f24c2869ee5ba689a2d757c652f917d12a43c9b24ba79dcff22abbea56c075d3d2bd7227cda96affff7f200000000000";
 
     const OUR_NONCE: u64 = 0x0123_4567_89ab_cdef;
 
@@ -234,6 +270,59 @@ mod tests {
         assert_eq!(again.command, original.command);
         assert_eq!(again.payload, original.payload);
         println!("sendcmpct: decode then encode is the identity");
+    }
+
+    #[test]
+    fn decodes_core_getheaders_and_headers() {
+        // Red if either command falls through to `Unknown`, or the two are
+        // swapped.
+        let request = decode(GETHEADERS);
+        let super::Message::GetHeaders(inner) = &request else {
+            panic!("{request}");
+        };
+        assert_eq!(inner.locator.len(), 3);
+        assert_eq!(request.to_string(), "getheaders (3 locator hashes)");
+        let reply = decode(HEADERS);
+        let super::Message::Headers(headers) = &reply else {
+            panic!("{reply}");
+        };
+        assert_eq!(headers.len(), 3);
+        assert_eq!(reply.to_string(), "headers (3)");
+        println!("<- {request}\n<- {reply}");
+    }
+
+    #[test]
+    fn getheaders_and_headers_re_encode_to_core_frames() {
+        // Red if either message encodes under the wrong command, or the
+        // payload comes back changed.
+        for hex in [GETHEADERS, HEADERS] {
+            let ours = encode_to_wire(decode(hex));
+            assert_eq!(ours, fixture(hex));
+            println!("{}: {} bytes, identical to Core's", decode(hex), ours.len());
+        }
+    }
+
+    #[test]
+    fn a_payload_that_does_not_parse_names_its_command() {
+        // Red if a payload error is dropped and the frame becomes `Unknown`,
+        // or the error loses the command it came from.
+        let mut bytes = fixture(HEADERS);
+        bytes[crate::message::HEADER_BYTES] = 4;
+        let frame = crate::message::Frame {
+            command: crate::message::Command::from_static("headers"),
+            payload: bytes[crate::message::HEADER_BYTES..].to_vec(),
+        };
+        let err = super::Message::decode(frame).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                super::Error::BadPayload { command, error: crate::headers::Error::Truncated }
+                    if command.to_string() == "headers"
+            ),
+            "{err}"
+        );
+        assert_eq!(err.to_string(), "headers payload: payload truncated");
+        println!("count 4 over three headers: {err}");
     }
 
     fn malformed(command: &'static str, len: usize) -> super::Error {

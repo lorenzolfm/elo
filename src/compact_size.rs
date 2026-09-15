@@ -6,6 +6,8 @@
 //! `CompactSize` is not always a length. `read_len` is for one that is: it
 //! takes the limit of the field it prefixes and returns a `usize` that is
 //! already under it, so the caller cannot allocate or slice before the bound.
+//! `write_len` is the other direction; every `CompactSize` elo writes is a
+//! length, so it takes a `usize`.
 
 #[derive(Debug)]
 pub enum Error {
@@ -63,6 +65,32 @@ pub fn read_len(bytes: &[u8], max: usize) -> Result<(usize, &[u8]), Error> {
         Ok(len) if len <= max => Ok((len, rest)),
         _ => Err(Error::TooLarge { value, max }),
     }
+}
+
+// `write_len` converts a `usize` to `u64` and treats failure as unreachable;
+// this is why it is.
+const _: () = assert!(usize::BITS <= 64);
+
+/// Appends `len` to `out` in the fewest bytes that hold it, Core's
+/// `WriteCompactSize` (`serialize.h:299`). `read` accepts nothing else.
+///
+/// # Panics
+///
+/// If `usize` is wider than `u64`. The compile-time assertion above rules
+/// that out on every target elo builds for.
+pub fn write_len(out: &mut Vec<u8>, len: usize) {
+    let Ok(value) = u64::try_from(len) else {
+        unreachable!("a usize fits in u64 on every target elo builds for")
+    };
+    // The marker and the width behind it: the table in `read`, mirrored.
+    let (marker, width) = match value {
+        0..=0xfc => (None, 1),
+        0xfd..=0xffff => (Some(0xfd), 2),
+        0x1_0000..=0xffff_ffff => (Some(0xfe), 4),
+        0x1_0000_0000.. => (Some(0xff), 8),
+    };
+    out.extend(marker);
+    out.extend_from_slice(&value.to_le_bytes()[..width]);
 }
 
 #[cfg(test)]
@@ -194,5 +222,44 @@ mod tests {
 
         let (zero, rest) = super::read_len(&[0, 7], 0).unwrap();
         assert_eq!((zero, rest), (0, &[7][..]), "the bound is inclusive");
+    }
+
+    #[test]
+    fn writes_what_core_wrote() {
+        // Red if a small length gets a marker, or 300 is not `fd` then two
+        // little-endian bytes.
+        let mut out = Vec::new();
+        super::write_len(&mut out, 16);
+        assert_eq!(out, fixture(USER_AGENT)[..1]);
+        out.clear();
+        super::write_len(&mut out, 300);
+        assert_eq!(out, fixture(THREE_HUNDRED_HEADERS));
+        println!(
+            "16 -> {:02x?}; 300 -> {THREE_HUNDRED_HEADERS}",
+            fixture(USER_AGENT)[..1].to_vec()
+        );
+    }
+
+    /// Derived from `WriteCompactSize`, `serialize.h:299`: the last value of
+    /// each width and the first of the next.
+    #[test]
+    fn writes_the_shortest_form_at_each_bound() {
+        // Red if any width bound is off by one, or the value is written
+        // big-endian.
+        for (len, expected) in [
+            (0, vec![0]),
+            (0xfc, vec![0xfc]),
+            (0xfd, vec![0xfd, 0xfd, 0]),
+            (0xffff, vec![0xfd, 0xff, 0xff]),
+            (0x1_0000, vec![0xfe, 0, 0, 1, 0]),
+            (0xffff_ffff, vec![0xfe, 0xff, 0xff, 0xff, 0xff]),
+            (0x1_0000_0000, vec![0xff, 0, 0, 0, 0, 1, 0, 0, 0]),
+            (usize::MAX, vec![0xff; 9]),
+        ] {
+            let mut out = Vec::new();
+            super::write_len(&mut out, len);
+            assert_eq!(out, expected, "{len:#x}");
+            println!("{len:#x} -> {out:02x?}");
+        }
     }
 }

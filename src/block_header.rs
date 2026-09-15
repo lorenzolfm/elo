@@ -13,36 +13,47 @@
 /// serialization order at `block.h:42`.
 pub const BYTES: usize = 80;
 
-const _: () = assert!(4 + 32 + 32 + 4 + 4 + 4 == BYTES);
+/// A `uint256`: a block hash or a merkle root on the wire.
+pub const HASH_BYTES: usize = 32;
+
+const _: () = assert!(4 + HASH_BYTES + HASH_BYTES + 4 + 4 + 4 == BYTES);
 
 /// `sha256d` of a serialized header (`block.cpp:15`, `hash.h:115`), in the
 /// order `sha256d` produced it. From `hash` it is computed; from `previous_block`
-/// it is what the peer claims, and the chain checks the claim by lookup.
-pub struct BlockHash([u8; 32]);
+/// and from a `getheaders` locator it is what the peer claims, and the chain
+/// checks the claim by lookup.
+pub struct BlockHash([u8; HASH_BYTES]);
 
 /// The root of the transaction merkle tree, in wire order like a block hash.
 /// Kept opaque: elo does not validate transactions, so nothing computes a
 /// root to compare it against. Its own type so that it cannot stand in for a
 /// block hash, and so that it prints the way Core prints it.
-pub struct MerkleRoot([u8; 32]);
+pub struct MerkleRoot([u8; HASH_BYTES]);
 
 impl BlockHash {
+    /// A hash as it came off the wire, in the order it runs there.
+    pub(crate) fn from_bytes(bytes: [u8; HASH_BYTES]) -> BlockHash {
+        BlockHash(bytes)
+    }
+
     /// The bytes as they run on the wire.
-    pub fn as_bytes(&self) -> &[u8; 32] {
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; HASH_BYTES] {
         &self.0
     }
 }
 
 impl MerkleRoot {
     /// The bytes as they run on the wire.
-    pub fn as_bytes(&self) -> &[u8; 32] {
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; HASH_BYTES] {
         &self.0
     }
 }
 
 /// Lowercase hex, last byte first: what Core prints and what
 /// `getblockhash` returns.
-fn fmt_reversed(bytes: &[u8; 32], f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+fn fmt_reversed(bytes: &[u8; HASH_BYTES], f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     for byte in bytes.iter().rev() {
         write!(f, "{byte:02x}")?;
     }
@@ -90,6 +101,11 @@ pub struct Header {
 }
 
 impl Header {
+    /// # Panics
+    ///
+    /// If the field widths do not add up to `BYTES`. They are constants, and
+    /// the `const` assertion beside `BYTES` sums them; a peer cannot reach it.
+    #[must_use]
     pub fn parse(bytes: &[u8; BYTES]) -> Header {
         let (version, rest) = parse_field::<4>(bytes);
         let (previous_block, rest) = parse_field::<32>(rest);
@@ -110,6 +126,11 @@ impl Header {
 
     /// The mirror of `parse`: the same widths in the same order, so the
     /// layout is written down once per direction and asserted in both.
+    ///
+    /// # Panics
+    ///
+    /// As `parse`: if the widths do not add up to `BYTES`.
+    #[must_use]
     pub fn encode(&self) -> [u8; BYTES] {
         let mut out = [0u8; BYTES];
         let (version, rest) = encode_field::<4>(&mut out);
@@ -130,6 +151,7 @@ impl Header {
 
     /// The hash is over the serialized header and nothing else: the
     /// transaction count and the transactions are not part of it.
+    #[must_use]
     pub fn hash(&self) -> BlockHash {
         BlockHash(bitcoin_hashes::sha256d::Hash::hash(&self.encode()).to_byte_array())
     }
