@@ -21,15 +21,22 @@ const SIGN: u32 = 0x0080_0000;
 /// `8 * (size - 3)` (`arith_uint256.cpp:180`, `:183`).
 const MANTISSA_BYTES: usize = 3;
 
-/// A 256-bit unsigned number: a decoded `nBits`, a network's `powLimit`,
-/// or a block hash read as one. Core's `arith_uint256` (`arith_uint256.h:31`)
-/// is eight 32-bit limbs, least significant first. This is four 64-bit
-/// limbs, *most* significant first, so that the derived comparison of the
-/// array is the comparison of the number: two equal-length arrays compared
-/// limb by limb from the top compare as the numbers they spell. No other
-/// operation is needed before step 10.
+/// A 256-bit unsigned number: what `nBits` decodes to before the limit is
+/// asked, or a block hash read as one. Core's `arith_uint256`
+/// (`arith_uint256.h:31`) is eight 32-bit limbs, least significant first.
+/// This is four 64-bit limbs, *most* significant first, so that the derived
+/// comparison of the array is the comparison of the number: two
+/// equal-length arrays compared limb by limb from the top compare as the
+/// numbers they spell. No other operation is needed before step 10.
 #[derive(PartialEq, PartialOrd)]
-pub struct Target([u64; LIMBS]);
+pub struct U256([u64; LIMBS]);
+
+/// A target a header may claim on one network: `nBits` decoded to a number
+/// that is not zero, not negative, within 256 bits, and at or below the
+/// network's `powLimit`. What `DeriveTarget` (`pow.cpp:146`) returns when it
+/// returns anything. Only `from_compact` and `limit` build one, so a
+/// `Target` in hand has passed every check but the hash.
+pub struct Target(U256);
 
 #[derive(Debug)]
 pub enum Error {
@@ -43,7 +50,8 @@ pub enum Error {
     /// `arith_uint256.cpp:188`.
     Overflow { bits: u32 },
     /// Easier than the network allows: `bnTarget > powLimit`, `pow.cpp:155`.
-    AboveLimit { target: Target, limit: Target },
+    /// The number decoded is no target, so it is carried as the number.
+    AboveLimit { target: U256, limit: Target },
     /// The hash is above the target the header claims: `pow.cpp:166`.
     NotMet {
         hash: crate::block_header::BlockHash,
@@ -67,8 +75,8 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl Target {
-    const ZERO: Target = Target([0; LIMBS]);
+impl U256 {
+    const ZERO: U256 = U256([0; LIMBS]);
 
     /// `SetCompact`, `arith_uint256.cpp:175`: the top byte of `nBits` is a
     /// size in bytes, the low 23 bits a mantissa, the bit between a sign.
@@ -80,7 +88,8 @@ impl Target {
     /// refuses on either flag or on a target of zero (`pow.cpp:155`). Here
     /// each refusal is its own error. Zero is the mantissa gone, and rules
     /// the other two out; both may hold at once, and the sign is named
-    /// first as Core tests it first.
+    /// first as Core tests it first. The limit is `Target::from_compact`'s
+    /// question: this is the number, whatever the network.
     ///
     /// # Errors
     ///
@@ -91,7 +100,7 @@ impl Target {
     /// If a mantissa that passed the overflow check shifts to zero. A size
     /// of 34 at most, with a mantissa of one byte, shifts by 248 at most:
     /// no bit is lost.
-    pub fn from_compact(bits: u32) -> Result<Target, Error> {
+    fn from_compact(bits: u32) -> Result<U256, Error> {
         let [size, ..] = bits.to_be_bytes();
         let size = usize::from(size);
         let mut mantissa = bits & MANTISSA;
@@ -109,56 +118,38 @@ impl Target {
         if overflow {
             return Err(Error::Overflow { bits });
         }
-        let target = if size <= MANTISSA_BYTES {
-            Target::from_u64(u64::from(mantissa))
+        let number = if size <= MANTISSA_BYTES {
+            U256::from_u64(u64::from(mantissa))
         } else {
-            Target::from_u64(u64::from(mantissa)).shl(8 * (size - MANTISSA_BYTES))
+            U256::from_u64(u64::from(mantissa)).shl(8 * (size - MANTISSA_BYTES))
         };
-        assert!(target != Target::ZERO, "the overflow check kept every bit");
-        Ok(target)
-    }
-
-    /// `powLimit` of `network`: the easiest target a header may claim.
-    /// `chainparams.cpp:96` mainnet, `:227` testnet3, `:334` testnet4,
-    /// `:575` regtest. Not a compact value: a compact target has at most 23
-    /// significant bits, and a limit has 224 or 255 of them.
-    #[must_use]
-    pub fn limit(network: crate::message::Network) -> Target {
-        match network {
-            crate::message::Network::Mainnet
-            | crate::message::Network::Testnet3
-            | crate::message::Network::Testnet4 => {
-                Target([0x0000_0000_ffff_ffff, u64::MAX, u64::MAX, u64::MAX])
-            }
-            crate::message::Network::Regtest => {
-                Target([0x7fff_ffff_ffff_ffff, u64::MAX, u64::MAX, u64::MAX])
-            }
-        }
+        assert!(number != U256::ZERO, "the overflow check kept every bit");
+        Ok(number)
     }
 
     /// `UintToArith256`, `arith_uint256.cpp:225`: the 32 bytes of a hash read
     /// as a little-endian number. That is the number Core prints, so a hash
-    /// and the target made from it print the same.
+    /// and the number made from it print the same.
     ///
     /// # Panics
     ///
     /// If the hash does not split into whole limbs. The `const` assertion
     /// beside `LIMBS` says it does.
     #[must_use]
-    pub fn from_hash(hash: &crate::block_header::BlockHash) -> Target {
+    pub fn from_hash(hash: &crate::block_header::BlockHash) -> U256 {
         let (chunks, rest) = hash.as_bytes().as_chunks::<{ LIMB_BITS / 8 }>();
         assert!(rest.is_empty(), "a hash is whole limbs");
         let mut limbs = [0; LIMBS];
         for (limb, chunk) in limbs.iter_mut().rev().zip(chunks) {
             *limb = u64::from_le_bytes(*chunk);
         }
-        Target(limbs)
+        U256(limbs)
     }
 
-    const fn from_u64(value: u64) -> Target {
+    const fn from_u64(value: u64) -> U256 {
         let mut limbs = [0; LIMBS];
         limbs[LIMBS - 1] = value;
-        Target(limbs)
+        U256(limbs)
     }
 
     /// `operator<<=`, `arith_uint256.cpp:14`, for a shift below the width:
@@ -169,7 +160,7 @@ impl Target {
     ///
     /// If `shift` is the width or more: the overflow check in `from_compact`
     /// rules it out, so reaching it is our bug.
-    fn shl(self, shift: usize) -> Target {
+    fn shl(self, shift: usize) -> U256 {
         assert!(shift < BITS, "a shift of {shift} clears every bit");
         let whole = shift / LIMB_BITS;
         let part = shift % LIMB_BITS;
@@ -185,13 +176,50 @@ impl Target {
                 limbs[above] |= limb >> (LIMB_BITS - part);
             }
         }
-        Target(limbs)
+        U256(limbs)
+    }
+}
+
+impl Target {
+    /// `DeriveTarget`, `pow.cpp:146`: `nBits` decoded as `U256::from_compact`
+    /// decodes it, then held at or below the limit of `network`. Equal
+    /// passes (`:155`).
+    ///
+    /// # Errors
+    ///
+    /// As `U256::from_compact`, then `AboveLimit`.
+    pub fn from_compact(bits: u32, network: crate::message::Network) -> Result<Target, Error> {
+        let target = U256::from_compact(bits)?;
+        let limit = Target::limit(network);
+        if target > limit.0 {
+            return Err(Error::AboveLimit { target, limit });
+        }
+        Ok(Target(target))
+    }
+
+    /// `powLimit` of `network`: the easiest target a header may claim, and
+    /// so a target itself. `chainparams.cpp:96` mainnet, `:227` testnet3,
+    /// `:334` testnet4, `:575` regtest. Not a compact value: a compact
+    /// target has at most 23 significant bits, and a limit has 224 or 255
+    /// of them.
+    #[must_use]
+    pub fn limit(network: crate::message::Network) -> Target {
+        match network {
+            crate::message::Network::Mainnet
+            | crate::message::Network::Testnet3
+            | crate::message::Network::Testnet4 => {
+                Target(U256([0x0000_0000_ffff_ffff, u64::MAX, u64::MAX, u64::MAX]))
+            }
+            crate::message::Network::Regtest => {
+                Target(U256([0x7fff_ffff_ffff_ffff, u64::MAX, u64::MAX, u64::MAX]))
+            }
+        }
     }
 }
 
 /// Lowercase hex, most significant first: `GetHex`, `arith_uint256.cpp:140`,
 /// the form `chainparams.cpp` writes a `powLimit` in.
-impl std::fmt::Display for Target {
+impl std::fmt::Display for U256 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for limb in &self.0 {
             write!(f, "{limb:016x}")?;
@@ -200,31 +228,40 @@ impl std::fmt::Display for Target {
     }
 }
 
-/// The same as `Display`: a target is a number and prints as one.
-impl std::fmt::Debug for Target {
+/// The same as `Display`: a number prints as one.
+impl std::fmt::Debug for U256 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self, f)
     }
 }
 
+/// A target prints as the number it is.
+impl std::fmt::Display for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::fmt::Debug for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
 /// `CheckProofOfWork`, `pow.cpp:140`, for one header: `bits` decodes to a
-/// target at or below the limit of `network`, and `hash` is at or below the
-/// target. Equal passes on both counts (`pow.cpp:155`, `:166`).
+/// target of `network`, and `hash` is at or below it. Equal passes
+/// (`pow.cpp:166`).
 ///
 /// # Errors
 ///
-/// As `Target::from_compact`, then `AboveLimit`, then `NotMet`.
+/// As `Target::from_compact`, then `NotMet`.
 pub fn check(
     hash: &crate::block_header::BlockHash,
     bits: u32,
     network: crate::message::Network,
 ) -> Result<(), Error> {
-    let target = Target::from_compact(bits)?;
-    let limit = Target::limit(network);
-    if target > limit {
-        return Err(Error::AboveLimit { target, limit });
-    }
-    if Target::from_hash(hash) > target {
+    let target = Target::from_compact(bits, network)?;
+    if U256::from_hash(hash) > target.0 {
         return Err(Error::NotMet {
             hash: hash.clone(),
             target,
@@ -343,7 +380,7 @@ mod tests {
         // direction, a flag is read before the bottom bytes are dropped, or
         // the limbs print in the wrong order.
         for (bits, expected) in CORE_VECTORS {
-            let got = super::Target::from_compact(bits);
+            let got = super::U256::from_compact(bits);
             match (expected, &got) {
                 (Ok(hex), Ok(target)) => assert_eq!(target.to_string(), hex, "{bits:#010x}"),
                 (Err(name), Err(error)) => assert_eq!(flag(error), name, "{bits:#010x}: {error}"),
@@ -366,7 +403,7 @@ mod tests {
             (0x207f_ffff, Ok("7fffff")),
             (0x217f_ffff, Err("overflow")),
         ] {
-            let got = super::Target::from_compact(bits);
+            let got = super::U256::from_compact(bits);
             match (expected, &got) {
                 (Ok(top), Ok(target)) => {
                     let hex = target.to_string();
@@ -385,11 +422,37 @@ mod tests {
         // Red if the shift runs before the mantissa is checked: a size of
         // 255 asks for a shift of 2016, past what `shl` allows, and Core's
         // overflow flag stays down because the mantissa is zero.
-        let err = super::Target::from_compact(0xff00_0000).unwrap_err();
+        let err = super::U256::from_compact(0xff00_0000).unwrap_err();
         assert!(
             matches!(err, super::Error::Zero { bits: 0xff00_0000 }),
             "{err}"
         );
+        println!("{err}");
+    }
+
+    #[test]
+    fn a_target_is_the_number_held_at_or_below_the_limit() {
+        // Red if `Target::from_compact` asks the limit before the decode,
+        // or takes a number above it: `0xff123456` overflows on every
+        // network and is named for that, not for the limit; regtest's
+        // genesis target is above mainnet's limit and below regtest's.
+        let err =
+            super::Target::from_compact(0xff12_3456, crate::message::Network::Regtest).unwrap_err();
+        assert!(matches!(err, super::Error::Overflow { .. }), "{err}");
+        let err =
+            super::Target::from_compact(0x207f_ffff, crate::message::Network::Mainnet).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                super::Error::AboveLimit { target, limit }
+                    if target.to_string() == REGTEST_GENESIS_TARGET
+                        && limit.to_string() == MAINNET_LIMIT
+            ),
+            "{err}"
+        );
+        let target =
+            super::Target::from_compact(0x207f_ffff, crate::message::Network::Regtest).unwrap();
+        assert_eq!(target.to_string(), REGTEST_GENESIS_TARGET);
         println!("{err}");
     }
 
@@ -416,13 +479,13 @@ mod tests {
             REGTEST_LIMIT
         );
         assert_eq!(
-            super::Target::from_compact(0x1d00_ffff)
+            super::Target::from_compact(0x1d00_ffff, crate::message::Network::Mainnet)
                 .unwrap()
                 .to_string(),
             MAINNET_GENESIS_TARGET
         );
         assert_eq!(
-            super::Target::from_compact(0x207f_ffff)
+            super::Target::from_compact(0x207f_ffff, crate::message::Network::Regtest)
                 .unwrap()
                 .to_string(),
             REGTEST_GENESIS_TARGET
@@ -438,10 +501,10 @@ mod tests {
         // right.
         let hash = crate::chain::genesis(crate::message::Network::Mainnet).hash();
         assert_eq!(hash.to_string(), MAINNET_GENESIS_HASH);
-        let number = super::Target::from_hash(&hash);
+        let number = super::U256::from_hash(&hash);
         assert_eq!(number.to_string(), MAINNET_GENESIS_HASH);
         assert!(
-            number < super::Target::from_compact(0x1d00_ffff).unwrap(),
+            number < super::U256::from_compact(0x1d00_ffff).unwrap(),
             "and it is below the target it claims"
         );
         println!("{number}");
@@ -452,11 +515,11 @@ mod tests {
         // Red if the limbs are least significant first, where the derived
         // order would be wrong: a top limb of one beats every lower limb
         // full.
-        let low_full = super::Target([0, 0, 0, u64::MAX]);
-        let next_up = super::Target([0, 0, 1, 0]);
-        let top_one = super::Target([1, 0, 0, 0]);
-        let top_one_again = super::Target([1, 0, 0, 0]);
-        let below_top = super::Target([0, u64::MAX, u64::MAX, u64::MAX]);
+        let low_full = super::U256([0, 0, 0, u64::MAX]);
+        let next_up = super::U256([0, 0, 1, 0]);
+        let top_one = super::U256([1, 0, 0, 0]);
+        let top_one_again = super::U256([1, 0, 0, 0]);
+        let below_top = super::U256([0, u64::MAX, u64::MAX, u64::MAX]);
         assert!(low_full < next_up);
         assert!(below_top < top_one);
         assert!(top_one > low_full);
@@ -468,13 +531,13 @@ mod tests {
     fn a_shift_carries_the_bits_that_cross_a_limb() {
         // Red if the carry into the limb above is dropped or lands one limb
         // off, or a shift by whole limbs is off by one limb.
-        let across = super::Target::from_u64(0xffff).shl(56);
+        let across = super::U256::from_u64(0xffff).shl(56);
         assert_eq!(across.0, [0, 0, 0xff, 0xff00_0000_0000_0000]);
-        let top_bit = super::Target::from_u64(1).shl(255);
+        let top_bit = super::U256::from_u64(1).shl(255);
         assert_eq!(top_bit.0, [1 << 63, 0, 0, 0]);
-        let whole = super::Target::from_u64(0x1234).shl(192);
+        let whole = super::U256::from_u64(0x1234).shl(192);
         assert_eq!(whole.0, [0x1234, 0, 0, 0]);
-        let none = super::Target::from_u64(0x1234).shl(0);
+        let none = super::U256::from_u64(0x1234).shl(0);
         assert_eq!(none.0, [0, 0, 0, 0x1234]);
         println!("{across}\n{top_bit}\n{whole}");
     }
@@ -482,7 +545,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "a shift of 256 clears every bit")]
     fn a_shift_of_the_width_is_our_bug() {
-        let _ = super::Target::from_u64(1).shl(256);
+        let _ = super::U256::from_u64(1).shl(256);
     }
 
     #[test]
