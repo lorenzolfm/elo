@@ -31,7 +31,7 @@ subversion string.
       the bytes on the wire run the other way.
 - [x] 6. `getheaders` and `headers`, including the vestigial zero
       transaction-count byte that follows each header on the wire.
-- [ ] 7. The block locator: ten recent hashes, then exponential backoff — and
+- [x] 7. The block locator: ten recent hashes, then exponential backoff — and
       why that shape finds a fork point fast.
 - [ ] 8. The in-memory chain and the sync loop, capped at a couple of batches.
       `Connection` already holds the `Link` and the `Network` (T3); the loop
