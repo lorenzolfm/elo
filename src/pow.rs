@@ -5,9 +5,9 @@
 //! then refuses a hash above it. Every refusal is the peer's, so every one
 //! is an error.
 //!
-//! `next_bits` is the other half: `GetNextWorkRequired` (`:15`) says which
+//! `next_bits` is the other half: `GetNextWorkRequired` (`:14`) says which
 //! `nBits` a header is allowed to claim at its height, and `retarget`
-//! (`:49`) is the arithmetic on a period boundary. `check` asks whether a
+//! (`:50`) is the arithmetic on a period boundary. `check` asks whether a
 //! header did the work it claims; `next_bits` asks whether it claimed the
 //! right amount.
 
@@ -56,10 +56,10 @@ struct Params {
     interval: usize,
     timespan: u32,
     /// `fPowAllowMinDifficultyBlocks`: a block more than two spacings after
-    /// the one before it may claim the limit (`pow.cpp:23`). Every network
+    /// the one before it may claim the limit (`pow.cpp:22`). Every network
     /// but mainnet.
     min_difficulty: bool,
-    /// `fPowNoRetargeting`: the difficulty never moves (`pow.cpp:51`).
+    /// `fPowNoRetargeting`: the difficulty never moves (`pow.cpp:52`).
     /// Regtest only.
     no_retargeting: bool,
     /// `enforce_BIP94`: a period is scaled from the target its *first* block
@@ -309,7 +309,7 @@ impl U256 {
         mantissa | (size << 24)
     }
 
-    /// `operator*=(uint32_t)`, `arith_uint256.cpp:46`: each limb times the
+    /// `operator*=(uint32_t)`, `arith_uint256.cpp:48`: each limb times the
     /// factor, the overflow carried into the limb above.
     ///
     /// # Panics
@@ -334,7 +334,7 @@ impl U256 {
         U256(limbs)
     }
 
-    /// `operator/=`, `arith_uint256.cpp:74`, for a divisor of one limb: long
+    /// `operator/=`, `arith_uint256.cpp:76`, for a divisor of one limb: long
     /// division from the top, each limb joined to the remainder above it. The
     /// remainder is below the divisor, so the pair is never wider than a
     /// `u128` and the digit it yields is never wider than a limb.
@@ -459,7 +459,7 @@ pub fn check(
     Ok(())
 }
 
-/// `CalculateNextWorkRequired`, `pow.cpp:49`, without the
+/// `CalculateNextWorkRequired`, `pow.cpp:50`, without the
 /// `fPowNoRetargeting` line that opens it: the target of `bits` scaled by
 /// `actual` over the seconds the period was meant to take, held at or below
 /// the limit of `network`, and written back in compact form.
@@ -493,7 +493,7 @@ pub fn retarget(bits: u32, actual: i64, network: crate::message::Network) -> Res
     Ok(held.to_compact())
 }
 
-/// `GetNextWorkRequired`, `pow.cpp:15`: the `nBits` the header after
+/// `GetNextWorkRequired`, `pow.cpp:14`: the `nBits` the header after
 /// `height_last` must claim. `at` reads a header of our chain by height and
 /// is never asked above `height_last`; `candidate` is the header the peer
 /// offers, and only a min-difficulty network reads it, for its time.
