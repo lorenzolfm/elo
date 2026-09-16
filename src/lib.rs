@@ -11,5 +11,6 @@ pub mod headers;
 pub mod link;
 pub mod locator;
 pub mod message;
+pub mod sync;
 pub mod version;
 pub mod wire;
