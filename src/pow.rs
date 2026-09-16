@@ -317,8 +317,9 @@ impl U256 {
     /// If the product passes 256 bits. Core lets it wrap. The one caller is
     /// `retarget`, where the number is a target at or below a `powLimit` of
     /// 224 bits and the factor is a clamped timespan below 2^23, so 247 bits
-    /// is the most the product takes; a network that retargets from a wider
-    /// limit would be our bug, not a peer's.
+    /// is the most the product takes. Only regtest has a wider limit, 255
+    /// bits, and `retarget` refuses regtest at its door: a network that
+    /// retargets from a wider limit would be our bug, not a peer's.
     fn mul_u32(self, factor: u32) -> U256 {
         let mut limbs = [0; LIMBS];
         let mut carry: u128 = 0;
@@ -474,12 +475,25 @@ pub fn check(
 /// result is not the exact ratio. It is what every node computes, which is
 /// what consensus asks.
 ///
+/// Not public: the `powLimit` of a network that does not retarget is free
+/// to be wider than the 224 bits `mul_u32` leaves room for, and regtest's is
+/// 255. `next_bits` answers for such a network before it reaches here, so
+/// the width is an invariant of ours and not a question a caller can ask.
+///
 /// # Errors
 ///
 /// As `Target::from_compact`: `bits` are a header's, so they must decode to
 /// a target of `network`.
-pub fn retarget(bits: u32, actual: i64, network: crate::message::Network) -> Result<u32, Error> {
+///
+/// # Panics
+///
+/// If `network` does not retarget, as above.
+fn retarget(bits: u32, actual: i64, network: crate::message::Network) -> Result<u32, Error> {
     let params = Params::of(network);
+    assert!(
+        !params.no_retargeting,
+        "a network that does not retarget has no period to scale"
+    );
     let low = i64::from(params.timespan / 4);
     let high = i64::from(params.timespan) * 4;
     let clamped = actual.clamp(low, high);
@@ -1084,6 +1098,17 @@ mod tests {
         let none = super::U256::from_u64(0x1234).shl(0);
         assert_eq!(none.0, [0, 0, 0, 0x1234]);
         println!("{across}\n{top_bit}\n{whole}");
+    }
+
+    #[test]
+    #[should_panic(expected = "a network that does not retarget has no period")]
+    fn scaling_a_period_of_a_network_that_has_none_is_our_bug() {
+        // Red if `retarget` scales for regtest. Its `powLimit` is 255 bits,
+        // and 255 bits times a clamped span of a day passes 256, so the
+        // multiply would fail on its carry instead of at the door.
+        // `next_bits` answers for regtest before it gets here; the guard is
+        // what says so.
+        let _ = super::retarget(0x207f_ffff, 86_400, crate::message::Network::Regtest);
     }
 
     #[test]
