@@ -223,6 +223,11 @@ impl Chain {
     ///
     /// # Panics
     ///
+    /// If a header that the difficulty check reads claims `nBits` that do
+    /// not decode. The work check refuses those first, for every header of
+    /// the batch, which is why it comes before the difficulty check and not
+    /// after it.
+    ///
     /// If the height after the append is not the height before plus the
     /// count of the batch. `Vec::extend` rules it out.
     pub fn extend(&mut self, headers: crate::headers::Headers) -> Result<(), Error> {
@@ -261,6 +266,11 @@ impl Chain {
                     None => unreachable!("height {height} is above the batch"),
                 }
             };
+            // Every header the closure can hand `next_bits` has `nBits`
+            // that decode: ours passed `check` before we kept them, and the
+            // batch's passed it at the top of this function. That is what
+            // keeps `next_bits` from panicking, so the work check stays in
+            // front of this loop.
             for (offset, header) in batch.iter().enumerate() {
                 let required =
                     crate::pow::next_bits(self.height() + offset, at, header, self.network);

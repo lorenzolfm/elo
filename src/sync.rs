@@ -60,7 +60,8 @@ pub enum Error {
     /// `headers` with more than it sends (`:4829`) and logs one that does
     /// not deserialize; with one peer we hang up on either.
     Wire(crate::wire::Error),
-    /// A header has no work, or the batch does not extend our tip.
+    /// A header has no work or claims the wrong `nBits`, or the batch
+    /// does not extend our tip.
     Chain(crate::chain::Error),
 }
 
@@ -111,8 +112,9 @@ impl From<crate::chain::Error> for Error {
 ///
 /// `Message` if a frame cannot be read or written, including `Io` with kind
 /// `TimedOut` when no `headers` arrives in `RESPONSE_TIME`. `Wire` if a
-/// known command does not parse. `Chain` if a header has no work or a batch
-/// does not extend our tip. On any error the chain holds every batch taken before it.
+/// known command does not parse. `Chain` if a header has no work, claims
+/// the wrong `nBits`, or a batch does not extend our tip. On any error the
+/// chain holds every batch taken before it.
 ///
 /// # Panics
 ///
