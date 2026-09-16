@@ -52,6 +52,15 @@ pub fn genesis(network: crate::message::Network) -> crate::block_header::Header 
 
 #[derive(Debug)]
 pub enum Error {
+    /// A header of the batch claims a target the network does not allow, or
+    /// hashes above the one it claims. Core checks the work of the whole
+    /// batch before it asks where the batch joins (`CheckHeadersPoW`,
+    /// `net_processing.cpp:2619`, called at `:2987` before `:3028`), and so
+    /// do we. `height` is the one the header would take.
+    Pow {
+        height: usize,
+        error: crate::pow::Error,
+    },
     /// The first header of a batch names a block that is not our tip. Core
     /// asks again from its best header and waits to see if they connect
     /// (`HandleUnconnectingHeaders`, `net_processing.cpp:2654`); with one
@@ -65,6 +74,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::Pow { height, error } => write!(f, "header at height {height}: {error}"),
             Error::NotOnTip {
                 previous_block,
                 tip,
@@ -78,8 +88,10 @@ impl std::error::Error for Error {}
 /// One branch of headers from genesis. Never empty: genesis is there from
 /// `new`, so there is always a tip and a locator. Each header names the one
 /// before it: `Headers` holds that within a batch, and `extend` checks it at
-/// the join.
+/// the join. Each header past genesis has the work it claims, at or below
+/// the limit of `network`; `extend` checks that too.
 pub struct Chain {
+    network: crate::message::Network,
     headers: Vec<crate::block_header::Header>,
 }
 
@@ -88,11 +100,13 @@ impl Chain {
     ///
     /// # Panics
     ///
-    /// If genesis is not at height 0 or names a block before it. `genesis`
-    /// rules both out.
+    /// If genesis is not at height 0, names a block before it, or lacks the
+    /// work it claims. `genesis` rules all three out; the third is the
+    /// `chainparams.cpp` assertion on the genesis hash, in another form.
     #[must_use]
     pub fn new(network: crate::message::Network) -> Chain {
         let chain = Chain {
+            network,
             headers: vec![genesis(network)],
         };
         assert_eq!(chain.height(), 0, "genesis is at height 0");
@@ -100,6 +114,10 @@ impl Chain {
             *chain.at(0).previous_block.as_bytes(),
             [0; crate::block_header::HASH_BYTES],
             "genesis names no block before it"
+        );
+        assert!(
+            crate::pow::check(&chain.tip(), chain.at(0).bits, network).is_ok(),
+            "genesis has the work it claims"
         );
         chain
     }
@@ -164,21 +182,32 @@ impl Chain {
         locator
     }
 
-    /// Appends a batch whose first header names our tip. An empty batch is
-    /// fine and changes nothing. `Headers::parse` bounded the batch and
-    /// checked that each header names the one before it; the join is the
-    /// one check left.
+    /// Appends a batch whose every header has the work it claims and whose
+    /// first header names our tip. An empty batch is fine and changes
+    /// nothing. `Headers::parse` bounded the batch and checked that each
+    /// header names the one before it; the work and the join are the checks
+    /// left, in that order, as Core orders them (`net_processing.cpp:2987`,
+    /// `:3028`).
     ///
     /// # Errors
     ///
-    /// `NotOnTip` if the first header names a block other than our tip. The
-    /// chain is unchanged.
+    /// `Pow` if a header claims a target above the limit of the network or
+    /// hashes above the target it claims. `NotOnTip` if the first header
+    /// names a block other than our tip. On either the chain is unchanged.
     ///
     /// # Panics
     ///
     /// If the height after the append is not the height before plus the
     /// count of the batch. `Vec::extend` rules it out.
     pub fn extend(&mut self, headers: crate::headers::Headers) -> Result<(), Error> {
+        for (offset, header) in headers.as_slice().iter().enumerate() {
+            crate::pow::check(&header.hash(), header.bits, self.network).map_err(|error| {
+                Error::Pow {
+                    height: self.height() + 1 + offset,
+                    error,
+                }
+            })?;
+        }
         let Some(first) = headers.as_slice().first() else {
             return Ok(());
         };
@@ -230,6 +259,40 @@ mod tests {
         crate::headers::Headers::parse(&fixture(FROM_GENESIS)).unwrap()
     }
 
+    /// `count` regtest headers after `previous`, each naming the one before
+    /// and each mined, as `sync.rs` builds a batch. `spoil` is the offset of
+    /// one header left at the nonce that fails, if any.
+    fn mined_after(
+        previous: &crate::block_header::BlockHash,
+        count: usize,
+        spoil: Option<usize>,
+    ) -> crate::headers::Headers {
+        let network = crate::message::Network::Regtest;
+        let mut payload = Vec::new();
+        crate::compact_size::write_len(&mut payload, count);
+        let mut previous_block = crate::block_header::BlockHash::from_bytes(*previous.as_bytes());
+        for offset in 0..count {
+            let mut header = crate::block_header::Header {
+                version: 1,
+                previous_block,
+                merkle_root: crate::block_header::MerkleRoot::from_bytes([0; 32]),
+                time: u32::try_from(offset).unwrap(),
+                bits: 0x207f_ffff,
+                nonce: 0,
+            };
+            crate::pow::mine(&mut header, network);
+            if spoil == Some(offset) {
+                while crate::pow::check(&header.hash(), header.bits, network).is_ok() {
+                    header.nonce += 1;
+                }
+            }
+            payload.extend_from_slice(&header.encode());
+            payload.push(0);
+            previous_block = header.hash();
+        }
+        crate::headers::Headers::parse(&payload).unwrap()
+    }
+
     #[test]
     fn genesis_is_built_from_chainparams_values() {
         // Red if a time, nonce or bits is off by one, a merkle root is in
@@ -270,23 +333,69 @@ mod tests {
     #[test]
     fn a_batch_off_the_tip_is_refused_and_the_chain_stands() {
         // Red if `extend` appends before it checks, or checks the last
-        // header instead of the first.
+        // header instead of the first. The batch has its work, so the join
+        // is the check it fails.
+        let mut chain = super::Chain::new(crate::message::Network::Regtest);
+        let elsewhere = super::Chain::new(crate::message::Network::Mainnet).tip();
+        let err = chain.extend(mined_after(&elsewhere, 2, None)).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                super::Error::NotOnTip { previous_block, tip }
+                    if previous_block.to_string() == MAINNET_GENESIS_HASH
+                        && tip.to_string() == REGTEST_GENESIS_HASH
+            ),
+            "{err}"
+        );
+        assert_eq!(chain.height(), 0, "nothing was kept");
+        println!("{err}");
+    }
+
+    #[test]
+    fn a_target_above_the_limit_is_refused_before_the_join() {
+        // Red if the join is checked before the work: Core's regtest
+        // headers claim `0x207fffff`, above mainnet's limit, and also fail
+        // to join a mainnet chain. The work is the error we name, as Core
+        // does (`net_processing.cpp:2987` before `:3028`).
         let mut chain = super::Chain::new(crate::message::Network::Mainnet);
         let err = chain.extend(after_genesis()).unwrap_err();
-        let super::Error::NotOnTip {
-            previous_block,
-            tip,
-        } = err;
-        assert_eq!(previous_block.to_string(), REGTEST_GENESIS_HASH);
-        assert_eq!(tip.to_string(), MAINNET_GENESIS_HASH);
-        assert_eq!(chain.height(), 0, "nothing was kept");
-        println!(
-            "{}",
-            super::Error::NotOnTip {
-                previous_block,
-                tip
-            }
+        assert!(
+            matches!(
+                &err,
+                super::Error::Pow {
+                    height: 1,
+                    error: crate::pow::Error::AboveLimit { .. }
+                }
+            ),
+            "{err}"
         );
+        assert_eq!(chain.height(), 0, "nothing was kept");
+        println!("{err}");
+    }
+
+    #[test]
+    fn a_header_without_its_work_is_refused_and_the_chain_stands() {
+        // Red if only the first header is checked, the height reported is
+        // the offset in the batch, or the headers before the bad one were
+        // kept. The second of three has a nonce that does not work.
+        let mut chain = super::Chain::new(crate::message::Network::Regtest);
+        let batch = mined_after(&chain.tip(), 3, Some(1));
+        let spoiled = batch.as_slice()[1].hash();
+        let err = chain.extend(batch).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                super::Error::Pow {
+                    height: 2,
+                    error: crate::pow::Error::NotMet { hash, .. }
+                } if hash.to_string() == spoiled.to_string()
+            ),
+            "{err}"
+        );
+        assert_eq!(chain.height(), 0, "nothing was kept");
+        chain.extend(mined_after(&chain.tip(), 3, None)).unwrap();
+        assert_eq!(chain.height(), 3, "and mined headers pass");
+        println!("{err}");
     }
 
     #[test]

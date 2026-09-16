@@ -60,7 +60,7 @@ pub enum Error {
     /// `headers` with more than it sends (`:4829`) and logs one that does
     /// not deserialize; with one peer we hang up on either.
     Wire(crate::wire::Error),
-    /// The batch does not extend our tip.
+    /// A header has no work, or the batch does not extend our tip.
     Chain(crate::chain::Error),
 }
 
@@ -111,8 +111,8 @@ impl From<crate::chain::Error> for Error {
 ///
 /// `Message` if a frame cannot be read or written, including `Io` with kind
 /// `TimedOut` when no `headers` arrives in `RESPONSE_TIME`. `Wire` if a
-/// known command does not parse. `Chain` if a batch does not extend our tip.
-/// On any error the chain holds every batch taken before it.
+/// known command does not parse. `Chain` if a header has no work or a batch
+/// does not extend our tip. On any error the chain holds every batch taken before it.
 ///
 /// # Panics
 ///
@@ -227,16 +227,16 @@ mod tests {
         out
     }
 
-    /// `count` headers after `previous`, each naming the one before, with
-    /// no work behind them: nothing checks that before step 9. Hand-built
-    /// because no captured `headers` is 2000 long; Core's rule for a full
-    /// batch is `net_processing.cpp:3106`.
+    /// `count` headers after `previous`, each naming the one before and
+    /// each mined to the regtest target, which takes two tries on average.
+    /// Hand-built because no captured `headers` is 2000 long; Core's rule
+    /// for a full batch is `net_processing.cpp:3106`.
     fn batch_after(previous: &crate::block_header::BlockHash, count: usize) -> Vec<u8> {
         let mut payload = Vec::new();
         crate::compact_size::write_len(&mut payload, count);
         let mut previous_block = crate::block_header::BlockHash::from_bytes(*previous.as_bytes());
         for i in 0..count {
-            let header = crate::block_header::Header {
+            let mut header = crate::block_header::Header {
                 version: 1,
                 previous_block,
                 merkle_root: crate::block_header::MerkleRoot::from_bytes([0; 32]),
@@ -244,6 +244,7 @@ mod tests {
                 bits: 0x207f_ffff,
                 nonce: 0,
             };
+            crate::pow::mine(&mut header, NETWORK);
             payload.extend_from_slice(&header.encode());
             payload.push(0);
             previous_block = header.hash();
