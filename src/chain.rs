@@ -85,11 +85,23 @@ pub struct Chain {
 
 impl Chain {
     /// A chain of genesis alone.
+    ///
+    /// # Panics
+    ///
+    /// If genesis is not at height 0 or names a block before it. `genesis`
+    /// rules both out.
     #[must_use]
     pub fn new(network: crate::message::Network) -> Chain {
-        Chain {
+        let chain = Chain {
             headers: vec![genesis(network)],
-        }
+        };
+        assert_eq!(chain.height(), 0, "genesis is at height 0");
+        assert_eq!(
+            *chain.at(0).previous_block.as_bytes(),
+            [0; crate::block_header::HASH_BYTES],
+            "genesis names no block before it"
+        );
+        chain
     }
 
     /// The height of the tip: genesis is 0, as `getblockcount` counts.
@@ -136,9 +148,20 @@ impl Chain {
     /// tip still answers with one header, and learns the peer's best block
     /// from it. We keep nothing about the peer, so we start at the tip, and a
     /// peer with nothing after it answers with an empty `headers`.
+    ///
+    /// # Panics
+    ///
+    /// If the locator does not start with our tip. `Locator::new` rules it
+    /// out: the first height it asks for is the one it is given.
     #[must_use]
     pub fn locator(&self) -> crate::locator::Locator {
-        crate::locator::Locator::new(self.height(), |height| self.hash_at(height))
+        let locator = crate::locator::Locator::new(self.height(), |height| self.hash_at(height));
+        assert_eq!(
+            locator.as_slice()[0].as_bytes(),
+            self.tip().as_bytes(),
+            "a locator from our tip starts with it"
+        );
+        locator
     }
 
     /// Appends a batch whose first header names our tip. An empty batch is
@@ -162,9 +185,7 @@ impl Chain {
         let tip = self.tip();
         if first.previous_block.as_bytes() != tip.as_bytes() {
             return Err(Error::NotOnTip {
-                previous_block: crate::block_header::BlockHash::from_bytes(
-                    *first.previous_block.as_bytes(),
-                ),
+                previous_block: first.previous_block.clone(),
                 tip,
             });
         }

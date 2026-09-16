@@ -21,7 +21,9 @@ const _: () = assert!(4 + HASH_BYTES + HASH_BYTES + 4 + 4 + 4 == BYTES);
 /// `sha256d` of a serialized header (`block.cpp:15`, `hash.h:115`), in the
 /// order `sha256d` produced it. From `hash` it is computed; from `previous_block`
 /// and from a `getheaders` locator it is what the peer claims, and the chain
-/// checks the claim by lookup.
+/// checks the claim by lookup. `Clone` because a chain reports the hash it
+/// refused next to its own tip, and both stay where they were.
+#[derive(Clone)]
 pub struct BlockHash([u8; HASH_BYTES]);
 
 /// The root of the transaction merkle tree, in wire order like a block hash.
