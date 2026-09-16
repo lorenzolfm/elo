@@ -21,7 +21,9 @@ const _: () = assert!(4 + HASH_BYTES + HASH_BYTES + 4 + 4 + 4 == BYTES);
 /// `sha256d` of a serialized header (`block.cpp:15`, `hash.h:115`), in the
 /// order `sha256d` produced it. From `hash` it is computed; from `previous_block`
 /// and from a `getheaders` locator it is what the peer claims, and the chain
-/// checks the claim by lookup.
+/// checks the claim by lookup. `Clone` because a chain reports the hash it
+/// refused next to its own tip, and both stay where they were.
+#[derive(Clone)]
 pub struct BlockHash([u8; HASH_BYTES]);
 
 /// The root of the transaction merkle tree, in wire order like a block hash.
@@ -32,7 +34,7 @@ pub struct MerkleRoot([u8; HASH_BYTES]);
 
 impl BlockHash {
     /// A hash as it came off the wire, in the order it runs there.
-    pub(crate) fn from_bytes(bytes: [u8; HASH_BYTES]) -> BlockHash {
+    pub(crate) const fn from_bytes(bytes: [u8; HASH_BYTES]) -> BlockHash {
         BlockHash(bytes)
     }
 
@@ -44,6 +46,12 @@ impl BlockHash {
 }
 
 impl MerkleRoot {
+    /// A root as it runs on the wire. Only a genesis header is built from
+    /// parts; every other root is parsed.
+    pub(crate) const fn from_bytes(bytes: [u8; HASH_BYTES]) -> MerkleRoot {
+        MerkleRoot(bytes)
+    }
+
     /// The bytes as they run on the wire.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8; HASH_BYTES] {

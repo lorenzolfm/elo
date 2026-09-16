@@ -409,3 +409,42 @@ fn core_serves_the_headers_after_genesis() {
         headers.len()
     );
 }
+
+/// The M2 gate, on regtest: after `generatetoaddress 2001`, elo's tip must
+/// be `getbestblockhash` and its height `getblockcount`. One block over a
+/// batch, so Core answers with a full batch and then a short one
+/// (`../bitcoin/src/net_processing.cpp:3106` at v31.1), and the second
+/// `getheaders` must carry a locator from the new tip.
+#[test]
+fn our_tip_is_core_best_block_after_a_full_batch_and_a_short_one() {
+    // Red if the second request is built from the old tip (Core answers
+    // with the same 2000 again and the chain refuses them), or a batch of
+    // exactly 2000 ends the sync at height 2000.
+    let Some(node) = node_or_skip("our_tip_is_core_best_block_after_a_full_batch_and_a_short_one")
+    else {
+        return;
+    };
+    node.cli(&["generatetoaddress", "2001", UNSPENDABLE])
+        .unwrap();
+    let best = node.cli(&["getbestblockhash"]).unwrap();
+    let best = best.trim();
+    let count = node.cli(&["getblockcount"]).unwrap();
+    assert_eq!(count.trim(), "2001");
+
+    let run = run_elo(&node, |peers| peers.contains("/elo:"));
+    assert!(run.status.success(), "elo exited with {}", run.status);
+    for line in [
+        "-> getheaders (from height 0)",
+        "<- headers (2000), height 2000",
+        "-> getheaders (from height 2000)",
+        "<- headers (1), height 2001",
+        &format!("synced: height 2001, tip {best}"),
+    ] {
+        assert!(
+            run.transcript.contains(line),
+            "no {line:?}:\n{}",
+            run.transcript
+        );
+    }
+    println!("getbestblockhash {best}, getblockcount 2001: synced");
+}
