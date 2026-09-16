@@ -288,9 +288,7 @@ mod tests {
             };
             crate::pow::mine(&mut header, network);
             if spoil == Some(offset) {
-                while crate::pow::check(&header.hash(), header.bits, network).is_ok() {
-                    header.nonce += 1;
-                }
+                crate::pow::spoil(&mut header, network);
             }
             payload.extend_from_slice(&header.encode());
             payload.push(0);

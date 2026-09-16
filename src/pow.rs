@@ -280,10 +280,14 @@ pub fn check(
     Ok(())
 }
 
+/// How many nonces `mine` and `spoil` try before they give up. On a regtest
+/// target a nonce works, or fails, every second try on average.
+#[cfg(test)]
+const TRIES_MAX: u32 = 1 << 16;
+
 /// The miner's side of `check`, for tests that build headers by hand: the
 /// smallest nonce whose hash meets the target the header claims, as
-/// `generatetoaddress` grinds one on regtest (`rpc/mining.cpp:142`). On a
-/// regtest target that is two tries on average.
+/// `generatetoaddress` grinds one on regtest (`rpc/mining.cpp:142`).
 ///
 /// # Panics
 ///
@@ -291,7 +295,6 @@ pub fn check(
 /// within reach of a test, or one above the limit, which no nonce fixes.
 #[cfg(test)]
 pub(crate) fn mine(header: &mut crate::block_header::Header, network: crate::message::Network) {
-    const TRIES_MAX: u32 = 1 << 16;
     for nonce in 0..TRIES_MAX {
         header.nonce = nonce;
         if check(&header.hash(), header.bits, network).is_ok() {
@@ -300,6 +303,28 @@ pub(crate) fn mine(header: &mut crate::block_header::Header, network: crate::mes
     }
     panic!(
         "no nonce below {TRIES_MAX} meets bits {:#010x}",
+        header.bits
+    );
+}
+
+/// The opposite of `mine`, for a header that must lose its work: the
+/// smallest nonce above the one held whose hash does not meet the target.
+///
+/// # Panics
+///
+/// If no nonce in `TRIES_MAX` fails: the header claims a target every hash
+/// is below, which no test target is.
+#[cfg(test)]
+pub(crate) fn spoil(header: &mut crate::block_header::Header, network: crate::message::Network) {
+    let mined = header.nonce;
+    for nonce in mined + 1..TRIES_MAX {
+        header.nonce = nonce;
+        if check(&header.hash(), header.bits, network).is_err() {
+            return;
+        }
+    }
+    panic!(
+        "no nonce below {TRIES_MAX} fails bits {:#010x}",
         header.bits
     );
 }
