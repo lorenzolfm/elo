@@ -12,9 +12,9 @@
 
 /// `HEADERS_RESPONSE_TIME`, `net_processing.cpp:100`: how long a `headers`
 /// may take to arrive after our `getheaders`. Core keeps one request in
-/// flight for this long before it asks again (`:2831`). Set as a deadline
-/// on the connection per request; the caller sets its own again after
-/// `run`.
+/// flight for this long before it asks again (`:2831`). It is the bound on
+/// `await_headers`, which sets it as the read deadline and clears it on the
+/// way out, so `run` leaves the connection with no deadline.
 pub const RESPONSE_TIME: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// How many batches one run asks for. ROADMAP step 8 caps the sync at a
@@ -102,10 +102,10 @@ impl From<crate::chain::Error> for Error {
 }
 
 /// Syncs `chain` from the peer on `connection`, which has finished its
-/// handshake. Each `getheaders` is followed by a read deadline of
-/// `RESPONSE_TIME`; `ping`s that arrive meanwhile are answered, and every
-/// other message is dropped. `report` is called once per event, in order,
-/// as it happens.
+/// handshake. Each `getheaders` is answered within `RESPONSE_TIME` or not
+/// at all; `ping`s that arrive meanwhile are answered, and every other
+/// message is dropped. `report` is called once per event, in order, as it
+/// happens. The connection comes back with no read deadline.
 ///
 /// # Errors
 ///
@@ -134,7 +134,6 @@ pub fn run<L: crate::link::Link>(
         report(Event::Asked {
             height: chain.height(),
         });
-        connection.set_read_deadline(Some(connection.now() + RESPONSE_TIME))?;
 
         let headers = await_headers(connection, &mut report)?;
         let count = headers.len();
@@ -144,6 +143,9 @@ pub fn run<L: crate::link::Link>(
             count,
             height: chain.height(),
         });
+        // `Headers::parse` bounded the batch, so a short one is the only
+        // shape left that is not full.
+        assert!(count <= crate::headers::HEADERS_MAX);
         if count < crate::headers::HEADERS_MAX {
             return Ok(Outcome::Synced);
         }
@@ -152,11 +154,25 @@ pub fn run<L: crate::link::Link>(
     Ok(Outcome::Capped)
 }
 
-/// Reads until a `headers` arrives, or the deadline does. A `ping` on the
-/// way is answered, so that a long wait does not cost us the peer
+/// Reads until a `headers` arrives, or `RESPONSE_TIME` passes. The loop has
+/// no count: a peer may send any number of frames first, and time is the
+/// bound, set here as the read deadline so that the loop and its bound are
+/// in one place. The deadline is cleared before either return. A `ping` on
+/// the way is answered, so that a long wait does not cost us the peer
 /// (`TIMEOUT_INTERVAL`, `net.h:59`). Anything else is dropped, and named,
 /// so that a new message must decide here whether it too is dropped.
 fn await_headers<L: crate::link::Link>(
+    connection: &mut crate::connection::Connection<L>,
+    report: &mut impl FnMut(Event),
+) -> Result<crate::headers::Headers, Error> {
+    connection.set_read_deadline(Some(connection.now() + RESPONSE_TIME))?;
+    let result = await_headers_until_deadline(connection, report);
+    connection.set_read_deadline(None)?;
+    result
+}
+
+/// The read loop of `await_headers`, with the deadline already set.
+fn await_headers_until_deadline<L: crate::link::Link>(
     connection: &mut crate::connection::Connection<L>,
     report: &mut impl FnMut(Event),
 ) -> Result<crate::headers::Headers, Error> {
