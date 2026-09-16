@@ -32,7 +32,7 @@ pub struct MerkleRoot([u8; HASH_BYTES]);
 
 impl BlockHash {
     /// A hash as it came off the wire, in the order it runs there.
-    pub(crate) fn from_bytes(bytes: [u8; HASH_BYTES]) -> BlockHash {
+    pub(crate) const fn from_bytes(bytes: [u8; HASH_BYTES]) -> BlockHash {
         BlockHash(bytes)
     }
 
@@ -44,6 +44,12 @@ impl BlockHash {
 }
 
 impl MerkleRoot {
+    /// A root as it runs on the wire. Only a genesis header is built from
+    /// parts; every other root is parsed.
+    pub(crate) const fn from_bytes(bytes: [u8; HASH_BYTES]) -> MerkleRoot {
+        MerkleRoot(bytes)
+    }
+
     /// The bytes as they run on the wire.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8; HASH_BYTES] {

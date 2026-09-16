@@ -204,6 +204,12 @@ impl Headers {
         &self.0
     }
 
+    /// The headers, for a chain to keep. The bound and the continuity go
+    /// with them; the chain checks the join and nothing else.
+    pub(crate) fn into_vec(self) -> Vec<crate::block_header::Header> {
+        self.0
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.0.len()

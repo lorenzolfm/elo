@@ -3,6 +3,7 @@
 //! reads.
 
 pub mod block_header;
+pub mod chain;
 mod compact_size;
 pub mod connection;
 pub mod handshake;
