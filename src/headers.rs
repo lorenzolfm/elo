@@ -144,7 +144,7 @@ impl GetHeaders {
 /// `sha256d` per header to re-check and is not asserted twice.
 ///
 /// Whether the first header names a block we know, and whether each header
-/// has the work it claims (step 9), are questions for the chain.
+/// has the work it claims, are questions for the chain.
 #[derive(Debug)]
 pub struct Headers(Vec<crate::block_header::Header>);
 

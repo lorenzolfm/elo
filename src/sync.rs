@@ -20,7 +20,7 @@ pub const RESPONSE_TIME: std::time::Duration = std::time::Duration::from_secs(12
 /// How many batches one run asks for. ROADMAP step 8 caps the sync at a
 /// couple; step 12, the full run from genesis, lifts the cap. Until then it
 /// is also what bounds the chain: `BATCHES_MAX * HEADERS_MAX` headers at
-/// most, from a peer whose headers nothing checks for work yet (step 9).
+/// most, each with the work it claims: `Chain::extend` checks every one.
 pub const BATCHES_MAX: usize = 2;
 
 /// How the sync ended.
