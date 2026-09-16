@@ -1,7 +1,7 @@
 //! Proof of work: `nBits` decoded to a 256-bit target, and the block hash
 //! held against it. `CheckProofOfWork`, `../bitcoin/src/pow.cpp:140` at
 //! v31.1: `DeriveTarget` (`:146`) decodes `nBits` and refuses a negative,
-//! zero, overflowing or too-easy target; `CheckProofOfWorkImpl` (`:160`)
+//! zero, overflowing or too-easy target; `CheckProofOfWorkImpl` (`:161`)
 //! then refuses a hash above it. Every refusal is the peer's, so every one
 //! is an error. Retargeting, which says what `nBits` should be, is step 10.
 
@@ -18,7 +18,7 @@ const MANTISSA_MASK: u32 = 0x007f_ffff;
 const SIGN_BIT: u32 = 0x0080_0000;
 
 /// Where the mantissa sits when the exponent is 3: `SetCompact` shifts by
-/// `8 * (size - 3)` (`arith_uint256.cpp:180`, `:183`).
+/// `8 * (size - 3)` (`arith_uint256.cpp:180`, `:184`).
 const MANTISSA_BYTES: usize = 3;
 
 /// A 256-bit unsigned number: what `nBits` decodes to before the limit is
