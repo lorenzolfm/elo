@@ -115,10 +115,9 @@ impl Chain {
             [0; crate::block_header::HASH_BYTES],
             "genesis names no block before it"
         );
-        assert!(
-            crate::pow::check(&chain.tip(), chain.at(0).bits, network).is_ok(),
-            "genesis has the work it claims"
-        );
+        if let Err(error) = crate::pow::check(&chain.tip(), chain.at(0).bits, network) {
+            panic!("genesis has the work it claims: {error}");
+        }
         chain
     }
 

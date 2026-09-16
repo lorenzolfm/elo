@@ -99,7 +99,7 @@ impl U256 {
     ///
     /// If a mantissa that passed the overflow check shifts to zero. A size
     /// of 34 at most, with a mantissa of one byte, shifts by 248 at most:
-    /// no bit is lost.
+    /// no bit is lost, so the number is not zero.
     fn from_compact(bits: u32) -> Result<U256, Error> {
         let [size, ..] = bits.to_be_bytes();
         let size = usize::from(size);
@@ -123,7 +123,7 @@ impl U256 {
         } else {
             U256::from_u64(u64::from(mantissa)).shl(8 * (size - MANTISSA_BYTES))
         };
-        assert!(number != U256::ZERO, "the overflow check kept every bit");
+        assert!(number != U256::ZERO, "the shift kept the mantissa");
         Ok(number)
     }
 
@@ -138,6 +138,7 @@ impl U256 {
     #[must_use]
     pub fn from_hash(hash: &crate::block_header::BlockHash) -> U256 {
         let (chunks, rest) = hash.as_bytes().as_chunks::<{ LIMB_BITS / 8 }>();
+        assert_eq!(chunks.len(), LIMBS, "a hash is exactly LIMBS limbs");
         assert!(rest.is_empty(), "a hash is whole limbs");
         let mut limbs = [0; LIMBS];
         for (limb, chunk) in limbs.iter_mut().rev().zip(chunks) {
@@ -255,12 +256,21 @@ impl std::fmt::Debug for Target {
 /// # Errors
 ///
 /// As `Target::from_compact`, then `NotMet`.
+///
+/// # Panics
+///
+/// If the target decoded is above the limit: `Target::from_compact` holds
+/// it there, so reaching it is our bug.
 pub fn check(
     hash: &crate::block_header::BlockHash,
     bits: u32,
     network: crate::message::Network,
 ) -> Result<(), Error> {
     let target = Target::from_compact(bits, network)?;
+    assert!(
+        target.0 <= Target::limit(network).0,
+        "a Target is at or below the limit"
+    );
     if U256::from_hash(hash) > target.0 {
         return Err(Error::NotMet {
             hash: hash.clone(),
