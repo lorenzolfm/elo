@@ -33,7 +33,7 @@ subversion string.
       transaction-count byte that follows each header on the wire.
 - [x] 7. The block locator: ten recent hashes, then exponential backoff — and
       why that shape finds a fork point fast.
-- [ ] 8. The in-memory chain and the sync loop, capped at a couple of batches.
+- [x] 8. The in-memory chain and the sync loop, capped at a couple of batches.
       `Connection` already holds the `Link` and the `Network` (T3); the loop
       reads and waits through it, never through the socket or the clock.
 - [ ] 9. Proof of work: decoding `nBits` to a 256-bit target, and the
