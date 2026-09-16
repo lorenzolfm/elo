@@ -3,7 +3,13 @@
 //! v31.1: `DeriveTarget` (`:146`) decodes `nBits` and refuses a negative,
 //! zero, overflowing or too-easy target; `CheckProofOfWorkImpl` (`:161`)
 //! then refuses a hash above it. Every refusal is the peer's, so every one
-//! is an error. Retargeting, which says what `nBits` should be, is step 10.
+//! is an error.
+//!
+//! `next_bits` is the other half: `GetNextWorkRequired` (`:15`) says which
+//! `nBits` a header is allowed to claim at its height, and `retarget`
+//! (`:49`) is the arithmetic on a period boundary. `check` asks whether a
+//! header did the work it claims; `next_bits` asks whether it claimed the
+//! right amount.
 
 const BITS: usize = 256;
 const LIMB_BITS: usize = 64;
@@ -20,6 +26,74 @@ const SIGN_BIT: u32 = 0x0080_0000;
 /// Where the mantissa sits when the exponent is 3: `SetCompact` shifts by
 /// `8 * (size - 3)` (`arith_uint256.cpp:180`, `:184`).
 const MANTISSA_BYTES: usize = 3;
+
+/// `nPowTargetSpacing`: the seconds one block is meant to take, ten minutes
+/// on every network (`chainparams.cpp:98`, `:229`, `:336`, `:577`).
+const SPACING: u32 = 10 * 60;
+
+/// `nPowTargetTimespan`: the seconds one difficulty period is meant to take,
+/// two weeks on mainnet and the two testnets (`chainparams.cpp:97`, `:228`,
+/// `:335`), one day on regtest (`:576`).
+const TIMESPAN_TWO_WEEKS: u32 = 14 * 24 * 60 * 60;
+const TIMESPAN_ONE_DAY: u32 = 24 * 60 * 60;
+
+/// `DifficultyAdjustmentInterval`, `params.h:126`: the blocks in one period,
+/// the timespan over the spacing. A height counts blocks, so an interval is
+/// a `usize`; the `const` assertions hold each one to the division it comes
+/// from.
+const INTERVAL_TWO_WEEKS: usize = 2016;
+const INTERVAL_ONE_DAY: usize = 144;
+
+const _: () = assert!(TIMESPAN_TWO_WEEKS / SPACING == 2016);
+const _: () = assert!(TIMESPAN_ONE_DAY / SPACING == 144);
+const _: () = assert!(INTERVAL_TWO_WEEKS == 2016);
+const _: () = assert!(INTERVAL_ONE_DAY == 144);
+
+/// How the difficulty moves on one network: the `Consensus::Params` fields
+/// that `GetNextWorkRequired` reads (`../bitcoin/src/consensus/params.h:113`),
+/// as `chainparams.cpp` sets them.
+struct Params {
+    interval: usize,
+    timespan: u32,
+    /// `fPowAllowMinDifficultyBlocks`: a block more than two spacings after
+    /// the one before it may claim the limit (`pow.cpp:23`). Every network
+    /// but mainnet.
+    min_difficulty: bool,
+    /// `fPowNoRetargeting`: the difficulty never moves (`pow.cpp:51`).
+    /// Regtest only.
+    no_retargeting: bool,
+    /// `enforce_BIP94`: a period is scaled from the target its *first* block
+    /// claims, not its last (`pow.cpp:67`), so that a min-difficulty block at
+    /// the end of a period cannot drop the difficulty of the next one.
+    /// Testnet4 only.
+    bip94: bool,
+}
+
+impl Params {
+    fn of(network: crate::message::Network) -> Params {
+        let (interval, timespan, min_difficulty, no_retargeting, bip94) = match network {
+            crate::message::Network::Mainnet => {
+                (INTERVAL_TWO_WEEKS, TIMESPAN_TWO_WEEKS, false, false, false)
+            }
+            crate::message::Network::Testnet3 => {
+                (INTERVAL_TWO_WEEKS, TIMESPAN_TWO_WEEKS, true, false, false)
+            }
+            crate::message::Network::Testnet4 => {
+                (INTERVAL_TWO_WEEKS, TIMESPAN_TWO_WEEKS, true, false, true)
+            }
+            crate::message::Network::Regtest => {
+                (INTERVAL_ONE_DAY, TIMESPAN_ONE_DAY, true, true, false)
+            }
+        };
+        Params {
+            interval,
+            timespan,
+            min_difficulty,
+            no_retargeting,
+            bip94,
+        }
+    }
+}
 
 /// A 256-bit unsigned number: what `nBits` decodes to before the limit is
 /// asked, or a block hash read as one. Core's `arith_uint256`
@@ -179,6 +253,111 @@ impl U256 {
         }
         U256(limbs)
     }
+
+    /// The number as 32 bytes, most significant first: the order `Display`
+    /// prints and the order `to_compact` reads a mantissa in.
+    fn to_be_bytes(&self) -> [u8; crate::block_header::HASH_BYTES] {
+        let mut bytes = [0; crate::block_header::HASH_BYTES];
+        let (chunks, rest) = bytes.as_chunks_mut::<{ LIMB_BITS / 8 }>();
+        assert_eq!(chunks.len(), LIMBS, "a number is exactly LIMBS limbs");
+        assert!(rest.is_empty(), "a number is whole limbs");
+        for (chunk, limb) in chunks.iter_mut().zip(&self.0) {
+            *chunk = limb.to_be_bytes();
+        }
+        bytes
+    }
+
+    /// `GetCompact`, `arith_uint256.cpp:195`: the size is how many bytes the
+    /// number takes, and the mantissa is its top three, or the whole of it
+    /// padded on the right when it is shorter. A mantissa that reaches the
+    /// sign bit gives a byte back to the size, so that no `nBits` this
+    /// writes reads as negative (`:207`).
+    ///
+    /// Not the inverse of `from_compact`: it returns the shortest form, and
+    /// `0x01123456` is not one (`arith_uint256_tests.cpp:482`). It *is* the
+    /// inverse for a number `from_compact` did not have to shift.
+    ///
+    /// # Panics
+    ///
+    /// If the mantissa keeps a bit above the low 23, or the size passes a
+    /// byte. The sign step rules both out: 32 bytes and one given back is
+    /// 33, and the width holds no more.
+    fn to_compact(&self) -> u32 {
+        let bytes = self.to_be_bytes();
+        let zeros = bytes.iter().take_while(|byte| **byte == 0).count();
+        let mut size = crate::block_header::HASH_BYTES - zeros;
+        let mut mantissa: u32 = 0;
+        for offset in 0..MANTISSA_BYTES {
+            let byte = bytes.get(zeros + offset).copied().unwrap_or(0);
+            mantissa = (mantissa << 8) | u32::from(byte);
+        }
+        if mantissa & SIGN_BIT != 0 {
+            mantissa >>= 8;
+            size += 1;
+        }
+        assert!(
+            mantissa & !MANTISSA_MASK == 0,
+            "the sign step freed the top"
+        );
+        assert!(
+            size <= crate::block_header::HASH_BYTES + 1,
+            "a size of {size}"
+        );
+        let Ok(size) = u32::try_from(size) else {
+            unreachable!("a size of {size} is one byte")
+        };
+        mantissa | (size << 24)
+    }
+
+    /// `operator*=(uint32_t)`, `arith_uint256.cpp:46`: each limb times the
+    /// factor, the overflow carried into the limb above.
+    ///
+    /// # Panics
+    ///
+    /// If the product passes 256 bits. Core lets it wrap. The one caller is
+    /// `retarget`, where the number is a target at or below a `powLimit` of
+    /// 224 bits and the factor is a clamped timespan below 2^23, so 247 bits
+    /// is the most the product takes; a network that retargets from a wider
+    /// limit would be our bug, not a peer's.
+    fn mul_u32(self, factor: u32) -> U256 {
+        let mut limbs = [0; LIMBS];
+        let mut carry: u128 = 0;
+        for (limb, out) in self.0.iter().zip(limbs.iter_mut()).rev() {
+            let product = u128::from(*limb) * u128::from(factor) + carry;
+            let Ok(low) = u64::try_from(product & u128::from(u64::MAX)) else {
+                unreachable!("the mask keeps one limb")
+            };
+            *out = low;
+            carry = product >> LIMB_BITS;
+        }
+        assert_eq!(carry, 0, "a target times a timespan stays in 256 bits");
+        U256(limbs)
+    }
+
+    /// `operator/=`, `arith_uint256.cpp:74`, for a divisor of one limb: long
+    /// division from the top, each limb joined to the remainder above it. The
+    /// remainder is below the divisor, so the pair is never wider than a
+    /// `u128` and the digit it yields is never wider than a limb.
+    ///
+    /// # Panics
+    ///
+    /// If `divisor` is zero. The one caller divides by a network's
+    /// `nPowTargetTimespan`, which is a constant above zero.
+    fn div_u32(self, divisor: u32) -> U256 {
+        assert!(divisor != 0, "a timespan is not zero");
+        let divisor = u128::from(divisor);
+        let mut limbs = [0; LIMBS];
+        let mut rest: u128 = 0;
+        for (limb, out) in self.0.iter().zip(limbs.iter_mut()) {
+            let joined = (rest << LIMB_BITS) | u128::from(*limb);
+            let Ok(digit) = u64::try_from(joined / divisor) else {
+                unreachable!("a remainder below the divisor leaves one limb")
+            };
+            *out = digit;
+            rest = joined % divisor;
+        }
+        U256(limbs)
+    }
 }
 
 impl Target {
@@ -278,6 +457,112 @@ pub fn check(
         });
     }
     Ok(())
+}
+
+/// `CalculateNextWorkRequired`, `pow.cpp:49`, without the
+/// `fPowNoRetargeting` line that opens it: the target of `bits` scaled by
+/// `actual` over the seconds the period was meant to take, held at or below
+/// the limit of `network`, and written back in compact form.
+///
+/// `actual` is the seconds the period really took, and it is signed: block
+/// times are not sorted, so the last block of a period can be older than the
+/// first. It is clamped to a quarter of the target timespan and to four
+/// times it (`pow.cpp:57`), so one period moves the target by four either
+/// way at most, and a span below zero is simply the low clamp.
+///
+/// The scaling drops the low bits, and `to_compact` keeps 23 of them, so the
+/// result is not the exact ratio. It is what every node computes, which is
+/// what consensus asks.
+///
+/// # Errors
+///
+/// As `Target::from_compact`: `bits` are a header's, so they must decode to
+/// a target of `network`.
+pub fn retarget(bits: u32, actual: i64, network: crate::message::Network) -> Result<u32, Error> {
+    let params = Params::of(network);
+    let low = i64::from(params.timespan / 4);
+    let high = i64::from(params.timespan) * 4;
+    let clamped = actual.clamp(low, high);
+    let Ok(clamped) = u32::try_from(clamped) else {
+        unreachable!("a timespan clamped to {low}..={high} fits a u32")
+    };
+    let target = Target::from_compact(bits, network)?;
+    let limit = Target::limit(network);
+    let scaled = target.0.mul_u32(clamped).div_u32(params.timespan);
+    let held = if scaled > limit.0 { limit.0 } else { scaled };
+    Ok(held.to_compact())
+}
+
+/// `GetNextWorkRequired`, `pow.cpp:15`: the `nBits` the header after
+/// `height_last` must claim. `at` reads a header of our chain by height and
+/// is never asked above `height_last`; `candidate` is the header the peer
+/// offers, and only a min-difficulty network reads it, for its time.
+///
+/// Away from a period boundary the answer is the last header's `nBits`, so
+/// the difficulty holds for a whole period. On the boundary the period is
+/// measured from the header `interval - 1` back, not `interval` back: the
+/// span covers one block interval less than the period it is divided by, so
+/// a period of 2016 blocks is timed as if it were 2015. The off-by-one has
+/// been consensus since 2009 and is copied here on purpose.
+///
+/// # Panics
+///
+/// If a boundary falls with fewer than `interval` headers under it, or if a
+/// header of our chain claims `nBits` that do not decode. Both are facts
+/// about our own chain: a chain starts at genesis and grows by one, and
+/// every header we keep passed `check` before we kept it.
+#[must_use]
+pub fn next_bits<'a>(
+    height_last: usize,
+    at: impl Fn(usize) -> &'a crate::block_header::Header,
+    candidate: &crate::block_header::Header,
+    network: crate::message::Network,
+) -> u32 {
+    let params = Params::of(network);
+    let limit_bits = Target::limit(network).0.to_compact();
+    if !(height_last + 1).is_multiple_of(params.interval) {
+        if !params.min_difficulty {
+            return at(height_last).bits;
+        }
+        // `pow.cpp:26`: on a test network a block more than two spacings
+        // after the one before it may claim the limit, so that a chain with
+        // no miner on it is never stuck.
+        let gap = i64::from(candidate.time) - i64::from(at(height_last).time);
+        if gap > i64::from(SPACING) * 2 {
+            return limit_bits;
+        }
+        // `pow.cpp:32`: those blocks do not set the difficulty. Walk back
+        // over them, and stop at the first block of the period whatever it
+        // claims.
+        let mut height = height_last;
+        while height > 0 && !height.is_multiple_of(params.interval) && at(height).bits == limit_bits
+        {
+            height -= 1;
+        }
+        return at(height).bits;
+    }
+    if params.no_retargeting {
+        return at(height_last).bits;
+    }
+    let Some(height_first) = (height_last + 1).checked_sub(params.interval) else {
+        unreachable!(
+            "a boundary at height {} has no period under it",
+            height_last + 1
+        )
+    };
+    let actual = i64::from(at(height_last).time) - i64::from(at(height_first).time);
+    // BIP94, `pow.cpp:67`: testnet4 scales the period from the target its
+    // first block claims. A min-difficulty block cannot be that one, so the
+    // real difficulty of the period survives at its start.
+    let height_source = if params.bip94 {
+        height_first
+    } else {
+        height_last
+    };
+    match retarget(at(height_source).bits, actual, network) {
+        Ok(bits) => bits,
+        Err(error) => panic!("the header of our chain at height {height_source}: {error}"),
+    }
 }
 
 /// How many nonces `mine` and `spoil` try before they give up. On a regtest
@@ -407,6 +692,230 @@ mod tests {
             super::Error::AboveLimit { .. } => "above limit",
             super::Error::NotMet { .. } => "not met",
         }
+    }
+
+    // Core's four `CalculateNextWorkRequired` cases, `test/pow_tests.cpp:18`,
+    // `:36`, `:51` and `:67`, all on mainnet: the time of the last block of
+    // the period, the time of the first, the bits in force, and the bits
+    // Core computes. The first is a plain retarget (blocks 30240 and 32255),
+    // the second is held at `powLimit` (blocks 0 and 2015), the third has a
+    // span below a quarter of two weeks (blocks 66528 and 68543), the fourth
+    // a span above four times it (block 46367, and a first time Core made
+    // up).
+    const CORE_RETARGETS: [(u32, u32, u32, u32); 4] = [
+        (1_262_152_739, 1_261_130_161, 0x1d00_ffff, 0x1d00_d86a),
+        (1_233_061_996, 1_231_006_505, 0x1d00_ffff, 0x1d00_ffff),
+        (1_279_297_671, 1_279_008_237, 0x1c05_a3f4, 0x1c01_68fd),
+        (1_269_211_443, 1_263_163_443, 0x1c38_7f6f, 0x1d00_e1fd),
+    ];
+
+    // `GetCompact` of each vector above that decodes, as
+    // `arith_uint256_tests.cpp:482` to `:528` expects it. Only the sizes of
+    // three and up come back as they went in: a compact value whose size
+    // shifted the mantissa is not the shortest form of its number.
+    const CORE_COMPACT: [(u32, u32); 6] = [
+        (0x0112_3456, 0x0112_0000),
+        (0x0212_3456, 0x0212_3400),
+        (0x0312_3456, 0x0312_3456),
+        (0x0412_3456, 0x0412_3456),
+        (0x0500_9234, 0x0500_9234),
+        (0x2012_3456, 0x2012_3456),
+    ];
+
+    /// The seconds two weeks hold: `nPowTargetTimespan` on mainnet.
+    const TWO_WEEKS: i64 = 14 * 24 * 60 * 60;
+
+    /// Headers for `next_bits` to read, one per time given, all claiming the
+    /// same bits. Nothing here is mined: `next_bits` asks what a header may
+    /// claim, and `check` is what asks whether it did the work.
+    fn timeline(times: &[u32], bits: u32) -> Vec<crate::block_header::Header> {
+        times
+            .iter()
+            .map(|time| crate::block_header::Header {
+                version: 1,
+                previous_block: crate::block_header::BlockHash::from_bytes([0; 32]),
+                merkle_root: crate::block_header::MerkleRoot::from_bytes([0; 32]),
+                time: *time,
+                bits,
+                nonce: 0,
+            })
+            .collect()
+    }
+
+    /// A header a peer offers, read only for its time.
+    fn candidate(time: u32) -> crate::block_header::Header {
+        timeline(&[time], 0x1d00_ffff)
+            .pop()
+            .unwrap_or_else(|| unreachable!("one time makes one header"))
+    }
+
+    #[test]
+    fn retarget_agrees_with_core_on_its_vectors() {
+        // Red if the span is scaled by the wrong ratio, the multiply and the
+        // divide swap places, the clamps use the wrong quarter or multiple,
+        // or the result is not held at the limit.
+        for (last, first, bits, expected) in CORE_RETARGETS {
+            let actual = i64::from(last) - i64::from(first);
+            let got = super::retarget(bits, actual, crate::message::Network::Mainnet).unwrap();
+            assert_eq!(got, expected, "{bits:#010x} over {actual} seconds");
+            println!("{bits:#010x} over {actual}s -> {got:#010x}");
+        }
+    }
+
+    #[test]
+    fn to_compact_agrees_with_core_on_its_vectors() {
+        // Red if the mantissa is taken from the wrong three bytes, the size
+        // counts bits instead of bytes, or the sign step is missing: a
+        // mantissa that reaches `0x00800000` must give a byte back to the
+        // size, or the value it writes reads back as negative.
+        for (bits, expected) in CORE_COMPACT {
+            let number = super::U256::from_compact(bits).unwrap();
+            assert_eq!(number.to_compact(), expected, "{bits:#010x} -> {number}");
+            println!("{bits:#010x} -> {number} -> {:#010x}", number.to_compact());
+        }
+        // `arith_uint256_tests.cpp:487`: 128 is one byte, and writing it as
+        // one would set the sign bit, so it is written as two.
+        assert_eq!(super::U256::from_u64(0x80).to_compact(), 0x0200_8000);
+    }
+
+    #[test]
+    fn the_limit_of_each_network_encodes_to_the_bits_its_genesis_claims() {
+        // Red if `to_compact` gives a byte back when the sign bit is clear,
+        // or keeps a mantissa that reaches it: mainnet's limit is `ffffff`
+        // at 28 bytes and must come back as `0x1d00ffff`, regtest's is
+        // `7fffff` at 32 bytes and must come back as `0x207fffff`. Those are
+        // the bits `chainparams.cpp` gives each genesis.
+        for network in ALL_NETWORKS {
+            let limit = super::Target::limit(network);
+            let genesis = crate::chain::genesis(network);
+            assert_eq!(limit.0.to_compact(), genesis.bits, "{limit}");
+            println!("{network:?}: {limit} -> {:#010x}", genesis.bits);
+        }
+    }
+
+    #[test]
+    fn a_span_at_or_below_a_quarter_of_the_period_is_read_as_a_quarter() {
+        // Red if the low clamp is missing, uses the wrong quarter, or lets a
+        // span below zero through: block times are not sorted, so the last
+        // block of a period can be older than the first.
+        const BITS: u32 = 0x1c05_a3f4;
+        let quarter = super::retarget(BITS, TWO_WEEKS / 4, crate::message::Network::Mainnet);
+        let quarter = quarter.unwrap();
+        for actual in [TWO_WEEKS / 4 - 1, 0, -1, i64::MIN] {
+            let got = super::retarget(BITS, actual, crate::message::Network::Mainnet).unwrap();
+            assert_eq!(got, quarter, "{actual} seconds");
+        }
+        let above = super::retarget(BITS, TWO_WEEKS / 2, crate::message::Network::Mainnet).unwrap();
+        assert_ne!(above, quarter);
+        println!("a quarter -> {quarter:#010x}, a half -> {above:#010x}");
+    }
+
+    #[test]
+    fn a_span_at_or_above_four_periods_is_read_as_four() {
+        // Red if the high clamp is missing or uses the wrong multiple: four
+        // times the period and one second more must give the same bits, and
+        // two times it must not.
+        const BITS: u32 = 0x1c38_7f6f;
+        let four = super::retarget(BITS, TWO_WEEKS * 4, crate::message::Network::Mainnet).unwrap();
+        for actual in [TWO_WEEKS * 4 + 1, i64::MAX] {
+            let got = super::retarget(BITS, actual, crate::message::Network::Mainnet).unwrap();
+            assert_eq!(got, four, "{actual} seconds");
+        }
+        let below = super::retarget(BITS, TWO_WEEKS * 2, crate::message::Network::Mainnet).unwrap();
+        assert_ne!(below, four);
+        println!("four periods -> {four:#010x}, two -> {below:#010x}");
+    }
+
+    #[test]
+    fn mainnet_holds_its_bits_until_the_last_block_of_the_period() {
+        // Red if the boundary test is off by one: the header after height
+        // 2014 still claims what 2014 claims, and the header after 2015 is
+        // the first that retargets. Six hundred seconds is the spacing, so
+        // three hundred is a period that came in at half the time and cannot
+        // leave the difficulty where it was.
+        let times: Vec<u32> = (0..2016u32)
+            .map(|height| 1_500_000_000 + height * 300)
+            .collect();
+        let headers = timeline(&times, 0x1d00_ffff);
+        let next = candidate(1_500_700_000);
+        let network = crate::message::Network::Mainnet;
+        let held = super::next_bits(2014, |height| &headers[height], &next, network);
+        assert_eq!(held, 0x1d00_ffff);
+        let moved = super::next_bits(2015, |height| &headers[height], &next, network);
+        assert_ne!(moved, 0x1d00_ffff);
+        println!("after 2014 {held:#010x}, after 2015 {moved:#010x}");
+    }
+
+    #[test]
+    fn a_period_is_timed_from_the_block_one_short_of_its_length() {
+        // Red if the first block of the period is `interval` back from the
+        // last instead of `interval - 1`: the span would then cover 2016
+        // block intervals and start one block earlier. Heights 2016 to 4031
+        // are the second period and run at the spacing, so the right span is
+        // 2015 spacings and gives `0x1d00ffde`. A jump of a day sits between
+        // heights 2015 and 2016: the wrong span picks it up, runs long, and
+        // is held at the limit the chain already claims.
+        let times: Vec<u32> = (0..4032u32)
+            .map(|height| {
+                let time = 1_500_000_000 + height * 600;
+                if height < 2016 { time - 86_400 } else { time }
+            })
+            .collect();
+        let headers = timeline(&times, 0x1d00_ffff);
+        let next = candidate(1_502_419_200);
+        let network = crate::message::Network::Mainnet;
+        let bits = super::next_bits(4031, |height| &headers[height], &next, network);
+        assert_eq!(bits, 0x1d00_ffde);
+        assert_ne!(bits, 0x1d00_ffff);
+        println!("2015 spacings -> {bits:#010x}");
+    }
+
+    #[test]
+    fn regtest_never_moves_its_bits() {
+        // Red if `fPowNoRetargeting` is not read: regtest ends a period
+        // every 144 blocks, and a period that came in at a tenth of the
+        // spacing would raise the difficulty on any network that retargets.
+        let times: Vec<u32> = (0..144u32)
+            .map(|height| 1_500_000_000 + height * 60)
+            .collect();
+        let headers = timeline(&times, 0x207f_ffff);
+        let next = candidate(1_500_008_640);
+        let network = crate::message::Network::Regtest;
+        let bits = super::next_bits(143, |height| &headers[height], &next, network);
+        assert_eq!(bits, 0x207f_ffff);
+        println!("after a tenth of a day -> {bits:#010x}");
+    }
+
+    #[test]
+    fn a_test_network_lets_a_block_more_than_two_spacings_late_claim_the_limit() {
+        // Red if the gap is compared with `>=` instead of `>`, or against
+        // one spacing instead of two: a candidate exactly two spacings after
+        // the header before it must still claim what that header claims, and
+        // one second later may claim the limit.
+        let headers = timeline(&[1_500_000_000, 1_500_000_600], 0x1b00_0100);
+        let network = crate::message::Network::Testnet3;
+        let on_time = candidate(1_500_000_600 + 1200);
+        let bits = super::next_bits(1, |height| &headers[height], &on_time, network);
+        assert_eq!(bits, 0x1b00_0100);
+        let late = candidate(1_500_000_600 + 1201);
+        let eased = super::next_bits(1, |height| &headers[height], &late, network);
+        assert_eq!(eased, 0x1d00_ffff);
+        println!("two spacings -> {bits:#010x}, one second more -> {eased:#010x}");
+    }
+
+    #[test]
+    fn a_test_network_walks_back_over_the_blocks_that_claimed_the_limit() {
+        // Red if the walk stops at the last header instead of the last one
+        // that claimed something other than the limit: heights 1 and 2 are
+        // min-difficulty blocks, height 0 holds the difficulty of the
+        // period, and that is the one the next header must claim.
+        let mut headers = timeline(&[1_500_000_000, 1_500_000_600, 1_500_001_200], 0x1d00_ffff);
+        headers[0].bits = 0x1b00_0100;
+        let network = crate::message::Network::Testnet3;
+        let next = candidate(1_500_001_800);
+        let bits = super::next_bits(2, |height| &headers[height], &next, network);
+        assert_eq!(bits, 0x1b00_0100);
+        println!("past two min-difficulty blocks -> {bits:#010x}");
     }
 
     #[test]
