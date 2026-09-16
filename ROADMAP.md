@@ -38,7 +38,7 @@ subversion string.
       reads and waits through it, never through the socket or the clock.
 - [x] 9. Proof of work: decoding `nBits` to a 256-bit target, and the
       comparison.
-- [ ] 10. Difficulty retargeting across the 2016-block boundary. The timespan
+- [x] 10. Difficulty retargeting across the 2016-block boundary. The timespan
       off-by-one, and the 4× clamps.
 - [ ] 11. Median time past.
 - [ ] 12. The full run from genesis.
