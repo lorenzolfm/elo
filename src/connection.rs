@@ -16,6 +16,12 @@ impl<L: crate::link::Link> Connection<L> {
         Connection { link, network }
     }
 
+    /// The network whose magic frames every message on this connection.
+    #[must_use]
+    pub fn network(&self) -> crate::message::Network {
+        self.network
+    }
+
     /// One frame from the peer.
     ///
     /// # Errors

@@ -20,7 +20,7 @@ pub const RESPONSE_TIME: std::time::Duration = std::time::Duration::from_secs(12
 /// How many batches one run asks for. ROADMAP step 8 caps the sync at a
 /// couple; step 12, the full run from genesis, lifts the cap. Until then it
 /// is also what bounds the chain: `BATCHES_MAX * HEADERS_MAX` headers at
-/// most, from a peer whose headers nothing checks for work yet (step 9).
+/// most, each with the work it claims: `Chain::extend` checks every one.
 pub const BATCHES_MAX: usize = 2;
 
 /// How the sync ended.
@@ -60,7 +60,7 @@ pub enum Error {
     /// `headers` with more than it sends (`:4829`) and logs one that does
     /// not deserialize; with one peer we hang up on either.
     Wire(crate::wire::Error),
-    /// The batch does not extend our tip.
+    /// A header has no work, or the batch does not extend our tip.
     Chain(crate::chain::Error),
 }
 
@@ -111,18 +111,26 @@ impl From<crate::chain::Error> for Error {
 ///
 /// `Message` if a frame cannot be read or written, including `Io` with kind
 /// `TimedOut` when no `headers` arrives in `RESPONSE_TIME`. `Wire` if a
-/// known command does not parse. `Chain` if a batch does not extend our tip.
-/// On any error the chain holds every batch taken before it.
+/// known command does not parse. `Chain` if a header has no work or a batch
+/// does not extend our tip. On any error the chain holds every batch taken before it.
 ///
 /// # Panics
 ///
-/// If the loop asks more than `BATCHES_MAX` times or returns without asking
-/// once. The loop condition rules both out.
+/// If the chain and the connection are on different networks: the magic
+/// that frames a `headers` and the limit that checks its work are one
+/// choice, made by whoever built the two. Also if the loop asks more than
+/// `BATCHES_MAX` times or returns without asking once; the loop condition
+/// rules both out.
 pub fn run<L: crate::link::Link>(
     connection: &mut crate::connection::Connection<L>,
     chain: &mut crate::chain::Chain,
     mut report: impl FnMut(Event),
 ) -> Result<Outcome, Error> {
+    assert_eq!(
+        connection.network(),
+        chain.network(),
+        "the chain and the connection are on one network"
+    );
     let mut batches = 0;
     while batches < BATCHES_MAX {
         let request = crate::wire::Message::GetHeaders(crate::headers::GetHeaders {
@@ -227,16 +235,16 @@ mod tests {
         out
     }
 
-    /// `count` headers after `previous`, each naming the one before, with
-    /// no work behind them: nothing checks that before step 9. Hand-built
-    /// because no captured `headers` is 2000 long; Core's rule for a full
-    /// batch is `net_processing.cpp:3106`.
+    /// `count` headers after `previous`, each naming the one before and
+    /// each mined to the regtest target, which takes two tries on average.
+    /// Hand-built because no captured `headers` is 2000 long; Core's rule
+    /// for a full batch is `net_processing.cpp:3106`.
     fn batch_after(previous: &crate::block_header::BlockHash, count: usize) -> Vec<u8> {
         let mut payload = Vec::new();
         crate::compact_size::write_len(&mut payload, count);
         let mut previous_block = crate::block_header::BlockHash::from_bytes(*previous.as_bytes());
         for i in 0..count {
-            let header = crate::block_header::Header {
+            let mut header = crate::block_header::Header {
                 version: 1,
                 previous_block,
                 merkle_root: crate::block_header::MerkleRoot::from_bytes([0; 32]),
@@ -244,6 +252,7 @@ mod tests {
                 bits: 0x207f_ffff,
                 nonce: 0,
             };
+            crate::pow::mine(&mut header, NETWORK);
             payload.extend_from_slice(&header.encode());
             payload.push(0);
             previous_block = header.hash();
@@ -352,6 +361,17 @@ mod tests {
             crate::wire::Message::Headers(headers) => headers,
             other => panic!("{other}"),
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "the chain and the connection are on one network")]
+    fn a_chain_on_another_network_than_the_connection_is_our_bug() {
+        // Red if the assertion is missing or after the first request: the
+        // script is empty, so a run that gets past the check fails on the
+        // read, not on the panic. `run` above builds the connection on
+        // `NETWORK`; the chain here is not.
+        let mut chain = crate::chain::Chain::new(crate::message::Network::Mainnet);
+        let _ = run(&mut chain, &[]);
     }
 
     #[test]

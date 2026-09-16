@@ -10,7 +10,9 @@ const _: () = assert!(4 + COMMAND_BYTES + 4 + 4 == HEADER_BYTES);
 // The length field is a `u32`. `read` converts it to `usize` and treats failure as unreachable; this is why it is.
 const _: () = assert!(usize::BITS >= 32);
 
-#[derive(Clone, Copy, Debug)]
+/// `PartialEq` because `sync::run` asserts that the chain and the
+/// connection it syncs from are on one network.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Network {
     Mainnet,
     Testnet3,

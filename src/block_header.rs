@@ -103,7 +103,7 @@ pub struct Header {
     pub previous_block: BlockHash,
     pub merkle_root: MerkleRoot,
     pub time: u32,
-    /// The target in compact form. Decoded in a later step.
+    /// The target in compact form; `pow::Target::from_compact` decodes it.
     pub bits: u32,
     pub nonce: u32,
 }
