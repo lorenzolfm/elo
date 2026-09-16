@@ -354,16 +354,19 @@ fn core_serves_the_headers_after_genesis() {
 
     let peer: std::net::SocketAddr = format!("127.0.0.1:{}", node.p2p_port).parse().unwrap();
     let stream = std::net::TcpStream::connect(peer).unwrap();
-    stream
-        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+    let mut connection = elo::connection::Connection::new(
+        elo::link::Tcp::new(stream),
+        elo::message::Network::Regtest,
+    );
+    connection
+        .set_read_deadline(Some(connection.now() + std::time::Duration::from_secs(10)))
         .unwrap();
-    let now = std::time::SystemTime::now()
+    let now = connection
+        .wall()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap();
     let our_version = elo::version::build(peer, i64::try_from(now.as_secs()).unwrap(), 0);
-    let network = elo::message::Network::Regtest;
-    let elo::handshake::Complete { mut stream, .. } =
-        elo::handshake::run(stream, network, &our_version).unwrap();
+    elo::handshake::run(&mut connection, &our_version).unwrap();
 
     let request = elo::wire::Message::GetHeaders(elo::headers::GetHeaders {
         locator: vec![genesis.hash()],
@@ -371,12 +374,14 @@ fn core_serves_the_headers_after_genesis() {
     });
     println!("-> {request}");
     let request = request.encode();
-    elo::message::write(&mut stream, network, request.command, &request.payload).unwrap();
+    connection
+        .write_frame(request.command, &request.payload)
+        .unwrap();
 
     // Core's post-verack burst comes first: `sendcmpct`, `ping`, `feefilter`.
     let headers = (0..8)
         .find_map(|_| {
-            let frame = elo::message::read(&mut stream, network).unwrap();
+            let frame = connection.read_frame().unwrap();
             match elo::wire::Message::decode(frame).unwrap() {
                 elo::wire::Message::Headers(headers) => Some(headers),
                 other => {
