@@ -122,6 +122,13 @@ impl Chain {
         chain
     }
 
+    /// The network whose genesis starts the chain and whose limit bounds
+    /// every target in it.
+    #[must_use]
+    pub fn network(&self) -> crate::message::Network {
+        self.network
+    }
+
     /// The height of the tip: genesis is 0, as `getblockcount` counts.
     ///
     /// # Panics

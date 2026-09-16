@@ -116,13 +116,21 @@ impl From<crate::chain::Error> for Error {
 ///
 /// # Panics
 ///
-/// If the loop asks more than `BATCHES_MAX` times or returns without asking
-/// once. The loop condition rules both out.
+/// If the chain and the connection are on different networks: the magic
+/// that frames a `headers` and the limit that checks its work are one
+/// choice, made by whoever built the two. Also if the loop asks more than
+/// `BATCHES_MAX` times or returns without asking once; the loop condition
+/// rules both out.
 pub fn run<L: crate::link::Link>(
     connection: &mut crate::connection::Connection<L>,
     chain: &mut crate::chain::Chain,
     mut report: impl FnMut(Event),
 ) -> Result<Outcome, Error> {
+    assert_eq!(
+        connection.network(),
+        chain.network(),
+        "the chain and the connection are on one network"
+    );
     let mut batches = 0;
     while batches < BATCHES_MAX {
         let request = crate::wire::Message::GetHeaders(crate::headers::GetHeaders {
@@ -353,6 +361,17 @@ mod tests {
             crate::wire::Message::Headers(headers) => headers,
             other => panic!("{other}"),
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "the chain and the connection are on one network")]
+    fn a_chain_on_another_network_than_the_connection_is_our_bug() {
+        // Red if the assertion is missing or after the first request: the
+        // script is empty, so a run that gets past the check fails on the
+        // read, not on the panic. `run` above builds the connection on
+        // `NETWORK`; the chain here is not.
+        let mut chain = crate::chain::Chain::new(crate::message::Network::Mainnet);
+        let _ = run(&mut chain, &[]);
     }
 
     #[test]
