@@ -14,8 +14,8 @@ const _: () = assert!(LIMBS * (LIMB_BITS / 8) == crate::block_header::HASH_BYTES
 
 /// The 23-bit mantissa of `nBits`, and the sign bit above it
 /// (`arith_uint256.cpp:178`, `:186`).
-const MANTISSA: u32 = 0x007f_ffff;
-const SIGN: u32 = 0x0080_0000;
+const MANTISSA_MASK: u32 = 0x007f_ffff;
+const SIGN_BIT: u32 = 0x0080_0000;
 
 /// Where the mantissa sits when the exponent is 3: `SetCompact` shifts by
 /// `8 * (size - 3)` (`arith_uint256.cpp:180`, `:183`).
@@ -103,14 +103,14 @@ impl U256 {
     fn from_compact(bits: u32) -> Result<U256, Error> {
         let [size, ..] = bits.to_be_bytes();
         let size = usize::from(size);
-        let mut mantissa = bits & MANTISSA;
+        let mut mantissa = bits & MANTISSA_MASK;
         if size <= MANTISSA_BYTES {
             mantissa >>= 8 * (MANTISSA_BYTES - size);
         }
         if mantissa == 0 {
             return Err(Error::Zero { bits });
         }
-        if bits & SIGN != 0 {
+        if bits & SIGN_BIT != 0 {
             return Err(Error::Negative { bits });
         }
         let overflow =
