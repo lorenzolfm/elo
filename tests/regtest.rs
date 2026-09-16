@@ -369,7 +369,7 @@ fn core_serves_the_headers_after_genesis() {
     elo::handshake::run(&mut connection, &our_version).unwrap();
 
     let request = elo::wire::Message::GetHeaders(elo::headers::GetHeaders {
-        locator: vec![genesis.hash()],
+        locator: elo::locator::Locator::new(0, |_| genesis.hash()),
         stop: None,
     });
     println!("-> {request}");
