@@ -36,7 +36,7 @@ subversion string.
 - [x] 8. The in-memory chain and the sync loop, capped at a couple of batches.
       `Connection` already holds the `Link` and the `Network` (T3); the loop
       reads and waits through it, never through the socket or the clock.
-- [ ] 9. Proof of work: decoding `nBits` to a 256-bit target, and the
+- [x] 9. Proof of work: decoding `nBits` to a 256-bit target, and the
       comparison.
 - [ ] 10. Difficulty retargeting across the 2016-block boundary. The timespan
       off-by-one, and the 4× clamps.
