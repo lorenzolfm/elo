@@ -7,14 +7,6 @@
 //! that `wire::Message` can turn back into frames; nothing in elo serves
 //! headers.
 
-/// `MAX_LOCATOR_SZ`, `net_processing.cpp:124`. Core disconnects a peer whose
-/// locator is longer (`:4399`).
-pub(crate) const LOCATOR_HASHES_MAX: usize = 101;
-
-// A locator count always fits one `CompactSize` byte; `GetHeaders::encode`
-// sizes its buffer on that.
-const _: () = assert!(LOCATOR_HASHES_MAX < 0xfd);
-
 /// `MAX_HEADERS_RESULTS`, `net_processing.h:51`. Core sends at most this many
 /// in one `headers` (`:4453`) and penalizes a peer that sends more (`:4829`).
 pub(crate) const HEADERS_MAX: usize = 2000;
@@ -32,10 +24,9 @@ const HEADER_BYTES: usize = crate::block_header::BYTES;
 pub struct GetHeaders {
     /// Hashes of blocks we have, newest first. The peer answers with the
     /// headers after the first one it knows, and after genesis if it knows
-    /// none (`FindForkInGlobalIndex`, `:4441`). Step 7 gives it its shape;
-    /// until then a caller passes what it has, and at most
-    /// `LOCATOR_HASHES_MAX` of it.
-    pub locator: Vec<crate::block_header::BlockHash>,
+    /// none (`FindForkInGlobalIndex`, `:4441`). `locator::Locator::new`
+    /// gives it Core's shape.
+    pub locator: crate::locator::Locator,
     /// The last header we want, or `None` for as many as the peer will send.
     /// `None` is a zero hash on the wire: `uint256()` where Core asks
     /// (`:2832`), `hashStop.IsNull()` where it answers (`:4448`).
@@ -48,7 +39,7 @@ pub enum Error {
     Truncated,
     /// The count in front of the list is not in its shortest form.
     NonCanonicalCount(u64),
-    /// More locator hashes than `LOCATOR_HASHES_MAX`, or more headers than
+    /// More locator hashes than `locator::HASHES_MAX`, or more headers than
     /// `HEADERS_MAX`.
     TooMany { count: u64, max: usize },
     /// The transaction count after a header is not zero. Core reads and
@@ -101,11 +92,11 @@ impl From<crate::compact_size::Error> for Error {
 
 impl GetHeaders {
     /// Reads a `getheaders` payload. Core reads the locator as a vector, so a
-    /// count above `LOCATOR_HASHES_MAX` is read whole and then disconnected
+    /// count above `locator::HASHES_MAX` is read whole and then disconnected
     /// (`:4399`); here the count is refused before a hash is read.
     pub(crate) fn parse(payload: &[u8]) -> Result<GetHeaders, Error> {
         let (_version, rest) = take::<4>(payload)?;
-        let (count, mut rest) = crate::compact_size::read_len(rest, LOCATOR_HASHES_MAX)?;
+        let (count, mut rest) = crate::compact_size::read_len(rest, crate::locator::HASHES_MAX)?;
         let mut locator = Vec::with_capacity(count);
         for _ in 0..count {
             let (hash, after) = take::<HASH_BYTES>(rest)?;
@@ -117,33 +108,23 @@ impl GetHeaders {
             return Err(Error::TrailingBytes(rest.len()));
         }
         assert_eq!(locator.len(), count);
-        assert!(locator.len() <= LOCATOR_HASHES_MAX);
+        let locator = crate::locator::Locator::from_wire(locator);
         let stop =
             (*stop != [0; HASH_BYTES]).then(|| crate::block_header::BlockHash::from_bytes(*stop));
         Ok(GetHeaders { locator, stop })
     }
 
-    /// The payload Core reads at `:4397`.
-    ///
-    /// # Panics
-    ///
-    /// If `locator` holds more than `LOCATOR_HASHES_MAX` hashes. Core would
-    /// hang up on the request, so a longer locator is our bug, not a message
-    /// to send.
+    /// The payload Core reads at `:4397`. A `Locator` holds Core's bound by
+    /// construction, so there is no request here that Core hangs up on.
     #[must_use]
     pub(crate) fn encode(&self) -> Vec<u8> {
-        assert!(
-            self.locator.len() <= LOCATOR_HASHES_MAX,
-            "a locator of {} hashes; Core takes {LOCATOR_HASHES_MAX}",
-            self.locator.len()
-        );
         // The version, a one-byte count (the `const` assertion beside
-        // `LOCATOR_HASHES_MAX`), the hashes, and the stop hash.
+        // `locator::HASHES_MAX`), the hashes, and the stop hash.
         let size = 4 + 1 + HASH_BYTES * (self.locator.len() + 1);
         let mut out = Vec::with_capacity(size);
         out.extend_from_slice(&LOCATOR_VERSION.to_le_bytes());
         crate::compact_size::write_len(&mut out, self.locator.len());
-        for hash in &self.locator {
+        for hash in self.locator.as_slice() {
             out.extend_from_slice(hash.as_bytes());
         }
         match &self.stop {
@@ -319,7 +300,12 @@ mod tests {
         // Red if the version field is not skipped, the hashes are read
         // reversed, or a zero stop hash is `Some`.
         let request = super::GetHeaders::parse(&fixture(CORE_GETHEADERS)).unwrap();
-        let locator: Vec<String> = request.locator.iter().map(ToString::to_string).collect();
+        let locator: Vec<String> = request
+            .locator
+            .as_slice()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         assert_eq!(locator, [BLOCK_2, BLOCK_1, GENESIS], "newest first");
         assert!(request.stop.is_none(), "{:?}", request.stop);
         println!("Core asks from {} up: {request:?}", locator[0]);
@@ -351,8 +337,10 @@ mod tests {
             panic!("{} headers", answer.len());
         };
         assert_eq!(answer.hash().to_string(), BLOCK_2);
+        // An empty locator is a shape no chain of ours produces, so it is
+        // built the way `parse` builds one.
         let ours = super::GetHeaders {
-            locator: Vec::new(),
+            locator: crate::locator::Locator::from_wire(Vec::new()),
             stop: Some(answer.hash()),
         }
         .encode();
@@ -526,24 +514,5 @@ mod tests {
         let err = super::GetHeaders::parse(&trailing).unwrap_err();
         assert!(matches!(err, super::Error::TrailingBytes(1)), "{err}");
         println!("{} prefixes truncated; one byte over: {err}", core.len());
-    }
-
-    #[test]
-    #[should_panic(expected = "a locator of 102 hashes")]
-    fn refuses_to_encode_a_locator_core_would_hang_up_on() {
-        // Red if the assertion is missing: Core would be the one to tell us.
-        let genesis = super::GetHeaders::parse(&fixture(CORE_GETHEADERS))
-            .unwrap()
-            .locator
-            .pop()
-            .unwrap();
-        let locator = (0..102)
-            .map(|_| crate::block_header::BlockHash::from_bytes(*genesis.as_bytes()))
-            .collect();
-        let _ = super::GetHeaders {
-            locator,
-            stop: None,
-        }
-        .encode();
     }
 }
