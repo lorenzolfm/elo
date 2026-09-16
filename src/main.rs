@@ -10,9 +10,9 @@ const PEER: &str = "127.0.0.1:18444";
 /// handshake (`DEFAULT_PEER_CONNECT_TIMEOUT`, `../bitcoin/src/net.h:87` at
 /// v31.1); on loopback, and with one peer, a sixth of that is generous.
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// After the handshake: how long we stay connected before we hang up, from
-/// the moment `verack` arrives, whatever the peer sends, unless the peer hangs
-/// up first. Long enough for Core's post-`verack` burst and for
+/// After the sync: how long we stay connected before we hang up, from the
+/// moment the last `headers` arrives, whatever the peer sends, unless the
+/// peer hangs up first. Long enough for Core's post-`verack` burst and for
 /// `tests/regtest.rs` to ask Core about us; short enough that `cargo test`
 /// stays quick.
 const LINGER: std::time::Duration = std::time::Duration::from_secs(2);
@@ -40,10 +40,28 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// Connects to `peer`, shakes hands, lingers, and narrates it all to `out`,
-/// the one place in elo that writes anything a person reads.
+/// Connects to `peer`, shakes hands, syncs headers, lingers, and narrates it
+/// all to `out`, the one place in elo that writes anything a person reads.
 fn run(peer: &str, out: &mut Log<impl std::io::Write>) -> Result<(), Box<dyn std::error::Error>> {
     let mut connection = connect(peer, out)?;
+
+    let mut chain = elo::chain::Chain::new(NETWORK);
+    let outcome = elo::sync::run(&mut connection, &mut chain, |event| {
+        out.line(format_args!("{event}"));
+    })?;
+    match outcome {
+        elo::sync::Outcome::Synced => out.line(format_args!(
+            "synced: height {}, tip {}",
+            chain.height(),
+            chain.tip()
+        )),
+        elo::sync::Outcome::Capped => out.line(format_args!(
+            "stopped at {} batches (ROADMAP step 8): height {}, tip {}; the peer may have more",
+            elo::sync::BATCHES_MAX,
+            chain.height(),
+            chain.tip()
+        )),
+    }
 
     // One deadline for every read, so a peer that keeps talking cannot keep
     // us here; the loop ends when the clock does.
@@ -81,7 +99,7 @@ fn run(peer: &str, out: &mut Log<impl std::io::Write>) -> Result<(), Box<dyn std
             Err(e) => return Err(e.into()),
         }
     }
-    out.line(format_args!("{LINGER:?} after the handshake, hanging up"));
+    out.line(format_args!("{LINGER:?} after the sync, hanging up"));
     Ok(())
 }
 
