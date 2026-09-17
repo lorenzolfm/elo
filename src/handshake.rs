@@ -156,99 +156,58 @@ mod tests {
             .collect()
     }
 
-    /// A scripted peer over a fixed clock. Once its frames are read it goes
-    /// quiet: with a deadline set that is a timeout, without one it is a
-    /// hang-up, since a blocking read with no bound and no peer ends the
-    /// stream. Both buffers are borrowed so the test can inspect them after
-    /// the `Connection` that owns the `Duplex` is gone.
-    #[derive(Debug)]
-    struct Duplex<'a> {
-        from_peer: &'a mut std::io::Cursor<Vec<u8>>,
-        to_peer: &'a mut Vec<u8>,
-        deadline: Option<std::time::Instant>,
+    /// The peer's frames, each one its own step: a read never crosses two,
+    /// so a hang-up or a silence can fall on a frame boundary.
+    fn sends(frames: &[&str]) -> Vec<crate::scripted::Step> {
+        frames
+            .iter()
+            .map(|hex| crate::scripted::Step::Send(fixture(hex)))
+            .collect()
     }
 
-    fn scripted(frames: &[&str]) -> std::io::Cursor<Vec<u8>> {
-        std::io::Cursor::new(frames.iter().flat_map(|hex| fixture(hex)).collect())
+    /// What one handshake left behind: what it returned, what we sent, and
+    /// how many scripted bytes the peer never got to say.
+    struct Ran {
+        result: Result<super::Complete, super::Error>,
+        sent: Vec<u8>,
+        unread: usize,
     }
 
-    fn unread(from_peer: &std::io::Cursor<Vec<u8>>) -> usize {
-        from_peer.get_ref().len() - usize::try_from(from_peer.position()).unwrap()
-    }
-
-    impl std::io::Read for Duplex<'_> {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            if unread(self.from_peer) == 0 && self.deadline.is_some() {
-                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
-            }
-            std::io::Read::read(&mut self.from_peer, buf)
-        }
-    }
-
-    impl crate::link::Link for Duplex<'_> {
-        fn set_read_deadline(
-            &mut self,
-            deadline: Option<std::time::Instant>,
-        ) -> std::io::Result<()> {
-            self.deadline = deadline;
-            Ok(())
-        }
-
-        fn now(&self) -> std::time::Instant {
-            std::time::Instant::now()
-        }
-
-        fn wall(&self) -> std::time::SystemTime {
-            std::time::UNIX_EPOCH
-        }
-    }
-
-    impl std::io::Write for Duplex<'_> {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            std::io::Write::write(self.to_peer, buf)
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// Runs the handshake against the scripted peer. Returns what the
-    /// handshake returned and how many scripted bytes it left unread.
+    /// Runs the handshake against a peer on this script. `chunk` bounds the
+    /// bytes one read serves; `wait`, when set, is the read deadline the
+    /// caller gives the loop, as `main.rs` does.
     fn run_with(
-        frames: &[&str],
-        sent: &mut Vec<u8>,
-        deadline: Option<std::time::Instant>,
-    ) -> (Result<super::Complete, super::Error>, usize) {
-        let mut from_peer = scripted(frames);
-        let mut connection = crate::connection::Connection::new(
-            Duplex {
-                from_peer: &mut from_peer,
-                to_peer: sent,
-                deadline: None,
-            },
-            crate::message::Network::Regtest,
-        );
-        connection.set_read_deadline(deadline).unwrap();
+        script: Vec<crate::scripted::Step>,
+        chunk: Option<usize>,
+        wait: Option<std::time::Duration>,
+    ) -> Ran {
+        let mut connection = match chunk {
+            Some(chunk) => crate::scripted::connect_in_chunks(script, chunk, std::time::UNIX_EPOCH),
+            None => crate::scripted::connect(script, std::time::UNIX_EPOCH),
+        };
+        if let Some(wait) = wait {
+            connection
+                .set_read_deadline(Some(connection.now() + wait))
+                .unwrap();
+        }
         let result = super::run(&mut connection, OUR_VERSION);
-        // `connection` borrows `from_peer` until here.
-        let _ = connection;
-        (result, unread(&from_peer))
+        Ran {
+            result,
+            sent: connection.link().sent().to_vec(),
+            unread: connection.link().unread(),
+        }
     }
 
-    fn run(frames: &[&str], sent: &mut Vec<u8>) -> Result<super::Complete, super::Error> {
-        run_with(frames, sent, None).0
+    fn run(frames: &[&str]) -> Ran {
+        run_with(sends(frames), None, None)
     }
 
     #[test]
     fn completes_against_core_bytes() {
-        let mut sent = Vec::new();
-        let (done, left) = run_with(
-            &[VERSION, WTXIDRELAY, SENDADDRV2, VERACK, SENDCMPCT],
-            &mut sent,
-            None,
-        );
-        let done = done.unwrap();
+        // Mutant: `run` takes the peer's `version` for the end of the
+        // handshake, or reads on past its `verack`.
+        let ran = run(&[VERSION, WTXIDRELAY, SENDADDRV2, VERACK, SENDCMPCT]);
+        let done = ran.result.unwrap();
 
         let commands: Vec<String> = done.seen.iter().map(|f| f.command.to_string()).collect();
         assert_eq!(
@@ -259,7 +218,7 @@ mod tests {
         assert_eq!(done.peer.user_agent, b"/Satoshi:31.1.0/");
         assert_eq!(done.peer.start_height, 0);
 
-        let to_peer = &sent;
+        let to_peer = &ran.sent;
         assert_eq!(
             &to_peer[..16],
             b"\xfa\xbf\xb5\xdaversion\0\0\0\0\0",
@@ -277,7 +236,7 @@ mod tests {
             "nothing else"
         );
         assert_eq!(
-            left,
+            ran.unread,
             fixture(SENDCMPCT).len(),
             "stops at verack; sendcmpct is left for the caller"
         );
@@ -289,12 +248,31 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_dripped_one_byte_per_read_is_read_whole() {
+        // Mutant: `message::read` calls `read` once for the header and once
+        // for the payload instead of `read_exact`; one byte is not a header.
+        let ran = run_with(
+            sends(&[VERSION, WTXIDRELAY, SENDADDRV2, VERACK]),
+            Some(1),
+            None,
+        );
+        let done = ran.result.unwrap();
+        assert_eq!(done.seen.len(), 4);
+        assert_eq!(done.peer.user_agent, b"/Satoshi:31.1.0/");
+        assert_eq!(ran.unread, 0);
+        println!("four frames, one byte per read; peer is {}", done.peer);
+    }
+
+    #[test]
     fn rejects_verack_before_version() {
-        let mut sent = Vec::new();
-        let err = run(&[VERACK, VERSION], &mut sent).unwrap_err();
+        // Mutant: the `(AwaitingVersion, VERACK)` arm drops the frame like
+        // the arms below it, so the `version` that follows completes a
+        // handshake the peer acknowledged before it saw ours.
+        let ran = run(&[VERACK, VERSION]);
+        let err = ran.result.unwrap_err();
         assert!(matches!(err, super::Error::VerackBeforeVersion), "{err}");
         assert_eq!(
-            sent.len(),
+            ran.sent.len(),
             crate::message::HEADER_BYTES + OUR_VERSION.len(),
             "no verack from us"
         );
@@ -321,14 +299,16 @@ mod tests {
 
     #[test]
     fn a_version_that_does_not_parse_earns_no_verack() {
-        let mut sent = Vec::new();
-        let err = run(&[&version_cut_to(80), WTXIDRELAY, VERACK], &mut sent).unwrap_err();
+        // Mutant: `run` writes the `verack` before it parses the peer's
+        // `version`, so a payload we cannot read still earns one.
+        let ran = run(&[&version_cut_to(80), WTXIDRELAY, VERACK]);
+        let err = ran.result.unwrap_err();
         assert!(
             matches!(err, super::Error::Version(crate::version::Error::Truncated)),
             "{err}"
         );
         assert_eq!(
-            sent.len(),
+            ran.sent.len(),
             crate::message::HEADER_BYTES + OUR_VERSION.len(),
             "no verack from us"
         );
@@ -337,8 +317,10 @@ mod tests {
 
     #[test]
     fn a_second_version_is_dropped_like_core_drops_it() {
-        let mut sent = Vec::new();
-        let done = run(&[VERSION, &version_cut_to(3), VERACK], &mut sent).unwrap();
+        // Mutant: the catch-all arm parses a second `version` instead of
+        // dropping it, so a three-byte one fails a handshake Core completes.
+        let ran = run(&[VERSION, &version_cut_to(3), VERACK]);
+        let done = ran.result.unwrap();
         assert_eq!(done.seen.len(), 3);
         assert_eq!(
             done.peer.user_agent, b"/Satoshi:31.1.0/",
@@ -349,21 +331,32 @@ mod tests {
 
     #[test]
     fn gives_up_without_verack() {
+        // Mutant: the bound counts only the frames before the `version`, or
+        // is one too high, so the `verack` after the sixteenth frame still
+        // completes the handshake.
         let mut frames = vec![VERSION];
         frames.resize(super::MESSAGES_BEFORE_VERACK_MAX, WTXIDRELAY);
         frames.push(VERACK);
-        let mut sent = Vec::new();
-        let err = run(&frames, &mut sent).unwrap_err();
+        let ran = run(&frames);
+        let err = ran.result.unwrap_err();
         assert!(matches!(err, super::Error::NoVerackAfter), "{err}");
+        assert_eq!(
+            ran.unread,
+            fixture(VERACK).len(),
+            "the verack that followed was never read"
+        );
         println!("{err}; the verack that followed was never read");
     }
 
     #[test]
     fn reports_a_peer_that_hangs_up_mid_handshake() {
-        let mut sent = Vec::new();
-        let err = run(&[VERSION], &mut sent).unwrap_err();
-        let super::Error::Message(crate::message::Error::Io(io)) = err else {
-            panic!("expected io, got {err}");
+        // Mutant: `run` takes the end of the stream for the end of the
+        // handshake and returns what it has, or calls it a timeout.
+        let mut script = sends(&[VERSION]);
+        script.push(crate::scripted::Step::HangUp);
+        let ran = run_with(script, None, None);
+        let super::Error::Message(crate::message::Error::Io(io)) = ran.result.unwrap_err() else {
+            panic!("expected io");
         };
         assert_eq!(io.kind(), std::io::ErrorKind::UnexpectedEof);
         println!("peer sent version then closed: {io}");
@@ -372,15 +365,15 @@ mod tests {
     #[test]
     fn a_deadline_before_verack_is_an_error_not_a_wait() {
         // Mutant: `run` matches `TimedOut` on `read_frame` and reads again.
-        let mut sent = Vec::new();
-        let deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
-        let (err, _) = run_with(&[VERSION], &mut sent, deadline);
-        let super::Error::Message(crate::message::Error::Io(io)) = err.unwrap_err() else {
+        let mut script = sends(&[VERSION]);
+        script.push(crate::scripted::Step::Silence);
+        let ran = run_with(script, None, Some(std::time::Duration::from_secs(10)));
+        let super::Error::Message(crate::message::Error::Io(io)) = ran.result.unwrap_err() else {
             panic!("expected io");
         };
         assert_eq!(io.kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(
-            sent.len(),
+            ran.sent.len(),
             2 * crate::message::HEADER_BYTES + OUR_VERSION.len(),
             "version answered with verack before the peer went quiet"
         );
