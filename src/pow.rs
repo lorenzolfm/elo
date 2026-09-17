@@ -515,10 +515,12 @@ pub fn check(
 
 /// A header that `check` accepted on one network: its `nBits` decode to a
 /// target of that network, and its hash is at or below that target. The
-/// field is private and `checked` is the only way to fill it, so a `Checked`
-/// in hand *is* the proof that the work was checked. `next_bits` takes these
-/// and nothing else, which is what keeps the two checks in order without a
-/// comment that says so.
+/// field is private, and outside tests `checked` is the only way to fill it,
+/// so a `Checked` in hand *is* the proof that the work was checked.
+/// `next_bits` takes these and nothing else, which is what keeps the two
+/// checks in order without a comment that says so. In test builds
+/// `unchecked` fills the field too, for the ancestors a test reads and
+/// never checks.
 pub struct Checked(crate::block_header::Header);
 
 impl Checked {
