@@ -49,51 +49,105 @@ const _: () = assert!(TIMESPAN_ONE_DAY / SPACING == 144);
 const _: () = assert!(INTERVAL_TWO_WEEKS == 2016);
 const _: () = assert!(INTERVAL_ONE_DAY == 144);
 
+/// `powLimit`: the easiest target a header may claim. Mainnet, testnet3 and
+/// testnet4 share a limit of 224 bits (`chainparams.cpp:96`, `:227`, `:334`);
+/// regtest has one of 255 (`:575`). Not compact values: a compact target
+/// holds 23 significant bits, and a limit holds 224 or 255 of them.
+const LIMIT_224: Target = Target(U256([0x0000_0000_ffff_ffff, u64::MAX, u64::MAX, u64::MAX]));
+const LIMIT_255: Target = Target(U256([0x7fff_ffff_ffff_ffff, u64::MAX, u64::MAX, u64::MAX]));
+
+/// Which block of a period gives the target the next period is scaled from:
+/// the last one (`pow.cpp:50`), or the first one under BIP94 (`:67`), so
+/// that a min-difficulty block at the end of a period cannot drop the
+/// difficulty of the next one.
+enum Edge {
+    First,
+    Last,
+}
+
+/// How a period ends. Core reads two booleans here, `fPowNoRetargeting` and
+/// `enforce_BIP94`, and only three of their four combinations are a network.
+/// This is the one question they answer: a network that does not retarget
+/// has no timespan to scale and no edge to scale from, and cannot be given
+/// either one.
+enum Retarget {
+    /// `fPowNoRetargeting`, `pow.cpp:52`: the difficulty never moves.
+    /// Regtest only.
+    Never,
+    /// The period is scaled from the target at `edge`, over `timespan`, the
+    /// seconds `nPowTargetTimespan` says it was meant to take.
+    Every { timespan: u32, edge: Edge },
+}
+
 /// How the difficulty moves on one network: the `Consensus::Params` fields
 /// that `GetNextWorkRequired` reads (`../bitcoin/src/consensus/params.h:113`),
-/// as `chainparams.cpp` sets them.
+/// as `chainparams.cpp` sets them. One arm of `of` describes a network
+/// whole, the `powLimit` with the rest, so no second `match` on the network
+/// can disagree with this one.
 struct Params {
     interval: usize,
-    timespan: u32,
+    limit: Target,
     /// `fPowAllowMinDifficultyBlocks`: a block more than two spacings after
     /// the one before it may claim the limit (`pow.cpp:22`). Every network
     /// but mainnet.
     min_difficulty: bool,
-    /// `fPowNoRetargeting`: the difficulty never moves (`pow.cpp:52`).
-    /// Regtest only.
-    no_retargeting: bool,
-    /// `enforce_BIP94`: a period is scaled from the target its *first* block
-    /// claims, not its last (`pow.cpp:67`), so that a min-difficulty block at
-    /// the end of a period cannot drop the difficulty of the next one.
-    /// Testnet4 only.
-    bip94: bool,
+    retarget: Retarget,
 }
 
 impl Params {
-    fn of(network: crate::message::Network) -> Params {
-        let (interval, timespan, min_difficulty, no_retargeting, bip94) = match network {
-            crate::message::Network::Mainnet => {
-                (INTERVAL_TWO_WEEKS, TIMESPAN_TWO_WEEKS, false, false, false)
-            }
-            crate::message::Network::Testnet3 => {
-                (INTERVAL_TWO_WEEKS, TIMESPAN_TWO_WEEKS, true, false, false)
-            }
-            crate::message::Network::Testnet4 => {
-                (INTERVAL_TWO_WEEKS, TIMESPAN_TWO_WEEKS, true, false, true)
-            }
-            crate::message::Network::Regtest => {
-                (INTERVAL_ONE_DAY, TIMESPAN_ONE_DAY, true, true, false)
-            }
-        };
-        Params {
-            interval,
-            timespan,
-            min_difficulty,
-            no_retargeting,
-            bip94,
+    const fn of(network: crate::message::Network) -> Params {
+        match network {
+            crate::message::Network::Mainnet => Params {
+                interval: INTERVAL_TWO_WEEKS,
+                limit: LIMIT_224,
+                min_difficulty: false,
+                retarget: Retarget::Every {
+                    timespan: TIMESPAN_TWO_WEEKS,
+                    edge: Edge::Last,
+                },
+            },
+            crate::message::Network::Testnet3 => Params {
+                interval: INTERVAL_TWO_WEEKS,
+                limit: LIMIT_224,
+                min_difficulty: true,
+                retarget: Retarget::Every {
+                    timespan: TIMESPAN_TWO_WEEKS,
+                    edge: Edge::Last,
+                },
+            },
+            crate::message::Network::Testnet4 => Params {
+                interval: INTERVAL_TWO_WEEKS,
+                limit: LIMIT_224,
+                min_difficulty: true,
+                retarget: Retarget::Every {
+                    timespan: TIMESPAN_TWO_WEEKS,
+                    edge: Edge::First,
+                },
+            },
+            crate::message::Network::Regtest => Params {
+                interval: INTERVAL_ONE_DAY,
+                limit: LIMIT_255,
+                min_difficulty: true,
+                retarget: Retarget::Never,
+            },
         }
     }
 }
+
+/// Whether the limit of `network` leaves `mul_u32` the room it needs. Only a
+/// network that retargets multiplies, so only those limits must fit.
+const fn the_product_fits(network: crate::message::Network) -> bool {
+    let params = Params::of(network);
+    match params.retarget {
+        Retarget::Never => true,
+        Retarget::Every { .. } => params.limit.0.leaves_room_for_a_timespan(),
+    }
+}
+
+const _: () = assert!(the_product_fits(crate::message::Network::Mainnet));
+const _: () = assert!(the_product_fits(crate::message::Network::Testnet3));
+const _: () = assert!(the_product_fits(crate::message::Network::Testnet4));
+const _: () = assert!(the_product_fits(crate::message::Network::Regtest));
 
 /// A 256-bit unsigned number: what `nBits` decodes to before the limit is
 /// asked, or a block hash read as one. Core's `arith_uint256`
@@ -151,6 +205,13 @@ impl std::error::Error for Error {}
 
 impl U256 {
     const ZERO: U256 = U256([0; LIMBS]);
+
+    /// Whether this number times a timespan stays inside 256 bits. A
+    /// timespan clamped to four periods is below 2^23, and 224 bits leave
+    /// the 32 above them free, so a number that reaches no higher fits.
+    const fn leaves_room_for_a_timespan(&self) -> bool {
+        self.0[0] <= 0x0000_0000_ffff_ffff
+    }
 
     /// `SetCompact`, `arith_uint256.cpp:175`: the top byte of `nBits` is a
     /// size in bytes, the low 23 bits a mantissa, the bit between a sign.
@@ -318,8 +379,8 @@ impl U256 {
     /// `retarget`, where the number is a target at or below a `powLimit` of
     /// 224 bits and the factor is a clamped timespan below 2^23, so 247 bits
     /// is the most the product takes. Only regtest has a wider limit, 255
-    /// bits, and `retarget` refuses regtest at its door: a network that
-    /// retargets from a wider limit would be our bug, not a peer's.
+    /// bits, and regtest does not retarget: the `const` assertions beside
+    /// `Params` hold every network that does to a limit that fits.
     fn mul_u32(self, factor: u32) -> U256 {
         let mut limbs = [0; LIMBS];
         let mut carry: u128 = 0;
@@ -379,22 +440,10 @@ impl Target {
     }
 
     /// `powLimit` of `network`: the easiest target a header may claim, and
-    /// so a target itself. `chainparams.cpp:96` mainnet, `:227` testnet3,
-    /// `:334` testnet4, `:575` regtest. Not a compact value: a compact
-    /// target has at most 23 significant bits, and a limit has 224 or 255
-    /// of them.
+    /// so a target itself. `Params` holds it beside the rest of the network.
     #[must_use]
     pub fn limit(network: crate::message::Network) -> Target {
-        match network {
-            crate::message::Network::Mainnet
-            | crate::message::Network::Testnet3
-            | crate::message::Network::Testnet4 => {
-                Target(U256([0x0000_0000_ffff_ffff, u64::MAX, u64::MAX, u64::MAX]))
-            }
-            crate::message::Network::Regtest => {
-                Target(U256([0x7fff_ffff_ffff_ffff, u64::MAX, u64::MAX, u64::MAX]))
-            }
-        }
+        Params::of(network).limit
     }
 }
 
@@ -556,8 +605,8 @@ impl<'a> View<'a> {
 
 /// `CalculateNextWorkRequired`, `pow.cpp:50`, without the
 /// `fPowNoRetargeting` line that opens it: `target` scaled by `actual` over
-/// the seconds the period was meant to take, held at or below the limit of
-/// `network`, and written back in compact form.
+/// `timespan`, the seconds the period was meant to take, held at or below
+/// `limit`, and written back in compact form.
 ///
 /// `actual` is the seconds the period really took, and it is signed: block
 /// times are not sorted, so the last block of a period can be older than the
@@ -569,33 +618,29 @@ impl<'a> View<'a> {
 /// result is not the exact ratio. It is what every node computes, which is
 /// what consensus asks.
 ///
-/// Not public: the `powLimit` of a network that does not retarget is free
-/// to be wider than the 224 bits `mul_u32` leaves room for, and regtest's is
-/// 255. `next_bits` answers for such a network before it reaches here, so
-/// the width is an invariant of ours and not a question a caller can ask.
-///
 /// The caller brings the target of a header it already checked, so there is
-/// no decode here and no error to return.
+/// no decode here and no error to return. It also brings the `timespan` and
+/// the `limit`, and a `Retarget::Every` is the only source of a timespan, so
+/// a network that does not retarget cannot reach here and cannot bring the
+/// 255-bit limit that would overflow the multiply.
 ///
 /// # Panics
 ///
-/// If `network` does not retarget, as above.
-fn retarget(target: Target, actual: i64, network: crate::message::Network) -> u32 {
-    let params = Params::of(network);
-    assert!(
-        !params.no_retargeting,
-        "a network that does not retarget has no period to scale"
-    );
-    let low = i64::from(params.timespan / 4);
-    let high = i64::from(params.timespan) * 4;
+/// If the product passes 256 bits, which the `const` assertions beside
+/// `Params` rule out.
+fn retarget(target: Target, actual: i64, timespan: u32, limit: &Target) -> u32 {
+    let low = i64::from(timespan / 4);
+    let high = i64::from(timespan) * 4;
     let clamped = actual.clamp(low, high);
     let Ok(clamped) = u32::try_from(clamped) else {
         unreachable!("a timespan clamped to {low}..={high} fits a u32")
     };
-    let limit = Target::limit(network);
-    let scaled = target.0.mul_u32(clamped).div_u32(params.timespan);
-    let held = if scaled > limit.0 { limit.0 } else { scaled };
-    held.to_compact()
+    let scaled = target.0.mul_u32(clamped).div_u32(timespan);
+    if scaled > limit.0 {
+        limit.0.to_compact()
+    } else {
+        scaled.to_compact()
+    }
 }
 
 /// `GetNextWorkRequired`, `pow.cpp:14`: the `nBits` the header after the
@@ -621,7 +666,7 @@ pub fn next_bits(
 ) -> u32 {
     let params = Params::of(network);
     let height_last = chain.last();
-    let limit_bits = Target::limit(network).0.to_compact();
+    let limit_bits = params.limit.0.to_compact();
     if !(height_last + 1).is_multiple_of(params.interval) {
         if !params.min_difficulty {
             return chain.at(height_last).header().bits;
@@ -645,9 +690,9 @@ pub fn next_bits(
         }
         return chain.at(height).header().bits;
     }
-    if params.no_retargeting {
+    let Retarget::Every { timespan, edge } = params.retarget else {
         return chain.at(height_last).header().bits;
-    }
+    };
     let Some(height_first) = (height_last + 1).checked_sub(params.interval) else {
         unreachable!(
             "a boundary at height {} has no period under it",
@@ -659,12 +704,16 @@ pub fn next_bits(
     // BIP94, `pow.cpp:67`: testnet4 scales the period from the target its
     // first block claims. A min-difficulty block cannot be that one, so the
     // real difficulty of the period survives at its start.
-    let height_source = if params.bip94 {
-        height_first
-    } else {
-        height_last
+    let height_source = match edge {
+        Edge::First => height_first,
+        Edge::Last => height_last,
     };
-    retarget(chain.at(height_source).target(network), actual, network)
+    retarget(
+        chain.at(height_source).target(network),
+        actual,
+        timespan,
+        &params.limit,
+    )
 }
 
 /// How many nonces `mine` and `spoil` try before they give up. On a regtest
@@ -855,9 +904,13 @@ mod tests {
         header(time, 0x1d00_ffff)
     }
 
-    /// The target of `bits` on mainnet, for the tests that scale one.
-    fn target(bits: u32) -> super::Target {
-        super::Target::from_compact(bits, crate::message::Network::Mainnet).unwrap()
+    /// `retarget` on mainnet, where Core's vectors come from: the target of
+    /// `bits` scaled over two weeks and held at the mainnet limit.
+    fn mainnet_retarget(bits: u32, actual: i64) -> u32 {
+        let network = crate::message::Network::Mainnet;
+        let target = super::Target::from_compact(bits, network).unwrap();
+        let params = super::Params::of(network);
+        super::retarget(target, actual, super::TIMESPAN_TWO_WEEKS, &params.limit)
     }
 
     #[test]
@@ -867,7 +920,7 @@ mod tests {
         // or the result is not held at the limit.
         for (last, first, bits, expected) in CORE_RETARGETS {
             let actual = i64::from(last) - i64::from(first);
-            let got = super::retarget(target(bits), actual, crate::message::Network::Mainnet);
+            let got = mainnet_retarget(bits, actual);
             assert_eq!(got, expected, "{bits:#010x} over {actual} seconds");
             println!("{bits:#010x} over {actual}s -> {got:#010x}");
         }
@@ -910,13 +963,12 @@ mod tests {
         // span below zero through: block times are not sorted, so the last
         // block of a period can be older than the first.
         const BITS: u32 = 0x1c05_a3f4;
-        let network = crate::message::Network::Mainnet;
-        let quarter = super::retarget(target(BITS), TWO_WEEKS / 4, network);
+        let quarter = mainnet_retarget(BITS, TWO_WEEKS / 4);
         for actual in [TWO_WEEKS / 4 - 1, 0, -1, i64::MIN] {
-            let got = super::retarget(target(BITS), actual, network);
+            let got = mainnet_retarget(BITS, actual);
             assert_eq!(got, quarter, "{actual} seconds");
         }
-        let above = super::retarget(target(BITS), TWO_WEEKS / 2, network);
+        let above = mainnet_retarget(BITS, TWO_WEEKS / 2);
         assert_ne!(above, quarter);
         println!("a quarter -> {quarter:#010x}, a half -> {above:#010x}");
     }
@@ -927,13 +979,12 @@ mod tests {
         // times the period and one second more must give the same bits, and
         // two times it must not.
         const BITS: u32 = 0x1c38_7f6f;
-        let network = crate::message::Network::Mainnet;
-        let four = super::retarget(target(BITS), TWO_WEEKS * 4, network);
+        let four = mainnet_retarget(BITS, TWO_WEEKS * 4);
         for actual in [TWO_WEEKS * 4 + 1, i64::MAX] {
-            let got = super::retarget(target(BITS), actual, network);
+            let got = mainnet_retarget(BITS, actual);
             assert_eq!(got, four, "{actual} seconds");
         }
-        let below = super::retarget(target(BITS), TWO_WEEKS * 2, network);
+        let below = mainnet_retarget(BITS, TWO_WEEKS * 2);
         assert_ne!(below, four);
         println!("four periods -> {four:#010x}, two -> {below:#010x}");
     }
@@ -1228,16 +1279,28 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "a network that does not retarget has no period")]
-    fn scaling_a_period_of_a_network_that_has_none_is_our_bug() {
-        // Red if `retarget` scales for regtest. Its `powLimit` is 255 bits,
-        // and 255 bits times a clamped span of a day passes 256, so the
-        // multiply would fail on its carry instead of at the door.
-        // `next_bits` answers for regtest before it gets here; the guard is
-        // what says so.
-        let regtest = crate::message::Network::Regtest;
-        let target = super::Target::from_compact(0x207f_ffff, regtest).unwrap();
-        let _ = super::retarget(target, 86_400, regtest);
+    fn only_a_network_with_a_limit_that_fits_retargets() {
+        // Red if a network is given a timespan beside a limit wider than 224
+        // bits: 255 bits times a clamped span passes 256, and `mul_u32` would
+        // fail on its carry at the first boundary. The `const` assertions
+        // beside `Params` are the guard; this is the same fact where a
+        // person reads it, and it names the one network that does not
+        // retarget.
+        for network in ALL_NETWORKS {
+            let params = super::Params::of(network);
+            match params.retarget {
+                super::Retarget::Never => assert!(
+                    matches!(network, crate::message::Network::Regtest),
+                    "{network:?}"
+                ),
+                super::Retarget::Every { .. } => assert!(
+                    params.limit.0.leaves_room_for_a_timespan(),
+                    "{network:?}: {}",
+                    params.limit
+                ),
+            }
+            println!("{network:?}: {}", params.limit);
+        }
     }
 
     #[test]
