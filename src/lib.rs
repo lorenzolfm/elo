@@ -12,6 +12,10 @@ pub mod link;
 pub mod locator;
 pub mod message;
 pub mod pow;
+// Test code only: no `main.rs`, `tests/` or fuzz target drives a loop
+// against a fake.
+#[cfg(test)]
+mod scripted;
 pub mod sync;
 pub mod version;
 pub mod wire;
