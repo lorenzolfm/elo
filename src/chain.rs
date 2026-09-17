@@ -109,7 +109,7 @@ impl std::error::Error for Error {}
 /// require at its height; `extend` checks both.
 pub struct Chain {
     network: crate::message::Network,
-    headers: Vec<crate::block_header::Header>,
+    headers: Vec<crate::pow::Checked>,
 }
 
 impl Chain {
@@ -122,9 +122,13 @@ impl Chain {
     /// `chainparams.cpp` assertion on the genesis hash, in another form.
     #[must_use]
     pub fn new(network: crate::message::Network) -> Chain {
+        let genesis = match crate::pow::checked(genesis(network), network) {
+            Ok(header) => header,
+            Err(error) => panic!("genesis has the work it claims: {error}"),
+        };
         let chain = Chain {
             network,
-            headers: vec![genesis(network)],
+            headers: vec![genesis],
         };
         assert_eq!(chain.height(), 0, "genesis is at height 0");
         assert_eq!(
@@ -132,9 +136,6 @@ impl Chain {
             [0; crate::block_header::HASH_BYTES],
             "genesis names no block before it"
         );
-        if let Err(error) = crate::pow::check(&chain.tip(), chain.at(0).bits, network) {
-            panic!("genesis has the work it claims: {error}");
-        }
         chain
     }
 
@@ -165,7 +166,7 @@ impl Chain {
     #[must_use]
     pub fn at(&self, height: usize) -> &crate::block_header::Header {
         assert!(height <= self.height(), "height {height} is above the tip");
-        &self.headers[height]
+        self.headers[height].header()
     }
 
     /// The hash of the header at `height`, computed on each call. A locator
@@ -223,69 +224,55 @@ impl Chain {
     ///
     /// # Panics
     ///
-    /// If a header that the difficulty check reads claims `nBits` that do
-    /// not decode. The work check refuses those first, for every header of
-    /// the batch, which is why it comes before the difficulty check and not
-    /// after it.
-    ///
     /// If the height after the append is not the height before plus the
     /// count of the batch. `Vec::extend` rules it out.
     pub fn extend(&mut self, headers: crate::headers::Headers) -> Result<(), Error> {
-        for (offset, header) in headers.as_slice().iter().enumerate() {
-            crate::pow::check(&header.hash(), header.bits, self.network).map_err(|error| {
-                Error::Pow {
-                    height: self.height() + 1 + offset,
-                    error,
-                }
-            })?;
+        // The work first, for the whole batch: `next_bits` reads a
+        // `pow::Checked` and nothing else, so the difficulty check below
+        // cannot run before this loop has made one of every header.
+        let mut batch = Vec::with_capacity(headers.len());
+        for (offset, header) in headers.into_vec().into_iter().enumerate() {
+            let height = self.height() + 1 + offset;
+            match crate::pow::checked(header, self.network) {
+                Ok(header) => batch.push(header),
+                Err(error) => return Err(Error::Pow { height, error }),
+            }
         }
-        let Some(first) = headers.as_slice().first() else {
+        let Some(first) = batch.first() else {
             return Ok(());
         };
         let tip = self.tip();
-        if first.previous_block.as_bytes() != tip.as_bytes() {
+        if first.header().previous_block.as_bytes() != tip.as_bytes() {
             return Err(Error::NotOnTip {
-                previous_block: first.previous_block.clone(),
+                previous_block: first.header().previous_block.clone(),
                 tip,
             });
         }
-        {
-            let batch = headers.as_slice();
-            let held = self.headers.len();
-            // The chain as it would be with the batch on it, so that a
-            // header of the batch can be the one a later header retargets
-            // from. Nothing has moved yet: the read is of our headers and
-            // the batch side by side.
-            let at = |height: usize| -> &crate::block_header::Header {
-                let header = match height.checked_sub(held) {
-                    None => self.headers.get(height),
-                    Some(offset) => batch.get(offset),
-                };
-                match header {
-                    Some(header) => header,
-                    None => unreachable!("height {height} is above the batch"),
+        let held = self.headers.len();
+        for (offset, header) in batch.iter().enumerate() {
+            // The chain as it would be with the batch up to here on it, so
+            // that a header of the batch can be the one a later header
+            // retargets from. Nothing has moved yet: the read is of our
+            // headers and the batch side by side.
+            let at = |height: usize| -> &crate::pow::Checked {
+                match height.checked_sub(held) {
+                    None => &self.headers[height],
+                    Some(offset) => &batch[offset],
                 }
             };
-            // Every header the closure can hand `next_bits` has `nBits`
-            // that decode: ours passed `check` before we kept them, and the
-            // batch's passed it at the top of this function. That is what
-            // keeps `next_bits` from panicking, so the work check stays in
-            // front of this loop.
-            for (offset, header) in batch.iter().enumerate() {
-                let required =
-                    crate::pow::next_bits(self.height() + offset, at, header, self.network);
-                if header.bits != required {
-                    return Err(Error::Bits {
-                        height: held + offset,
-                        claimed: header.bits,
-                        required,
-                    });
-                }
+            let required =
+                crate::pow::next_bits(self.height() + offset, at, header.header(), self.network);
+            if header.header().bits != required {
+                return Err(Error::Bits {
+                    height: held + offset,
+                    claimed: header.header().bits,
+                    required,
+                });
             }
         }
         let height_before = self.height();
-        let count = headers.len();
-        self.headers.extend(headers.into_vec());
+        let count = batch.len();
+        self.headers.extend(batch);
         assert_eq!(self.height(), height_before + count);
         Ok(())
     }

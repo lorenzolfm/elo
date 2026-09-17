@@ -433,6 +433,9 @@ impl std::fmt::Debug for Target {
 /// target of `network`, and `hash` is at or below it. Equal passes
 /// (`pow.cpp:166`).
 ///
+/// The target it decoded comes back with the `Ok`: the caller asked what
+/// the header claims, and that is the answer.
+///
 /// # Errors
 ///
 /// As `Target::from_compact`, then `NotMet`.
@@ -445,7 +448,7 @@ pub fn check(
     hash: &crate::block_header::BlockHash,
     bits: u32,
     network: crate::message::Network,
-) -> Result<(), Error> {
+) -> Result<Target, Error> {
     let target = Target::from_compact(bits, network)?;
     assert!(
         target.0 <= Target::limit(network).0,
@@ -457,13 +460,59 @@ pub fn check(
             target,
         });
     }
-    Ok(())
+    Ok(target)
+}
+
+/// A header that `check` accepted on one network: its `nBits` decode to a
+/// target of that network, and its hash is at or below that target. The
+/// field is private and `checked` is the only way to fill it, so a `Checked`
+/// in hand *is* the proof that the work was checked. `next_bits` takes these
+/// and nothing else, which is what keeps the two checks in order without a
+/// comment that says so.
+pub struct Checked(crate::block_header::Header);
+
+impl Checked {
+    /// The header itself, for everything that does not need the proof.
+    #[must_use]
+    pub fn header(&self) -> &crate::block_header::Header {
+        &self.0
+    }
+
+    /// The target the header claims. A target is 32 bytes and one header in
+    /// a period is asked for its own, so it is decoded here rather than
+    /// kept beside every header we hold.
+    ///
+    /// # Panics
+    ///
+    /// If the `nBits` do not decode to a target of `network`, which says
+    /// the header was checked against another network. A chain holds one
+    /// network and checks every header it keeps against that one.
+    fn target(&self, network: crate::message::Network) -> Target {
+        match Target::from_compact(self.0.bits, network) {
+            Ok(target) => target,
+            Err(error) => panic!("a header we kept claims bits that do not decode: {error}"),
+        }
+    }
+}
+
+/// `check` for a whole header, with the header back inside the proof: this
+/// is how a chain takes a header in.
+///
+/// # Errors
+///
+/// As `check`.
+pub fn checked(
+    header: crate::block_header::Header,
+    network: crate::message::Network,
+) -> Result<Checked, Error> {
+    check(&header.hash(), header.bits, network)?;
+    Ok(Checked(header))
 }
 
 /// `CalculateNextWorkRequired`, `pow.cpp:50`, without the
-/// `fPowNoRetargeting` line that opens it: the target of `bits` scaled by
-/// `actual` over the seconds the period was meant to take, held at or below
-/// the limit of `network`, and written back in compact form.
+/// `fPowNoRetargeting` line that opens it: `target` scaled by `actual` over
+/// the seconds the period was meant to take, held at or below the limit of
+/// `network`, and written back in compact form.
 ///
 /// `actual` is the seconds the period really took, and it is signed: block
 /// times are not sorted, so the last block of a period can be older than the
@@ -480,15 +529,13 @@ pub fn check(
 /// 255. `next_bits` answers for such a network before it reaches here, so
 /// the width is an invariant of ours and not a question a caller can ask.
 ///
-/// # Errors
-///
-/// As `Target::from_compact`: `bits` are a header's, so they must decode to
-/// a target of `network`.
+/// The caller brings the target of a header it already checked, so there is
+/// no decode here and no error to return.
 ///
 /// # Panics
 ///
 /// If `network` does not retarget, as above.
-fn retarget(bits: u32, actual: i64, network: crate::message::Network) -> Result<u32, Error> {
+fn retarget(target: Target, actual: i64, network: crate::message::Network) -> u32 {
     let params = Params::of(network);
     assert!(
         !params.no_retargeting,
@@ -500,17 +547,17 @@ fn retarget(bits: u32, actual: i64, network: crate::message::Network) -> Result<
     let Ok(clamped) = u32::try_from(clamped) else {
         unreachable!("a timespan clamped to {low}..={high} fits a u32")
     };
-    let target = Target::from_compact(bits, network)?;
     let limit = Target::limit(network);
     let scaled = target.0.mul_u32(clamped).div_u32(params.timespan);
     let held = if scaled > limit.0 { limit.0 } else { scaled };
-    Ok(held.to_compact())
+    held.to_compact()
 }
 
 /// `GetNextWorkRequired`, `pow.cpp:14`: the `nBits` the header after
-/// `height_last` must claim. `at` reads a header of our chain by height and
-/// is never asked above `height_last`; `candidate` is the header the peer
-/// offers, and only a min-difficulty network reads it, for its time.
+/// `height_last` must claim. `at` reads a checked header of our chain by
+/// height and is never asked above `height_last`; `candidate` is the header
+/// the peer offers, and only a min-difficulty network reads it, for its
+/// time.
 ///
 /// Away from a period boundary the answer is the last header's `nBits`, so
 /// the difficulty holds for a whole period. On the boundary the period is
@@ -521,14 +568,12 @@ fn retarget(bits: u32, actual: i64, network: crate::message::Network) -> Result<
 ///
 /// # Panics
 ///
-/// If a boundary falls with fewer than `interval` headers under it, or if a
-/// header of our chain claims `nBits` that do not decode. Both are facts
-/// about our own chain: a chain starts at genesis and grows by one, and
-/// every header we keep passed `check` before we kept it.
+/// If a boundary falls with fewer than `interval` headers under it. A chain
+/// starts at genesis and grows by one, so it cannot.
 #[must_use]
 pub fn next_bits<'a>(
     height_last: usize,
-    at: impl Fn(usize) -> &'a crate::block_header::Header,
+    at: impl Fn(usize) -> &'a Checked,
     candidate: &crate::block_header::Header,
     network: crate::message::Network,
 ) -> u32 {
@@ -536,12 +581,12 @@ pub fn next_bits<'a>(
     let limit_bits = Target::limit(network).0.to_compact();
     if !(height_last + 1).is_multiple_of(params.interval) {
         if !params.min_difficulty {
-            return at(height_last).bits;
+            return at(height_last).header().bits;
         }
         // `pow.cpp:26`: on a test network a block more than two spacings
         // after the one before it may claim the limit, so that a chain with
         // no miner on it is never stuck.
-        let gap = i64::from(candidate.time) - i64::from(at(height_last).time);
+        let gap = i64::from(candidate.time) - i64::from(at(height_last).header().time);
         if gap > i64::from(SPACING) * 2 {
             return limit_bits;
         }
@@ -549,14 +594,16 @@ pub fn next_bits<'a>(
         // over them, and stop at the first block of the period whatever it
         // claims.
         let mut height = height_last;
-        while height > 0 && !height.is_multiple_of(params.interval) && at(height).bits == limit_bits
+        while height > 0
+            && !height.is_multiple_of(params.interval)
+            && at(height).header().bits == limit_bits
         {
             height -= 1;
         }
-        return at(height).bits;
+        return at(height).header().bits;
     }
     if params.no_retargeting {
-        return at(height_last).bits;
+        return at(height_last).header().bits;
     }
     let Some(height_first) = (height_last + 1).checked_sub(params.interval) else {
         unreachable!(
@@ -564,7 +611,8 @@ pub fn next_bits<'a>(
             height_last + 1
         )
     };
-    let actual = i64::from(at(height_last).time) - i64::from(at(height_first).time);
+    let actual =
+        i64::from(at(height_last).header().time) - i64::from(at(height_first).header().time);
     // BIP94, `pow.cpp:67`: testnet4 scales the period from the target its
     // first block claims. A min-difficulty block cannot be that one, so the
     // real difficulty of the period survives at its start.
@@ -573,10 +621,7 @@ pub fn next_bits<'a>(
     } else {
         height_last
     };
-    match retarget(at(height_source).bits, actual, network) {
-        Ok(bits) => bits,
-        Err(error) => panic!("the header of our chain at height {height_source}: {error}"),
-    }
+    retarget(at(height_source).target(network), actual, network)
 }
 
 /// How many nonces `mine` and `spoil` try before they give up. On a regtest
@@ -739,28 +784,37 @@ mod tests {
     /// The seconds two weeks hold: `nPowTargetTimespan` on mainnet.
     const TWO_WEEKS: i64 = 14 * 24 * 60 * 60;
 
+    /// A header with a time and bits, and nothing else `next_bits` reads.
+    fn header(time: u32, bits: u32) -> crate::block_header::Header {
+        crate::block_header::Header {
+            version: 1,
+            previous_block: crate::block_header::BlockHash::from_bytes([0; 32]),
+            merkle_root: crate::block_header::MerkleRoot::from_bytes([0; 32]),
+            time,
+            bits,
+            nonce: 0,
+        }
+    }
+
     /// Headers for `next_bits` to read, one per time given, all claiming the
     /// same bits. Nothing here is mined: `next_bits` asks what a header may
-    /// claim, and `check` is what asks whether it did the work.
-    fn timeline(times: &[u32], bits: u32) -> Vec<crate::block_header::Header> {
+    /// claim, and `check` is what asks whether it did the work, so the
+    /// tests fill the proof themselves.
+    fn timeline(times: &[u32], bits: u32) -> Vec<super::Checked> {
         times
             .iter()
-            .map(|time| crate::block_header::Header {
-                version: 1,
-                previous_block: crate::block_header::BlockHash::from_bytes([0; 32]),
-                merkle_root: crate::block_header::MerkleRoot::from_bytes([0; 32]),
-                time: *time,
-                bits,
-                nonce: 0,
-            })
+            .map(|time| super::Checked(header(*time, bits)))
             .collect()
     }
 
     /// A header a peer offers, read only for its time.
     fn candidate(time: u32) -> crate::block_header::Header {
-        timeline(&[time], 0x1d00_ffff)
-            .pop()
-            .unwrap_or_else(|| unreachable!("one time makes one header"))
+        header(time, 0x1d00_ffff)
+    }
+
+    /// The target of `bits` on mainnet, for the tests that scale one.
+    fn target(bits: u32) -> super::Target {
+        super::Target::from_compact(bits, crate::message::Network::Mainnet).unwrap()
     }
 
     #[test]
@@ -770,7 +824,7 @@ mod tests {
         // or the result is not held at the limit.
         for (last, first, bits, expected) in CORE_RETARGETS {
             let actual = i64::from(last) - i64::from(first);
-            let got = super::retarget(bits, actual, crate::message::Network::Mainnet).unwrap();
+            let got = super::retarget(target(bits), actual, crate::message::Network::Mainnet);
             assert_eq!(got, expected, "{bits:#010x} over {actual} seconds");
             println!("{bits:#010x} over {actual}s -> {got:#010x}");
         }
@@ -813,13 +867,13 @@ mod tests {
         // span below zero through: block times are not sorted, so the last
         // block of a period can be older than the first.
         const BITS: u32 = 0x1c05_a3f4;
-        let quarter = super::retarget(BITS, TWO_WEEKS / 4, crate::message::Network::Mainnet);
-        let quarter = quarter.unwrap();
+        let network = crate::message::Network::Mainnet;
+        let quarter = super::retarget(target(BITS), TWO_WEEKS / 4, network);
         for actual in [TWO_WEEKS / 4 - 1, 0, -1, i64::MIN] {
-            let got = super::retarget(BITS, actual, crate::message::Network::Mainnet).unwrap();
+            let got = super::retarget(target(BITS), actual, network);
             assert_eq!(got, quarter, "{actual} seconds");
         }
-        let above = super::retarget(BITS, TWO_WEEKS / 2, crate::message::Network::Mainnet).unwrap();
+        let above = super::retarget(target(BITS), TWO_WEEKS / 2, network);
         assert_ne!(above, quarter);
         println!("a quarter -> {quarter:#010x}, a half -> {above:#010x}");
     }
@@ -830,12 +884,13 @@ mod tests {
         // times the period and one second more must give the same bits, and
         // two times it must not.
         const BITS: u32 = 0x1c38_7f6f;
-        let four = super::retarget(BITS, TWO_WEEKS * 4, crate::message::Network::Mainnet).unwrap();
+        let network = crate::message::Network::Mainnet;
+        let four = super::retarget(target(BITS), TWO_WEEKS * 4, network);
         for actual in [TWO_WEEKS * 4 + 1, i64::MAX] {
-            let got = super::retarget(BITS, actual, crate::message::Network::Mainnet).unwrap();
+            let got = super::retarget(target(BITS), actual, network);
             assert_eq!(got, four, "{actual} seconds");
         }
-        let below = super::retarget(BITS, TWO_WEEKS * 2, crate::message::Network::Mainnet).unwrap();
+        let below = super::retarget(target(BITS), TWO_WEEKS * 2, network);
         assert_ne!(below, four);
         println!("four periods -> {four:#010x}, two -> {below:#010x}");
     }
@@ -924,7 +979,7 @@ mod tests {
         // min-difficulty blocks, height 0 holds the difficulty of the
         // period, and that is the one the next header must claim.
         let mut headers = timeline(&[1_500_000_000, 1_500_000_600, 1_500_001_200], 0x1d00_ffff);
-        headers[0].bits = 0x1b00_0100;
+        headers[0] = super::Checked(header(1_500_000_000, 0x1b00_0100));
         let network = crate::message::Network::Testnet3;
         let next = candidate(1_500_001_800);
         let bits = super::next_bits(2, |height| &headers[height], &next, network);
@@ -1108,7 +1163,9 @@ mod tests {
         // multiply would fail on its carry instead of at the door.
         // `next_bits` answers for regtest before it gets here; the guard is
         // what says so.
-        let _ = super::retarget(0x207f_ffff, 86_400, crate::message::Network::Regtest);
+        let regtest = crate::message::Network::Regtest;
+        let target = super::Target::from_compact(0x207f_ffff, regtest).unwrap();
+        let _ = super::retarget(target, 86_400, regtest);
     }
 
     #[test]
