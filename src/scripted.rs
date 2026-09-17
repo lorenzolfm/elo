@@ -199,6 +199,10 @@ pub fn connect_in_chunks(
     chunk: usize,
     wall: std::time::SystemTime,
 ) -> crate::connection::Connection<Peer> {
+    assert!(
+        chunk > 0,
+        "a chunk of zero serves no bytes: every read would be a hang-up"
+    );
     connection(script, Some(chunk), wall)
 }
 
@@ -428,6 +432,14 @@ mod tests {
             .unwrap();
         assert!(connection.link_mut().read(&mut [0u8; 4]).is_err());
         let _ = connection.link_mut().read(&mut [0u8; 4]);
+    }
+
+    #[test]
+    #[should_panic(expected = "a chunk of zero")]
+    fn a_chunk_of_zero_is_our_bug() {
+        // Mutant: the assertion is missing, so every read serves nothing
+        // and the test reads a peer that hung up before its first byte.
+        let _ = super::connect_in_chunks(vec![super::Step::Send(b"abc".to_vec())], 0, WALL);
     }
 
     #[test]
