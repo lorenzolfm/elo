@@ -93,7 +93,8 @@ impl std::fmt::Display for Error {
                 required,
             } => write!(
                 f,
-                "header at height {height} claims bits {claimed:#010x}, the rules require {required:#010x}"
+                "header at height {height} claims bits {claimed:#010x}, \
+                 the rules require {required:#010x}"
             ),
         }
     }
