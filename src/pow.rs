@@ -572,8 +572,15 @@ impl<'a> View<'a> {
     /// A view of `held` with `batch` after it. `Chain::extend` builds one
     /// for each header of a batch, over the headers in front of that one:
     /// a header of the batch can be the one a later header retargets from.
+    ///
+    /// # Panics
+    ///
+    /// If `held` is empty. A chain holds genesis before it holds anything
+    /// else, so every view starts at one. `last` reads the same invariant
+    /// at the other end.
     #[must_use]
     pub fn new(held: &'a [Checked], batch: &'a [Checked]) -> View<'a> {
+        assert!(!held.is_empty(), "a view starts at genesis");
         View { held, batch }
     }
 
@@ -582,7 +589,7 @@ impl<'a> View<'a> {
     ///
     /// # Panics
     ///
-    /// If the view is empty. A chain starts at genesis, so it is not.
+    /// If the view is empty. `new` asserts it is not.
     fn last(&self) -> usize {
         let count = self.held.len() + self.batch.len();
         assert!(count > 0, "a view starts at genesis");
@@ -1139,6 +1146,16 @@ mod tests {
         // be the slice's.
         let held = timeline(&[1_500_000_000, 1_500_000_600], 0x1d00_ffff);
         let _ = super::View::new(&held, &[]).at(2);
+    }
+
+    #[test]
+    #[should_panic(expected = "a view starts at genesis")]
+    fn a_view_over_nothing_held_is_our_bug() {
+        // Red if `new` takes the invariant on trust and leaves it to `last`:
+        // a view is built from a chain, and a chain holds genesis before it
+        // holds anything else. The batch alone is not a chain.
+        let batch = timeline(&[1_500_000_000], 0x1d00_ffff);
+        let _ = super::View::new(&[], &batch);
     }
 
     #[test]
