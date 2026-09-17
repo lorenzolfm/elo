@@ -1075,6 +1075,35 @@ mod tests {
     }
 
     #[test]
+    fn the_two_testnets_scale_the_period_from_opposite_ends_of_it() {
+        // Red if `Edge` is read backwards, or if both networks are given the
+        // same end: BIP94 (`pow.cpp:67`) has testnet4 scale the period from
+        // the target its *first* block claims, so that a min-difficulty
+        // block at the end of a period cannot drop the difficulty of the
+        // next one, while testnet3 scales from the last block as mainnet
+        // does. The first block of this period claims the limit and the
+        // last claims something harder, and the period ran exactly the two
+        // weeks it was meant to, so the scaling is one to one and each
+        // network must answer with the bits of the block it reads.
+        const FIRST: u32 = 0x1d00_ffff;
+        const LAST: u32 = 0x1c05_a3f4;
+        let mut times: Vec<u32> = (0..2016u32)
+            .map(|height| 1_500_000_000 + height * 600)
+            .collect();
+        times[2015] = times[0] + 1_209_600;
+        let mut headers = timeline(&times, LAST);
+        headers[0] = super::Checked(header(times[0], FIRST));
+        let next = candidate(times[2015] + 600);
+        let view = super::View::new(&headers, &[]);
+        let testnet4 = super::next_bits(&view, &next, crate::message::Network::Testnet4);
+        let testnet3 = super::next_bits(&view, &next, crate::message::Network::Testnet3);
+        assert_eq!(testnet4, FIRST);
+        assert_eq!(testnet3, LAST);
+        assert_ne!(testnet4, testnet3);
+        println!("testnet4 {testnet4:#010x}, testnet3 {testnet3:#010x}");
+    }
+
+    #[test]
     fn regtest_never_moves_its_bits() {
         // Red if `fPowNoRetargeting` is not read: regtest ends a period
         // every 144 blocks, and a period that came in at a tenth of the
