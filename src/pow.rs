@@ -590,7 +590,7 @@ impl<'a> View<'a> {
     /// # Panics
     ///
     /// If the view is empty. `new` asserts it is not.
-    fn last(&self) -> usize {
+    pub(crate) fn last(&self) -> usize {
         let count = self.held.len() + self.batch.len();
         assert!(count > 0, "a view starts at genesis");
         count - 1

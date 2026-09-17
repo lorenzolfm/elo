@@ -225,17 +225,26 @@ impl Chain {
     /// # Panics
     ///
     /// If the height after the append is not the height before plus the
-    /// count of the batch. `Vec::extend` rules it out.
+    /// count of the batch. `Vec::extend` rules it out. Or if the view built
+    /// for a header does not end at the header before it.
     pub fn extend(&mut self, headers: crate::headers::Headers) -> Result<(), Error> {
+        // The height of the first header of the batch: we hold heights 0
+        // to `held - 1`, so the batch starts at `held`. Both loops below
+        // report a height, and this is the one place it is derived.
+        let held = self.headers.len();
         // The work first, for the whole batch: `next_bits` reads a
         // `pow::Checked` and nothing else, so the difficulty check below
         // cannot run before this loop has made one of every header.
         let mut batch = Vec::with_capacity(headers.len());
         for (offset, header) in headers.into_vec().into_iter().enumerate() {
-            let height = self.height() + 1 + offset;
             match crate::pow::checked(header, self.network) {
                 Ok(header) => batch.push(header),
-                Err(error) => return Err(Error::Pow { height, error }),
+                Err(error) => {
+                    return Err(Error::Pow {
+                        height: held + offset,
+                        error,
+                    });
+                }
             }
         }
         let Some(first) = batch.first() else {
@@ -248,17 +257,22 @@ impl Chain {
                 tip,
             });
         }
-        let held = self.headers.len();
         for (offset, header) in batch.iter().enumerate() {
             // The chain as it would be with the batch up to here on it, so
             // that a header of the batch can be the one a later header
             // retargets from. Nothing has moved yet: the view is of our
             // headers and the batch side by side.
-            let chain = crate::pow::View::new(&self.headers, &batch[..offset]);
-            let required = crate::pow::next_bits(&chain, header.header(), self.network);
+            let view = crate::pow::View::new(&self.headers, &batch[..offset]);
+            let height = held + offset;
+            assert_eq!(
+                view.last() + 1,
+                height,
+                "the view ends at the header before the one we check"
+            );
+            let required = crate::pow::next_bits(&view, header.header(), self.network);
             if header.header().bits != required {
                 return Err(Error::Bits {
-                    height: held + offset,
+                    height,
                     claimed: header.header().bits,
                     required,
                 });
