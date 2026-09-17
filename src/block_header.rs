@@ -167,8 +167,8 @@ impl Header {
 
 /// The next `N` bytes, and the rest. `parse` starts from a fixed-size array
 /// and every width is a constant, so running out of bytes is our bug, not
-/// the peer's. That is why this is not `version::take`: `take` reads a slice
-/// the peer sized and returns `Truncated` when it runs out.
+/// the peer's. That is why this panics where `version::parse` and
+/// `headers::parse` return `Truncated`: they read a slice the peer sized.
 fn parse_field<const N: usize>(bytes: &[u8]) -> (&[u8; N], &[u8]) {
     let Some(split) = bytes.split_first_chunk() else {
         unreachable!("a header field runs past {BYTES} bytes")

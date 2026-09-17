@@ -150,22 +150,26 @@ impl From<crate::compact_size::Error> for Error {
 /// height. `relay` alone stays optional: BIP37 added it, and Core takes an
 /// absent one as `true`. Bytes after it are ignored, as Core ignores them.
 pub(crate) fn parse(payload: &[u8]) -> Result<Peer, Error> {
-    let (protocol, rest) = take::<4>(payload)?;
+    let (protocol, rest) = payload.split_first_chunk::<4>().ok_or(Error::Truncated)?;
     let protocol = i32::from_le_bytes(*protocol);
     if protocol < PEER_PROTOCOL_VERSION_MIN {
         return Err(Error::Obsolete(protocol));
     }
-    let (services, rest) = take::<8>(rest)?;
-    let (_timestamp, rest) = take::<8>(rest)?;
-    let (_addr_recv, rest) = take::<NET_ADDR_BYTES>(rest)?;
-    let (_addr_from, rest) = take::<NET_ADDR_BYTES>(rest)?;
-    let (_nonce, rest) = take::<8>(rest)?;
+    let (services, rest) = rest.split_first_chunk::<8>().ok_or(Error::Truncated)?;
+    let (_timestamp, rest) = rest.split_first_chunk::<8>().ok_or(Error::Truncated)?;
+    let (_addr_recv, rest) = rest
+        .split_first_chunk::<NET_ADDR_BYTES>()
+        .ok_or(Error::Truncated)?;
+    let (_addr_from, rest) = rest
+        .split_first_chunk::<NET_ADDR_BYTES>()
+        .ok_or(Error::Truncated)?;
+    let (_nonce, rest) = rest.split_first_chunk::<8>().ok_or(Error::Truncated)?;
     let (agent_len, rest) = crate::compact_size::read_len(rest, USER_AGENT_BYTES_MAX)?;
     if rest.len() < agent_len {
         return Err(Error::Truncated);
     }
     let (user_agent, rest) = rest.split_at(agent_len);
-    let (start_height, rest) = take::<4>(rest)?;
+    let (start_height, rest) = rest.split_first_chunk::<4>().ok_or(Error::Truncated)?;
     let start_height = i32::from_le_bytes(*start_height);
     let start_height =
         u32::try_from(start_height).map_err(|_| Error::NegativeHeight(start_height))?;
@@ -181,11 +185,6 @@ pub(crate) fn parse(payload: &[u8]) -> Result<Peer, Error> {
         start_height,
         relay,
     })
-}
-
-/// The next `N` bytes, and the rest.
-fn take<const N: usize>(bytes: &[u8]) -> Result<(&[u8; N], &[u8]), Error> {
-    bytes.split_first_chunk().ok_or(Error::Truncated)
 }
 
 /// The 26-byte address inside `version`: services, a 16-byte IPv6 address

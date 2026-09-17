@@ -95,15 +95,19 @@ impl GetHeaders {
     /// count above `locator::HASHES_MAX` is read whole and then disconnected
     /// (`:4399`); here the count is refused before a hash is read.
     pub(crate) fn parse(payload: &[u8]) -> Result<GetHeaders, Error> {
-        let (_version, rest) = take::<4>(payload)?;
+        let (_version, rest) = payload.split_first_chunk::<4>().ok_or(Error::Truncated)?;
         let (count, mut rest) = crate::compact_size::read_len(rest, crate::locator::HASHES_MAX)?;
         let mut locator = Vec::with_capacity(count);
         for _ in 0..count {
-            let (hash, after) = take::<HASH_BYTES>(rest)?;
+            let (hash, after) = rest
+                .split_first_chunk::<HASH_BYTES>()
+                .ok_or(Error::Truncated)?;
             locator.push(crate::block_header::BlockHash::from_bytes(*hash));
             rest = after;
         }
-        let (stop, rest) = take::<HASH_BYTES>(rest)?;
+        let (stop, rest) = rest
+            .split_first_chunk::<HASH_BYTES>()
+            .ok_or(Error::Truncated)?;
         if !rest.is_empty() {
             return Err(Error::TrailingBytes(rest.len()));
         }
@@ -159,7 +163,9 @@ impl Headers {
         let (count, mut rest) = crate::compact_size::read_len(payload, HEADERS_MAX)?;
         let mut headers: Vec<crate::block_header::Header> = Vec::with_capacity(count);
         for index in 0..count {
-            let (header, after) = take::<HEADER_BYTES>(rest)?;
+            let (header, after) = rest
+                .split_first_chunk::<HEADER_BYTES>()
+                .ok_or(Error::Truncated)?;
             let (&transaction_count, after) = after.split_first().ok_or(Error::Truncated)?;
             if transaction_count != 0 {
                 return Err(Error::TransactionCount(transaction_count));
@@ -219,11 +225,6 @@ impl Headers {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
-}
-
-/// The next `N` bytes, and the rest.
-fn take<const N: usize>(bytes: &[u8]) -> Result<(&[u8; N], &[u8]), Error> {
-    bytes.split_first_chunk().ok_or(Error::Truncated)
 }
 
 #[cfg(test)]
