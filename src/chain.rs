@@ -69,6 +69,14 @@ pub enum Error {
         previous_block: crate::block_header::BlockHash,
         tip: crate::block_header::BlockHash,
     },
+    /// A header claims `nBits` that are not the ones the retargeting rules
+    /// require at its height. Core's `bad-diffbits`,
+    /// `ContextualCheckBlockHeader`, `validation.cpp:4136`.
+    Bits {
+        height: usize,
+        claimed: u32,
+        required: u32,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -79,6 +87,15 @@ impl std::fmt::Display for Error {
                 previous_block,
                 tip,
             } => write!(f, "headers follow {previous_block}, our tip is {tip}"),
+            Error::Bits {
+                height,
+                claimed,
+                required,
+            } => write!(
+                f,
+                "header at height {height} claims bits {claimed:#010x}, \
+                 the rules require {required:#010x}"
+            ),
         }
     }
 }
@@ -89,10 +106,11 @@ impl std::error::Error for Error {}
 /// `new`, so there is always a tip and a locator. Each header names the one
 /// before it: `Headers` holds that within a batch, and `extend` checks it at
 /// the join. Each header past genesis has the work it claims, at or below
-/// the limit of `network`; `extend` checks that too.
+/// the limit of `network`, and claims the `nBits` the retargeting rules
+/// require at its height; `extend` checks both.
 pub struct Chain {
     network: crate::message::Network,
-    headers: Vec<crate::block_header::Header>,
+    headers: Vec<crate::pow::Checked>,
 }
 
 impl Chain {
@@ -105,9 +123,13 @@ impl Chain {
     /// `chainparams.cpp` assertion on the genesis hash, in another form.
     #[must_use]
     pub fn new(network: crate::message::Network) -> Chain {
+        let genesis = match crate::pow::checked(genesis(network), network) {
+            Ok(header) => header,
+            Err(error) => panic!("genesis has the work it claims: {error}"),
+        };
         let chain = Chain {
             network,
-            headers: vec![genesis(network)],
+            headers: vec![genesis],
         };
         assert_eq!(chain.height(), 0, "genesis is at height 0");
         assert_eq!(
@@ -115,9 +137,6 @@ impl Chain {
             [0; crate::block_header::HASH_BYTES],
             "genesis names no block before it"
         );
-        if let Err(error) = crate::pow::check(&chain.tip(), chain.at(0).bits, network) {
-            panic!("genesis has the work it claims: {error}");
-        }
         chain
     }
 
@@ -148,7 +167,7 @@ impl Chain {
     #[must_use]
     pub fn at(&self, height: usize) -> &crate::block_header::Header {
         assert!(height <= self.height(), "height {height} is above the tip");
-        &self.headers[height]
+        self.headers[height].header()
     }
 
     /// The hash of the header at `height`, computed on each call. A locator
@@ -188,45 +207,81 @@ impl Chain {
         locator
     }
 
-    /// Appends a batch whose every header has the work it claims and whose
-    /// first header names our tip. An empty batch is fine and changes
-    /// nothing. `Headers::parse` bounded the batch and checked that each
-    /// header names the one before it; the work and the join are the checks
-    /// left, in that order, as Core orders them (`net_processing.cpp:2987`,
-    /// `:3028`).
+    /// Appends a batch whose every header has the work it claims, whose
+    /// first header names our tip, and whose every header claims the `nBits`
+    /// the rules require. An empty batch is fine and changes nothing.
+    /// `Headers::parse` bounded the batch and checked that each header names
+    /// the one before it; the work, the join and the difficulty are the
+    /// checks left, in that order, as Core orders them
+    /// (`net_processing.cpp:2987`, `:3028`, then `validation.cpp:4136`).
     ///
     /// # Errors
     ///
     /// `Pow` if a header claims a target above the limit of the network or
     /// hashes above the target it claims. `NotOnTip` if the first header
-    /// names a block other than our tip. On either the chain is unchanged.
+    /// names a block other than our tip. `Bits` if a header claims `nBits`
+    /// that the retargeting rules do not allow at its height. On any of the
+    /// three the chain is unchanged.
     ///
     /// # Panics
     ///
     /// If the height after the append is not the height before plus the
-    /// count of the batch. `Vec::extend` rules it out.
+    /// count of the batch. `Vec::extend` rules it out. Or if the view built
+    /// for a header does not end at the header before it.
     pub fn extend(&mut self, headers: crate::headers::Headers) -> Result<(), Error> {
-        for (offset, header) in headers.as_slice().iter().enumerate() {
-            crate::pow::check(&header.hash(), header.bits, self.network).map_err(|error| {
-                Error::Pow {
-                    height: self.height() + 1 + offset,
-                    error,
+        // The height of the first header of the batch: we hold heights 0
+        // to `held - 1`, so the batch starts at `held`. Both loops below
+        // report a height, and this is the one place it is derived.
+        let held = self.headers.len();
+        // The work first, for the whole batch: `next_bits` reads a
+        // `pow::Checked` and nothing else, so the difficulty check below
+        // cannot run before this loop has made one of every header.
+        let mut batch = Vec::with_capacity(headers.len());
+        for (offset, header) in headers.into_vec().into_iter().enumerate() {
+            match crate::pow::checked(header, self.network) {
+                Ok(header) => batch.push(header),
+                Err(error) => {
+                    return Err(Error::Pow {
+                        height: held + offset,
+                        error,
+                    });
                 }
-            })?;
+            }
         }
-        let Some(first) = headers.as_slice().first() else {
+        let Some(first) = batch.first() else {
             return Ok(());
         };
         let tip = self.tip();
-        if first.previous_block.as_bytes() != tip.as_bytes() {
+        if first.header().previous_block.as_bytes() != tip.as_bytes() {
             return Err(Error::NotOnTip {
-                previous_block: first.previous_block.clone(),
+                previous_block: first.header().previous_block.clone(),
                 tip,
             });
         }
+        for (offset, header) in batch.iter().enumerate() {
+            // The chain as it would be with the batch up to here on it, so
+            // that a header of the batch can be the one a later header
+            // retargets from. Nothing has moved yet: the view is of our
+            // headers and the batch side by side.
+            let view = crate::pow::View::new(&self.headers, &batch[..offset]);
+            let height = held + offset;
+            assert_eq!(
+                view.last() + 1,
+                height,
+                "the view ends at the header before the one we check"
+            );
+            let required = crate::pow::next_bits(&view, header.header(), self.network);
+            if header.header().bits != required {
+                return Err(Error::Bits {
+                    height,
+                    claimed: header.header().bits,
+                    required,
+                });
+            }
+        }
         let height_before = self.height();
-        let count = headers.len();
-        self.headers.extend(headers.into_vec());
+        let count = batch.len();
+        self.headers.extend(batch);
         assert_eq!(self.height(), height_before + count);
         Ok(())
     }
@@ -263,6 +318,27 @@ mod tests {
 
     fn after_genesis() -> crate::headers::Headers {
         crate::headers::Headers::parse(&fixture(FROM_GENESIS)).unwrap()
+    }
+
+    /// One mined regtest header after `previous` that claims `bits`, as a
+    /// batch of its own. `mined_after` always claims what regtest genesis
+    /// claims; this one is for the header that claims something else.
+    fn claiming(previous: &crate::block_header::BlockHash, bits: u32) -> crate::headers::Headers {
+        let network = crate::message::Network::Regtest;
+        let mut header = crate::block_header::Header {
+            version: 1,
+            previous_block: crate::block_header::BlockHash::from_bytes(*previous.as_bytes()),
+            merkle_root: crate::block_header::MerkleRoot::from_bytes([0; 32]),
+            time: 0,
+            bits,
+            nonce: 0,
+        };
+        crate::pow::mine(&mut header, network);
+        let mut payload = Vec::new();
+        crate::compact_size::write_len(&mut payload, 1);
+        payload.extend_from_slice(&header.encode());
+        payload.push(0);
+        crate::headers::Headers::parse(&payload).unwrap()
     }
 
     /// `count` regtest headers after `previous`, each naming the one before
@@ -411,6 +487,35 @@ mod tests {
         let err = chain.extend(after_genesis()).unwrap_err();
         assert!(matches!(err, super::Error::NotOnTip { .. }), "{err}");
         assert_eq!(chain.height(), 3);
+        println!("{err}");
+    }
+
+    #[test]
+    fn a_header_that_claims_the_wrong_bits_is_refused() {
+        // Red if `extend` does not check the difficulty, or asks for it at
+        // the wrong height: regtest never retargets, so the header after
+        // genesis must claim what genesis claims, `0x207fffff`. One step
+        // harder, `0x207ffffe`, is still work a test can do and still a
+        // target under the limit, so the work and the join both pass and
+        // the claim is the only thing wrong with it.
+        let mut chain = super::Chain::new(crate::message::Network::Regtest);
+        chain.extend(claiming(&chain.tip(), 0x207f_ffff)).unwrap();
+        assert_eq!(chain.height(), 1, "the right claim is kept");
+        let err = chain
+            .extend(claiming(&chain.tip(), 0x207f_fffe))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                super::Error::Bits {
+                    height: 2,
+                    claimed: 0x207f_fffe,
+                    required: 0x207f_ffff,
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(chain.height(), 1, "the wrong claim is not kept");
         println!("{err}");
     }
 
