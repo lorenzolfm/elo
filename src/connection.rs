@@ -57,6 +57,20 @@ impl<L: crate::link::Link> Connection<L> {
         self.link.set_read_deadline(deadline)
     }
 
+    /// The link under the connection, for a test to read what the loop sent
+    /// it and what it has left to say.
+    #[cfg(test)]
+    pub(crate) fn link(&self) -> &L {
+        &self.link
+    }
+
+    /// The same, to drive the link itself: the tests of the scripted peer
+    /// read from it without a frame around the bytes.
+    #[cfg(test)]
+    pub(crate) fn link_mut(&mut self) -> &mut L {
+        &mut self.link
+    }
+
     /// See [`crate::link::Link::now`].
     pub fn now(&self) -> std::time::Instant {
         self.link.now()
