@@ -263,54 +263,13 @@ mod tests {
         framed(crate::wire::Message::Headers(headers))
     }
 
-    /// A scripted peer over a fixed clock, as in `handshake.rs`: once its
-    /// bytes are read it goes quiet, and with a deadline set that is a
-    /// timeout.
-    struct Duplex<'a> {
-        from_peer: &'a mut std::io::Cursor<Vec<u8>>,
-        to_peer: &'a mut Vec<u8>,
-        deadline: Option<std::time::Instant>,
-    }
-
-    fn unread(from_peer: &std::io::Cursor<Vec<u8>>) -> usize {
-        from_peer.get_ref().len() - usize::try_from(from_peer.position()).unwrap()
-    }
-
-    impl std::io::Read for Duplex<'_> {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            if unread(self.from_peer) == 0 && self.deadline.is_some() {
-                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
-            }
-            std::io::Read::read(&mut self.from_peer, buf)
-        }
-    }
-
-    impl std::io::Write for Duplex<'_> {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            std::io::Write::write(self.to_peer, buf)
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl crate::link::Link for Duplex<'_> {
-        fn set_read_deadline(
-            &mut self,
-            deadline: Option<std::time::Instant>,
-        ) -> std::io::Result<()> {
-            self.deadline = deadline;
-            Ok(())
-        }
-
-        fn now(&self) -> std::time::Instant {
-            std::time::Instant::now()
-        }
-
-        fn wall(&self) -> std::time::SystemTime {
-            std::time::UNIX_EPOCH
-        }
+    /// Every frame its own step, as in `handshake.rs`: a read never
+    /// crosses two.
+    fn sends(frames: Vec<Vec<u8>>) -> Vec<crate::scripted::Step> {
+        frames
+            .into_iter()
+            .map(crate::scripted::Step::Send)
+            .collect()
     }
 
     /// What one run left behind.
@@ -319,30 +278,36 @@ mod tests {
         events: Vec<String>,
         sent: Vec<u8>,
         unread: usize,
+        /// How far the peer's clock moved. Only a `Silence` moves it, so
+        /// this is how long the loop waited.
+        waited: std::time::Duration,
     }
 
-    fn run(chain: &mut crate::chain::Chain, script: &[Vec<u8>]) -> Ran {
-        let mut from_peer = std::io::Cursor::new(script.concat());
-        let mut sent = Vec::new();
-        let mut events = Vec::new();
-        let result = {
-            let mut connection = crate::connection::Connection::new(
-                Duplex {
-                    from_peer: &mut from_peer,
-                    to_peer: &mut sent,
-                    deadline: None,
-                },
-                NETWORK,
-            );
-            super::run(&mut connection, chain, |event| {
-                events.push(event.to_string());
-            })
+    fn run(chain: &mut crate::chain::Chain, script: Vec<crate::scripted::Step>) -> Ran {
+        run_with(chain, script, None)
+    }
+
+    /// The same, with `chunk` bytes at most per read.
+    fn run_with(
+        chain: &mut crate::chain::Chain,
+        script: Vec<crate::scripted::Step>,
+        chunk: Option<usize>,
+    ) -> Ran {
+        let mut connection = match chunk {
+            Some(chunk) => crate::scripted::connect_in_chunks(script, chunk, std::time::UNIX_EPOCH),
+            None => crate::scripted::connect(script, std::time::UNIX_EPOCH),
         };
+        let started = connection.now();
+        let mut events = Vec::new();
+        let result = super::run(&mut connection, chain, |event| {
+            events.push(event.to_string());
+        });
         Ran {
             result,
             events,
-            sent,
-            unread: unread(&from_peer),
+            sent: connection.link().sent().to_vec(),
+            unread: connection.link().unread(),
+            waited: connection.now() - started,
         }
     }
 
@@ -373,7 +338,7 @@ mod tests {
         // read, not on the panic. `run` above builds the connection on
         // `NETWORK`; the chain here is not.
         let mut chain = crate::chain::Chain::new(crate::message::Network::Mainnet);
-        let _ = run(&mut chain, &[]);
+        let _ = run(&mut chain, Vec::new());
     }
 
     #[test]
@@ -385,12 +350,12 @@ mod tests {
         let expected_request = getheaders(&chain);
         let ran = run(
             &mut chain,
-            &[
+            sends(vec![
                 fixture(SENDCMPCT),
                 fixture(PING),
                 fixture(FEEFILTER),
                 fixture(HEADERS),
-            ],
+            ]),
         );
         assert!(matches!(ran.result, Ok(super::Outcome::Synced)));
         assert_eq!(chain.height(), 3);
@@ -424,7 +389,7 @@ mod tests {
         let short = batch_after(&at_2000.tip(), 5);
         let last = headers_in(&short).as_slice().last().unwrap().hash();
 
-        let ran = run(&mut chain, &[full, short]);
+        let ran = run(&mut chain, sends(vec![full, short]));
         assert!(matches!(ran.result, Ok(super::Outcome::Synced)));
         assert_eq!(chain.height(), 2005);
         assert_eq!(chain.tip().to_string(), last.to_string());
@@ -455,7 +420,7 @@ mod tests {
         }
         let third = script.last().unwrap().len();
 
-        let ran = run(&mut chain, &script);
+        let ran = run(&mut chain, sends(script));
         assert!(matches!(ran.result, Ok(super::Outcome::Capped)));
         assert_eq!(
             chain.height(),
@@ -477,7 +442,7 @@ mod tests {
         // our tip.
         let mut chain = crate::chain::Chain::new(NETWORK);
         chain.extend(headers_in(&fixture(HEADERS))).unwrap();
-        let ran = run(&mut chain, &[fixture(HEADERS)]);
+        let ran = run(&mut chain, sends(vec![fixture(HEADERS)]));
         let err = ran.result.err().unwrap();
         assert!(
             matches!(
@@ -494,10 +459,13 @@ mod tests {
 
     #[test]
     fn silence_after_getheaders_is_a_timeout() {
-        // Red if the loop waits without a deadline, or treats a frame that
-        // is not `headers` as the answer.
+        // Red if the loop waits without a deadline, treats a frame that is
+        // not `headers` as the answer, or bounds each read instead of the
+        // wait: the clock then stops short of `RESPONSE_TIME`.
         let mut chain = crate::chain::Chain::new(NETWORK);
-        let ran = run(&mut chain, &[fixture(SENDCMPCT), fixture(PING)]);
+        let mut script = sends(vec![fixture(SENDCMPCT), fixture(PING)]);
+        script.push(crate::scripted::Step::Silence);
+        let ran = run(&mut chain, script);
         let err = ran.result.err().unwrap();
         assert!(
             matches!(
@@ -510,7 +478,8 @@ mod tests {
         assert_eq!(chain.height(), 0);
         let pong = framed(crate::wire::Message::Pong(PING_NONCE));
         assert!(ran.sent.ends_with(&pong), "the ping was answered first");
-        println!("{err}");
+        assert_eq!(ran.waited, super::RESPONSE_TIME, "waited the whole bound");
+        println!("{err} after {:?}", ran.waited);
     }
 
     #[test]
@@ -527,7 +496,7 @@ mod tests {
         crate::message::write(&mut bad, NETWORK, frame.command, &payload).unwrap();
 
         let mut chain = crate::chain::Chain::new(NETWORK);
-        let ran = run(&mut chain, &[bad]);
+        let ran = run(&mut chain, sends(vec![bad]));
         let err = ran.result.err().unwrap();
         assert!(
             matches!(
@@ -538,5 +507,67 @@ mod tests {
         );
         assert_eq!(chain.height(), 0);
         println!("{err}");
+    }
+
+    #[test]
+    fn a_headers_dripped_one_byte_per_read_is_read_whole() {
+        // Red if `message::read` reads once instead of `read_exact`, or the
+        // loop takes a short read for a frame: one byte is not a header.
+        let mut chain = crate::chain::Chain::new(NETWORK);
+        let ran = run_with(
+            &mut chain,
+            sends(vec![fixture(PING), fixture(HEADERS)]),
+            Some(1),
+        );
+        assert!(matches!(ran.result, Ok(super::Outcome::Synced)));
+        assert_eq!(chain.height(), 3);
+        assert_eq!(chain.tip().to_string(), BLOCK_3);
+        assert_eq!(ran.unread, 0);
+        println!("{}", ran.events.join("\n"));
+    }
+
+    #[test]
+    fn a_hang_up_while_we_wait_is_an_end_of_stream_not_a_timeout() {
+        // Red if the loop reports the deadline instead of the peer: a
+        // deadline is set the whole time we wait, so a hang-up must not
+        // come back as `TimedOut`.
+        let mut chain = crate::chain::Chain::new(NETWORK);
+        let half = fixture(HEADERS)[..crate::message::HEADER_BYTES + 10].to_vec();
+        let mut script = sends(vec![half]);
+        script.push(crate::scripted::Step::HangUp);
+        let ran = run(&mut chain, script);
+        let err = ran.result.err().unwrap();
+        assert!(
+            matches!(
+                &err,
+                super::Error::Message(crate::message::Error::Io(e))
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof
+            ),
+            "{err}"
+        );
+        assert_eq!(chain.height(), 0);
+        assert_eq!(ran.waited, std::time::Duration::ZERO, "no wait at all");
+        println!("peer left ten bytes into a headers: {err}");
+    }
+
+    #[test]
+    fn a_redundant_verack_is_dropped_like_core_drops_it() {
+        // Red if the `Verack` arm ends the wait or fails the sync. The
+        // handshake is over, so a second `verack` is a message Core drops
+        // (`../bitcoin/src/net_processing.cpp:3823` at v31.1).
+        let mut chain = crate::chain::Chain::new(NETWORK);
+        let expected_request = getheaders(&chain);
+        let ran = run(
+            &mut chain,
+            sends(vec![framed(crate::wire::Message::Verack), fixture(HEADERS)]),
+        );
+        assert!(matches!(ran.result, Ok(super::Outcome::Synced)));
+        assert_eq!(chain.height(), 3);
+        assert_eq!(ran.sent, expected_request, "the verack earned no answer");
+        assert_eq!(
+            ran.events,
+            ["-> getheaders (from height 0)", "<- headers (3), height 3"]
+        );
+        println!("{}", ran.events.join("\n"));
     }
 }
