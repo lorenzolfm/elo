@@ -460,11 +460,19 @@ mod tests {
     #[test]
     fn silence_after_getheaders_is_a_timeout() {
         // Red if the loop waits without a deadline, treats a frame that is
-        // not `headers` as the answer, or bounds each read instead of the
-        // wait: the clock then stops short of `RESPONSE_TIME`.
+        // not `headers` as the answer, or arms the deadline before each
+        // read instead of once for the whole wait: each of the two waits
+        // below fits `RESPONSE_TIME`, and together they do not, thus a
+        // bound re-armed on the `ping` reaches the end of the script and
+        // reads a hang-up instead.
         let mut chain = crate::chain::Chain::new(NETWORK);
-        let mut script = sends(vec![fixture(SENDCMPCT), fixture(PING)]);
-        script.push(crate::scripted::Step::Silence);
+        let wait = super::RESPONSE_TIME * 2 / 3;
+        let script = vec![
+            crate::scripted::Step::Send(fixture(SENDCMPCT)),
+            crate::scripted::Step::Wait(wait),
+            crate::scripted::Step::Send(fixture(PING)),
+            crate::scripted::Step::Wait(wait),
+        ];
         let ran = run(&mut chain, script);
         let err = ran.result.err().unwrap();
         assert!(

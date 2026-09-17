@@ -1,14 +1,31 @@
-//! The peer a test writes: a script of moves, a clock only silence moves,
+//! The peer a test writes: a script of moves, a clock the script moves,
 //! and everything we sent kept for the test to read. It is a
 //! [`Link`](crate::link::Link), so it reaches `handshake::run` and
 //! `sync::run` with no socket, no thread and no real time: a timeout is a
 //! return value, and a run is replayable (issue #21).
+//!
+//! The peer keeps the read side of the [`Link`](crate::link::Link)
+//! contract that `link::Tcp` keeps: a read that reaches the deadline fails
+//! with [`std::io::ErrorKind::TimedOut`], and a read after that one fails
+//! the same way until a new deadline is set. Here the second read panics
+//! instead, because against a real peer a loop that reads on after a
+//! timeout spins, and that is our bug.
 
 /// One move by the peer. A script is a list of them, used in order.
 pub enum Step {
     /// These bytes, over as many reads as the reader asks for, at most
-    /// `chunk` of them per read.
+    /// `chunk` of them per read. They cost no time; a peer that takes its
+    /// time to speak says [`Step::Wait`] first.
     Send(Vec<u8>),
+    /// Nothing for this long, and then the script goes on. Both clocks move
+    /// by it. A wait that reaches the read deadline stops there and the
+    /// read fails with [`std::io::ErrorKind::TimedOut`]; the step is used
+    /// up either way.
+    ///
+    /// This is the step that tells a deadline on the whole wait from one
+    /// re-armed before each read: two waits that each fit the bound, and
+    /// together do not, end the wait only under the first (issue #4).
+    Wait(std::time::Duration),
     /// Nothing until the deadline. The clock moves to the deadline and the
     /// read fails with [`std::io::ErrorKind::TimedOut`]. A `Silence` with no
     /// deadline set is a test that waits forever, which is our bug, so it
@@ -30,6 +47,9 @@ pub struct Peer {
     /// The most bytes one read serves, or `None` for as many as asked.
     chunk: Option<usize>,
     deadline: Option<std::time::Instant>,
+    /// Set by the read that reached the deadline, cleared by a new one. The
+    /// next read while it is set is our bug: see the module doc.
+    timed_out: bool,
     now: std::time::Instant,
     wall: std::time::SystemTime,
 }
@@ -49,15 +69,46 @@ impl Peer {
             .skip(self.step)
             .map(|step| match step {
                 Step::Send(bytes) => bytes.len(),
-                Step::Silence | Step::HangUp => 0,
+                Step::Wait(_) | Step::Silence | Step::HangUp => 0,
             })
             .sum();
         scripted - self.served
+    }
+
+    /// What is left of the read deadline, or `None` with none set.
+    fn left_to_deadline(&self) -> Option<std::time::Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(self.now))
+    }
+
+    /// Both clocks move by the same amount, so that a test can read either
+    /// one.
+    fn advance(&mut self, waited: std::time::Duration) {
+        self.now += waited;
+        self.wall += waited;
+    }
+
+    /// The error of a read that reached the deadline, and the latch that
+    /// makes the next one a panic.
+    fn timed_out(&mut self) -> std::io::Error {
+        self.timed_out = true;
+        std::io::Error::from(std::io::ErrorKind::TimedOut)
     }
 }
 
 impl std::io::Read for Peer {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        assert!(
+            !self.timed_out,
+            "a read after the read that timed out, with the same deadline: \
+             against a real peer this loop spins"
+        );
+        // As `link::Tcp::read` does with the remainder it would pass to
+        // `set_read_timeout`: a deadline already reached fails the read
+        // before the peer is asked for anything.
+        if self.left_to_deadline().is_some_and(|left| left.is_zero()) {
+            return Err(self.timed_out());
+        }
         loop {
             match self.script.get(self.step) {
                 None | Some(Step::HangUp) => return Ok(0),
@@ -76,18 +127,26 @@ impl std::io::Read for Peer {
                     self.step += 1;
                     self.served = 0;
                 }
+                Some(Step::Wait(waited)) => {
+                    let waited = *waited;
+                    self.step += 1;
+                    match self.left_to_deadline() {
+                        // The wait runs into the deadline: the clocks stop
+                        // there, and the step behind this one never speaks.
+                        Some(left) if left <= waited => {
+                            self.advance(left);
+                            return Err(self.timed_out());
+                        }
+                        _ => self.advance(waited),
+                    }
+                }
                 Some(Step::Silence) => {
-                    let Some(deadline) = self.deadline else {
+                    let Some(left) = self.left_to_deadline() else {
                         panic!("a Silence with no deadline set waits forever");
                     };
-                    // Both clocks move by the same amount, so that a test
-                    // can read either one. A deadline already passed moves
-                    // neither.
-                    let waited = deadline.saturating_duration_since(self.now);
-                    self.now += waited;
-                    self.wall += waited;
+                    self.advance(left);
                     self.step += 1;
-                    return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                    return Err(self.timed_out());
                 }
             }
         }
@@ -108,6 +167,7 @@ impl std::io::Write for Peer {
 impl crate::link::Link for Peer {
     fn set_read_deadline(&mut self, deadline: Option<std::time::Instant>) -> std::io::Result<()> {
         self.deadline = deadline;
+        self.timed_out = false;
         Ok(())
     }
 
@@ -155,6 +215,7 @@ fn connection(
             sent: Vec::new(),
             chunk,
             deadline: None,
+            timed_out: false,
             now: std::time::Instant::now(),
             wall,
         },
@@ -261,6 +322,112 @@ mod tests {
         assert_eq!(connection.now() - started, wait);
         assert_eq!(connection.wall(), WALL + wait);
         println!("{err} after {wait:?}; wall is {:?}", connection.wall());
+    }
+
+    #[test]
+    fn a_wait_under_the_deadline_lets_the_script_go_on() {
+        // Mutant: `Wait` fails the read like a `Silence`, or serves the
+        // step behind it without moving either clock. A peer that is slow
+        // is not a peer that is gone.
+        let mut connection = super::connect(
+            vec![
+                super::Step::Wait(std::time::Duration::from_secs(30)),
+                super::Step::Send(b"abc".to_vec()),
+            ],
+            WALL,
+        );
+        let started = connection.now();
+        connection
+            .set_read_deadline(Some(started + std::time::Duration::from_secs(100)))
+            .unwrap();
+        let mut buf = [0u8; 3];
+        assert_eq!(connection.link_mut().read(&mut buf).unwrap(), 3);
+        assert_eq!(&buf, b"abc");
+        assert_eq!(
+            connection.now() - started,
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(connection.wall(), WALL + std::time::Duration::from_secs(30));
+        println!("quiet for 30 s, then three bytes on the same read");
+    }
+
+    #[test]
+    fn a_wait_past_the_deadline_stops_at_the_deadline() {
+        // Mutant: the wait moves the clocks by the whole of itself, so a
+        // test reads a timeout later than the bound it set; or the step
+        // behind the wait speaks although the bound had passed.
+        let mut connection = super::connect(
+            vec![
+                super::Step::Wait(std::time::Duration::from_secs(120)),
+                super::Step::Send(b"abc".to_vec()),
+            ],
+            WALL,
+        );
+        let started = connection.now();
+        let bound = std::time::Duration::from_secs(100);
+        connection.set_read_deadline(Some(started + bound)).unwrap();
+        let err = connection.link_mut().read(&mut [0u8; 3]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert_eq!(connection.now() - started, bound);
+        assert_eq!(connection.wall(), WALL + bound);
+        assert_eq!(connection.link().unread(), 3, "the bytes behind it");
+        println!("{err} at the bound, with three bytes never said");
+    }
+
+    #[test]
+    fn a_deadline_already_reached_fails_the_read_at_once() {
+        // Mutant: `read` asks the script before it asks the clock, as it
+        // did while only a `Silence` could fail a read. `link::Tcp` fails
+        // this read; the fake that stands in for it must fail it too.
+        let mut connection = super::connect(vec![super::Step::Send(b"abc".to_vec())], WALL);
+        let past = connection
+            .now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+        connection.set_read_deadline(Some(past)).unwrap();
+        let err = connection.link_mut().read(&mut [0u8; 3]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert_eq!(connection.link().unread(), 3, "nothing was served");
+        println!("deadline one second ago: {err}");
+    }
+
+    #[test]
+    fn a_new_deadline_lets_the_loop_read_again() {
+        // Mutant: the latch is never cleared, so a loop that answers a
+        // timeout with a fresh bound — which is what `sync::await_headers`
+        // does per batch — panics on its next read.
+        let mut connection = super::connect(
+            vec![
+                super::Step::Wait(std::time::Duration::from_secs(120)),
+                super::Step::Send(b"abc".to_vec()),
+            ],
+            WALL,
+        );
+        connection
+            .set_read_deadline(Some(connection.now() + std::time::Duration::from_secs(100)))
+            .unwrap();
+        assert!(connection.link_mut().read(&mut [0u8; 3]).is_err());
+        connection
+            .set_read_deadline(Some(connection.now() + std::time::Duration::from_secs(100)))
+            .unwrap();
+        let mut buf = [0u8; 3];
+        assert_eq!(connection.link_mut().read(&mut buf).unwrap(), 3);
+        assert_eq!(&buf, b"abc");
+        println!("a new bound, and the peer speaks again");
+    }
+
+    #[test]
+    #[should_panic(expected = "this loop spins")]
+    fn a_read_after_the_timeout_is_our_bug() {
+        // Mutant: the latch is missing, so the fake answers the read the
+        // way `link::Tcp` does. Against a real peer the loop under test
+        // spins on a deadline it never re-arms; here it must say so.
+        let mut connection = super::connect(vec![super::Step::Silence], WALL);
+        connection
+            .set_read_deadline(Some(connection.now() + std::time::Duration::from_secs(1)))
+            .unwrap();
+        assert!(connection.link_mut().read(&mut [0u8; 4]).is_err());
+        let _ = connection.link_mut().read(&mut [0u8; 4]);
     }
 
     #[test]
