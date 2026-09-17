@@ -646,6 +646,26 @@ fn retarget(target: Target, timespan_actual: i64, timespan_target: u32, limit: &
     }
 }
 
+/// One answer from `next_bits`, held to what a header may claim. The rules
+/// must ask for `nBits` that decode to a target of `network`: if they ask
+/// for anything else, no header can meet both them and `check`, and the
+/// chain stops at that height for good with the refusal blamed on the peer.
+/// `check` decodes on the way in, this decodes on the way out, so the
+/// property is asserted at both ends of the pair. Every path here already
+/// holds it — a checked header's own claim, the limit, or a product held at
+/// or below the limit — and a decode is a few shifts beside the two hashes
+/// the header has already cost.
+///
+/// # Panics
+///
+/// If the bits do not decode to a target of `network`, which is our bug.
+fn next_bits_required(bits: u32, network: crate::message::Network) -> u32 {
+    if let Err(error) = Target::from_compact(bits, network) {
+        panic!("the rules require bits {bits:#010x} that no header may claim: {error}");
+    }
+    bits
+}
+
 /// `GetNextWorkRequired`, `pow.cpp:14`: the `nBits` the header after the
 /// last header of `view` must claim. `candidate` is the header the peer
 /// offers, and only a min-difficulty network reads it, for its time.
@@ -660,7 +680,8 @@ fn retarget(target: Target, timespan_actual: i64, timespan_target: u32, limit: &
 /// # Panics
 ///
 /// If a boundary falls with fewer than `interval` headers under it. A chain
-/// starts at genesis and grows by one, so it cannot.
+/// starts at genesis and grows by one, so it cannot. Or if the answer is
+/// not bits a header may claim, as `next_bits_required` says.
 #[must_use]
 pub fn next_bits(
     view: &View,
@@ -671,7 +692,7 @@ pub fn next_bits(
     let height_last = view.last();
     if !(height_last + 1).is_multiple_of(params.interval) {
         if !params.min_difficulty {
-            return view.at(height_last).header().bits;
+            return next_bits_required(view.at(height_last).header().bits, network);
         }
         let limit_bits = params.limit.0.to_compact();
         // `pow.cpp:26`: on a test network a block more than two spacings
@@ -679,7 +700,7 @@ pub fn next_bits(
         // no miner on it is never stuck.
         let gap = i64::from(candidate.time) - i64::from(view.at(height_last).header().time);
         if gap > i64::from(SPACING) * 2 {
-            return limit_bits;
+            return next_bits_required(limit_bits, network);
         }
         // `pow.cpp:32`: those blocks do not set the difficulty. Walk back
         // over them, and stop at the first block of the period whatever it
@@ -693,14 +714,14 @@ pub fn next_bits(
         {
             height -= 1;
         }
-        return view.at(height).header().bits;
+        return next_bits_required(view.at(height).header().bits, network);
     }
     let Retarget::Every {
         timespan_target,
         edge,
     } = params.retarget
     else {
-        return view.at(height_last).header().bits;
+        return next_bits_required(view.at(height_last).header().bits, network);
     };
     let Some(height_first) = (height_last + 1).checked_sub(params.interval) else {
         unreachable!(
@@ -717,12 +738,13 @@ pub fn next_bits(
         Edge::First => height_first,
         Edge::Last => height_last,
     };
-    retarget(
+    let bits = retarget(
         view.at(height_source).target(network),
         timespan_actual,
         timespan_target,
         &params.limit,
-    )
+    );
+    next_bits_required(bits, network)
 }
 
 /// How many nonces `mine` and `spoil` try before they give up. On a regtest
