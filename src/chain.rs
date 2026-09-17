@@ -252,16 +252,10 @@ impl Chain {
         for (offset, header) in batch.iter().enumerate() {
             // The chain as it would be with the batch up to here on it, so
             // that a header of the batch can be the one a later header
-            // retargets from. Nothing has moved yet: the read is of our
+            // retargets from. Nothing has moved yet: the view is of our
             // headers and the batch side by side.
-            let at = |height: usize| -> &crate::pow::Checked {
-                match height.checked_sub(held) {
-                    None => &self.headers[height],
-                    Some(offset) => &batch[offset],
-                }
-            };
-            let required =
-                crate::pow::next_bits(self.height() + offset, at, header.header(), self.network);
+            let chain = crate::pow::View::new(&self.headers, &batch[..offset]);
+            let required = crate::pow::next_bits(&chain, header.header(), self.network);
             if header.header().bits != required {
                 return Err(Error::Bits {
                     height: held + offset,

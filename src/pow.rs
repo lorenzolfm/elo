@@ -509,6 +509,51 @@ pub fn checked(
     Ok(Checked(header))
 }
 
+/// The chain `next_bits` reads: the headers we hold, and after them the part
+/// of a batch already taken. Every height from 0 to `last` is one of them,
+/// so the height a header follows is a fact of the view and not a number the
+/// caller brings beside it.
+pub struct View<'a> {
+    held: &'a [Checked],
+    batch: &'a [Checked],
+}
+
+impl<'a> View<'a> {
+    /// A view of `held` with `batch` after it. `Chain::extend` builds one
+    /// for each header of a batch, over the headers in front of that one:
+    /// a header of the batch can be the one a later header retargets from.
+    #[must_use]
+    pub fn new(held: &'a [Checked], batch: &'a [Checked]) -> View<'a> {
+        View { held, batch }
+    }
+
+    /// The height of the last header of the view: the height the header a
+    /// peer offers would follow.
+    ///
+    /// # Panics
+    ///
+    /// If the view is empty. A chain starts at genesis, so it is not.
+    fn last(&self) -> usize {
+        let count = self.held.len() + self.batch.len();
+        assert!(count > 0, "a view starts at genesis");
+        count - 1
+    }
+
+    /// The header at `height`.
+    ///
+    /// # Panics
+    ///
+    /// If `height` is above `last`. As `Chain::at`: a height here is an
+    /// index into our own chain, never a number a peer sends.
+    fn at(&self, height: usize) -> &Checked {
+        assert!(height <= self.last(), "height {height} is above the view");
+        match height.checked_sub(self.held.len()) {
+            None => &self.held[height],
+            Some(offset) => &self.batch[offset],
+        }
+    }
+}
+
 /// `CalculateNextWorkRequired`, `pow.cpp:50`, without the
 /// `fPowNoRetargeting` line that opens it: `target` scaled by `actual` over
 /// the seconds the period was meant to take, held at or below the limit of
@@ -553,11 +598,9 @@ fn retarget(target: Target, actual: i64, network: crate::message::Network) -> u3
     held.to_compact()
 }
 
-/// `GetNextWorkRequired`, `pow.cpp:14`: the `nBits` the header after
-/// `height_last` must claim. `at` reads a checked header of our chain by
-/// height and is never asked above `height_last`; `candidate` is the header
-/// the peer offers, and only a min-difficulty network reads it, for its
-/// time.
+/// `GetNextWorkRequired`, `pow.cpp:14`: the `nBits` the header after the
+/// last header of `chain` must claim. `candidate` is the header the peer
+/// offers, and only a min-difficulty network reads it, for its time.
 ///
 /// Away from a period boundary the answer is the last header's `nBits`, so
 /// the difficulty holds for a whole period. On the boundary the period is
@@ -571,22 +614,22 @@ fn retarget(target: Target, actual: i64, network: crate::message::Network) -> u3
 /// If a boundary falls with fewer than `interval` headers under it. A chain
 /// starts at genesis and grows by one, so it cannot.
 #[must_use]
-pub fn next_bits<'a>(
-    height_last: usize,
-    at: impl Fn(usize) -> &'a Checked,
+pub fn next_bits(
+    chain: &View,
     candidate: &crate::block_header::Header,
     network: crate::message::Network,
 ) -> u32 {
     let params = Params::of(network);
+    let height_last = chain.last();
     let limit_bits = Target::limit(network).0.to_compact();
     if !(height_last + 1).is_multiple_of(params.interval) {
         if !params.min_difficulty {
-            return at(height_last).header().bits;
+            return chain.at(height_last).header().bits;
         }
         // `pow.cpp:26`: on a test network a block more than two spacings
         // after the one before it may claim the limit, so that a chain with
         // no miner on it is never stuck.
-        let gap = i64::from(candidate.time) - i64::from(at(height_last).header().time);
+        let gap = i64::from(candidate.time) - i64::from(chain.at(height_last).header().time);
         if gap > i64::from(SPACING) * 2 {
             return limit_bits;
         }
@@ -596,14 +639,14 @@ pub fn next_bits<'a>(
         let mut height = height_last;
         while height > 0
             && !height.is_multiple_of(params.interval)
-            && at(height).header().bits == limit_bits
+            && chain.at(height).header().bits == limit_bits
         {
             height -= 1;
         }
-        return at(height).header().bits;
+        return chain.at(height).header().bits;
     }
     if params.no_retargeting {
-        return at(height_last).header().bits;
+        return chain.at(height_last).header().bits;
     }
     let Some(height_first) = (height_last + 1).checked_sub(params.interval) else {
         unreachable!(
@@ -611,8 +654,8 @@ pub fn next_bits<'a>(
             height_last + 1
         )
     };
-    let actual =
-        i64::from(at(height_last).header().time) - i64::from(at(height_first).header().time);
+    let actual = i64::from(chain.at(height_last).header().time)
+        - i64::from(chain.at(height_first).header().time);
     // BIP94, `pow.cpp:67`: testnet4 scales the period from the target its
     // first block claims. A min-difficulty block cannot be that one, so the
     // real difficulty of the period survives at its start.
@@ -621,7 +664,7 @@ pub fn next_bits<'a>(
     } else {
         height_last
     };
-    retarget(at(height_source).target(network), actual, network)
+    retarget(chain.at(height_source).target(network), actual, network)
 }
 
 /// How many nonces `mine` and `spoil` try before they give up. On a regtest
@@ -908,9 +951,11 @@ mod tests {
         let headers = timeline(&times, 0x1d00_ffff);
         let next = candidate(1_500_700_000);
         let network = crate::message::Network::Mainnet;
-        let held = super::next_bits(2014, |height| &headers[height], &next, network);
+        let view = super::View::new(&headers[..=2014], &[]);
+        let held = super::next_bits(&view, &next, network);
         assert_eq!(held, 0x1d00_ffff);
-        let moved = super::next_bits(2015, |height| &headers[height], &next, network);
+        let view = super::View::new(&headers[..=2015], &[]);
+        let moved = super::next_bits(&view, &next, network);
         assert_ne!(moved, 0x1d00_ffff);
         println!("after 2014 {held:#010x}, after 2015 {moved:#010x}");
     }
@@ -933,7 +978,8 @@ mod tests {
         let headers = timeline(&times, 0x1d00_ffff);
         let next = candidate(1_502_419_200);
         let network = crate::message::Network::Mainnet;
-        let bits = super::next_bits(4031, |height| &headers[height], &next, network);
+        let view = super::View::new(&headers[..=4031], &[]);
+        let bits = super::next_bits(&view, &next, network);
         assert_eq!(bits, 0x1d00_ffde);
         assert_ne!(bits, 0x1d00_ffff);
         println!("2015 spacings -> {bits:#010x}");
@@ -950,7 +996,8 @@ mod tests {
         let headers = timeline(&times, 0x207f_ffff);
         let next = candidate(1_500_008_640);
         let network = crate::message::Network::Regtest;
-        let bits = super::next_bits(143, |height| &headers[height], &next, network);
+        let view = super::View::new(&headers[..=143], &[]);
+        let bits = super::next_bits(&view, &next, network);
         assert_eq!(bits, 0x207f_ffff);
         println!("after a tenth of a day -> {bits:#010x}");
     }
@@ -964,10 +1011,11 @@ mod tests {
         let headers = timeline(&[1_500_000_000, 1_500_000_600], 0x1b00_0100);
         let network = crate::message::Network::Testnet3;
         let on_time = candidate(1_500_000_600 + 1200);
-        let bits = super::next_bits(1, |height| &headers[height], &on_time, network);
+        let view = super::View::new(&headers[..=1], &[]);
+        let bits = super::next_bits(&view, &on_time, network);
         assert_eq!(bits, 0x1b00_0100);
         let late = candidate(1_500_000_600 + 1201);
-        let eased = super::next_bits(1, |height| &headers[height], &late, network);
+        let eased = super::next_bits(&view, &late, network);
         assert_eq!(eased, 0x1d00_ffff);
         println!("two spacings -> {bits:#010x}, one second more -> {eased:#010x}");
     }
@@ -982,9 +1030,33 @@ mod tests {
         headers[0] = super::Checked(header(1_500_000_000, 0x1b00_0100));
         let network = crate::message::Network::Testnet3;
         let next = candidate(1_500_001_800);
-        let bits = super::next_bits(2, |height| &headers[height], &next, network);
+        let view = super::View::new(&headers[..=2], &[]);
+        let bits = super::next_bits(&view, &next, network);
         assert_eq!(bits, 0x1b00_0100);
         println!("past two min-difficulty blocks -> {bits:#010x}");
+    }
+
+    #[test]
+    fn a_view_reads_across_the_join_of_what_we_hold_and_the_batch() {
+        // Red if the batch is counted from the wrong end, or `last` is off
+        // by one: with one header held and one in the batch, the batch
+        // header sits at height 1 and is the last of the view.
+        let held = timeline(&[1_500_000_000], 0x1d00_ffff);
+        let batch = timeline(&[1_500_000_600], 0x1b00_0100);
+        let view = super::View::new(&held, &batch);
+        assert_eq!(view.last(), 1);
+        assert_eq!(view.at(0).header().bits, 0x1d00_ffff);
+        assert_eq!(view.at(1).header().bits, 0x1b00_0100);
+        println!("one held, one in the batch, last {}", view.last());
+    }
+
+    #[test]
+    #[should_panic(expected = "height 2 is above the view")]
+    fn a_height_above_the_view_is_our_bug() {
+        // Red if `at` indexes without the assertion; the panic message would
+        // be the slice's.
+        let held = timeline(&[1_500_000_000, 1_500_000_600], 0x1d00_ffff);
+        let _ = super::View::new(&held, &[]).at(2);
     }
 
     #[test]
