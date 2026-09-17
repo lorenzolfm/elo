@@ -74,9 +74,10 @@ enum Retarget {
     /// `fPowNoRetargeting`, `pow.cpp:52`: the difficulty never moves.
     /// Regtest only.
     Never,
-    /// The period is scaled from the target at `edge`, over `timespan`, the
-    /// seconds `nPowTargetTimespan` says it was meant to take.
-    Every { timespan: u32, edge: Edge },
+    /// The period is scaled from the target at `edge`, over
+    /// `timespan_target`, the seconds `nPowTargetTimespan` says it was meant
+    /// to take.
+    Every { timespan_target: u32, edge: Edge },
 }
 
 /// How the difficulty moves on one network: the `Consensus::Params` fields
@@ -102,7 +103,7 @@ impl Params {
                 limit: LIMIT_224,
                 min_difficulty: false,
                 retarget: Retarget::Every {
-                    timespan: TIMESPAN_TWO_WEEKS,
+                    timespan_target: TIMESPAN_TWO_WEEKS,
                     edge: Edge::Last,
                 },
             },
@@ -111,7 +112,7 @@ impl Params {
                 limit: LIMIT_224,
                 min_difficulty: true,
                 retarget: Retarget::Every {
-                    timespan: TIMESPAN_TWO_WEEKS,
+                    timespan_target: TIMESPAN_TWO_WEEKS,
                     edge: Edge::Last,
                 },
             },
@@ -120,7 +121,7 @@ impl Params {
                 limit: LIMIT_224,
                 min_difficulty: true,
                 retarget: Retarget::Every {
-                    timespan: TIMESPAN_TWO_WEEKS,
+                    timespan_target: TIMESPAN_TWO_WEEKS,
                     edge: Edge::First,
                 },
             },
@@ -604,38 +605,40 @@ impl<'a> View<'a> {
 }
 
 /// `CalculateNextWorkRequired`, `pow.cpp:50`, without the
-/// `fPowNoRetargeting` line that opens it: `target` scaled by `actual` over
-/// `timespan`, the seconds the period was meant to take, held at or below
-/// `limit`, and written back in compact form.
+/// `fPowNoRetargeting` line that opens it: `target` scaled by
+/// `timespan_actual` over `timespan_target`, the seconds the period was
+/// meant to take, held at or below `limit`, and written back in compact
+/// form.
 ///
-/// `actual` is the seconds the period really took, and it is signed: block
-/// times are not sorted, so the last block of a period can be older than the
-/// first. It is clamped to a quarter of the target timespan and to four
-/// times it (`pow.cpp:57`), so one period moves the target by four either
-/// way at most, and a span below zero is simply the low clamp.
+/// `timespan_actual` is the seconds the period really took, and it is
+/// signed: block times are not sorted, so the last block of a period can be
+/// older than the first. It is clamped to a quarter of the target timespan
+/// and to four times it (`pow.cpp:57`), so one period moves the target by
+/// four either way at most, and a span below zero is simply the low clamp.
 ///
 /// The scaling drops the low bits, and `to_compact` keeps 23 of them, so the
 /// result is not the exact ratio. It is what every node computes, which is
 /// what consensus asks.
 ///
 /// The caller brings the target of a header it already checked, so there is
-/// no decode here and no error to return. It also brings the `timespan` and
-/// the `limit`, and a `Retarget::Every` is the only source of a timespan, so
-/// a network that does not retarget cannot reach here and cannot bring the
-/// 255-bit limit that would overflow the multiply.
+/// no decode here and no error to return. It also brings the
+/// `timespan_target` and the `limit`, and a `Retarget::Every` is the only
+/// source of a target timespan, so a network that does not retarget cannot
+/// reach here and cannot bring the 255-bit limit that would overflow the
+/// multiply.
 ///
 /// # Panics
 ///
 /// If the product passes 256 bits, which the `const` assertions beside
 /// `Params` rule out.
-fn retarget(target: Target, actual: i64, timespan: u32, limit: &Target) -> u32 {
-    let low = i64::from(timespan / 4);
-    let high = i64::from(timespan) * 4;
-    let clamped = actual.clamp(low, high);
+fn retarget(target: Target, timespan_actual: i64, timespan_target: u32, limit: &Target) -> u32 {
+    let low = i64::from(timespan_target / 4);
+    let high = i64::from(timespan_target) * 4;
+    let clamped = timespan_actual.clamp(low, high);
     let Ok(clamped) = u32::try_from(clamped) else {
         unreachable!("a timespan clamped to {low}..={high} fits a u32")
     };
-    let scaled = target.0.mul_u32(clamped).div_u32(timespan);
+    let scaled = target.0.mul_u32(clamped).div_u32(timespan_target);
     if scaled > limit.0 {
         limit.0.to_compact()
     } else {
@@ -644,7 +647,7 @@ fn retarget(target: Target, actual: i64, timespan: u32, limit: &Target) -> u32 {
 }
 
 /// `GetNextWorkRequired`, `pow.cpp:14`: the `nBits` the header after the
-/// last header of `chain` must claim. `candidate` is the header the peer
+/// last header of `view` must claim. `candidate` is the header the peer
 /// offers, and only a min-difficulty network reads it, for its time.
 ///
 /// Away from a period boundary the answer is the last header's `nBits`, so
@@ -660,38 +663,44 @@ fn retarget(target: Target, actual: i64, timespan: u32, limit: &Target) -> u32 {
 /// starts at genesis and grows by one, so it cannot.
 #[must_use]
 pub fn next_bits(
-    chain: &View,
+    view: &View,
     candidate: &crate::block_header::Header,
     network: crate::message::Network,
 ) -> u32 {
     let params = Params::of(network);
-    let height_last = chain.last();
-    let limit_bits = params.limit.0.to_compact();
+    let height_last = view.last();
     if !(height_last + 1).is_multiple_of(params.interval) {
         if !params.min_difficulty {
-            return chain.at(height_last).header().bits;
+            return view.at(height_last).header().bits;
         }
+        let limit_bits = params.limit.0.to_compact();
         // `pow.cpp:26`: on a test network a block more than two spacings
         // after the one before it may claim the limit, so that a chain with
         // no miner on it is never stuck.
-        let gap = i64::from(candidate.time) - i64::from(chain.at(height_last).header().time);
+        let gap = i64::from(candidate.time) - i64::from(view.at(height_last).header().time);
         if gap > i64::from(SPACING) * 2 {
             return limit_bits;
         }
         // `pow.cpp:32`: those blocks do not set the difficulty. Walk back
         // over them, and stop at the first block of the period whatever it
-        // claims.
+        // claims. The height falls by one each step and the walk stops at a
+        // multiple of the interval, so it takes `interval - 1` steps at
+        // most: 2015 on the networks that retarget, 143 on regtest.
         let mut height = height_last;
         while height > 0
             && !height.is_multiple_of(params.interval)
-            && chain.at(height).header().bits == limit_bits
+            && view.at(height).header().bits == limit_bits
         {
             height -= 1;
         }
-        return chain.at(height).header().bits;
+        return view.at(height).header().bits;
     }
-    let Retarget::Every { timespan, edge } = params.retarget else {
-        return chain.at(height_last).header().bits;
+    let Retarget::Every {
+        timespan_target,
+        edge,
+    } = params.retarget
+    else {
+        return view.at(height_last).header().bits;
     };
     let Some(height_first) = (height_last + 1).checked_sub(params.interval) else {
         unreachable!(
@@ -699,8 +708,8 @@ pub fn next_bits(
             height_last + 1
         )
     };
-    let actual = i64::from(chain.at(height_last).header().time)
-        - i64::from(chain.at(height_first).header().time);
+    let timespan_actual = i64::from(view.at(height_last).header().time)
+        - i64::from(view.at(height_first).header().time);
     // BIP94, `pow.cpp:67`: testnet4 scales the period from the target its
     // first block claims. A min-difficulty block cannot be that one, so the
     // real difficulty of the period survives at its start.
@@ -709,9 +718,9 @@ pub fn next_bits(
         Edge::Last => height_last,
     };
     retarget(
-        chain.at(height_source).target(network),
-        actual,
-        timespan,
+        view.at(height_source).target(network),
+        timespan_actual,
+        timespan_target,
         &params.limit,
     )
 }
