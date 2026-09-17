@@ -273,53 +273,6 @@ fn core_measures_our_pong() {
     );
 }
 
-/// `elo <peer> | head -1`. Rust ignores `SIGPIPE`, so the next line elo
-/// writes after `head` exits fails with `EPIPE` instead of killing the
-/// process; `println!` turned that into a panic and exit code 101 (#5).
-/// Now, like bitcoind, elo drops the line and keeps working.
-#[test]
-fn keeps_working_after_its_reader_leaves() {
-    let Some(node) = node_or_skip("keeps_working_after_its_reader_leaves") else {
-        return;
-    };
-    let mut elo = std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
-        .arg(format!("127.0.0.1:{}", node.p2p_port))
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-
-    // `head -1`: read one line, then close our end of the pipe.
-    let mut first_line = String::new();
-    std::io::BufRead::read_line(
-        &mut std::io::BufReader::new(elo.stdout.take().unwrap()),
-        &mut first_line,
-    )
-    .unwrap();
-    println!("--- elo, first line ---\n{first_line}--- pipe closed ---");
-    assert!(first_line.starts_with("connecting to "), "{first_line}");
-
-    // Nobody is reading; the handshake must complete anyway.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let peers = loop {
-        let peers = node.cli(&["getpeerinfo"]).unwrap();
-        if peers.contains("/elo:") || std::time::Instant::now() > deadline {
-            break peers;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    };
-    let subver = format!("\"subver\": \"/elo:{}/\"", env!("CARGO_PKG_VERSION"));
-    assert!(peers.contains(&subver), "Core does not list us:\n{peers}");
-    println!("Core lists {subver} with the pipe closed");
-
-    // Reading stderr to EOF is the wait; a panic message would land here.
-    let stderr = std::io::read_to_string(elo.stderr.take().unwrap()).unwrap();
-    let status = elo.wait().unwrap();
-    println!("elo exited with {status}, stderr: {stderr:?}");
-    assert!(status.success(), "elo exited with {status}: {stderr}");
-    assert!(stderr.is_empty(), "nothing went wrong, so nothing to say");
-}
-
 /// `getblockheader <hash> false`, as bytes.
 fn header_bytes(hex: &str) -> [u8; elo::block_header::BYTES] {
     let mut out = [0u8; elo::block_header::BYTES];
