@@ -46,8 +46,6 @@ const INTERVAL_ONE_DAY: usize = 144;
 
 const _: () = assert!(TIMESPAN_TWO_WEEKS / SPACING == 2016);
 const _: () = assert!(TIMESPAN_ONE_DAY / SPACING == 144);
-const _: () = assert!(INTERVAL_TWO_WEEKS == 2016);
-const _: () = assert!(INTERVAL_ONE_DAY == 144);
 
 /// `powLimit`: the easiest target a header may claim. Mainnet, testnet3 and
 /// testnet4 share a limit of 224 bits (`chainparams.cpp:96`, `:227`, `:334`);
