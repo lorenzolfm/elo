@@ -515,10 +515,12 @@ pub fn check(
 
 /// A header that `check` accepted on one network: its `nBits` decode to a
 /// target of that network, and its hash is at or below that target. The
-/// field is private and `checked` is the only way to fill it, so a `Checked`
-/// in hand *is* the proof that the work was checked. `next_bits` takes these
-/// and nothing else, which is what keeps the two checks in order without a
-/// comment that says so.
+/// field is private, and outside tests `checked` is the only way to fill it,
+/// so a `Checked` in hand *is* the proof that the work was checked.
+/// `next_bits` takes these and nothing else, which is what keeps the two
+/// checks in order without a comment that says so. In test builds
+/// `unchecked` fills the field too, for the ancestors a test reads and
+/// never checks.
 pub struct Checked(crate::block_header::Header);
 
 impl Checked {
@@ -557,58 +559,6 @@ pub fn checked(
 ) -> Result<Checked, Error> {
     check(&header.hash(), header.bits, network)?;
     Ok(Checked(header))
-}
-
-/// The chain `next_bits` reads: the headers we hold, and after them the part
-/// of a batch already taken. Every height from 0 to `last` is one of them,
-/// so the height a header follows is a fact of the view and not a number the
-/// caller brings beside it.
-pub struct View<'a> {
-    held: &'a [Checked],
-    batch: &'a [Checked],
-}
-
-impl<'a> View<'a> {
-    /// A view of `held` with `batch` after it. `Chain::extend` builds one
-    /// for each header of a batch, over the headers in front of that one:
-    /// a header of the batch can be the one a later header retargets from.
-    ///
-    /// # Panics
-    ///
-    /// If `held` is empty. A chain holds genesis before it holds anything
-    /// else, so every view starts at one. `last` reads the same invariant
-    /// at the other end.
-    #[must_use]
-    pub fn new(held: &'a [Checked], batch: &'a [Checked]) -> View<'a> {
-        assert!(!held.is_empty(), "a view starts at genesis");
-        View { held, batch }
-    }
-
-    /// The height of the last header of the view: the height the header a
-    /// peer offers would follow.
-    ///
-    /// # Panics
-    ///
-    /// If the view is empty. `new` asserts it is not.
-    pub(crate) fn last(&self) -> usize {
-        let count = self.held.len() + self.batch.len();
-        assert!(count > 0, "a view starts at genesis");
-        count - 1
-    }
-
-    /// The header at `height`.
-    ///
-    /// # Panics
-    ///
-    /// If `height` is above `last`. As `Chain::at`: a height here is an
-    /// index into our own chain, never a number a peer sends.
-    fn at(&self, height: usize) -> &Checked {
-        assert!(height <= self.last(), "height {height} is above the view");
-        match height.checked_sub(self.held.len()) {
-            None => &self.held[height],
-            Some(offset) => &self.batch[offset],
-        }
-    }
 }
 
 /// `CalculateNextWorkRequired`, `pow.cpp:50`, without the
@@ -674,7 +624,7 @@ fn next_bits_required(bits: u32, network: crate::message::Network) -> u32 {
 }
 
 /// `GetNextWorkRequired`, `pow.cpp:14`: the `nBits` the header after the
-/// last header of `view` must claim. `candidate` is the header the peer
+/// last of `ancestors` must claim. `candidate` is the header the peer
 /// offers, and only a min-difficulty network reads it, for its time.
 ///
 /// Away from a period boundary the answer is the last header's `nBits`, so
@@ -690,22 +640,22 @@ fn next_bits_required(bits: u32, network: crate::message::Network) -> u32 {
 /// starts at genesis and grows by one, so it cannot. Or if the answer is
 /// not bits a header may claim, as `next_bits_required` says.
 #[must_use]
-pub fn next_bits(
-    view: &View,
+pub(crate) fn next_bits(
+    ancestors: &crate::ancestors::Ancestors,
     candidate: &crate::block_header::Header,
     network: crate::message::Network,
 ) -> u32 {
     let params = Params::of(network);
-    let height_last = view.last();
+    let height_last = ancestors.height_last();
     if !(height_last + 1).is_multiple_of(params.interval) {
         if !params.min_difficulty {
-            return next_bits_required(view.at(height_last).header().bits, network);
+            return next_bits_required(ancestors.at(height_last).header().bits, network);
         }
         let limit_bits = params.limit.0.to_compact();
         // `pow.cpp:26`: on a test network a block more than two spacings
         // after the one before it may claim the limit, so that a chain with
         // no miner on it is never stuck.
-        let gap = i64::from(candidate.time) - i64::from(view.at(height_last).header().time);
+        let gap = i64::from(candidate.time) - i64::from(ancestors.at(height_last).header().time);
         if gap > i64::from(SPACING) * 2 {
             return next_bits_required(limit_bits, network);
         }
@@ -717,18 +667,18 @@ pub fn next_bits(
         let mut height = height_last;
         while height > 0
             && !height.is_multiple_of(params.interval)
-            && view.at(height).header().bits == limit_bits
+            && ancestors.at(height).header().bits == limit_bits
         {
             height -= 1;
         }
-        return next_bits_required(view.at(height).header().bits, network);
+        return next_bits_required(ancestors.at(height).header().bits, network);
     }
     let Retarget::Every {
         timespan_target,
         edge,
     } = params.retarget
     else {
-        return next_bits_required(view.at(height_last).header().bits, network);
+        return next_bits_required(ancestors.at(height_last).header().bits, network);
     };
     let Some(height_first) = (height_last + 1).checked_sub(params.interval) else {
         unreachable!(
@@ -736,8 +686,8 @@ pub fn next_bits(
             height_last + 1
         )
     };
-    let timespan_actual = i64::from(view.at(height_last).header().time)
-        - i64::from(view.at(height_first).header().time);
+    let timespan_actual = i64::from(ancestors.at(height_last).header().time)
+        - i64::from(ancestors.at(height_first).header().time);
     // BIP94, `pow.cpp:67`: testnet4 scales the period from the target its
     // first block claims. A min-difficulty block cannot be that one, so the
     // real difficulty of the period survives at its start.
@@ -746,7 +696,7 @@ pub fn next_bits(
         Edge::Last => height_last,
     };
     let bits = retarget(
-        view.at(height_source).target(network),
+        ancestors.at(height_source).target(network),
         timespan_actual,
         timespan_target,
         &params.limit,
@@ -801,6 +751,15 @@ pub(crate) fn spoil(header: &mut crate::block_header::Header, network: crate::me
         "no nonce below {TRIES_MAX} fails bits {:#010x}",
         header.bits
     );
+}
+
+/// A `Checked` whose proof is filled in by hand, for tests that read a
+/// chain rather than check one. Ancestors are read for the heights, times
+/// and bits of the headers before a candidate and never for their work, so
+/// a test that builds them has no reason to mine.
+#[cfg(test)]
+pub(crate) fn unchecked(header: crate::block_header::Header) -> Checked {
+    Checked(header)
 }
 
 #[cfg(test)]
@@ -1040,11 +999,11 @@ mod tests {
         let headers = timeline(&times, 0x1d00_ffff);
         let next = candidate(1_500_700_000);
         let network = crate::message::Network::Mainnet;
-        let view = super::View::new(&headers[..=2014], &[]);
-        let held = super::next_bits(&view, &next, network);
+        let ancestors = crate::ancestors::Ancestors::new(&headers[..=2014], &[]);
+        let held = super::next_bits(&ancestors, &next, network);
         assert_eq!(held, 0x1d00_ffff);
-        let view = super::View::new(&headers[..=2015], &[]);
-        let moved = super::next_bits(&view, &next, network);
+        let ancestors = crate::ancestors::Ancestors::new(&headers[..=2015], &[]);
+        let moved = super::next_bits(&ancestors, &next, network);
         assert_ne!(moved, 0x1d00_ffff);
         println!("after 2014 {held:#010x}, after 2015 {moved:#010x}");
     }
@@ -1067,8 +1026,8 @@ mod tests {
         let headers = timeline(&times, 0x1d00_ffff);
         let next = candidate(1_502_419_200);
         let network = crate::message::Network::Mainnet;
-        let view = super::View::new(&headers[..=4031], &[]);
-        let bits = super::next_bits(&view, &next, network);
+        let ancestors = crate::ancestors::Ancestors::new(&headers[..=4031], &[]);
+        let bits = super::next_bits(&ancestors, &next, network);
         assert_eq!(bits, 0x1d00_ffde);
         assert_ne!(bits, 0x1d00_ffff);
         println!("2015 spacings -> {bits:#010x}");
@@ -1094,9 +1053,9 @@ mod tests {
         let mut headers = timeline(&times, LAST);
         headers[0] = super::Checked(header(times[0], FIRST));
         let next = candidate(times[2015] + 600);
-        let view = super::View::new(&headers, &[]);
-        let testnet4 = super::next_bits(&view, &next, crate::message::Network::Testnet4);
-        let testnet3 = super::next_bits(&view, &next, crate::message::Network::Testnet3);
+        let ancestors = crate::ancestors::Ancestors::new(&headers, &[]);
+        let testnet4 = super::next_bits(&ancestors, &next, crate::message::Network::Testnet4);
+        let testnet3 = super::next_bits(&ancestors, &next, crate::message::Network::Testnet3);
         assert_eq!(testnet4, FIRST);
         assert_eq!(testnet3, LAST);
         assert_ne!(testnet4, testnet3);
@@ -1114,8 +1073,8 @@ mod tests {
         let headers = timeline(&times, 0x207f_ffff);
         let next = candidate(1_500_008_640);
         let network = crate::message::Network::Regtest;
-        let view = super::View::new(&headers[..=143], &[]);
-        let bits = super::next_bits(&view, &next, network);
+        let ancestors = crate::ancestors::Ancestors::new(&headers[..=143], &[]);
+        let bits = super::next_bits(&ancestors, &next, network);
         assert_eq!(bits, 0x207f_ffff);
         println!("after a tenth of a day -> {bits:#010x}");
     }
@@ -1129,11 +1088,11 @@ mod tests {
         let headers = timeline(&[1_500_000_000, 1_500_000_600], 0x1b00_0100);
         let network = crate::message::Network::Testnet3;
         let on_time = candidate(1_500_000_600 + 1200);
-        let view = super::View::new(&headers[..=1], &[]);
-        let bits = super::next_bits(&view, &on_time, network);
+        let ancestors = crate::ancestors::Ancestors::new(&headers[..=1], &[]);
+        let bits = super::next_bits(&ancestors, &on_time, network);
         assert_eq!(bits, 0x1b00_0100);
         let late = candidate(1_500_000_600 + 1201);
-        let eased = super::next_bits(&view, &late, network);
+        let eased = super::next_bits(&ancestors, &late, network);
         assert_eq!(eased, 0x1d00_ffff);
         println!("two spacings -> {bits:#010x}, one second more -> {eased:#010x}");
     }
@@ -1148,43 +1107,10 @@ mod tests {
         headers[0] = super::Checked(header(1_500_000_000, 0x1b00_0100));
         let network = crate::message::Network::Testnet3;
         let next = candidate(1_500_001_800);
-        let view = super::View::new(&headers[..=2], &[]);
-        let bits = super::next_bits(&view, &next, network);
+        let ancestors = crate::ancestors::Ancestors::new(&headers[..=2], &[]);
+        let bits = super::next_bits(&ancestors, &next, network);
         assert_eq!(bits, 0x1b00_0100);
         println!("past two min-difficulty blocks -> {bits:#010x}");
-    }
-
-    #[test]
-    fn a_view_reads_across_the_join_of_what_we_hold_and_the_batch() {
-        // Red if the batch is counted from the wrong end, or `last` is off
-        // by one: with one header held and one in the batch, the batch
-        // header sits at height 1 and is the last of the view.
-        let held = timeline(&[1_500_000_000], 0x1d00_ffff);
-        let batch = timeline(&[1_500_000_600], 0x1b00_0100);
-        let view = super::View::new(&held, &batch);
-        assert_eq!(view.last(), 1);
-        assert_eq!(view.at(0).header().bits, 0x1d00_ffff);
-        assert_eq!(view.at(1).header().bits, 0x1b00_0100);
-        println!("one held, one in the batch, last {}", view.last());
-    }
-
-    #[test]
-    #[should_panic(expected = "height 2 is above the view")]
-    fn a_height_above_the_view_is_our_bug() {
-        // Red if `at` indexes without the assertion; the panic message would
-        // be the slice's.
-        let held = timeline(&[1_500_000_000, 1_500_000_600], 0x1d00_ffff);
-        let _ = super::View::new(&held, &[]).at(2);
-    }
-
-    #[test]
-    #[should_panic(expected = "a view starts at genesis")]
-    fn a_view_over_nothing_held_is_our_bug() {
-        // Red if `new` takes the invariant on trust and leaves it to `last`:
-        // a view is built from a chain, and a chain holds genesis before it
-        // holds anything else. The batch alone is not a chain.
-        let batch = timeline(&[1_500_000_000], 0x1d00_ffff);
-        let _ = super::View::new(&[], &batch);
     }
 
     #[test]

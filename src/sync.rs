@@ -237,11 +237,20 @@ mod tests {
         out
     }
 
-    /// `count` headers after `previous`, each naming the one before and
-    /// each mined to the regtest target, which takes two tries on average.
-    /// Hand-built because no captured `headers` is 2000 long; Core's rule
-    /// for a full batch is `net_processing.cpp:3106`.
-    fn batch_after(previous: &crate::block_header::BlockHash, count: usize) -> Vec<u8> {
+    /// `count` headers from `height_first` on, after `previous`, each naming
+    /// the one before and each mined to the regtest target, which takes two
+    /// tries on average. Hand-built because no captured `headers` is 2000
+    /// long; Core's rule for a full batch is `net_processing.cpp:3106`.
+    ///
+    /// The time rises by one a block from the time regtest genesis claims,
+    /// so every header comes after the median time past of the ones before
+    /// it and the batch is about the loop and not about time.
+    fn batch_after(
+        previous: &crate::block_header::BlockHash,
+        height_first: usize,
+        count: usize,
+    ) -> Vec<u8> {
+        let genesis = crate::chain::genesis(NETWORK);
         let mut payload = Vec::new();
         crate::compact_size::write_len(&mut payload, count);
         let mut previous_block = crate::block_header::BlockHash::from_bytes(*previous.as_bytes());
@@ -250,7 +259,7 @@ mod tests {
                 version: 1,
                 previous_block,
                 merkle_root: crate::block_header::MerkleRoot::from_bytes([0; 32]),
-                time: u32::try_from(i).unwrap(),
+                time: genesis.time + u32::try_from(height_first + i).unwrap(),
                 bits: 0x207f_ffff,
                 nonce: 0,
             };
@@ -380,13 +389,13 @@ mod tests {
         // request carries the old locator.
         let mut chain = crate::chain::Chain::new(NETWORK);
         let first_request = getheaders(&chain);
-        let full = batch_after(&chain.tip(), crate::headers::HEADERS_MAX);
+        let full = batch_after(&chain.tip(), 1, crate::headers::HEADERS_MAX);
         // The second request, built from a chain in the state the loop is
         // in when it asks.
         let mut at_2000 = crate::chain::Chain::new(NETWORK);
         at_2000.extend(headers_in(&full)).unwrap();
         let second_request = getheaders(&at_2000);
-        let short = batch_after(&at_2000.tip(), 5);
+        let short = batch_after(&at_2000.tip(), crate::headers::HEADERS_MAX + 1, 5);
         let last = headers_in(&short).as_slice().last().unwrap().hash();
 
         let ran = run(&mut chain, sends(vec![full, short]));
@@ -413,9 +422,11 @@ mod tests {
         let mut chain = crate::chain::Chain::new(NETWORK);
         let mut script = Vec::new();
         let mut previous = chain.tip();
+        let mut height_first = 1;
         for _ in 0..=super::BATCHES_MAX {
-            let batch = batch_after(&previous, crate::headers::HEADERS_MAX);
+            let batch = batch_after(&previous, height_first, crate::headers::HEADERS_MAX);
             previous = headers_in(&batch).as_slice().last().unwrap().hash();
+            height_first += crate::headers::HEADERS_MAX;
             script.push(batch);
         }
         let third = script.last().unwrap().len();

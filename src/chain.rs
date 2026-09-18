@@ -77,6 +77,14 @@ pub enum Error {
         claimed: u32,
         required: u32,
     },
+    /// A header does not come after the median time past of the headers
+    /// before it. Core's `time-too-old`, `ContextualCheckBlockHeader`,
+    /// `validation.cpp:4140`.
+    TimeTooOld {
+        height: usize,
+        time: u32,
+        median_time_past: u32,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -96,6 +104,15 @@ impl std::fmt::Display for Error {
                 "header at height {height} claims bits {claimed:#010x}, \
                  the rules require {required:#010x}"
             ),
+            Error::TimeTooOld {
+                height,
+                time,
+                median_time_past,
+            } => write!(
+                f,
+                "header at height {height} has time {time}, at or before the \
+                 median time past {median_time_past} of the headers before it"
+            ),
         }
     }
 }
@@ -106,8 +123,9 @@ impl std::error::Error for Error {}
 /// `new`, so there is always a tip and a locator. Each header names the one
 /// before it: `Headers` holds that within a batch, and `extend` checks it at
 /// the join. Each header past genesis has the work it claims, at or below
-/// the limit of `network`, and claims the `nBits` the retargeting rules
-/// require at its height; `extend` checks both.
+/// the limit of `network`, claims the `nBits` the retargeting rules require
+/// at its height, and comes after the median time past of the headers
+/// before it; `extend` checks all three.
 pub struct Chain {
     network: crate::message::Network,
     headers: Vec<crate::pow::Checked>,
@@ -209,45 +227,37 @@ impl Chain {
 
     /// Appends a batch whose every header has the work it claims, whose
     /// first header names our tip, and whose every header claims the `nBits`
-    /// the rules require. An empty batch is fine and changes nothing.
+    /// the rules require and comes after the median time past of the headers
+    /// before it. An empty batch is fine and changes nothing.
     /// `Headers::parse` bounded the batch and checked that each header names
-    /// the one before it; the work, the join and the difficulty are the
-    /// checks left, in that order, as Core orders them
-    /// (`net_processing.cpp:2987`, `:3028`, then `validation.cpp:4136`).
+    /// the one before it; the work, the join, the difficulty and the time
+    /// are the checks left, in that order, as Core orders them
+    /// (`net_processing.cpp:2987`, `:3028`, then `validation.cpp:4136` and
+    /// `:4140`).
     ///
     /// # Errors
     ///
     /// `Pow` if a header claims a target above the limit of the network or
     /// hashes above the target it claims. `NotOnTip` if the first header
     /// names a block other than our tip. `Bits` if a header claims `nBits`
-    /// that the retargeting rules do not allow at its height. On any of the
-    /// three the chain is unchanged.
+    /// that the retargeting rules do not allow at its height. `TimeTooOld`
+    /// if a header does not come after the median time past of the headers
+    /// before it. On any of the four the chain is unchanged.
     ///
     /// # Panics
     ///
     /// If the height after the append is not the height before plus the
-    /// count of the batch. `Vec::extend` rules it out. Or if the view built
-    /// for a header does not end at the header before it.
+    /// count of the batch. `Vec::extend` rules it out.
     pub fn extend(&mut self, headers: crate::headers::Headers) -> Result<(), Error> {
         // The height of the first header of the batch: we hold heights 0
-        // to `held - 1`, so the batch starts at `held`. Both loops below
-        // report a height, and this is the one place it is derived.
+        // to `held - 1`, so the batch starts at `held`. `checked_batch`
+        // has no ancestors and names its errors by this; the loop below
+        // has them and reads the height from them.
         let held = self.headers.len();
         // The work first, for the whole batch: `next_bits` reads a
-        // `pow::Checked` and nothing else, so the difficulty check below
-        // cannot run before this loop has made one of every header.
-        let mut batch = Vec::with_capacity(headers.len());
-        for (offset, header) in headers.into_vec().into_iter().enumerate() {
-            match crate::pow::checked(header, self.network) {
-                Ok(header) => batch.push(header),
-                Err(error) => {
-                    return Err(Error::Pow {
-                        height: held + offset,
-                        error,
-                    });
-                }
-            }
-        }
+        // `pow::Checked` and nothing else, so neither contextual check
+        // below can run before every header of the batch has one.
+        let batch = checked_batch(headers, held, self.network)?;
         let Some(first) = batch.first() else {
             return Ok(());
         };
@@ -260,22 +270,36 @@ impl Chain {
         }
         for (offset, header) in batch.iter().enumerate() {
             // The chain as it would be with the batch up to here on it, so
-            // that a header of the batch can be the one a later header
-            // retargets from. Nothing has moved yet: the view is of our
-            // headers and the batch side by side.
-            let view = crate::pow::View::new(&self.headers, &batch[..offset]);
-            let height = held + offset;
-            assert_eq!(
-                view.last() + 1,
-                height,
-                "the view ends at the header before the one we check"
-            );
-            let required = crate::pow::next_bits(&view, header.header(), self.network);
+            // that a header of the batch can be one a later header retargets
+            // from or takes a median time past over. Nothing has moved yet:
+            // the ancestors are our headers and the batch side by side.
+            let ancestors = crate::ancestors::Ancestors::new(&self.headers, &batch[..offset]);
+            // The height the header would take, read from the ancestors
+            // and not counted a second time beside it: they end at the
+            // header before this one, as Core reads `pindexPrev->nHeight + 1`
+            // (`validation.cpp:4132`).
+            let height = ancestors.height_last() + 1;
+            let required = crate::pow::next_bits(&ancestors, header.header(), self.network);
             if header.header().bits != required {
                 return Err(Error::Bits {
                     height,
                     claimed: header.header().bits,
                     required,
+                });
+            }
+            // `validation.cpp:4140`, after the difficulty as Core has it: a
+            // header must be *later* than the median, so a header that ties
+            // it is refused. Without this a miner could hold the chain's
+            // clock still, and the clock is what the next retarget divides
+            // by. The bound at the other end, `time-too-new`, needs a clock
+            // of our own and waits for one (`Link::wall`,
+            // `validation.cpp:4156`).
+            let median_time_past = ancestors.median_time_past();
+            if header.header().time <= median_time_past {
+                return Err(Error::TimeTooOld {
+                    height,
+                    time: header.header().time,
+                    median_time_past,
                 });
             }
         }
@@ -285,6 +309,41 @@ impl Chain {
         assert_eq!(self.height(), height_before + count);
         Ok(())
     }
+}
+
+/// Every header of `headers` with the work it claims checked, in the order
+/// the peer sent them. Core checks the work of a whole batch before it asks
+/// where the batch joins (`CheckHeadersPoW`, `net_processing.cpp:2619`,
+/// called at `:2987` before `:3028`), and `Chain::extend` follows it.
+///
+/// `height_first` is the height the first header of the batch would take,
+/// and names the header that failed. There is no assertion on the count
+/// here: `Headers::parse` bounded it against `HEADERS_MAX` and asserts the
+/// bound it enforced (`headers.rs:182`), so the capacity below is already
+/// held away from a length a peer chose.
+///
+/// # Errors
+///
+/// `Pow` if a header claims a target above the limit of `network`, or
+/// hashes above the target it claims.
+fn checked_batch(
+    headers: crate::headers::Headers,
+    height_first: usize,
+    network: crate::message::Network,
+) -> Result<Vec<crate::pow::Checked>, Error> {
+    let mut batch = Vec::with_capacity(headers.len());
+    for (offset, header) in headers.into_vec().into_iter().enumerate() {
+        match crate::pow::checked(header, network) {
+            Ok(header) => batch.push(header),
+            Err(error) => {
+                return Err(Error::Pow {
+                    height: height_first + offset,
+                    error,
+                });
+            }
+        }
+    }
+    Ok(batch)
 }
 
 #[cfg(test)]
@@ -320,16 +379,21 @@ mod tests {
         crate::headers::Headers::parse(&fixture(FROM_GENESIS)).unwrap()
     }
 
-    /// One mined regtest header after `previous` that claims `bits`, as a
-    /// batch of its own. `mined_after` always claims what regtest genesis
-    /// claims; this one is for the header that claims something else.
-    fn claiming(previous: &crate::block_header::BlockHash, bits: u32) -> crate::headers::Headers {
+    /// One mined regtest header after `previous` that claims `time` and
+    /// `bits`, as a batch of its own. `mined_after` builds a whole batch and
+    /// picks both for itself; this one is for the tests where one of the two
+    /// is the thing under test.
+    fn one_after(
+        previous: &crate::block_header::BlockHash,
+        time: u32,
+        bits: u32,
+    ) -> crate::headers::Headers {
         let network = crate::message::Network::Regtest;
         let mut header = crate::block_header::Header {
             version: 1,
             previous_block: crate::block_header::BlockHash::from_bytes(*previous.as_bytes()),
             merkle_root: crate::block_header::MerkleRoot::from_bytes([0; 32]),
-            time: 0,
+            time,
             bits,
             nonce: 0,
         };
@@ -341,11 +405,22 @@ mod tests {
         crate::headers::Headers::parse(&payload).unwrap()
     }
 
-    /// `count` regtest headers after `previous`, each naming the one before
-    /// and each mined, as `sync.rs` builds a batch. `spoil` is the offset of
-    /// one header left at the nonce that fails, if any.
+    /// The time a header a test builds claims at `height`: one second a
+    /// block from the time regtest genesis claims. Times that rise put every
+    /// header after the median time past of the ones before it, which is
+    /// what a test that is not about time wants.
+    fn time_at(height: usize) -> u32 {
+        let genesis = super::genesis(crate::message::Network::Regtest);
+        genesis.time + u32::try_from(height).expect("a test height fits")
+    }
+
+    /// `count` regtest headers from `height_first` on, after `previous`,
+    /// each naming the one before and each mined, as `sync.rs` builds a
+    /// batch. `spoil` is the offset of one header left at the nonce that
+    /// fails, if any.
     fn mined_after(
         previous: &crate::block_header::BlockHash,
+        height_first: usize,
         count: usize,
         spoil: Option<usize>,
     ) -> crate::headers::Headers {
@@ -358,7 +433,7 @@ mod tests {
                 version: 1,
                 previous_block,
                 merkle_root: crate::block_header::MerkleRoot::from_bytes([0; 32]),
-                time: u32::try_from(offset).unwrap(),
+                time: time_at(height_first + offset),
                 bits: 0x207f_ffff,
                 nonce: 0,
             };
@@ -417,7 +492,9 @@ mod tests {
         // is the check it fails.
         let mut chain = super::Chain::new(crate::message::Network::Regtest);
         let elsewhere = super::Chain::new(crate::message::Network::Mainnet).tip();
-        let err = chain.extend(mined_after(&elsewhere, 2, None)).unwrap_err();
+        let err = chain
+            .extend(mined_after(&elsewhere, 1, 2, None))
+            .unwrap_err();
         assert!(
             matches!(
                 &err,
@@ -459,7 +536,7 @@ mod tests {
         // the offset in the batch, or the headers before the bad one were
         // kept. The second of three has a nonce that does not work.
         let mut chain = super::Chain::new(crate::message::Network::Regtest);
-        let batch = mined_after(&chain.tip(), 3, Some(1));
+        let batch = mined_after(&chain.tip(), 1, 3, Some(1));
         let spoiled = batch.as_slice()[1].hash();
         let err = chain.extend(batch).unwrap_err();
         assert!(
@@ -473,9 +550,58 @@ mod tests {
             "{err}"
         );
         assert_eq!(chain.height(), 0, "nothing was kept");
-        chain.extend(mined_after(&chain.tip(), 3, None)).unwrap();
+        chain.extend(mined_after(&chain.tip(), 1, 3, None)).unwrap();
         assert_eq!(chain.height(), 3, "and mined headers pass");
         println!("{err}");
+    }
+
+    #[test]
+    fn a_header_that_ties_the_median_time_past_is_refused_and_the_chain_stands() {
+        // Red if the comparison is `<` and not `<=`, or reads the tip's time
+        // in place of the median. `time_at` gives a header a second a block,
+        // so over eleven headers the median sits five seconds under the tip
+        // and a header that ties the one is nowhere near tying the other.
+        let mut chain = super::Chain::new(crate::message::Network::Regtest);
+        chain
+            .extend(mined_after(&chain.tip(), 1, 11, None))
+            .unwrap();
+        let median = time_at(6);
+        let err = chain
+            .extend(one_after(&chain.tip(), median, 0x207f_ffff))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                super::Error::TimeTooOld {
+                    height: 12,
+                    time,
+                    median_time_past,
+                } if time == median && median_time_past == median
+            ),
+            "{err}"
+        );
+        assert_eq!(chain.height(), 11, "nothing was kept");
+        println!("{err}");
+    }
+
+    #[test]
+    fn a_header_older_than_its_parent_passes_where_it_beats_the_median() {
+        // Red if the rule is read as "later than the header before it". A
+        // block time is the miner's own clock and the chain does not sort
+        // them, so a header four seconds older than our tip is a header Core
+        // accepts, as long as it comes after the median.
+        let mut chain = super::Chain::new(crate::message::Network::Regtest);
+        chain
+            .extend(mined_after(&chain.tip(), 1, 11, None))
+            .unwrap();
+        let tip_time = chain.at(chain.height()).time;
+        let time = time_at(7);
+        assert!(time < tip_time, "the header is older than our tip");
+        chain
+            .extend(one_after(&chain.tip(), time, 0x207f_ffff))
+            .unwrap();
+        assert_eq!(chain.height(), 12);
+        println!("tip at {tip_time}, header at {time}, kept");
     }
 
     #[test]
@@ -499,10 +625,12 @@ mod tests {
         // target under the limit, so the work and the join both pass and
         // the claim is the only thing wrong with it.
         let mut chain = super::Chain::new(crate::message::Network::Regtest);
-        chain.extend(claiming(&chain.tip(), 0x207f_ffff)).unwrap();
+        chain
+            .extend(one_after(&chain.tip(), time_at(1), 0x207f_ffff))
+            .unwrap();
         assert_eq!(chain.height(), 1, "the right claim is kept");
         let err = chain
-            .extend(claiming(&chain.tip(), 0x207f_fffe))
+            .extend(one_after(&chain.tip(), time_at(2), 0x207f_fffe))
             .unwrap_err();
         assert!(
             matches!(
