@@ -2,6 +2,7 @@
 //! targets link. `main.rs` is the binary: which peer, how long, what a person
 //! reads.
 
+pub mod ancestors;
 pub mod block_header;
 pub mod chain;
 mod compact_size;

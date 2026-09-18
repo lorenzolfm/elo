@@ -226,7 +226,7 @@ impl Chain {
     /// # Panics
     ///
     /// If the height after the append is not the height before plus the
-    /// count of the batch. `Vec::extend` rules it out. Or if the view built
+    /// count of the batch. `Vec::extend` rules it out. Or if the ancestors built
     /// for a header does not end at the header before it.
     pub fn extend(&mut self, headers: crate::headers::Headers) -> Result<(), Error> {
         // The height of the first header of the batch: we hold heights 0
@@ -261,16 +261,16 @@ impl Chain {
         for (offset, header) in batch.iter().enumerate() {
             // The chain as it would be with the batch up to here on it, so
             // that a header of the batch can be the one a later header
-            // retargets from. Nothing has moved yet: the view is of our
+            // retargets from. Nothing has moved yet: the ancestors are our
             // headers and the batch side by side.
-            let view = crate::pow::View::new(&self.headers, &batch[..offset]);
+            let ancestors = crate::ancestors::Ancestors::new(&self.headers, &batch[..offset]);
             let height = held + offset;
             assert_eq!(
-                view.last() + 1,
+                ancestors.height_last() + 1,
                 height,
-                "the view ends at the header before the one we check"
+                "the ancestors end at the header before the one we check"
             );
-            let required = crate::pow::next_bits(&view, header.header(), self.network);
+            let required = crate::pow::next_bits(&ancestors, header.header(), self.network);
             if header.header().bits != required {
                 return Err(Error::Bits {
                     height,
