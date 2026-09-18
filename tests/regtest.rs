@@ -274,8 +274,8 @@ fn core_measures_our_pong() {
 }
 
 /// `getblockheader <hash> false`, as bytes.
-fn header_bytes(hex: &str) -> [u8; elo::block_header::BYTES] {
-    let mut out = [0u8; elo::block_header::BYTES];
+fn header_bytes(hex: &str) -> [u8; elo::chain::block_header::BYTES] {
+    let mut out = [0u8; elo::chain::block_header::BYTES];
     assert_eq!(hex.len(), 2 * out.len(), "one header: {hex}");
     for (i, byte) in out.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap();
@@ -300,16 +300,16 @@ fn core_serves_the_headers_after_genesis() {
     let genesis = node
         .cli(&["getblockheader", genesis_hash, "false"])
         .unwrap();
-    let genesis = elo::block_header::Header::parse(&header_bytes(genesis.trim()));
+    let genesis = elo::chain::block_header::Header::parse(&header_bytes(genesis.trim()));
     assert_eq!(genesis.hash().to_string(), genesis_hash);
     let best = node.cli(&["getbestblockhash"]).unwrap();
     let best = best.trim();
 
     let peer: std::net::SocketAddr = format!("127.0.0.1:{}", node.p2p_port).parse().unwrap();
     let stream = std::net::TcpStream::connect(peer).unwrap();
-    let mut connection = elo::connection::Connection::new(
-        elo::link::Tcp::new(stream),
-        elo::message::Network::Regtest,
+    let mut connection = elo::p2p::connection::Connection::new(
+        elo::p2p::link::Tcp::new(stream),
+        elo::chain::network::Network::Regtest,
     );
     connection
         .set_read_deadline(Some(connection.now() + std::time::Duration::from_secs(10)))
@@ -318,11 +318,11 @@ fn core_serves_the_headers_after_genesis() {
         .wall()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap();
-    let our_version = elo::version::build(peer, i64::try_from(now.as_secs()).unwrap(), 0);
+    let our_version = elo::p2p::version::build(peer, i64::try_from(now.as_secs()).unwrap(), 0);
     elo::handshake::run(&mut connection, &our_version).unwrap();
 
-    let request = elo::wire::Message::GetHeaders(elo::headers::GetHeaders {
-        locator: elo::locator::Locator::new(0, |_| genesis.hash()),
+    let request = elo::p2p::message::Message::GetHeaders(elo::p2p::headers::GetHeaders {
+        locator: elo::chain::locator::Locator::new(0, |_| genesis.hash()),
         stop: None,
     });
     println!("-> {request}");
@@ -335,8 +335,8 @@ fn core_serves_the_headers_after_genesis() {
     let headers = (0..8)
         .find_map(|_| {
             let frame = connection.read_frame().unwrap();
-            match elo::wire::Message::decode(frame).unwrap() {
-                elo::wire::Message::Headers(headers) => Some(headers),
+            match elo::p2p::message::Message::decode(frame).unwrap() {
+                elo::p2p::message::Message::Headers(headers) => Some(headers),
                 other => {
                     println!("<- {other} skipped");
                     None

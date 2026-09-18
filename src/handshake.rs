@@ -10,8 +10,8 @@
 //! negotiation in between (`net_processing.cpp:3664`, `:3716`, `:3725`,
 //! `:3744`).
 
-const VERSION: crate::message::Command = crate::message::Command::from_static("version");
-const VERACK: crate::message::Command = crate::message::Command::from_static("verack");
+const VERSION: crate::p2p::frame::Command = crate::p2p::frame::Command::from_static("version");
+const VERACK: crate::p2p::frame::Command = crate::p2p::frame::Command::from_static("verack");
 
 /// How many messages we read before we give up waiting for `verack`. Core
 /// sends at most four before it: `version`, `wtxidrelay`, `sendaddrv2` and
@@ -26,10 +26,10 @@ const MESSAGES_BEFORE_VERACK_MAX: usize = 16;
 
 #[derive(Debug)]
 pub enum Error {
-    Message(crate::message::Error),
+    Message(crate::p2p::frame::Error),
     /// The peer's `version` did not parse, or is too old to keep. Core would
     /// log the first and wait out its 60 s timer; with one peer we hang up.
-    Version(crate::version::Error),
+    Version(crate::p2p::version::Error),
     /// The peer acknowledged our `version` before it sent its own. Core drops
     /// every message that arrives before `version`
     /// (`net_processing.cpp:3815`); with one peer we have nothing to keep, so
@@ -54,14 +54,14 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl From<crate::message::Error> for Error {
-    fn from(e: crate::message::Error) -> Self {
+impl From<crate::p2p::frame::Error> for Error {
+    fn from(e: crate::p2p::frame::Error) -> Self {
         Error::Message(e)
     }
 }
 
-impl From<crate::version::Error> for Error {
-    fn from(e: crate::version::Error) -> Self {
+impl From<crate::p2p::version::Error> for Error {
+    fn from(e: crate::p2p::version::Error) -> Self {
         Error::Version(e)
     }
 }
@@ -69,11 +69,11 @@ impl From<crate::version::Error> for Error {
 /// A handshake that finished: both sides have sent `version` and `verack`.
 #[derive(Debug)]
 pub struct Complete {
-    pub peer: crate::version::Peer,
+    pub peer: crate::p2p::version::Peer,
     /// Every frame the peer sent, up to and including its `verack`, in order,
     /// for the caller to report: at most `MESSAGES_BEFORE_VERACK_MAX`, each
-    /// already bounded by `message::read`.
-    pub seen: Vec<crate::message::Frame>,
+    /// already bounded by `frame::read`.
+    pub seen: Vec<crate::p2p::frame::Frame>,
 }
 
 /// Where we are between our `version` and the peer's `verack`. The peer's
@@ -81,7 +81,7 @@ pub struct Complete {
 /// send is one that a parsed `version` earned.
 enum State {
     AwaitingVersion,
-    AwaitingVerack(crate::version::Peer),
+    AwaitingVerack(crate::p2p::version::Peer),
 }
 
 /// Runs the handshake over `connection`. On `Ok` the connection is
@@ -103,8 +103,8 @@ enum State {
 ///
 /// If `seen` outgrows `MESSAGES_BEFORE_VERACK_MAX`. The loop condition rules
 /// that out; the assertions restate it where a frame is kept.
-pub fn run<L: crate::link::Link>(
-    connection: &mut crate::connection::Connection<L>,
+pub fn run<L: crate::p2p::link::Link>(
+    connection: &mut crate::p2p::connection::Connection<L>,
     our_version: &[u8],
 ) -> Result<Complete, Error> {
     connection.write_frame(VERSION, our_version)?;
@@ -115,7 +115,7 @@ pub fn run<L: crate::link::Link>(
         let frame = connection.read_frame()?;
         state = match (state, frame.command) {
             (State::AwaitingVersion, VERSION) => {
-                let peer = crate::version::parse(&frame.payload)?;
+                let peer = crate::p2p::version::parse(&frame.payload)?;
                 connection.write_frame(VERACK, &[])?;
                 State::AwaitingVerack(peer)
             }
@@ -158,10 +158,10 @@ mod tests {
 
     /// The peer's frames, each one its own step: a read never crosses two,
     /// so a hang-up or a silence can fall on a frame boundary.
-    fn sends(frames: &[&str]) -> Vec<crate::scripted::Step> {
+    fn sends(frames: &[&str]) -> Vec<crate::p2p::scripted::Step> {
         frames
             .iter()
-            .map(|hex| crate::scripted::Step::Send(fixture(hex)))
+            .map(|hex| crate::p2p::scripted::Step::Send(fixture(hex)))
             .collect()
     }
 
@@ -177,13 +177,15 @@ mod tests {
     /// bytes one read serves; `wait`, when set, is the read deadline the
     /// caller gives the loop, as `main.rs` does.
     fn run_with(
-        script: Vec<crate::scripted::Step>,
+        script: Vec<crate::p2p::scripted::Step>,
         chunk: Option<usize>,
         wait: Option<std::time::Duration>,
     ) -> Ran {
         let mut connection = match chunk {
-            Some(chunk) => crate::scripted::connect_in_chunks(script, chunk, std::time::UNIX_EPOCH),
-            None => crate::scripted::connect(script, std::time::UNIX_EPOCH),
+            Some(chunk) => {
+                crate::p2p::scripted::connect_in_chunks(script, chunk, std::time::UNIX_EPOCH)
+            }
+            None => crate::p2p::scripted::connect(script, std::time::UNIX_EPOCH),
         };
         if let Some(wait) = wait {
             connection
@@ -224,7 +226,7 @@ mod tests {
             b"\xfa\xbf\xb5\xdaversion\0\0\0\0\0",
             "BIP324 v1 prefix"
         );
-        let our_version_frame_len = crate::message::HEADER_BYTES + OUR_VERSION.len();
+        let our_version_frame_len = crate::p2p::frame::HEADER_BYTES + OUR_VERSION.len();
         assert_eq!(
             &to_peer[our_version_frame_len..],
             fixture(VERACK),
@@ -232,7 +234,7 @@ mod tests {
         );
         assert_eq!(
             to_peer.len(),
-            our_version_frame_len + crate::message::HEADER_BYTES,
+            our_version_frame_len + crate::p2p::frame::HEADER_BYTES,
             "nothing else"
         );
         assert_eq!(
@@ -249,7 +251,7 @@ mod tests {
 
     #[test]
     fn a_frame_dripped_one_byte_per_read_is_read_whole() {
-        // Mutant: `message::read` calls `read` once for the header and once
+        // Mutant: `frame::read` calls `read` once for the header and once
         // for the payload instead of `read_exact`; one byte is not a header.
         let ran = run_with(
             sends(&[VERSION, WTXIDRELAY, SENDADDRV2, VERACK]),
@@ -273,7 +275,7 @@ mod tests {
         assert!(matches!(err, super::Error::VerackBeforeVersion), "{err}");
         assert_eq!(
             ran.sent.len(),
-            crate::message::HEADER_BYTES + OUR_VERSION.len(),
+            crate::p2p::frame::HEADER_BYTES + OUR_VERSION.len(),
             "no verack from us"
         );
         println!("{err}");
@@ -282,11 +284,11 @@ mod tests {
     /// Core's `version` frame with its payload cut to `len` bytes, framed
     /// again so the envelope passes and only the payload is wrong.
     fn version_cut_to(len: usize) -> String {
-        let payload = &fixture(VERSION)[crate::message::HEADER_BYTES..][..len];
+        let payload = &fixture(VERSION)[crate::p2p::frame::HEADER_BYTES..][..len];
         let mut bytes = Vec::new();
-        crate::message::write(
+        crate::p2p::frame::write(
             &mut bytes,
-            crate::message::Network::Regtest,
+            crate::chain::network::Network::Regtest,
             super::VERSION,
             payload,
         )
@@ -304,12 +306,15 @@ mod tests {
         let ran = run(&[&version_cut_to(80), WTXIDRELAY, VERACK]);
         let err = ran.result.unwrap_err();
         assert!(
-            matches!(err, super::Error::Version(crate::version::Error::Truncated)),
+            matches!(
+                err,
+                super::Error::Version(crate::p2p::version::Error::Truncated)
+            ),
             "{err}"
         );
         assert_eq!(
             ran.sent.len(),
-            crate::message::HEADER_BYTES + OUR_VERSION.len(),
+            crate::p2p::frame::HEADER_BYTES + OUR_VERSION.len(),
             "no verack from us"
         );
         println!("{err}; the stream is dropped with the peer's verack unread");
@@ -353,9 +358,10 @@ mod tests {
         // Mutant: `run` takes the end of the stream for the end of the
         // handshake and returns what it has, or calls it a timeout.
         let mut script = sends(&[VERSION]);
-        script.push(crate::scripted::Step::HangUp);
+        script.push(crate::p2p::scripted::Step::HangUp);
         let ran = run_with(script, None, None);
-        let super::Error::Message(crate::message::Error::Io(io)) = ran.result.unwrap_err() else {
+        let super::Error::Message(crate::p2p::frame::Error::Io(io)) = ran.result.unwrap_err()
+        else {
             panic!("expected io");
         };
         assert_eq!(io.kind(), std::io::ErrorKind::UnexpectedEof);
@@ -366,15 +372,16 @@ mod tests {
     fn a_deadline_before_verack_is_an_error_not_a_wait() {
         // Mutant: `run` matches `TimedOut` on `read_frame` and reads again.
         let mut script = sends(&[VERSION]);
-        script.push(crate::scripted::Step::Silence);
+        script.push(crate::p2p::scripted::Step::Silence);
         let ran = run_with(script, None, Some(std::time::Duration::from_secs(10)));
-        let super::Error::Message(crate::message::Error::Io(io)) = ran.result.unwrap_err() else {
+        let super::Error::Message(crate::p2p::frame::Error::Io(io)) = ran.result.unwrap_err()
+        else {
             panic!("expected io");
         };
         assert_eq!(io.kind(), std::io::ErrorKind::TimedOut);
         assert_eq!(
             ran.sent.len(),
-            2 * crate::message::HEADER_BYTES + OUR_VERSION.len(),
+            2 * crate::p2p::frame::HEADER_BYTES + OUR_VERSION.len(),
             "version answered with verack before the peer went quiet"
         );
         println!("peer sent version then nothing: {io}");

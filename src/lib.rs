@@ -1,22 +1,12 @@
 //! The protocol: bytes in, values out, and back. This is what tests and fuzz
 //! targets link. `main.rs` is the binary: which peer, how long, what a person
 //! reads.
+//!
+//! Two layers. `p2p` speaks to the peer: frames, messages, and one file per
+//! message. `chain` is what we know: headers, work, the network. `p2p` calls
+//! `chain`; `chain` names nothing in `p2p`.
 
-mod ancestors;
-pub mod block_header;
 pub mod chain;
-mod compact_size;
-pub mod connection;
 pub mod handshake;
-pub mod headers;
-pub mod link;
-pub mod locator;
-pub mod message;
-pub mod pow;
-// Test code only: no `main.rs`, `tests/` or fuzz target drives a loop
-// against a fake.
-#[cfg(test)]
-mod scripted;
+pub mod p2p;
 pub mod sync;
-pub mod version;
-pub mod wire;

@@ -4,6 +4,14 @@
 //! its one peer serves. A reorg is out of scope (ROADMAP, "After"), so a
 //! header that does not extend the tip is an error, not a fork.
 
+pub(crate) mod ancestors;
+pub mod block_header;
+pub mod locator;
+pub mod network;
+pub mod pow;
+pub(crate) mod retarget;
+pub mod u256;
+
 /// The version of every genesis header, and the roots of the two coinbase
 /// transactions there are: `CreateGenesisBlock`,
 /// `../bitcoin/src/kernel/chainparams.cpp:36`, `:68`. Mainnet, testnet3 and
@@ -11,11 +19,11 @@
 /// Both roots are in wire order, the reverse of what `chainparams.cpp`
 /// asserts.
 const GENESIS_VERSION: i32 = 1;
-const MERKLE_ROOT_2009: [u8; crate::block_header::HASH_BYTES] = [
+const MERKLE_ROOT_2009: [u8; crate::chain::block_header::HASH_BYTES] = [
     0x3b, 0xa3, 0xed, 0xfd, 0x7a, 0x7b, 0x12, 0xb2, 0x7a, 0xc7, 0x2c, 0x3e, 0x67, 0x76, 0x8f, 0x61,
     0x7f, 0xc8, 0x1b, 0xc3, 0x88, 0x8a, 0x51, 0x32, 0x3a, 0x9f, 0xb8, 0xaa, 0x4b, 0x1e, 0x5e, 0x4a,
 ];
-const MERKLE_ROOT_TESTNET4: [u8; crate::block_header::HASH_BYTES] = [
+const MERKLE_ROOT_TESTNET4: [u8; crate::chain::block_header::HASH_BYTES] = [
     0x4e, 0x7b, 0x2b, 0x91, 0x28, 0xfe, 0x02, 0x91, 0xdb, 0x06, 0x93, 0xaf, 0x2a, 0xe4, 0x18, 0xb7,
     0x67, 0xe6, 0x57, 0xcd, 0x40, 0x7e, 0x80, 0xcb, 0x14, 0x34, 0x22, 0x1e, 0xae, 0xa7, 0xa0, 0x7a,
 ];
@@ -24,26 +32,28 @@ const MERKLE_ROOT_TESTNET4: [u8; crate::block_header::HASH_BYTES] = [
 /// `CreateGenesisBlock` as time, nonce and bits (`:134` mainnet, `:260`
 /// testnet3, `:370` testnet4, `:634` regtest), around the parts they share.
 #[must_use]
-pub fn genesis(network: crate::message::Network) -> crate::block_header::Header {
+pub fn genesis(network: crate::chain::network::Network) -> crate::chain::block_header::Header {
     let (time, nonce, bits, merkle_root) = match network {
-        crate::message::Network::Mainnet => {
+        crate::chain::network::Network::Mainnet => {
             (1_231_006_505, 2_083_236_893, 0x1d00_ffff, MERKLE_ROOT_2009)
         }
-        crate::message::Network::Testnet3 => {
+        crate::chain::network::Network::Testnet3 => {
             (1_296_688_602, 414_098_458, 0x1d00_ffff, MERKLE_ROOT_2009)
         }
-        crate::message::Network::Testnet4 => (
+        crate::chain::network::Network::Testnet4 => (
             1_714_777_860,
             393_743_547,
             0x1d00_ffff,
             MERKLE_ROOT_TESTNET4,
         ),
-        crate::message::Network::Regtest => (1_296_688_602, 2, 0x207f_ffff, MERKLE_ROOT_2009),
+        crate::chain::network::Network::Regtest => {
+            (1_296_688_602, 2, 0x207f_ffff, MERKLE_ROOT_2009)
+        }
     };
-    crate::block_header::Header {
+    crate::chain::block_header::Header {
         version: GENESIS_VERSION,
-        previous_block: crate::block_header::BlockHash::from_bytes([0; 32]),
-        merkle_root: crate::block_header::MerkleRoot::from_bytes(merkle_root),
+        previous_block: crate::chain::block_header::BlockHash::from_bytes([0; 32]),
+        merkle_root: crate::chain::block_header::MerkleRoot::from_bytes(merkle_root),
         time,
         bits,
         nonce,
@@ -59,15 +69,15 @@ pub enum Error {
     /// do we. `height` is the one the header would take.
     Pow {
         height: usize,
-        error: crate::pow::Error,
+        error: crate::chain::pow::Error,
     },
     /// The first header of a batch names a block that is not our tip. Core
     /// asks again from its best header and waits to see if they connect
     /// (`HandleUnconnectingHeaders`, `net_processing.cpp:2654`); with one
     /// branch and no reorg, we have nothing to connect them to.
     NotOnTip {
-        previous_block: crate::block_header::BlockHash,
-        tip: crate::block_header::BlockHash,
+        previous_block: crate::chain::block_header::BlockHash,
+        tip: crate::chain::block_header::BlockHash,
     },
     /// A header claims `nBits` that are not the ones the retargeting rules
     /// require at its height. Core's `bad-diffbits`,
@@ -127,8 +137,8 @@ impl std::error::Error for Error {}
 /// at its height, and comes after the median time past of the headers
 /// before it; `extend` checks all three.
 pub struct Chain {
-    network: crate::message::Network,
-    headers: Vec<crate::pow::Checked>,
+    network: crate::chain::network::Network,
+    headers: Vec<crate::chain::pow::Checked>,
 }
 
 impl Chain {
@@ -140,8 +150,8 @@ impl Chain {
     /// work it claims. `genesis` rules all three out; the third is the
     /// `chainparams.cpp` assertion on the genesis hash, in another form.
     #[must_use]
-    pub fn new(network: crate::message::Network) -> Chain {
-        let genesis = match crate::pow::checked(genesis(network), network) {
+    pub fn new(network: crate::chain::network::Network) -> Chain {
+        let genesis = match crate::chain::pow::checked(genesis(network), network) {
             Ok(header) => header,
             Err(error) => panic!("genesis has the work it claims: {error}"),
         };
@@ -152,7 +162,7 @@ impl Chain {
         assert_eq!(chain.height(), 0, "genesis is at height 0");
         assert_eq!(
             *chain.at(0).previous_block.as_bytes(),
-            [0; crate::block_header::HASH_BYTES],
+            [0; crate::chain::block_header::HASH_BYTES],
             "genesis names no block before it"
         );
         chain
@@ -161,7 +171,7 @@ impl Chain {
     /// The network whose genesis starts the chain and whose limit bounds
     /// every target in it.
     #[must_use]
-    pub fn network(&self) -> crate::message::Network {
+    pub fn network(&self) -> crate::chain::network::Network {
         self.network
     }
 
@@ -183,7 +193,7 @@ impl Chain {
     /// If `height` is above the tip. A height is an index into our chain,
     /// never a peer's number; every caller asks at or below `height()`.
     #[must_use]
-    pub fn at(&self, height: usize) -> &crate::block_header::Header {
+    pub fn at(&self, height: usize) -> &crate::chain::block_header::Header {
         assert!(height <= self.height(), "height {height} is above the tip");
         self.headers[height].header()
     }
@@ -195,12 +205,12 @@ impl Chain {
     ///
     /// As [`Self::at`].
     #[must_use]
-    pub fn hash_at(&self, height: usize) -> crate::block_header::BlockHash {
+    pub fn hash_at(&self, height: usize) -> crate::chain::block_header::BlockHash {
         self.at(height).hash()
     }
 
     #[must_use]
-    pub fn tip(&self) -> crate::block_header::BlockHash {
+    pub fn tip(&self) -> crate::chain::block_header::BlockHash {
         self.hash_at(self.height())
     }
 
@@ -215,8 +225,9 @@ impl Chain {
     /// If the locator does not start with our tip. `Locator::new` rules it
     /// out: the first height it asks for is the one it is given.
     #[must_use]
-    pub fn locator(&self) -> crate::locator::Locator {
-        let locator = crate::locator::Locator::new(self.height(), |height| self.hash_at(height));
+    pub fn locator(&self) -> crate::chain::locator::Locator {
+        let locator =
+            crate::chain::locator::Locator::new(self.height(), |height| self.hash_at(height));
         assert_eq!(
             locator.as_slice()[0].as_bytes(),
             self.tip().as_bytes(),
@@ -248,7 +259,7 @@ impl Chain {
     ///
     /// If the height after the append is not the height before plus the
     /// count of the batch. `Vec::extend` rules it out.
-    pub fn extend(&mut self, headers: crate::headers::Headers) -> Result<(), Error> {
+    pub fn extend(&mut self, headers: crate::p2p::headers::Headers) -> Result<(), Error> {
         // The height of the first header of the batch: we hold heights 0
         // to `held - 1`, so the batch starts at `held`. `checked_batch`
         // has no ancestors and names its errors by this; the loop below
@@ -273,13 +284,15 @@ impl Chain {
             // that a header of the batch can be one a later header retargets
             // from or takes a median time past over. Nothing has moved yet:
             // the ancestors are our headers and the batch side by side.
-            let ancestors = crate::ancestors::Ancestors::new(&self.headers, &batch[..offset]);
+            let ancestors =
+                crate::chain::ancestors::Ancestors::new(&self.headers, &batch[..offset]);
             // The height the header would take, read from the ancestors
             // and not counted a second time beside it: they end at the
             // header before this one, as Core reads `pindexPrev->nHeight + 1`
             // (`validation.cpp:4132`).
             let height = ancestors.height_last() + 1;
-            let required = crate::pow::next_bits(&ancestors, header.header(), self.network);
+            let required =
+                crate::chain::retarget::next_bits(&ancestors, header.header(), self.network);
             if header.header().bits != required {
                 return Err(Error::Bits {
                     height,
@@ -327,13 +340,13 @@ impl Chain {
 /// `Pow` if a header claims a target above the limit of `network`, or
 /// hashes above the target it claims.
 fn checked_batch(
-    headers: crate::headers::Headers,
+    headers: crate::p2p::headers::Headers,
     height_first: usize,
-    network: crate::message::Network,
-) -> Result<Vec<crate::pow::Checked>, Error> {
+    network: crate::chain::network::Network,
+) -> Result<Vec<crate::chain::pow::Checked>, Error> {
     let mut batch = Vec::with_capacity(headers.len());
     for (offset, header) in headers.into_vec().into_iter().enumerate() {
-        match crate::pow::checked(header, network) {
+        match crate::chain::pow::checked(header, network) {
             Ok(header) => batch.push(header),
             Err(error) => {
                 return Err(Error::Pow {
@@ -375,8 +388,8 @@ mod tests {
             .collect()
     }
 
-    fn after_genesis() -> crate::headers::Headers {
-        crate::headers::Headers::parse(&fixture(FROM_GENESIS)).unwrap()
+    fn after_genesis() -> crate::p2p::headers::Headers {
+        crate::p2p::headers::Headers::parse(&fixture(FROM_GENESIS)).unwrap()
     }
 
     /// One mined regtest header after `previous` that claims `time` and
@@ -384,25 +397,25 @@ mod tests {
     /// picks both for itself; this one is for the tests where one of the two
     /// is the thing under test.
     fn one_after(
-        previous: &crate::block_header::BlockHash,
+        previous: &crate::chain::block_header::BlockHash,
         time: u32,
         bits: u32,
-    ) -> crate::headers::Headers {
-        let network = crate::message::Network::Regtest;
-        let mut header = crate::block_header::Header {
+    ) -> crate::p2p::headers::Headers {
+        let network = crate::chain::network::Network::Regtest;
+        let mut header = crate::chain::block_header::Header {
             version: 1,
-            previous_block: crate::block_header::BlockHash::from_bytes(*previous.as_bytes()),
-            merkle_root: crate::block_header::MerkleRoot::from_bytes([0; 32]),
+            previous_block: crate::chain::block_header::BlockHash::from_bytes(*previous.as_bytes()),
+            merkle_root: crate::chain::block_header::MerkleRoot::from_bytes([0; 32]),
             time,
             bits,
             nonce: 0,
         };
-        crate::pow::mine(&mut header, network);
+        crate::chain::pow::mine(&mut header, network);
         let mut payload = Vec::new();
-        crate::compact_size::write_len(&mut payload, 1);
+        crate::p2p::compact_size::write_len(&mut payload, 1);
         payload.extend_from_slice(&header.encode());
         payload.push(0);
-        crate::headers::Headers::parse(&payload).unwrap()
+        crate::p2p::headers::Headers::parse(&payload).unwrap()
     }
 
     /// The time a header a test builds claims at `height`: one second a
@@ -410,7 +423,7 @@ mod tests {
     /// header after the median time past of the ones before it, which is
     /// what a test that is not about time wants.
     fn time_at(height: usize) -> u32 {
-        let genesis = super::genesis(crate::message::Network::Regtest);
+        let genesis = super::genesis(crate::chain::network::Network::Regtest);
         genesis.time + u32::try_from(height).expect("a test height fits")
     }
 
@@ -419,33 +432,34 @@ mod tests {
     /// batch. `spoil` is the offset of one header left at the nonce that
     /// fails, if any.
     fn mined_after(
-        previous: &crate::block_header::BlockHash,
+        previous: &crate::chain::block_header::BlockHash,
         height_first: usize,
         count: usize,
         spoil: Option<usize>,
-    ) -> crate::headers::Headers {
-        let network = crate::message::Network::Regtest;
+    ) -> crate::p2p::headers::Headers {
+        let network = crate::chain::network::Network::Regtest;
         let mut payload = Vec::new();
-        crate::compact_size::write_len(&mut payload, count);
-        let mut previous_block = crate::block_header::BlockHash::from_bytes(*previous.as_bytes());
+        crate::p2p::compact_size::write_len(&mut payload, count);
+        let mut previous_block =
+            crate::chain::block_header::BlockHash::from_bytes(*previous.as_bytes());
         for offset in 0..count {
-            let mut header = crate::block_header::Header {
+            let mut header = crate::chain::block_header::Header {
                 version: 1,
                 previous_block,
-                merkle_root: crate::block_header::MerkleRoot::from_bytes([0; 32]),
+                merkle_root: crate::chain::block_header::MerkleRoot::from_bytes([0; 32]),
                 time: time_at(height_first + offset),
                 bits: 0x207f_ffff,
                 nonce: 0,
             };
-            crate::pow::mine(&mut header, network);
+            crate::chain::pow::mine(&mut header, network);
             if spoil == Some(offset) {
-                crate::pow::spoil(&mut header, network);
+                crate::chain::pow::spoil(&mut header, network);
             }
             payload.extend_from_slice(&header.encode());
             payload.push(0);
             previous_block = header.hash();
         }
-        crate::headers::Headers::parse(&payload).unwrap()
+        crate::p2p::headers::Headers::parse(&payload).unwrap()
     }
 
     #[test]
@@ -454,10 +468,22 @@ mod tests {
         // display order or on the wrong network, or two networks are
         // swapped: the hash covers every byte.
         for (network, hash) in [
-            (crate::message::Network::Mainnet, MAINNET_GENESIS_HASH),
-            (crate::message::Network::Testnet3, TESTNET3_GENESIS_HASH),
-            (crate::message::Network::Testnet4, TESTNET4_GENESIS_HASH),
-            (crate::message::Network::Regtest, REGTEST_GENESIS_HASH),
+            (
+                crate::chain::network::Network::Mainnet,
+                MAINNET_GENESIS_HASH,
+            ),
+            (
+                crate::chain::network::Network::Testnet3,
+                TESTNET3_GENESIS_HASH,
+            ),
+            (
+                crate::chain::network::Network::Testnet4,
+                TESTNET4_GENESIS_HASH,
+            ),
+            (
+                crate::chain::network::Network::Regtest,
+                REGTEST_GENESIS_HASH,
+            ),
         ] {
             let chain = super::Chain::new(network);
             assert_eq!(chain.tip().to_string(), hash, "{network:?}");
@@ -472,7 +498,7 @@ mod tests {
         // Red if `extend` compares against the wrong header, or counts from
         // the wrong end. Height and tip come from `getblockcount` and
         // `getbestblockhash` on the node that served the fixture.
-        let mut chain = super::Chain::new(crate::message::Network::Regtest);
+        let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
         chain.extend(after_genesis()).unwrap();
         assert_eq!(chain.height(), 3);
         assert_eq!(chain.hash_at(0).to_string(), REGTEST_GENESIS_HASH);
@@ -490,8 +516,8 @@ mod tests {
         // Red if `extend` appends before it checks, or checks the last
         // header instead of the first. The batch has its work, so the join
         // is the check it fails.
-        let mut chain = super::Chain::new(crate::message::Network::Regtest);
-        let elsewhere = super::Chain::new(crate::message::Network::Mainnet).tip();
+        let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
+        let elsewhere = super::Chain::new(crate::chain::network::Network::Mainnet).tip();
         let err = chain
             .extend(mined_after(&elsewhere, 1, 2, None))
             .unwrap_err();
@@ -514,14 +540,14 @@ mod tests {
         // headers claim `0x207fffff`, above mainnet's limit, and also fail
         // to join a mainnet chain. The work is the error we name, as Core
         // does (`net_processing.cpp:2987` before `:3028`).
-        let mut chain = super::Chain::new(crate::message::Network::Mainnet);
+        let mut chain = super::Chain::new(crate::chain::network::Network::Mainnet);
         let err = chain.extend(after_genesis()).unwrap_err();
         assert!(
             matches!(
                 &err,
                 super::Error::Pow {
                     height: 1,
-                    error: crate::pow::Error::AboveLimit { .. }
+                    error: crate::chain::pow::Error::AboveLimit { .. }
                 }
             ),
             "{err}"
@@ -535,7 +561,7 @@ mod tests {
         // Red if only the first header is checked, the height reported is
         // the offset in the batch, or the headers before the bad one were
         // kept. The second of three has a nonce that does not work.
-        let mut chain = super::Chain::new(crate::message::Network::Regtest);
+        let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
         let batch = mined_after(&chain.tip(), 1, 3, Some(1));
         let spoiled = batch.as_slice()[1].hash();
         let err = chain.extend(batch).unwrap_err();
@@ -544,7 +570,7 @@ mod tests {
                 &err,
                 super::Error::Pow {
                     height: 2,
-                    error: crate::pow::Error::NotMet { hash, .. }
+                    error: crate::chain::pow::Error::NotMet { hash, .. }
                 } if hash.to_string() == spoiled.to_string()
             ),
             "{err}"
@@ -561,7 +587,7 @@ mod tests {
         // in place of the median. `time_at` gives a header a second a block,
         // so over eleven headers the median sits five seconds under the tip
         // and a header that ties the one is nowhere near tying the other.
-        let mut chain = super::Chain::new(crate::message::Network::Regtest);
+        let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
         chain
             .extend(mined_after(&chain.tip(), 1, 11, None))
             .unwrap();
@@ -590,7 +616,7 @@ mod tests {
         // block time is the miner's own clock and the chain does not sort
         // them, so a header four seconds older than our tip is a header Core
         // accepts, as long as it comes after the median.
-        let mut chain = super::Chain::new(crate::message::Network::Regtest);
+        let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
         chain
             .extend(mined_after(&chain.tip(), 1, 11, None))
             .unwrap();
@@ -608,7 +634,7 @@ mod tests {
     fn the_same_batch_twice_is_refused() {
         // Red if `extend` accepts a batch that starts below the tip, which is
         // the shape a peer on a fork sends.
-        let mut chain = super::Chain::new(crate::message::Network::Regtest);
+        let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
         chain.extend(after_genesis()).unwrap();
         let err = chain.extend(after_genesis()).unwrap_err();
         assert!(matches!(err, super::Error::NotOnTip { .. }), "{err}");
@@ -624,7 +650,7 @@ mod tests {
         // harder, `0x207ffffe`, is still work a test can do and still a
         // target under the limit, so the work and the join both pass and
         // the claim is the only thing wrong with it.
-        let mut chain = super::Chain::new(crate::message::Network::Regtest);
+        let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
         chain
             .extend(one_after(&chain.tip(), time_at(1), 0x207f_ffff))
             .unwrap();
@@ -650,8 +676,8 @@ mod tests {
     #[test]
     fn an_empty_batch_changes_nothing() {
         // Red if `extend` reads a first header that is not there.
-        let mut chain = super::Chain::new(crate::message::Network::Regtest);
-        let empty = crate::headers::Headers::parse(&[0]).unwrap();
+        let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
+        let empty = crate::p2p::headers::Headers::parse(&[0]).unwrap();
         chain.extend(empty).unwrap();
         assert_eq!(chain.height(), 0);
         println!("still genesis alone");
@@ -661,7 +687,7 @@ mod tests {
     fn the_locator_starts_at_the_tip() {
         // Red if `locator` starts one below the tip as Core does, or the
         // hashes are not the chain's.
-        let mut chain = super::Chain::new(crate::message::Network::Regtest);
+        let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
         chain.extend(after_genesis()).unwrap();
         let locator = chain.locator();
         let hashes = locator.as_slice();
@@ -676,7 +702,7 @@ mod tests {
     fn a_height_above_the_tip_is_our_bug() {
         // Red if `at` indexes without the assertion; the panic message would
         // be the Vec's.
-        let chain = super::Chain::new(crate::message::Network::Regtest);
+        let chain = super::Chain::new(crate::chain::network::Network::Regtest);
         let _ = chain.at(1);
     }
 }

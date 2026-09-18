@@ -1,24 +1,24 @@
-//! One peer: the [`Link`](crate::link::Link) its bytes travel, and the
+//! One peer: the [`Link`](crate::p2p::link::Link) its bytes travel, and the
 //! network whose magic frames them. Every frame in or out goes through here.
 
 /// A connection to one peer. Holds the network so that a frame cannot be
 /// read with one magic and answered with another, and so callers stop
 /// passing it on every call (ROADMAP step 8).
 #[derive(Debug)]
-pub struct Connection<L: crate::link::Link> {
+pub struct Connection<L: crate::p2p::link::Link> {
     link: L,
-    network: crate::message::Network,
+    network: crate::chain::network::Network,
 }
 
-impl<L: crate::link::Link> Connection<L> {
+impl<L: crate::p2p::link::Link> Connection<L> {
     #[must_use]
-    pub fn new(link: L, network: crate::message::Network) -> Self {
+    pub fn new(link: L, network: crate::chain::network::Network) -> Self {
         Connection { link, network }
     }
 
     /// The network whose magic frames every message on this connection.
     #[must_use]
-    pub fn network(&self) -> crate::message::Network {
+    pub fn network(&self) -> crate::chain::network::Network {
         self.network
     }
 
@@ -26,26 +26,26 @@ impl<L: crate::link::Link> Connection<L> {
     ///
     /// # Errors
     ///
-    /// As [`crate::message::read`]. `Io` with kind `TimedOut` when the
+    /// As [`crate::p2p::frame::read`]. `Io` with kind `TimedOut` when the
     /// deadline from [`Self::set_read_deadline`] passes first.
-    pub fn read_frame(&mut self) -> Result<crate::message::Frame, crate::message::Error> {
-        crate::message::read(&mut self.link, self.network)
+    pub fn read_frame(&mut self) -> Result<crate::p2p::frame::Frame, crate::p2p::frame::Error> {
+        crate::p2p::frame::read(&mut self.link, self.network)
     }
 
     /// One frame to the peer.
     ///
     /// # Errors
     ///
-    /// As [`crate::message::write`].
+    /// As [`crate::p2p::frame::write`].
     pub fn write_frame(
         &mut self,
-        command: crate::message::Command,
+        command: crate::p2p::frame::Command,
         payload: &[u8],
-    ) -> Result<(), crate::message::Error> {
-        crate::message::write(&mut self.link, self.network, command, payload)
+    ) -> Result<(), crate::p2p::frame::Error> {
+        crate::p2p::frame::write(&mut self.link, self.network, command, payload)
     }
 
-    /// See [`crate::link::Link::set_read_deadline`].
+    /// See [`crate::p2p::link::Link::set_read_deadline`].
     ///
     /// # Errors
     ///
@@ -71,12 +71,12 @@ impl<L: crate::link::Link> Connection<L> {
         &mut self.link
     }
 
-    /// See [`crate::link::Link::now`].
+    /// See [`crate::p2p::link::Link::now`].
     pub fn now(&self) -> std::time::Instant {
         self.link.now()
     }
 
-    /// See [`crate::link::Link::wall`].
+    /// See [`crate::p2p::link::Link::wall`].
     pub fn wall(&self) -> std::time::SystemTime {
         self.link.wall()
     }
@@ -103,7 +103,7 @@ mod tests {
         }
     }
 
-    impl crate::link::Link for Mute {
+    impl crate::p2p::link::Link for Mute {
         fn set_read_deadline(&mut self, _: Option<std::time::Instant>) -> std::io::Result<()> {
             Ok(())
         }
@@ -121,9 +121,9 @@ mod tests {
     fn frames_carry_the_connections_network() {
         // Mutant: `write_frame` passes `Network::Regtest` instead of `self.network`.
         let mut connection =
-            super::Connection::new(Mute(Vec::new()), crate::message::Network::Mainnet);
+            super::Connection::new(Mute(Vec::new()), crate::chain::network::Network::Mainnet);
         connection
-            .write_frame(crate::message::Command::from_static("verack"), &[])
+            .write_frame(crate::p2p::frame::Command::from_static("verack"), &[])
             .unwrap();
         assert_eq!(
             &connection.link.0[..4],

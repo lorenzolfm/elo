@@ -1,10 +1,10 @@
 //! The peer a test writes: a script of moves, a clock the script moves,
 //! and everything we sent kept for the test to read. It is a
-//! [`Link`](crate::link::Link), so it reaches `handshake::run` and
+//! [`Link`](crate::p2p::link::Link), so it reaches `handshake::run` and
 //! `sync::run` with no socket, no thread and no real time: a timeout is a
 //! return value, and a run is replayable (issue #21).
 //!
-//! The peer keeps the read side of the [`Link`](crate::link::Link)
+//! The peer keeps the read side of the [`Link`](crate::p2p::link::Link)
 //! contract that `link::Tcp` keeps: a read that reaches the deadline fails
 //! with [`std::io::ErrorKind::TimedOut`], and a read after that one fails
 //! the same way until a new deadline is set. Here the second read panics
@@ -164,7 +164,7 @@ impl std::io::Write for Peer {
     }
 }
 
-impl crate::link::Link for Peer {
+impl crate::p2p::link::Link for Peer {
     fn set_read_deadline(&mut self, deadline: Option<std::time::Instant>) -> std::io::Result<()> {
         self.deadline = deadline;
         self.timed_out = false;
@@ -188,7 +188,7 @@ impl crate::link::Link for Peer {
 pub fn connect(
     script: Vec<Step>,
     wall: std::time::SystemTime,
-) -> crate::connection::Connection<Peer> {
+) -> crate::p2p::connection::Connection<Peer> {
     connection(script, None, wall)
 }
 
@@ -198,7 +198,7 @@ pub fn connect_in_chunks(
     script: Vec<Step>,
     chunk: usize,
     wall: std::time::SystemTime,
-) -> crate::connection::Connection<Peer> {
+) -> crate::p2p::connection::Connection<Peer> {
     assert!(
         chunk > 0,
         "a chunk of zero serves no bytes: every read would be a hang-up"
@@ -210,8 +210,8 @@ fn connection(
     script: Vec<Step>,
     chunk: Option<usize>,
     wall: std::time::SystemTime,
-) -> crate::connection::Connection<Peer> {
-    crate::connection::Connection::new(
+) -> crate::p2p::connection::Connection<Peer> {
+    crate::p2p::connection::Connection::new(
         Peer {
             script,
             step: 0,
@@ -223,7 +223,7 @@ fn connection(
             now: std::time::Instant::now(),
             wall,
         },
-        crate::message::Network::Regtest,
+        crate::chain::network::Network::Regtest,
     )
 }
 
@@ -300,14 +300,14 @@ mod tests {
         // Mutant: `write` keeps the last buffer only, so a test that reads
         // `sent` sees the last frame and misses every one before it.
         let mut connection = super::connect(Vec::new(), WALL);
-        let verack = crate::message::Command::from_static("verack");
+        let verack = crate::p2p::frame::Command::from_static("verack");
         connection.write_frame(verack, &[]).unwrap();
         connection.write_frame(verack, &[]).unwrap();
         let sent = connection.link().sent();
-        assert_eq!(sent.len(), 2 * crate::message::HEADER_BYTES);
+        assert_eq!(sent.len(), 2 * crate::p2p::frame::HEADER_BYTES);
         assert_eq!(
-            &sent[..crate::message::HEADER_BYTES],
-            &sent[crate::message::HEADER_BYTES..],
+            &sent[..crate::p2p::frame::HEADER_BYTES],
+            &sent[crate::p2p::frame::HEADER_BYTES..],
             "two veracks, byte for byte"
         );
         println!("two frames kept whole: {sent:02x?}");

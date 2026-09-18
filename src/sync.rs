@@ -7,7 +7,7 @@
 //! (`:2966`).
 //!
 //! Everything the loop reads and every moment it waits go through the
-//! [`Connection`](crate::connection::Connection): no socket, no clock, so a
+//! [`Connection`](crate::p2p::connection::Connection): no socket, no clock, so a
 //! simulator can drive it.
 
 /// `HEADERS_RESPONSE_TIME`, `net_processing.cpp:100`: how long a `headers`
@@ -55,11 +55,11 @@ impl std::fmt::Display for Event {
 pub enum Error {
     /// A frame could not be read or written, the deadline passed, or the
     /// peer hung up.
-    Message(crate::message::Error),
+    Message(crate::p2p::frame::Error),
     /// A command we know with a payload we cannot read. Core penalizes a
     /// `headers` with more than it sends (`:4829`) and logs one that does
     /// not deserialize; with one peer we hang up on either.
-    Wire(crate::wire::Error),
+    Wire(crate::p2p::message::Error),
     /// A header has no work or claims the wrong `nBits`, or the batch
     /// does not extend our tip.
     Chain(crate::chain::Error),
@@ -77,8 +77,8 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl From<crate::message::Error> for Error {
-    fn from(e: crate::message::Error) -> Self {
+impl From<crate::p2p::frame::Error> for Error {
+    fn from(e: crate::p2p::frame::Error) -> Self {
         Error::Message(e)
     }
 }
@@ -86,12 +86,12 @@ impl From<crate::message::Error> for Error {
 /// The link refusing a deadline is an I/O error like any other on it.
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
-        Error::Message(crate::message::Error::from(e))
+        Error::Message(crate::p2p::frame::Error::from(e))
     }
 }
 
-impl From<crate::wire::Error> for Error {
-    fn from(e: crate::wire::Error) -> Self {
+impl From<crate::p2p::message::Error> for Error {
+    fn from(e: crate::p2p::message::Error) -> Self {
         Error::Wire(e)
     }
 }
@@ -123,8 +123,8 @@ impl From<crate::chain::Error> for Error {
 /// choice, made by whoever built the two. Also if the loop asks more than
 /// `BATCHES_MAX` times or returns without asking once; the loop condition
 /// rules both out.
-pub fn run<L: crate::link::Link>(
-    connection: &mut crate::connection::Connection<L>,
+pub fn run<L: crate::p2p::link::Link>(
+    connection: &mut crate::p2p::connection::Connection<L>,
     chain: &mut crate::chain::Chain,
     mut report: impl FnMut(Event),
 ) -> Result<Outcome, Error> {
@@ -135,7 +135,7 @@ pub fn run<L: crate::link::Link>(
     );
     let mut batches = 0;
     while batches < BATCHES_MAX {
-        let request = crate::wire::Message::GetHeaders(crate::headers::GetHeaders {
+        let request = crate::p2p::message::Message::GetHeaders(crate::p2p::headers::GetHeaders {
             locator: chain.locator(),
             stop: None,
         })
@@ -155,8 +155,8 @@ pub fn run<L: crate::link::Link>(
         });
         // `Headers::parse` bounded the batch, so a short one is the only
         // shape left that is not full.
-        assert!(count <= crate::headers::HEADERS_MAX);
-        if count < crate::headers::HEADERS_MAX {
+        assert!(count <= crate::p2p::headers::HEADERS_MAX);
+        if count < crate::p2p::headers::HEADERS_MAX {
             return Ok(Outcome::Synced);
         }
     }
@@ -171,10 +171,10 @@ pub fn run<L: crate::link::Link>(
 /// the way is answered, so that a long wait does not cost us the peer
 /// (`TIMEOUT_INTERVAL`, `net.h:59`). Anything else is dropped, and named,
 /// so that a new message must decide here whether it too is dropped.
-fn await_headers<L: crate::link::Link>(
-    connection: &mut crate::connection::Connection<L>,
+fn await_headers<L: crate::p2p::link::Link>(
+    connection: &mut crate::p2p::connection::Connection<L>,
     report: &mut impl FnMut(Event),
-) -> Result<crate::headers::Headers, Error> {
+) -> Result<crate::p2p::headers::Headers, Error> {
     connection.set_read_deadline(Some(connection.now() + RESPONSE_TIME))?;
     let result = await_headers_until_deadline(connection, report);
     connection.set_read_deadline(None)?;
@@ -182,31 +182,31 @@ fn await_headers<L: crate::link::Link>(
 }
 
 /// The read loop of `await_headers`, with the deadline already set.
-fn await_headers_until_deadline<L: crate::link::Link>(
-    connection: &mut crate::connection::Connection<L>,
+fn await_headers_until_deadline<L: crate::p2p::link::Link>(
+    connection: &mut crate::p2p::connection::Connection<L>,
     report: &mut impl FnMut(Event),
-) -> Result<crate::headers::Headers, Error> {
+) -> Result<crate::p2p::headers::Headers, Error> {
     loop {
         let frame = connection.read_frame()?;
-        match crate::wire::Message::decode(frame)? {
-            crate::wire::Message::Headers(headers) => return Ok(headers),
-            crate::wire::Message::Ping(nonce) => {
-                let pong = crate::wire::Message::Pong(nonce).encode();
+        match crate::p2p::message::Message::decode(frame)? {
+            crate::p2p::message::Message::Headers(headers) => return Ok(headers),
+            crate::p2p::message::Message::Ping(nonce) => {
+                let pong = crate::p2p::message::Message::Pong(nonce).encode();
                 connection.write_frame(pong.command, &pong.payload)?;
                 report(Event::Ponged(nonce));
             }
-            crate::wire::Message::Version(_)
-            | crate::wire::Message::Verack
-            | crate::wire::Message::Pong(_)
-            | crate::wire::Message::GetHeaders(_)
-            | crate::wire::Message::Unknown(_) => {}
+            crate::p2p::message::Message::Version(_)
+            | crate::p2p::message::Message::Verack
+            | crate::p2p::message::Message::Pong(_)
+            | crate::p2p::message::Message::GetHeaders(_)
+            | crate::p2p::message::Message::Unknown(_) => {}
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    // Core's frames, Bitcoin Core v31.1.0, `bitcoind -regtest`, as `wire.rs`
+    // Core's frames, Bitcoin Core v31.1.0, `bitcoind -regtest`, as `message.rs`
     // has them: the post-`verack` burst of 2026-09-13, and the `headers`
     // for a locator of genesis alone after `generatetoaddress 3` on
     // 2026-09-15. `headers.rs` prints the chain.
@@ -220,7 +220,7 @@ mod tests {
     const GENESIS: &str = "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206";
     const BLOCK_3: &str = "08e1a659dc25965d0cdf6d093b9247b09e9ce97a22cc77bca0b510ba4b337d61";
 
-    const NETWORK: crate::message::Network = crate::message::Network::Regtest;
+    const NETWORK: crate::chain::network::Network = crate::chain::network::Network::Regtest;
 
     fn fixture(hex: &str) -> Vec<u8> {
         (0..hex.len())
@@ -229,11 +229,11 @@ mod tests {
             .collect()
     }
 
-    /// A frame as `message::write` puts it on the wire.
-    fn framed(message: crate::wire::Message) -> Vec<u8> {
+    /// A frame as `frame::write` puts it on the wire.
+    fn framed(message: crate::p2p::message::Message) -> Vec<u8> {
         let frame = message.encode();
         let mut out = Vec::new();
-        crate::message::write(&mut out, NETWORK, frame.command, &frame.payload).unwrap();
+        crate::p2p::frame::write(&mut out, NETWORK, frame.command, &frame.payload).unwrap();
         out
     }
 
@@ -246,38 +246,39 @@ mod tests {
     /// so every header comes after the median time past of the ones before
     /// it and the batch is about the loop and not about time.
     fn batch_after(
-        previous: &crate::block_header::BlockHash,
+        previous: &crate::chain::block_header::BlockHash,
         height_first: usize,
         count: usize,
     ) -> Vec<u8> {
         let genesis = crate::chain::genesis(NETWORK);
         let mut payload = Vec::new();
-        crate::compact_size::write_len(&mut payload, count);
-        let mut previous_block = crate::block_header::BlockHash::from_bytes(*previous.as_bytes());
+        crate::p2p::compact_size::write_len(&mut payload, count);
+        let mut previous_block =
+            crate::chain::block_header::BlockHash::from_bytes(*previous.as_bytes());
         for i in 0..count {
-            let mut header = crate::block_header::Header {
+            let mut header = crate::chain::block_header::Header {
                 version: 1,
                 previous_block,
-                merkle_root: crate::block_header::MerkleRoot::from_bytes([0; 32]),
+                merkle_root: crate::chain::block_header::MerkleRoot::from_bytes([0; 32]),
                 time: genesis.time + u32::try_from(height_first + i).unwrap(),
                 bits: 0x207f_ffff,
                 nonce: 0,
             };
-            crate::pow::mine(&mut header, NETWORK);
+            crate::chain::pow::mine(&mut header, NETWORK);
             payload.extend_from_slice(&header.encode());
             payload.push(0);
             previous_block = header.hash();
         }
-        let headers = crate::headers::Headers::parse(&payload).unwrap();
-        framed(crate::wire::Message::Headers(headers))
+        let headers = crate::p2p::headers::Headers::parse(&payload).unwrap();
+        framed(crate::p2p::message::Message::Headers(headers))
     }
 
     /// Every frame its own step, as in `handshake.rs`: a read never
     /// crosses two.
-    fn sends(frames: Vec<Vec<u8>>) -> Vec<crate::scripted::Step> {
+    fn sends(frames: Vec<Vec<u8>>) -> Vec<crate::p2p::scripted::Step> {
         frames
             .into_iter()
-            .map(crate::scripted::Step::Send)
+            .map(crate::p2p::scripted::Step::Send)
             .collect()
     }
 
@@ -292,19 +293,21 @@ mod tests {
         waited: std::time::Duration,
     }
 
-    fn run(chain: &mut crate::chain::Chain, script: Vec<crate::scripted::Step>) -> Ran {
+    fn run(chain: &mut crate::chain::Chain, script: Vec<crate::p2p::scripted::Step>) -> Ran {
         run_with(chain, script, None)
     }
 
     /// The same, with `chunk` bytes at most per read.
     fn run_with(
         chain: &mut crate::chain::Chain,
-        script: Vec<crate::scripted::Step>,
+        script: Vec<crate::p2p::scripted::Step>,
         chunk: Option<usize>,
     ) -> Ran {
         let mut connection = match chunk {
-            Some(chunk) => crate::scripted::connect_in_chunks(script, chunk, std::time::UNIX_EPOCH),
-            None => crate::scripted::connect(script, std::time::UNIX_EPOCH),
+            Some(chunk) => {
+                crate::p2p::scripted::connect_in_chunks(script, chunk, std::time::UNIX_EPOCH)
+            }
+            None => crate::p2p::scripted::connect(script, std::time::UNIX_EPOCH),
         };
         let started = connection.now();
         let mut events = Vec::new();
@@ -322,8 +325,8 @@ mod tests {
 
     /// Our `getheaders` for a locator from `chain`'s tip, on the wire.
     fn getheaders(chain: &crate::chain::Chain) -> Vec<u8> {
-        framed(crate::wire::Message::GetHeaders(
-            crate::headers::GetHeaders {
+        framed(crate::p2p::message::Message::GetHeaders(
+            crate::p2p::headers::GetHeaders {
                 locator: chain.locator(),
                 stop: None,
             },
@@ -331,10 +334,10 @@ mod tests {
     }
 
     /// The headers inside a framed `headers`.
-    fn headers_in(batch: &[u8]) -> crate::headers::Headers {
-        let frame = crate::message::read(&mut &batch[..], NETWORK).unwrap();
-        match crate::wire::Message::decode(frame).unwrap() {
-            crate::wire::Message::Headers(headers) => headers,
+    fn headers_in(batch: &[u8]) -> crate::p2p::headers::Headers {
+        let frame = crate::p2p::frame::read(&mut &batch[..], NETWORK).unwrap();
+        match crate::p2p::message::Message::decode(frame).unwrap() {
+            crate::p2p::message::Message::Headers(headers) => headers,
             other => panic!("{other}"),
         }
     }
@@ -346,7 +349,7 @@ mod tests {
         // script is empty, so a run that gets past the check fails on the
         // read, not on the panic. `run` above builds the connection on
         // `NETWORK`; the chain here is not.
-        let mut chain = crate::chain::Chain::new(crate::message::Network::Mainnet);
+        let mut chain = crate::chain::Chain::new(crate::chain::network::Network::Mainnet);
         let _ = run(&mut chain, Vec::new());
     }
 
@@ -369,7 +372,7 @@ mod tests {
         assert!(matches!(ran.result, Ok(super::Outcome::Synced)));
         assert_eq!(chain.height(), 3);
         assert_eq!(chain.tip().to_string(), BLOCK_3);
-        let pong = framed(crate::wire::Message::Pong(PING_NONCE));
+        let pong = framed(crate::p2p::message::Message::Pong(PING_NONCE));
         assert_eq!(ran.sent, [expected_request, pong].concat());
         assert_eq!(
             ran.events,
@@ -389,13 +392,13 @@ mod tests {
         // request carries the old locator.
         let mut chain = crate::chain::Chain::new(NETWORK);
         let first_request = getheaders(&chain);
-        let full = batch_after(&chain.tip(), 1, crate::headers::HEADERS_MAX);
+        let full = batch_after(&chain.tip(), 1, crate::p2p::headers::HEADERS_MAX);
         // The second request, built from a chain in the state the loop is
         // in when it asks.
         let mut at_2000 = crate::chain::Chain::new(NETWORK);
         at_2000.extend(headers_in(&full)).unwrap();
         let second_request = getheaders(&at_2000);
-        let short = batch_after(&at_2000.tip(), crate::headers::HEADERS_MAX + 1, 5);
+        let short = batch_after(&at_2000.tip(), crate::p2p::headers::HEADERS_MAX + 1, 5);
         let last = headers_in(&short).as_slice().last().unwrap().hash();
 
         let ran = run(&mut chain, sends(vec![full, short]));
@@ -424,9 +427,9 @@ mod tests {
         let mut previous = chain.tip();
         let mut height_first = 1;
         for _ in 0..=super::BATCHES_MAX {
-            let batch = batch_after(&previous, height_first, crate::headers::HEADERS_MAX);
+            let batch = batch_after(&previous, height_first, crate::p2p::headers::HEADERS_MAX);
             previous = headers_in(&batch).as_slice().last().unwrap().hash();
-            height_first += crate::headers::HEADERS_MAX;
+            height_first += crate::p2p::headers::HEADERS_MAX;
             script.push(batch);
         }
         let third = script.last().unwrap().len();
@@ -435,7 +438,7 @@ mod tests {
         assert!(matches!(ran.result, Ok(super::Outcome::Capped)));
         assert_eq!(
             chain.height(),
-            super::BATCHES_MAX * crate::headers::HEADERS_MAX
+            super::BATCHES_MAX * crate::p2p::headers::HEADERS_MAX
         );
         assert_eq!(ran.unread, third, "the third batch was never asked for");
         assert_eq!(
@@ -479,23 +482,23 @@ mod tests {
         let mut chain = crate::chain::Chain::new(NETWORK);
         let wait = super::RESPONSE_TIME * 2 / 3;
         let script = vec![
-            crate::scripted::Step::Send(fixture(SENDCMPCT)),
-            crate::scripted::Step::Wait(wait),
-            crate::scripted::Step::Send(fixture(PING)),
-            crate::scripted::Step::Wait(wait),
+            crate::p2p::scripted::Step::Send(fixture(SENDCMPCT)),
+            crate::p2p::scripted::Step::Wait(wait),
+            crate::p2p::scripted::Step::Send(fixture(PING)),
+            crate::p2p::scripted::Step::Wait(wait),
         ];
         let ran = run(&mut chain, script);
         let err = ran.result.err().unwrap();
         assert!(
             matches!(
                 &err,
-                super::Error::Message(crate::message::Error::Io(e))
+                super::Error::Message(crate::p2p::frame::Error::Io(e))
                     if e.kind() == std::io::ErrorKind::TimedOut
             ),
             "{err}"
         );
         assert_eq!(chain.height(), 0);
-        let pong = framed(crate::wire::Message::Pong(PING_NONCE));
+        let pong = framed(crate::p2p::message::Message::Pong(PING_NONCE));
         assert!(ran.sent.ends_with(&pong), "the ping was answered first");
         assert_eq!(ran.waited, super::RESPONSE_TIME, "waited the whole bound");
         println!("{err} after {:?}", ran.waited);
@@ -507,12 +510,12 @@ mod tests {
         // `headers` with the first transaction count set to one, reframed
         // so that the checksum holds; Core reads any count (`:4834`), we
         // refuse it, and either way the peer hangs up on nothing.
-        let frame = crate::message::read(&mut &fixture(HEADERS)[..], NETWORK).unwrap();
+        let frame = crate::p2p::frame::read(&mut &fixture(HEADERS)[..], NETWORK).unwrap();
         let mut payload = frame.payload;
         assert_eq!(payload[1 + 80], 0, "the count after the first header");
         payload[1 + 80] = 1;
         let mut bad = Vec::new();
-        crate::message::write(&mut bad, NETWORK, frame.command, &payload).unwrap();
+        crate::p2p::frame::write(&mut bad, NETWORK, frame.command, &payload).unwrap();
 
         let mut chain = crate::chain::Chain::new(NETWORK);
         let ran = run(&mut chain, sends(vec![bad]));
@@ -520,7 +523,7 @@ mod tests {
         assert!(
             matches!(
                 &err,
-                super::Error::Wire(crate::wire::Error::BadPayload { .. })
+                super::Error::Wire(crate::p2p::message::Error::BadPayload { .. })
             ),
             "{err}"
         );
@@ -530,7 +533,7 @@ mod tests {
 
     #[test]
     fn a_headers_dripped_one_byte_per_read_is_read_whole() {
-        // Red if `message::read` reads once instead of `read_exact`, or the
+        // Red if `frame::read` reads once instead of `read_exact`, or the
         // loop takes a short read for a frame: one byte is not a header.
         let mut chain = crate::chain::Chain::new(NETWORK);
         let ran = run_with(
@@ -551,15 +554,15 @@ mod tests {
         // deadline is set the whole time we wait, so a hang-up must not
         // come back as `TimedOut`.
         let mut chain = crate::chain::Chain::new(NETWORK);
-        let half = fixture(HEADERS)[..crate::message::HEADER_BYTES + 10].to_vec();
+        let half = fixture(HEADERS)[..crate::p2p::frame::HEADER_BYTES + 10].to_vec();
         let mut script = sends(vec![half]);
-        script.push(crate::scripted::Step::HangUp);
+        script.push(crate::p2p::scripted::Step::HangUp);
         let ran = run(&mut chain, script);
         let err = ran.result.err().unwrap();
         assert!(
             matches!(
                 &err,
-                super::Error::Message(crate::message::Error::Io(e))
+                super::Error::Message(crate::p2p::frame::Error::Io(e))
                     if e.kind() == std::io::ErrorKind::UnexpectedEof
             ),
             "{err}"
@@ -578,7 +581,10 @@ mod tests {
         let expected_request = getheaders(&chain);
         let ran = run(
             &mut chain,
-            sends(vec![framed(crate::wire::Message::Verack), fixture(HEADERS)]),
+            sends(vec![
+                framed(crate::p2p::message::Message::Verack),
+                fixture(HEADERS),
+            ]),
         );
         assert!(matches!(ran.result, Ok(super::Outcome::Synced)));
         assert_eq!(chain.height(), 3);

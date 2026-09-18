@@ -4,7 +4,7 @@
 //!
 //! elo sends the request and reads the answer. The other direction, reading a
 //! request and writing an answer, is here so that both messages are values
-//! that `wire::Message` can turn back into frames; nothing in elo serves
+//! that `message::Message` can turn back into frames; nothing in elo serves
 //! headers.
 
 /// `MAX_HEADERS_RESULTS`, `net_processing.h:51`. Core sends at most this many
@@ -15,8 +15,8 @@ pub(crate) const HEADERS_MAX: usize = 2000;
 /// Written in front of every locator, read by nobody (`block.h:118`).
 const LOCATOR_VERSION: i32 = 70016;
 
-const HASH_BYTES: usize = crate::block_header::HASH_BYTES;
-const HEADER_BYTES: usize = crate::block_header::BYTES;
+const HASH_BYTES: usize = crate::chain::block_header::HASH_BYTES;
+const HEADER_BYTES: usize = crate::chain::block_header::BYTES;
 
 /// A `getheaders` payload: a `CBlockLocator`, then `hashStop`
 /// (`net_processing.cpp:4397`).
@@ -26,11 +26,11 @@ pub struct GetHeaders {
     /// headers after the first one it knows, and after genesis if it knows
     /// none (`FindForkInGlobalIndex`, `:4441`). `locator::Locator::new`
     /// gives it Core's shape.
-    pub locator: crate::locator::Locator,
+    pub locator: crate::chain::locator::Locator,
     /// The last header we want, or `None` for as many as the peer will send.
     /// `None` is a zero hash on the wire: `uint256()` where Core asks
     /// (`:2832`), `hashStop.IsNull()` where it answers (`:4448`).
-    pub stop: Option<crate::block_header::BlockHash>,
+    pub stop: Option<crate::chain::block_header::BlockHash>,
 }
 
 #[derive(Debug)]
@@ -76,14 +76,14 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl From<crate::compact_size::Error> for Error {
+impl From<crate::p2p::compact_size::Error> for Error {
     /// Each payload has one `CompactSize`, the count in front of its list,
     /// so each of its errors is an error about that count.
-    fn from(e: crate::compact_size::Error) -> Self {
+    fn from(e: crate::p2p::compact_size::Error) -> Self {
         match e {
-            crate::compact_size::Error::Truncated => Error::Truncated,
-            crate::compact_size::Error::NonCanonical(count) => Error::NonCanonicalCount(count),
-            crate::compact_size::Error::TooLarge { value, max } => {
+            crate::p2p::compact_size::Error::Truncated => Error::Truncated,
+            crate::p2p::compact_size::Error::NonCanonical(count) => Error::NonCanonicalCount(count),
+            crate::p2p::compact_size::Error::TooLarge { value, max } => {
                 Error::TooMany { count: value, max }
             }
         }
@@ -95,22 +95,23 @@ impl GetHeaders {
     /// count above `locator::HASHES_MAX` is read whole and then disconnected
     /// (`:4399`); here the count is refused before a hash is read.
     pub(crate) fn parse(payload: &[u8]) -> Result<GetHeaders, Error> {
-        let (_version, rest) = crate::compact_size::take::<4>(payload)?;
-        let (count, mut rest) = crate::compact_size::read_len(rest, crate::locator::HASHES_MAX)?;
+        let (_version, rest) = crate::p2p::compact_size::take::<4>(payload)?;
+        let (count, mut rest) =
+            crate::p2p::compact_size::read_len(rest, crate::chain::locator::HASHES_MAX)?;
         let mut locator = Vec::with_capacity(count);
         for _ in 0..count {
-            let (hash, after) = crate::compact_size::take::<HASH_BYTES>(rest)?;
-            locator.push(crate::block_header::BlockHash::from_bytes(*hash));
+            let (hash, after) = crate::p2p::compact_size::take::<HASH_BYTES>(rest)?;
+            locator.push(crate::chain::block_header::BlockHash::from_bytes(*hash));
             rest = after;
         }
-        let (stop, rest) = crate::compact_size::take::<HASH_BYTES>(rest)?;
+        let (stop, rest) = crate::p2p::compact_size::take::<HASH_BYTES>(rest)?;
         if !rest.is_empty() {
             return Err(Error::TrailingBytes(rest.len()));
         }
         assert_eq!(locator.len(), count);
-        let locator = crate::locator::Locator::from_wire(locator);
-        let stop =
-            (*stop != [0; HASH_BYTES]).then(|| crate::block_header::BlockHash::from_bytes(*stop));
+        let locator = crate::chain::locator::Locator::from_wire(locator);
+        let stop = (*stop != [0; HASH_BYTES])
+            .then(|| crate::chain::block_header::BlockHash::from_bytes(*stop));
         Ok(GetHeaders { locator, stop })
     }
 
@@ -123,7 +124,7 @@ impl GetHeaders {
         let size = 4 + 1 + HASH_BYTES * (self.locator.len() + 1);
         let mut out = Vec::with_capacity(size);
         out.extend_from_slice(&LOCATOR_VERSION.to_le_bytes());
-        crate::compact_size::write_len(&mut out, self.locator.len());
+        crate::p2p::compact_size::write_len(&mut out, self.locator.len());
         for hash in self.locator.as_slice() {
             out.extend_from_slice(hash.as_bytes());
         }
@@ -146,7 +147,7 @@ impl GetHeaders {
 /// Whether the first header names a block we know, and whether each header
 /// has the work it claims, are questions for the chain.
 #[derive(Debug)]
-pub struct Headers(Vec<crate::block_header::Header>);
+pub struct Headers(Vec<crate::chain::block_header::Header>);
 
 impl Headers {
     /// Reads a `headers` payload: a count, then that many headers, each
@@ -156,15 +157,15 @@ impl Headers {
     /// takes. Then each header must name the one before it, as Core requires
     /// once it has the list (`:2673`); here a gap is refused as it is read.
     pub(crate) fn parse(payload: &[u8]) -> Result<Headers, Error> {
-        let (count, mut rest) = crate::compact_size::read_len(payload, HEADERS_MAX)?;
-        let mut headers: Vec<crate::block_header::Header> = Vec::with_capacity(count);
+        let (count, mut rest) = crate::p2p::compact_size::read_len(payload, HEADERS_MAX)?;
+        let mut headers: Vec<crate::chain::block_header::Header> = Vec::with_capacity(count);
         for index in 0..count {
-            let (header, after) = crate::compact_size::take::<HEADER_BYTES>(rest)?;
+            let (header, after) = crate::p2p::compact_size::take::<HEADER_BYTES>(rest)?;
             let (&transaction_count, after) = after.split_first().ok_or(Error::Truncated)?;
             if transaction_count != 0 {
                 return Err(Error::TransactionCount(transaction_count));
             }
-            let header = crate::block_header::Header::parse(header);
+            let header = crate::chain::block_header::Header::parse(header);
             // The first header has nothing before it to name.
             let names_the_last = headers
                 .last()
@@ -191,7 +192,7 @@ impl Headers {
         // Room for the count in its `fd` form, which a count below 0xfd
         // does not need: two bytes over for a short run, never short.
         let mut out = Vec::with_capacity(3 + self.0.len() * (HEADER_BYTES + 1));
-        crate::compact_size::write_len(&mut out, self.0.len());
+        crate::p2p::compact_size::write_len(&mut out, self.0.len());
         for header in &self.0 {
             out.extend_from_slice(&header.encode());
             out.push(0);
@@ -200,13 +201,13 @@ impl Headers {
     }
 
     #[must_use]
-    pub fn as_slice(&self) -> &[crate::block_header::Header] {
+    pub fn as_slice(&self) -> &[crate::chain::block_header::Header] {
         &self.0
     }
 
     /// The headers, for a chain to keep. The bound and the continuity go
     /// with them; the chain checks the join and nothing else.
-    pub(crate) fn into_vec(self) -> Vec<crate::block_header::Header> {
+    pub(crate) fn into_vec(self) -> Vec<crate::chain::block_header::Header> {
         self.0
     }
 
@@ -263,7 +264,7 @@ mod tests {
             .collect()
     }
 
-    fn hashes(headers: &[crate::block_header::Header]) -> Vec<String> {
+    fn hashes(headers: &[crate::chain::block_header::Header]) -> Vec<String> {
         headers.iter().map(|h| h.hash().to_string()).collect()
     }
 
@@ -341,7 +342,7 @@ mod tests {
         // An empty locator is a shape no chain of ours produces, so it is
         // built the way `parse` builds one.
         let ours = super::GetHeaders {
-            locator: crate::locator::Locator::from_wire(Vec::new()),
+            locator: crate::chain::locator::Locator::from_wire(Vec::new()),
             stop: Some(answer.hash()),
         }
         .encode();
