@@ -167,7 +167,7 @@ impl Header {
 
 /// The next `N` bytes, and the rest. `parse` starts from a fixed-size array
 /// and every width is a constant, so running out of bytes is our bug, not
-/// the peer's. That is why this is not `compact_size::take`: `take` reads a
+/// the peer's. That is why this is not `payload::take`: `take` reads a
 /// slice the peer sized and returns `Truncated` when it runs out.
 fn parse_field<const N: usize>(bytes: &[u8]) -> (&[u8; N], &[u8]) {
     let Some(split) = bytes.split_first_chunk() else {

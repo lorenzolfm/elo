@@ -76,16 +76,14 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl From<crate::compact_size::Error> for Error {
+impl From<crate::payload::Error> for Error {
     /// Each payload has one `CompactSize`, the count in front of its list,
     /// so each of its errors is an error about that count.
-    fn from(e: crate::compact_size::Error) -> Self {
+    fn from(e: crate::payload::Error) -> Self {
         match e {
-            crate::compact_size::Error::Truncated => Error::Truncated,
-            crate::compact_size::Error::NonCanonical(count) => Error::NonCanonicalCount(count),
-            crate::compact_size::Error::TooLarge { value, max } => {
-                Error::TooMany { count: value, max }
-            }
+            crate::payload::Error::Truncated => Error::Truncated,
+            crate::payload::Error::NonCanonical(count) => Error::NonCanonicalCount(count),
+            crate::payload::Error::TooLarge { value, max } => Error::TooMany { count: value, max },
         }
     }
 }
@@ -95,15 +93,15 @@ impl GetHeaders {
     /// count above `locator::HASHES_MAX` is read whole and then disconnected
     /// (`:4399`); here the count is refused before a hash is read.
     pub(crate) fn parse(payload: &[u8]) -> Result<GetHeaders, Error> {
-        let (_version, rest) = crate::compact_size::take::<4>(payload)?;
-        let (count, mut rest) = crate::compact_size::read_len(rest, crate::locator::HASHES_MAX)?;
+        let (_version, rest) = crate::payload::take::<4>(payload)?;
+        let (count, mut rest) = crate::payload::read_len(rest, crate::locator::HASHES_MAX)?;
         let mut locator = Vec::with_capacity(count);
         for _ in 0..count {
-            let (hash, after) = crate::compact_size::take::<HASH_BYTES>(rest)?;
+            let (hash, after) = crate::payload::take::<HASH_BYTES>(rest)?;
             locator.push(crate::block_header::BlockHash::from_bytes(*hash));
             rest = after;
         }
-        let (stop, rest) = crate::compact_size::take::<HASH_BYTES>(rest)?;
+        let (stop, rest) = crate::payload::take::<HASH_BYTES>(rest)?;
         if !rest.is_empty() {
             return Err(Error::TrailingBytes(rest.len()));
         }
@@ -123,7 +121,7 @@ impl GetHeaders {
         let size = 4 + 1 + HASH_BYTES * (self.locator.len() + 1);
         let mut out = Vec::with_capacity(size);
         out.extend_from_slice(&LOCATOR_VERSION.to_le_bytes());
-        crate::compact_size::write_len(&mut out, self.locator.len());
+        crate::payload::write_len(&mut out, self.locator.len());
         for hash in self.locator.as_slice() {
             out.extend_from_slice(hash.as_bytes());
         }
@@ -156,10 +154,10 @@ impl Headers {
     /// takes. Then each header must name the one before it, as Core requires
     /// once it has the list (`:2673`); here a gap is refused as it is read.
     pub(crate) fn parse(payload: &[u8]) -> Result<Headers, Error> {
-        let (count, mut rest) = crate::compact_size::read_len(payload, HEADERS_MAX)?;
+        let (count, mut rest) = crate::payload::read_len(payload, HEADERS_MAX)?;
         let mut headers: Vec<crate::block_header::Header> = Vec::with_capacity(count);
         for index in 0..count {
-            let (header, after) = crate::compact_size::take::<HEADER_BYTES>(rest)?;
+            let (header, after) = crate::payload::take::<HEADER_BYTES>(rest)?;
             let (&transaction_count, after) = after.split_first().ok_or(Error::Truncated)?;
             if transaction_count != 0 {
                 return Err(Error::TransactionCount(transaction_count));
@@ -191,7 +189,7 @@ impl Headers {
         // Room for the count in its `fd` form, which a count below 0xfd
         // does not need: two bytes over for a short run, never short.
         let mut out = Vec::with_capacity(3 + self.0.len() * (HEADER_BYTES + 1));
-        crate::compact_size::write_len(&mut out, self.0.len());
+        crate::payload::write_len(&mut out, self.0.len());
         for header in &self.0 {
             out.extend_from_slice(&header.encode());
             out.push(0);

@@ -335,7 +335,7 @@ mod tests {
         };
         crate::pow::mine(&mut header, network);
         let mut payload = Vec::new();
-        crate::compact_size::write_len(&mut payload, 1);
+        crate::payload::write_len(&mut payload, 1);
         payload.extend_from_slice(&header.encode());
         payload.push(0);
         crate::headers::Headers::parse(&payload).unwrap()
@@ -351,7 +351,7 @@ mod tests {
     ) -> crate::headers::Headers {
         let network = crate::message::Network::Regtest;
         let mut payload = Vec::new();
-        crate::compact_size::write_len(&mut payload, count);
+        crate::payload::write_len(&mut payload, count);
         let mut previous_block = crate::block_header::BlockHash::from_bytes(*previous.as_bytes());
         for offset in 0..count {
             let mut header = crate::block_header::Header {

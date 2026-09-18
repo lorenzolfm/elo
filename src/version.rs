@@ -127,17 +127,15 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl From<crate::compact_size::Error> for Error {
+impl From<crate::payload::Error> for Error {
     /// The one `CompactSize` in a `version` is the user agent's length, so
     /// each of its errors is an error about that field. A prefix cut short
     /// is the payload cut short: one error, not two.
-    fn from(e: crate::compact_size::Error) -> Self {
+    fn from(e: crate::payload::Error) -> Self {
         match e {
-            crate::compact_size::Error::Truncated => Error::Truncated,
-            crate::compact_size::Error::NonCanonical(len) => {
-                Error::NonCanonicalUserAgentLength(len)
-            }
-            crate::compact_size::Error::TooLarge { value, .. } => Error::UserAgentTooLong(value),
+            crate::payload::Error::Truncated => Error::Truncated,
+            crate::payload::Error::NonCanonical(len) => Error::NonCanonicalUserAgentLength(len),
+            crate::payload::Error::TooLarge { value, .. } => Error::UserAgentTooLong(value),
         }
     }
 }
@@ -150,22 +148,22 @@ impl From<crate::compact_size::Error> for Error {
 /// height. `relay` alone stays optional: BIP37 added it, and Core takes an
 /// absent one as `true`. Bytes after it are ignored, as Core ignores them.
 pub(crate) fn parse(payload: &[u8]) -> Result<Peer, Error> {
-    let (protocol, rest) = crate::compact_size::take::<4>(payload)?;
+    let (protocol, rest) = crate::payload::take::<4>(payload)?;
     let protocol = i32::from_le_bytes(*protocol);
     if protocol < PEER_PROTOCOL_VERSION_MIN {
         return Err(Error::Obsolete(protocol));
     }
-    let (services, rest) = crate::compact_size::take::<8>(rest)?;
-    let (_timestamp, rest) = crate::compact_size::take::<8>(rest)?;
-    let (_addr_recv, rest) = crate::compact_size::take::<NET_ADDR_BYTES>(rest)?;
-    let (_addr_from, rest) = crate::compact_size::take::<NET_ADDR_BYTES>(rest)?;
-    let (_nonce, rest) = crate::compact_size::take::<8>(rest)?;
-    let (agent_len, rest) = crate::compact_size::read_len(rest, USER_AGENT_BYTES_MAX)?;
+    let (services, rest) = crate::payload::take::<8>(rest)?;
+    let (_timestamp, rest) = crate::payload::take::<8>(rest)?;
+    let (_addr_recv, rest) = crate::payload::take::<NET_ADDR_BYTES>(rest)?;
+    let (_addr_from, rest) = crate::payload::take::<NET_ADDR_BYTES>(rest)?;
+    let (_nonce, rest) = crate::payload::take::<8>(rest)?;
+    let (agent_len, rest) = crate::payload::read_len(rest, USER_AGENT_BYTES_MAX)?;
     if rest.len() < agent_len {
         return Err(Error::Truncated);
     }
     let (user_agent, rest) = rest.split_at(agent_len);
-    let (start_height, rest) = crate::compact_size::take::<4>(rest)?;
+    let (start_height, rest) = crate::payload::take::<4>(rest)?;
     let start_height = i32::from_le_bytes(*start_height);
     let start_height =
         u32::try_from(start_height).map_err(|_| Error::NegativeHeight(start_height))?;

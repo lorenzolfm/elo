@@ -243,7 +243,7 @@ mod tests {
     /// for a full batch is `net_processing.cpp:3106`.
     fn batch_after(previous: &crate::block_header::BlockHash, count: usize) -> Vec<u8> {
         let mut payload = Vec::new();
-        crate::compact_size::write_len(&mut payload, count);
+        crate::payload::write_len(&mut payload, count);
         let mut previous_block = crate::block_header::BlockHash::from_bytes(*previous.as_bytes());
         for i in 0..count {
             let mut header = crate::block_header::Header {

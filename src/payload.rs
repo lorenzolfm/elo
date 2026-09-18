@@ -1,17 +1,17 @@
+//! Reading a payload the peer sized: the primitives every decoder of a
+//! variable-length message is built from, and the one error type for a
+//! payload that ends too soon.
+//!
+//! `take` is the next `N` bytes, or `Truncated`. `read` and `read_len` are
 //! `CompactSize`, the length prefix in front of every list and string on the
 //! wire: one byte below 0xfd, else a marker byte and 2, 4 or 8 little-endian
-//! bytes. Core's `ReadCompactSize`, `../bitcoin/src/serialize.h:330` at v31.1.
-//!
-//! `read` returns the value unbounded: `u64::MAX` is a valid encoding, and a
-//! `CompactSize` is not always a length. `read_len` is for one that is: it
-//! takes the limit of the field it prefixes and returns a `usize` that is
-//! already under it, so the caller cannot allocate or slice before the bound.
-//! `write_len` is the other direction; every `CompactSize` elo writes is a
-//! length, so it takes a `usize`.
-//!
-//! `take` is the fixed-width neighbour: the next `N` bytes of a payload, or
-//! `Truncated`. It lives here so that the two errors a peer-sized payload
-//! can raise, a short prefix and a short field, are one type.
+//! bytes (Core's `ReadCompactSize`, `../bitcoin/src/serialize.h:330` at
+//! v31.1). `read` returns the value unbounded: `u64::MAX` is a valid
+//! encoding, and a `CompactSize` is not always a length. `read_len` is for
+//! one that is: it takes the limit of the field it prefixes and returns a
+//! `usize` that is already under it, so the caller cannot allocate or slice
+//! before the bound. `write_len` is the other direction; every `CompactSize`
+//! elo writes is a length, so it takes a `usize`.
 
 #[derive(Debug)]
 pub enum Error {
