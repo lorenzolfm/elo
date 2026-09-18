@@ -40,7 +40,7 @@ subversion string.
       comparison.
 - [x] 10. Difficulty retargeting across the 2016-block boundary. The timespan
       off-by-one, and the 4× clamps.
-- [ ] 11. Median time past.
+- [x] 11. Median time past.
 - [ ] 12. The full run from genesis.
 
 **Gate:** our tip hash equals the homelab node's `getbestblockhash`, and our
