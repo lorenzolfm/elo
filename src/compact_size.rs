@@ -8,6 +8,10 @@
 //! already under it, so the caller cannot allocate or slice before the bound.
 //! `write_len` is the other direction; every `CompactSize` elo writes is a
 //! length, so it takes a `usize`.
+//!
+//! `take` is the fixed-width neighbour: the next `N` bytes of a payload, or
+//! `Truncated`. It lives here so that the two errors a peer-sized payload
+//! can raise, a short prefix and a short field, are one type.
 
 #[derive(Debug)]
 pub enum Error {
@@ -31,6 +35,11 @@ impl std::fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// The next `N` bytes of `bytes`, and the rest.
+pub fn take<const N: usize>(bytes: &[u8]) -> Result<(&[u8; N], &[u8]), Error> {
+    bytes.split_first_chunk().ok_or(Error::Truncated)
+}
 
 /// Decodes the `CompactSize` at the front of `bytes`. Returns the value and
 /// the bytes after it.
