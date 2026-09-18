@@ -190,10 +190,20 @@ mod tests {
             .collect()
     }
 
+    /// The hashes in Core's `getheaders` payload: after the four-byte
+    /// version and the one-byte count, 32 bytes each, up to the stop hash.
+    /// Read here by hand so that the chain's tests read nothing from `p2p`.
     fn core_locator() -> super::Locator {
-        crate::p2p::getheaders::GetHeaders::parse(&fixture(CORE_GETHEADERS))
-            .unwrap()
-            .locator
+        let payload = fixture(CORE_GETHEADERS);
+        let count = usize::from(payload[4]);
+        let hashes = payload[5..]
+            .chunks(crate::chain::block_header::HASH_BYTES)
+            .take(count)
+            .map(|chunk| {
+                crate::chain::block_header::BlockHash::from_bytes(chunk.try_into().unwrap())
+            })
+            .collect();
+        super::Locator::from_wire(hashes)
     }
 
     #[test]
@@ -219,11 +229,10 @@ mod tests {
     }
 
     #[test]
-    fn new_asks_for_each_height_and_rebuilds_core_locator_byte_for_byte() {
+    fn new_asks_for_each_height_and_rebuilds_core_locator() {
         // Red if `new` maps heights to hashes in another order, or skips one.
         // The lookup here is Core's own locator by position, which is a chain
         // only at the heights `heights(198)` names; a wrong height panics.
-        let core = fixture(CORE_GETHEADERS);
         let core_hashes = core_locator();
         let heights = super::heights(198);
         let mut asked = Vec::new();
@@ -235,12 +244,14 @@ mod tests {
             )
         });
         assert_eq!(asked, heights, "asked once per height, newest first");
-        let request = crate::p2p::getheaders::GetHeaders {
-            locator: ours,
-            stop: None,
-        };
-        assert_eq!(request.encode(), core);
-        println!("{} bytes, identical to Core's", core.len());
+        let ours: Vec<String> = ours.as_slice().iter().map(ToString::to_string).collect();
+        let core: Vec<String> = core_hashes
+            .as_slice()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(ours, core);
+        println!("{} hashes, the same as Core's", core.len());
     }
 
     #[test]

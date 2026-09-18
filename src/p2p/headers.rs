@@ -29,10 +29,6 @@ pub enum Error {
     TransactionCount(u8),
     /// Bytes after the last header.
     TrailingBytes(usize),
-    /// The header at `index` does not name the one before it. Core penalizes
-    /// the peer for this before it looks at its chain
-    /// (`CheckHeadersAreContinuous`, `:2673`, from `CheckHeadersPoW`, `:2628`).
-    NotContinuous { index: usize },
 }
 
 impl std::fmt::Display for Error {
@@ -45,12 +41,6 @@ impl std::fmt::Display for Error {
                 write!(f, "transaction count {count} after a header, expected 0")
             }
             Error::TrailingBytes(len) => write!(f, "{len} bytes after the last field"),
-            Error::NotContinuous { index } => {
-                write!(
-                    f,
-                    "header at index {index} does not name the header before it"
-                )
-            }
         }
     }
 }
@@ -71,15 +61,13 @@ impl From<crate::p2p::compact_size::Error> for Error {
     }
 }
 
-/// A `headers` payload as one peer sent it: at most `HEADERS_MAX`, each
-/// naming the one before it. Only `parse` builds one, so both facts hold by
-/// construction, and the chain checks one join, the first header against
-/// what it has, not one per header. `encode` asserts the bound again, so a
-/// second constructor cannot break it in silence; continuity costs a
-/// `sha256d` per header to re-check and is not asserted twice.
+/// A `headers` payload as one peer sent it: at most `HEADERS_MAX`. Only
+/// `parse` builds one, so the bound holds by construction; `encode` asserts
+/// it again, so a second constructor cannot break it in silence.
 ///
-/// Whether the first header names a block we know, and whether each header
-/// has the work it claims, are questions for the chain.
+/// Whether each header names the one before it, whether the first names a
+/// block we know, and whether each has the work it claims, are questions for
+/// the chain: `Chain::extend` asks them in Core's order.
 #[derive(Debug)]
 pub struct Headers(Vec<crate::chain::block_header::Header>);
 
@@ -88,26 +76,17 @@ impl Headers {
     /// followed by the transaction count of a block that carries none
     /// (`:4446`). Core reads it the same way (`:4827` to `:4836`), but
     /// accepts any transaction count; we accept the one byte a count of zero
-    /// takes. Then each header must name the one before it, as Core requires
-    /// once it has the list (`:2673`); here a gap is refused as it is read.
+    /// takes.
     pub(crate) fn parse(payload: &[u8]) -> Result<Headers, Error> {
         let (count, mut rest) = crate::p2p::compact_size::read_len(payload, HEADERS_MAX)?;
         let mut headers: Vec<crate::chain::block_header::Header> = Vec::with_capacity(count);
-        for index in 0..count {
+        for _ in 0..count {
             let (header, after) = crate::p2p::compact_size::take::<HEADER_BYTES>(rest)?;
             let (&transaction_count, after) = after.split_first().ok_or(Error::Truncated)?;
             if transaction_count != 0 {
                 return Err(Error::TransactionCount(transaction_count));
             }
-            let header = crate::chain::block_header::Header::parse(header);
-            // The first header has nothing before it to name.
-            let names_the_last = headers
-                .last()
-                .is_none_or(|last| header.previous_block.as_bytes() == last.hash().as_bytes());
-            if !names_the_last {
-                return Err(Error::NotContinuous { index });
-            }
-            headers.push(header);
+            headers.push(crate::chain::block_header::Header::parse(header));
             rest = after;
         }
         if !rest.is_empty() {
@@ -139,9 +118,9 @@ impl Headers {
         &self.0
     }
 
-    /// The headers, for a chain to keep. The bound and the continuity go
-    /// with them; the chain checks the join and nothing else.
-    pub(crate) fn into_vec(self) -> Vec<crate::chain::block_header::Header> {
+    /// The headers, for a chain to keep: what `Chain::extend` takes.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<crate::chain::block_header::Header> {
         self.0
     }
 
@@ -171,8 +150,6 @@ mod tests {
     // The script connected, shook hands, and sent three `getheaders`. Core's
     // `headers` to a locator of genesis alone: blocks 1 to 3.
     const FROM_GENESIS: &str = "030000002006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910fce25a9ef6a61909eadcc696fb71eb4d3216de17cc3731ecdd321a030e9213a1226cda96affff7f2000000000000000002034cf96da8f1b387300eaa047d30955fbaf1b0bb6f261f22425454a6b43b7b233650b72ea7da500a8429598a02571115bf2b6ee26da96be0378ff7cba4c98780e27cda96affff7f200300000000000000200e6ddccc471aeeb899ff667f7d55da0443769850872e6d44924d32d610f24c2869ee5ba689a2d757c652f917d12a43c9b24ba79dcff22abbea56c075d3d2bd7227cda96affff7f200000000000";
-    // Core's answer to a request that stopped at block 2: that header alone.
-    const STOP_AT_TWO: &str = "010000002034cf96da8f1b387300eaa047d30955fbaf1b0bb6f261f22425454a6b43b7b233650b72ea7da500a8429598a02571115bf2b6ee26da96be0378ff7cba4c98780e27cda96affff7f200300000000";
     // Core's answer to a locator of its own tip: nothing after it.
     const FROM_TIP: &str = "00";
     const GENESIS: &str = "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206";
@@ -281,32 +258,21 @@ mod tests {
         println!("{err}; Core reads the count and ignores it (net_processing.cpp:4835)");
     }
     #[test]
-    fn rejects_a_header_that_does_not_name_the_one_before() {
-        // Red if the continuity check is missing, compares the wrong pair, or
-        // reports the wrong index. One bit in the `previous_block` of header
-        // 2 (index 1): headers 1 and 3 are untouched, and 3 still names 2, so
-        // only index 1 is a gap.
+    fn a_gap_between_headers_is_not_the_parsers_call() {
+        // Red if the parser refuses a batch for its shape rather than its
+        // bytes: one bit in the `previous_block` of header 2 leaves three
+        // well-formed headers that do not chain, and that is `Chain::extend`'s
+        // to refuse (Core: `CheckHeadersAreContinuous`, `net_processing.cpp:2673`).
         let mut payload = fixture(FROM_GENESIS);
         payload[1 + (super::HEADER_BYTES + 1) + 4] ^= 1;
-        let err = super::Headers::parse(&payload).unwrap_err();
-        assert!(
-            matches!(err, super::Error::NotContinuous { index: 1 }),
-            "{err}"
-        );
-        println!(
-            "{err}; Core: Misbehaving, 'non-continuous headers sequence' (net_processing.cpp:2629)"
-        );
-        // The same bit in the only header of a run: nothing before it to
-        // name, so the run is continuous and the chain will be the one to
-        // refuse it.
-        let mut payload = fixture(STOP_AT_TWO);
-        payload[1 + 4] ^= 1;
         let headers = super::Headers::parse(&payload).unwrap();
+        assert_eq!(headers.len(), 3);
         assert_ne!(
-            headers.as_slice()[0].previous_block.to_string(),
+            headers.as_slice()[1].previous_block.to_string(),
             BLOCK_1,
-            "the first header names nothing we know, and that is not the parser's call"
+            "header 2 no longer names header 1"
         );
+        println!("three headers, one gap, parsed: the chain refuses it, not the parser");
     }
     #[test]
     fn every_byte_of_a_headers_payload_is_required() {

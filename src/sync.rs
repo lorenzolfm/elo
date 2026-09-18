@@ -148,7 +148,7 @@ pub fn run<L: crate::p2p::link::Link>(
 
         let headers = await_headers(connection, &mut report)?;
         let count = headers.len();
-        chain.extend(headers)?;
+        chain.extend(headers.into_vec())?;
         batches += 1;
         report(Event::Took {
             count,
@@ -397,7 +397,7 @@ mod tests {
         // The second request, built from a chain in the state the loop is
         // in when it asks.
         let mut at_2000 = crate::chain::Chain::new(NETWORK);
-        at_2000.extend(headers_in(&full)).unwrap();
+        at_2000.extend(headers_in(&full).into_vec()).unwrap();
         let second_request = getheaders(&at_2000);
         let short = batch_after(&at_2000.tip(), crate::p2p::headers::HEADERS_MAX + 1, 5);
         let last = headers_in(&short).as_slice().last().unwrap().hash();
@@ -456,7 +456,9 @@ mod tests {
         // those three already: the shape a peer answers from a fork below
         // our tip.
         let mut chain = crate::chain::Chain::new(NETWORK);
-        chain.extend(headers_in(&fixture(HEADERS))).unwrap();
+        chain
+            .extend(headers_in(&fixture(HEADERS)).into_vec())
+            .unwrap();
         let ran = run(&mut chain, sends(vec![fixture(HEADERS)]));
         let err = ran.result.err().unwrap();
         assert!(

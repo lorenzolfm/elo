@@ -75,6 +75,11 @@ pub enum Error {
     /// asks again from its best header and waits to see if they connect
     /// (`HandleUnconnectingHeaders`, `net_processing.cpp:2654`); with one
     /// branch and no reorg, we have nothing to connect them to.
+    /// The header at `index` of the batch does not name the one before it.
+    /// Core refuses the batch for this before it looks at its chain
+    /// (`CheckHeadersAreContinuous`, `net_processing.cpp:2673`, from
+    /// `CheckHeadersPoW`, `:2628`).
+    NotContinuous { index: usize },
     NotOnTip {
         previous_block: crate::chain::block_header::BlockHash,
         tip: crate::chain::block_header::BlockHash,
@@ -101,6 +106,10 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Pow { height, error } => write!(f, "header at height {height}: {error}"),
+            Error::NotContinuous { index } => write!(
+                f,
+                "header at index {index} does not name the header before it"
+            ),
             Error::NotOnTip {
                 previous_block,
                 tip,
@@ -240,26 +249,31 @@ impl Chain {
     /// first header names our tip, and whose every header claims the `nBits`
     /// the rules require and comes after the median time past of the headers
     /// before it. An empty batch is fine and changes nothing.
-    /// `Headers::parse` bounded the batch and checked that each header names
-    /// the one before it; the work, the join, the difficulty and the time
-    /// are the checks left, in that order, as Core orders them
-    /// (`net_processing.cpp:2987`, `:3028`, then `validation.cpp:4136` and
-    /// `:4140`).
+    /// The batch comes as the headers themselves, in the order the peer sent
+    /// them: what a `headers` message carries, with the message gone. The
+    /// checks run in Core's order: the work of every header, that each names
+    /// the one before it, the join to our tip, then the difficulty and the
+    /// time of each (`CheckHeadersPoW`, `net_processing.cpp:2619`, at
+    /// `:2987`; `:3028`; then `validation.cpp:4136` and `:4140`).
     ///
     /// # Errors
     ///
     /// `Pow` if a header claims a target above the limit of the network or
-    /// hashes above the target it claims. `NotOnTip` if the first header
+    /// hashes above the target it claims. `NotContinuous` if a header does
+    /// not name the one before it. `NotOnTip` if the first header
     /// names a block other than our tip. `Bits` if a header claims `nBits`
     /// that the retargeting rules do not allow at its height. `TimeTooOld`
     /// if a header does not come after the median time past of the headers
-    /// before it. On any of the four the chain is unchanged.
+    /// before it. On any of the five the chain is unchanged.
     ///
     /// # Panics
     ///
     /// If the height after the append is not the height before plus the
     /// count of the batch. `Vec::extend` rules it out.
-    pub fn extend(&mut self, headers: crate::p2p::headers::Headers) -> Result<(), Error> {
+    pub fn extend(
+        &mut self,
+        headers: Vec<crate::chain::block_header::Header>,
+    ) -> Result<(), Error> {
         // The height of the first header of the batch: we hold heights 0
         // to `held - 1`, so the batch starts at `held`. `checked_batch`
         // has no ancestors and names its errors by this; the loop below
@@ -330,24 +344,41 @@ impl Chain {
 /// called at `:2987` before `:3028`), and `Chain::extend` follows it.
 ///
 /// `height_first` is the height the first header of the batch would take,
-/// and names the header that failed. There is no assertion on the count
-/// here: `Headers::parse` bounded it against `HEADERS_MAX` and asserts the
-/// bound it enforced (`headers.rs:182`), so the capacity below is already
-/// held away from a length a peer chose.
+/// and names the header that failed. The count is not bounded here: the
+/// headers are already in memory, so the length a peer chose has already
+/// been paid for by whoever read them off the wire and bounded it there.
+///
+/// After the work, continuity: each header names the one before it, as Core
+/// requires once it has the list (`:2673`). The hash it compares is the one
+/// the work check just computed, kept in the `Checked`.
 ///
 /// # Errors
 ///
 /// `Pow` if a header claims a target above the limit of `network`, or
-/// hashes above the target it claims.
+/// hashes above the target it claims. `NotContinuous` if a header does not
+/// name the one before it.
 fn checked_batch(
-    headers: crate::p2p::headers::Headers,
+    headers: Vec<crate::chain::block_header::Header>,
     height_first: usize,
     network: crate::chain::network::Network,
 ) -> Result<Vec<crate::chain::pow::Checked>, Error> {
     let mut batch = Vec::with_capacity(headers.len());
-    for (offset, header) in headers.into_vec().into_iter().enumerate() {
+    for (offset, header) in headers.into_iter().enumerate() {
         match crate::chain::pow::checked(header, network) {
-            Ok(header) => batch.push(header),
+            Ok(header) => {
+                // The first header has nothing before it to name.
+                let names_the_last =
+                    batch
+                        .last()
+                        .is_none_or(|last: &crate::chain::pow::Checked| {
+                            header.header().previous_block.as_bytes()
+                                == last.header().hash().as_bytes()
+                        });
+                if !names_the_last {
+                    return Err(Error::NotContinuous { index: offset });
+                }
+                batch.push(header);
+            }
             Err(error) => {
                 return Err(Error::Pow {
                     height: height_first + offset,
@@ -388,8 +419,28 @@ mod tests {
             .collect()
     }
 
-    fn after_genesis() -> crate::p2p::headers::Headers {
-        crate::p2p::headers::Headers::parse(&fixture(FROM_GENESIS)).unwrap()
+    /// The headers in a `headers` payload: a one-byte count, then each
+    /// header and the zero transaction count after it. Read here by hand so
+    /// that the chain's tests read nothing from `p2p`.
+    fn headers_in(payload: &[u8]) -> Vec<crate::chain::block_header::Header> {
+        let (&count, rest) = payload.split_first().unwrap();
+        let count = usize::from(count);
+        let stride = crate::chain::block_header::BYTES + 1;
+        assert_eq!(rest.len(), count * stride, "count and payload agree");
+        rest.chunks(stride)
+            .map(|chunk| {
+                assert_eq!(chunk[crate::chain::block_header::BYTES], 0);
+                let bytes: [u8; crate::chain::block_header::BYTES] = chunk
+                    [..crate::chain::block_header::BYTES]
+                    .try_into()
+                    .unwrap();
+                crate::chain::block_header::Header::parse(&bytes)
+            })
+            .collect()
+    }
+
+    fn after_genesis() -> Vec<crate::chain::block_header::Header> {
+        headers_in(&fixture(FROM_GENESIS))
     }
 
     /// One mined regtest header after `previous` that claims `time` and
@@ -400,7 +451,7 @@ mod tests {
         previous: &crate::chain::block_header::BlockHash,
         time: u32,
         bits: u32,
-    ) -> crate::p2p::headers::Headers {
+    ) -> Vec<crate::chain::block_header::Header> {
         let network = crate::chain::network::Network::Regtest;
         let mut header = crate::chain::block_header::Header {
             version: 1,
@@ -411,11 +462,7 @@ mod tests {
             nonce: 0,
         };
         crate::chain::pow::mine(&mut header, network);
-        let mut payload = Vec::new();
-        crate::p2p::compact_size::write_len(&mut payload, 1);
-        payload.extend_from_slice(&header.encode());
-        payload.push(0);
-        crate::p2p::headers::Headers::parse(&payload).unwrap()
+        vec![header]
     }
 
     /// The time a header a test builds claims at `height`: one second a
@@ -436,10 +483,9 @@ mod tests {
         height_first: usize,
         count: usize,
         spoil: Option<usize>,
-    ) -> crate::p2p::headers::Headers {
+    ) -> Vec<crate::chain::block_header::Header> {
         let network = crate::chain::network::Network::Regtest;
-        let mut payload = Vec::new();
-        crate::p2p::compact_size::write_len(&mut payload, count);
+        let mut batch = Vec::with_capacity(count);
         let mut previous_block =
             crate::chain::block_header::BlockHash::from_bytes(*previous.as_bytes());
         for offset in 0..count {
@@ -455,11 +501,10 @@ mod tests {
             if spoil == Some(offset) {
                 crate::chain::pow::spoil(&mut header, network);
             }
-            payload.extend_from_slice(&header.encode());
-            payload.push(0);
             previous_block = header.hash();
+            batch.push(header);
         }
-        crate::p2p::headers::Headers::parse(&payload).unwrap()
+        batch
     }
 
     #[test]
@@ -674,11 +719,34 @@ mod tests {
     }
 
     #[test]
+    fn a_header_that_does_not_name_the_one_before_is_refused() {
+        // Red if the continuity check is missing, compares the wrong pair, or
+        // reports the wrong index. One bit in the `previous_block` of header
+        // 2 (index 1): headers 1 and 3 are untouched, and 3 still names 2, so
+        // only index 1 is a gap. The bit flips before the work check would
+        // fail, so the batch is spoiled after mining and the work re-done.
+        let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
+        let mut batch = mined_after(&chain.tip(), 1, 3, None);
+        let mut bytes = *batch[1].previous_block.as_bytes();
+        bytes[0] ^= 1;
+        batch[1].previous_block = crate::chain::block_header::BlockHash::from_bytes(bytes);
+        crate::chain::pow::mine(&mut batch[1], crate::chain::network::Network::Regtest);
+        let err = chain.extend(batch).unwrap_err();
+        assert!(
+            matches!(err, super::Error::NotContinuous { index: 1 }),
+            "{err}"
+        );
+        assert_eq!(chain.height(), 0);
+        println!(
+            "{err}; Core: Misbehaving, 'non-continuous headers sequence' (net_processing.cpp:2629)"
+        );
+    }
+
+    #[test]
     fn an_empty_batch_changes_nothing() {
         // Red if `extend` reads a first header that is not there.
         let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
-        let empty = crate::p2p::headers::Headers::parse(&[0]).unwrap();
-        chain.extend(empty).unwrap();
+        chain.extend(Vec::new()).unwrap();
         assert_eq!(chain.height(), 0);
         println!("still genesis alone");
     }
