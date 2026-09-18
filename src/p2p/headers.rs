@@ -140,9 +140,8 @@ impl Headers {
     #[must_use]
     pub(crate) fn encode(&self) -> Vec<u8> {
         assert!(self.0.len() <= HEADERS_MAX);
-        // Room for the count in its `fd` form, which a count below 0xfd
-        // does not need: two bytes over for a short run, never short.
-        let mut out = Vec::with_capacity(3 + self.0.len() * (HEADER_BYTES + 1));
+        let count_len = crate::p2p::compact_size::encoded_len(self.0.len());
+        let mut out = Vec::with_capacity(count_len + self.0.len() * (HEADER_BYTES + 1));
         crate::p2p::compact_size::write_len(&mut out, self.0.len());
         for header in &self.0 {
             out.extend_from_slice(&header.encode());

@@ -91,15 +91,31 @@ pub fn write_len(out: &mut Vec<u8>, len: usize) {
     let Ok(value) = u64::try_from(len) else {
         unreachable!("a usize fits in u64 on every target elo builds for")
     };
-    // The marker and the width behind it: the table in `read`, mirrored.
-    let (marker, width) = match value {
+    let (marker, width) = form(len);
+    out.extend(marker);
+    out.extend_from_slice(&value.to_le_bytes()[..width]);
+}
+
+/// The marker in front of `len`, if it needs one, and the width of the
+/// value behind it: the table in `read`, mirrored. The ranges are `u64`
+/// values; on a narrower `usize` the upper arms are simply never taken.
+const fn form(len: usize) -> (Option<u8>, usize) {
+    match len {
         0..=0xfc => (None, 1),
         0xfd..=0xffff => (Some(0xfd), 2),
         0x1_0000..=0xffff_ffff => (Some(0xfe), 4),
-        0x1_0000_0000.. => (Some(0xff), 8),
-    };
-    out.extend(marker);
-    out.extend_from_slice(&value.to_le_bytes()[..width]);
+        _ => (Some(0xff), 8),
+    }
+}
+
+/// How many bytes `write_len` appends for `len`: 1, 3, 5 or 9. Const, so a
+/// payload whose length prefix is fixed at compile time can size itself.
+#[must_use]
+pub const fn encoded_len(len: usize) -> usize {
+    match form(len) {
+        (None, width) => width,
+        (Some(_), width) => 1 + width,
+    }
 }
 
 #[cfg(test)]
@@ -251,6 +267,24 @@ mod tests {
 
     /// Derived from `WriteCompactSize`, `serialize.h:299`: the last value of
     /// each width and the first of the next.
+    #[test]
+    fn encoded_len_is_what_write_len_appends() {
+        for len in [
+            0,
+            1,
+            0xfc,
+            0xfd,
+            0xffff,
+            0x1_0000,
+            0xffff_ffff,
+            0x1_0000_0000,
+        ] {
+            let mut out = Vec::new();
+            super::write_len(&mut out, len);
+            assert_eq!(super::encoded_len(len), out.len(), "{len:#x}");
+        }
+    }
+
     #[test]
     fn writes_the_shortest_form_at_each_bound() {
         // Red if any width bound is off by one, or the value is written

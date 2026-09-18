@@ -21,13 +21,19 @@ const USER_AGENT_BYTES_MAX: usize = 256;
 
 pub const USER_AGENT: &str = concat!("/elo:", env!("CARGO_PKG_VERSION"), "/");
 
-// The user agent is length-prefixed with a `CompactSize`. Below 0xfd that is
-// the length itself in one byte; `build` relies on it and encodes nothing else.
-const _: () = assert!(USER_AGENT.len() < 0xfd);
-
-/// Every field but the user agent: version 4, services 8, timestamp 8, two
-/// addresses of 26, nonce 8, agent length 1, height 4, relay 1.
-const FIXED_BYTES: usize = 4 + 8 + 8 + NET_ADDR_BYTES + NET_ADDR_BYTES + 8 + 1 + 4 + 1;
+/// The payload `build` writes: version 4, services 8, timestamp 8, two
+/// addresses of 26, nonce 8, the user agent behind its `CompactSize` length,
+/// height 4, relay 1.
+const PAYLOAD_BYTES: usize = 4
+    + 8
+    + 8
+    + NET_ADDR_BYTES
+    + NET_ADDR_BYTES
+    + 8
+    + crate::p2p::compact_size::encoded_len(USER_AGENT.len())
+    + USER_AGENT.len()
+    + 4
+    + 1;
 
 /// Services 8, IPv6 address 16, port 2. No timestamp: `version` carries the
 /// pre-31402 address form, `net_processing.cpp:1582`.
@@ -37,26 +43,22 @@ const NET_ADDR_BYTES: usize = 8 + 16 + 2;
 ///
 /// # Panics
 ///
-/// If `USER_AGENT` is 0xfd bytes or longer, or the payload does not come to
-/// `FIXED_BYTES + USER_AGENT.len()`. Both are facts about elo, fixed at
-/// compile time; a peer cannot reach them.
+/// If the payload does not come to `PAYLOAD_BYTES`. That is a fact about
+/// elo, fixed at compile time; a peer cannot reach it.
 #[must_use]
 pub fn build(peer: std::net::SocketAddr, timestamp: i64, nonce: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(FIXED_BYTES + USER_AGENT.len());
+    let mut out = Vec::with_capacity(PAYLOAD_BYTES);
     out.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
     out.extend_from_slice(&0u64.to_le_bytes()); // services: none
     out.extend_from_slice(&timestamp.to_le_bytes());
     push_net_addr(&mut out, Some(peer)); // addr_recv: the peer as we see it
     push_net_addr(&mut out, None); // addr_from: Core ignores it, sends zeros
     out.extend_from_slice(&nonce.to_le_bytes());
-    let Ok(agent_len) = u8::try_from(USER_AGENT.len()) else {
-        unreachable!("the compile-time assertion above bounds the agent below 0xfd")
-    };
-    out.push(agent_len);
+    crate::p2p::compact_size::write_len(&mut out, USER_AGENT.len());
     out.extend_from_slice(USER_AGENT.as_bytes());
     out.extend_from_slice(&0i32.to_le_bytes()); // start_height: we hold no chain
     out.push(0); // relay (BIP37): do not announce transactions to us
-    assert_eq!(out.len(), FIXED_BYTES + USER_AGENT.len());
+    assert_eq!(out.len(), PAYLOAD_BYTES);
     out
 }
 
@@ -352,12 +354,7 @@ mod tests {
     fn with_user_agent(agent: &[u8]) -> Vec<u8> {
         let core = fixture(CORE);
         let mut payload = core[..80].to_vec();
-        if agent.len() < 0xfd {
-            payload.push(u8::try_from(agent.len()).unwrap());
-        } else {
-            payload.push(0xfd);
-            payload.extend_from_slice(&u16::try_from(agent.len()).unwrap().to_le_bytes());
-        }
+        crate::p2p::compact_size::write_len(&mut payload, agent.len());
         payload.extend_from_slice(agent);
         payload.extend_from_slice(&core[97..]);
         payload
