@@ -250,24 +250,14 @@ impl Chain {
     /// count of the batch. `Vec::extend` rules it out.
     pub fn extend(&mut self, headers: crate::headers::Headers) -> Result<(), Error> {
         // The height of the first header of the batch: we hold heights 0
-        // to `held - 1`, so the batch starts at `held`. The loop below has
-        // the ancestors and reads the height from them; this loop has none.
+        // to `held - 1`, so the batch starts at `held`. `checked_batch`
+        // has no ancestors and names its errors by this; the loop below
+        // has them and reads the height from them.
         let held = self.headers.len();
         // The work first, for the whole batch: `next_bits` reads a
-        // `pow::Checked` and nothing else, so the difficulty check below
-        // cannot run before this loop has made one of every header.
-        let mut batch = Vec::with_capacity(headers.len());
-        for (offset, header) in headers.into_vec().into_iter().enumerate() {
-            match crate::pow::checked(header, self.network) {
-                Ok(header) => batch.push(header),
-                Err(error) => {
-                    return Err(Error::Pow {
-                        height: held + offset,
-                        error,
-                    });
-                }
-            }
-        }
+        // `pow::Checked` and nothing else, so neither contextual check
+        // below can run before every header of the batch has one.
+        let batch = checked_batch(headers, held, self.network)?;
         let Some(first) = batch.first() else {
             return Ok(());
         };
@@ -319,6 +309,41 @@ impl Chain {
         assert_eq!(self.height(), height_before + count);
         Ok(())
     }
+}
+
+/// Every header of `headers` with the work it claims checked, in the order
+/// the peer sent them. Core checks the work of a whole batch before it asks
+/// where the batch joins (`CheckHeadersPoW`, `net_processing.cpp:2619`,
+/// called at `:2987` before `:3028`), and `Chain::extend` follows it.
+///
+/// `height_first` is the height the first header of the batch would take,
+/// and names the header that failed. There is no assertion on the count
+/// here: `Headers::parse` bounded it against `HEADERS_MAX` and asserts the
+/// bound it enforced (`headers.rs:182`), so the capacity below is already
+/// held away from a length a peer chose.
+///
+/// # Errors
+///
+/// `Pow` if a header claims a target above the limit of `network`, or
+/// hashes above the target it claims.
+fn checked_batch(
+    headers: crate::headers::Headers,
+    height_first: usize,
+    network: crate::message::Network,
+) -> Result<Vec<crate::pow::Checked>, Error> {
+    let mut batch = Vec::with_capacity(headers.len());
+    for (offset, header) in headers.into_vec().into_iter().enumerate() {
+        match crate::pow::checked(header, network) {
+            Ok(header) => batch.push(header),
+            Err(error) => {
+                return Err(Error::Pow {
+                    height: height_first + offset,
+                    error,
+                });
+            }
+        }
+    }
+    Ok(batch)
 }
 
 #[cfg(test)]
