@@ -17,7 +17,7 @@ const _: () = assert!(SPAN_HEADERS_MAX % 2 == 1);
 /// The chain a contextual check reads. Every height from 0 to `height_last`
 /// is one of the headers in it, so the height a header follows is a fact of
 /// the ancestors and not a number the caller brings beside it.
-pub struct Ancestors<'a> {
+pub(crate) struct Ancestors<'a> {
     held: &'a [crate::pow::Checked],
     batch: &'a [crate::pow::Checked],
 }
@@ -33,7 +33,10 @@ impl<'a> Ancestors<'a> {
     /// else, so every header has genesis behind it. `height_last` reads
     /// the same invariant at the other end.
     #[must_use]
-    pub fn new(held: &'a [crate::pow::Checked], batch: &'a [crate::pow::Checked]) -> Ancestors<'a> {
+    pub(crate) fn new(
+        held: &'a [crate::pow::Checked],
+        batch: &'a [crate::pow::Checked],
+    ) -> Ancestors<'a> {
         assert!(!held.is_empty(), "ancestors start at genesis");
         Ancestors { held, batch }
     }

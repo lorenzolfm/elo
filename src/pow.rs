@@ -638,7 +638,7 @@ fn next_bits_required(bits: u32, network: crate::message::Network) -> u32 {
 /// starts at genesis and grows by one, so it cannot. Or if the answer is
 /// not bits a header may claim, as `next_bits_required` says.
 #[must_use]
-pub fn next_bits(
+pub(crate) fn next_bits(
     ancestors: &crate::ancestors::Ancestors,
     candidate: &crate::block_header::Header,
     network: crate::message::Network,
