@@ -475,7 +475,7 @@ mod tests {
     }
 
     /// `count` regtest headers from `height_first` on, after `previous`,
-    /// each naming the one before and each mined, as `sync.rs` builds a
+    /// each naming the one before and each mined, as `peer.rs` builds a
     /// batch. `spoil` is the offset of one header left at the nonce that
     /// fails, if any.
     fn mined_after(

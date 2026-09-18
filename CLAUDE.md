@@ -29,6 +29,20 @@ of that budget and uncapped. If a step does not fit, it is two steps.
 
 Always ask before adding.
 
+## Layout
+
+- `src/p2p/` speaks the protocol. One file per message, with its command,
+  its payload type, its codec and, where the message does something, its
+  `handle`. `frame.rs` is the envelope, `message.rs` the union and the one
+  `match` on the command.
+- `src/chain/` is what we know: headers, work, the network, the chain. It
+  holds the types and the rules.
+- `p2p` calls `chain`. `chain` names nothing in `p2p`, in tests too.
+- `src/peer.rs` is the one loop: it reads a frame, decodes it, routes the
+  message to its handler, and writes what the handler hands back. A handler
+  returns messages; it never writes to the connection. The phase of the
+  session and every bound on it live in the loop, not in a handler.
+
 ## Conventions
 
 - Idiomatic Rust.

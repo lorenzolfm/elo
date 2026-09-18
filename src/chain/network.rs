@@ -5,7 +5,7 @@
 //! its `powLimit`, how its difficulty moves, lives beside the code that reads
 //! it: `chain::genesis`, `pow::Params`.
 
-/// `PartialEq` because `sync::run` asserts that the chain and the
+/// `PartialEq` because `peer::run` asserts that the chain and the
 /// connection it syncs from are on one network.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Network {

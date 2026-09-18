@@ -1,7 +1,7 @@
 //! The peer a test writes: a script of moves, a clock the script moves,
 //! and everything we sent kept for the test to read. It is a
-//! [`Link`](crate::p2p::link::Link), so it reaches `handshake::run` and
-//! `sync::run` with no socket, no thread and no real time: a timeout is a
+//! [`Link`](crate::p2p::link::Link), so it reaches `peer::run`
+//! with no socket, no thread and no real time: a timeout is a
 //! return value, and a run is replayable (issue #21).
 //!
 //! The peer keeps the read side of the [`Link`](crate::p2p::link::Link)
@@ -398,7 +398,7 @@ mod tests {
     #[test]
     fn a_new_deadline_lets_the_loop_read_again() {
         // Mutant: the latch is never cleared, so a loop that answers a
-        // timeout with a fresh bound — which is what `sync::await_headers`
+        // timeout with a fresh bound — which is what `peer::await_headers`
         // does per batch — panics on its next read.
         let mut connection = super::connect(
             vec![
