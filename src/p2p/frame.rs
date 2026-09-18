@@ -1,3 +1,10 @@
+//! The envelope every message travels in: network magic, a 12-byte
+//! NUL-padded command, the payload length, and `sha256d` of the payload cut
+//! to four bytes (`CMessageHeader`, `../bitcoin/src/protocol.h:32` at
+//! v31.1). `read` checks the magic, the length and the checksum and hands
+//! over a `Frame`, a command with its payload; `write` does the reverse.
+//! What the payload means is the next module's question (`frame.rs`).
+
 /// Core's `MAX_PROTOCOL_MESSAGE_LENGTH`, `src/net.h:65` at v31.1.
 const MAX_PAYLOAD_BYTES: usize = 4_000_000;
 
@@ -9,27 +16,6 @@ const _: () = assert!(4 + COMMAND_BYTES + 4 + 4 == HEADER_BYTES);
 
 // The length field is a `u32`. `read` converts it to `usize` and treats failure as unreachable; this is why it is.
 const _: () = assert!(usize::BITS >= 32);
-
-/// `PartialEq` because `sync::run` asserts that the chain and the
-/// connection it syncs from are on one network.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Network {
-    Mainnet,
-    Testnet3,
-    Testnet4,
-    Regtest,
-}
-
-impl Network {
-    fn magic(self) -> [u8; 4] {
-        match self {
-            Network::Mainnet => [0xf9, 0xbe, 0xb4, 0xd9],
-            Network::Testnet3 => [0x0b, 0x11, 0x09, 0x07],
-            Network::Testnet4 => [0x1c, 0x16, 0x3f, 0x28],
-            Network::Regtest => [0xfa, 0xbf, 0xb5, 0xda],
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Command([u8; COMMAND_BYTES]);
@@ -142,7 +128,7 @@ fn checksum(payload: &[u8]) -> [u8; 4] {
 /// reaches `writer`. `Io` if `writer` fails.
 pub fn write(
     writer: &mut impl std::io::Write,
-    network: Network,
+    network: crate::chain::network::Network,
     command: Command,
     payload: &[u8],
 ) -> Result<(), Error> {
@@ -176,7 +162,10 @@ pub fn write(
 ///
 /// If `usize` is narrower than `u32`. The compile-time assertion beside
 /// `HEADER_BYTES` rules that out on every target elo builds for.
-pub fn read(reader: &mut impl std::io::Read, network: Network) -> Result<Frame, Error> {
+pub fn read(
+    reader: &mut impl std::io::Read,
+    network: crate::chain::network::Network,
+) -> Result<Frame, Error> {
     let mut header = [0u8; HEADER_BYTES];
     reader.read_exact(&mut header)?;
 
@@ -233,7 +222,7 @@ mod tests {
             .collect()
     }
 
-    fn read_err(bytes: &[u8], network: super::Network) -> super::Error {
+    fn read_err(bytes: &[u8], network: crate::chain::network::Network) -> super::Error {
         match super::read(&mut &bytes[..], network) {
             Err(e) => e,
             Ok(_) => panic!("expected an error"),
@@ -244,7 +233,7 @@ mod tests {
     fn reads_core_verack() {
         // Red if `read` demands at least one payload byte.
         let bytes = fixture(VERACK);
-        let frame = super::read(&mut &bytes[..], super::Network::Regtest).unwrap();
+        let frame = super::read(&mut &bytes[..], crate::chain::network::Network::Regtest).unwrap();
         assert_eq!(frame.command, super::Command::from_static("verack"));
         assert!(frame.payload.is_empty());
         println!(
@@ -258,7 +247,7 @@ mod tests {
     fn reads_core_ping() {
         // Red if the length field is read big-endian.
         let bytes = fixture(PING);
-        let frame = super::read(&mut &bytes[..], super::Network::Regtest).unwrap();
+        let frame = super::read(&mut &bytes[..], crate::chain::network::Network::Regtest).unwrap();
         assert_eq!(frame.command, super::Command::from_static("ping"));
         assert_eq!(frame.payload.len(), 8);
         println!("ping nonce (LE bytes): {:02x?}", frame.payload);
@@ -273,7 +262,7 @@ mod tests {
             let command = super::Command::from_static(name);
             super::write(
                 &mut ours,
-                super::Network::Regtest,
+                crate::chain::network::Network::Regtest,
                 command,
                 &core[super::HEADER_BYTES..],
             )
@@ -289,7 +278,7 @@ mod tests {
     #[test]
     fn rejects_wrong_magic() {
         // Red if the magic check is missing.
-        let err = read_err(&fixture(VERACK), super::Network::Mainnet);
+        let err = read_err(&fixture(VERACK), crate::chain::network::Network::Mainnet);
         assert!(matches!(err, super::Error::BadMagic(_)), "{err}");
         println!("mainnet reader on regtest bytes: {err}");
     }
@@ -299,7 +288,7 @@ mod tests {
         // Red if the checksum check is missing.
         let mut bytes = fixture(PING);
         bytes[24] ^= 1;
-        let err = read_err(&bytes, super::Network::Regtest);
+        let err = read_err(&bytes, crate::chain::network::Network::Regtest);
         assert!(matches!(err, super::Error::BadChecksum { .. }), "{err}");
         println!("one bit flipped in the nonce: {err}");
     }
@@ -309,7 +298,7 @@ mod tests {
         // Red if the length check is missing, or allows one byte over.
         let mut bytes = fixture(PING);
         bytes[16..20].copy_from_slice(&4_000_001u32.to_le_bytes());
-        let err = read_err(&bytes, super::Network::Regtest);
+        let err = read_err(&bytes, crate::chain::network::Network::Regtest);
         assert!(
             matches!(err, super::Error::PayloadTooLong(4_000_001)),
             "{err}"
@@ -329,18 +318,24 @@ mod tests {
         let payload = vec![0u8; super::MAX_PAYLOAD_BYTES];
         let command = super::Command::from_static("block");
         let mut header = [0u8; super::HEADER_BYTES];
-        header[..4].copy_from_slice(&super::Network::Regtest.magic());
+        header[..4].copy_from_slice(&crate::chain::network::Network::Regtest.magic());
         header[4..16].copy_from_slice(command.as_bytes());
         header[16..20].copy_from_slice(&4_000_000u32.to_le_bytes());
         header[20..].copy_from_slice(&super::checksum(&payload));
 
         let mut reader = std::io::Read::chain(&header[..], &payload[..]);
-        let frame = super::read(&mut reader, super::Network::Regtest).unwrap();
+        let frame = super::read(&mut reader, crate::chain::network::Network::Regtest).unwrap();
         assert_eq!(frame.command, command);
         assert_eq!(frame.payload.len(), super::MAX_PAYLOAD_BYTES);
 
         let mut ours = Vec::new();
-        super::write(&mut ours, super::Network::Regtest, command, &payload).unwrap();
+        super::write(
+            &mut ours,
+            crate::chain::network::Network::Regtest,
+            command,
+            &payload,
+        )
+        .unwrap();
         assert_eq!(&ours[..super::HEADER_BYTES], &header);
         assert_eq!(ours.len(), super::HEADER_BYTES + super::MAX_PAYLOAD_BYTES);
         println!(
@@ -356,7 +351,12 @@ mod tests {
         let payload = vec![0u8; super::MAX_PAYLOAD_BYTES + 1];
         let mut sink = Vec::new();
         let command = super::Command::from_static("block");
-        let Err(err) = super::write(&mut sink, super::Network::Regtest, command, &payload) else {
+        let Err(err) = super::write(
+            &mut sink,
+            crate::chain::network::Network::Regtest,
+            command,
+            &payload,
+        ) else {
             panic!("expected an error");
         };
         assert!(
@@ -372,7 +372,13 @@ mod tests {
         // Red if `write` truncates the command to leave room for a NUL.
         const GETCFCHECKPT: super::Command = super::Command::from_static("getcfcheckpt");
         let mut bytes = Vec::new();
-        super::write(&mut bytes, super::Network::Regtest, GETCFCHECKPT, &[]).unwrap();
+        super::write(
+            &mut bytes,
+            crate::chain::network::Network::Regtest,
+            GETCFCHECKPT,
+            &[],
+        )
+        .unwrap();
         assert_eq!(&bytes[4..16], b"getcfcheckpt");
         println!("command field full, no NUL: {:02x?}", &bytes[4..16]);
     }
@@ -388,11 +394,11 @@ mod tests {
         // captured `VERACK` frame.
         let verack = fixture(VERACK);
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&super::Network::Regtest.magic());
+        bytes.extend_from_slice(&crate::chain::network::Network::Regtest.magic());
         bytes.extend_from_slice(b"getcfcheckpt");
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&verack[20..]);
-        let frame = super::read(&mut &bytes[..], super::Network::Regtest).unwrap();
+        let frame = super::read(&mut &bytes[..], crate::chain::network::Network::Regtest).unwrap();
         assert_eq!(frame.command, super::Command::from_static("getcfcheckpt"));
         println!("command field full, no NUL: {}", frame.command);
     }
@@ -403,7 +409,7 @@ mod tests {
         for (name, byte) in [("US", 0x1f), ("DEL", 0x7f)] {
             let mut bytes = fixture(PING);
             bytes[4] = byte;
-            let err = read_err(&bytes, super::Network::Regtest);
+            let err = read_err(&bytes, crate::chain::network::Network::Regtest);
             assert!(matches!(err, super::Error::BadCommand(_)), "{err}");
             println!("{name} in the command: {err}");
         }
@@ -418,7 +424,8 @@ mod tests {
         for byte in [0x20, 0x7e] {
             let mut bytes = fixture(PING);
             bytes[4] = byte;
-            let frame = super::read(&mut &bytes[..], super::Network::Regtest).unwrap();
+            let frame =
+                super::read(&mut &bytes[..], crate::chain::network::Network::Regtest).unwrap();
             assert_eq!(frame.command.as_bytes()[0], byte);
             println!(
                 "first command byte {byte:#04x}: read as `{}`",
@@ -431,7 +438,10 @@ mod tests {
     fn reports_a_truncated_payload_as_io() {
         // Red if `read` accepts a short payload instead of demanding every byte.
         let bytes = fixture(PING);
-        let err = read_err(&bytes[..bytes.len() - 1], super::Network::Regtest);
+        let err = read_err(
+            &bytes[..bytes.len() - 1],
+            crate::chain::network::Network::Regtest,
+        );
         let super::Error::Io(io) = err else {
             panic!("expected io, got {err}");
         };
@@ -444,7 +454,7 @@ mod tests {
         // Red if the padding check is missing.
         let mut bytes = fixture(VERACK);
         bytes[15] = b'x';
-        let err = read_err(&bytes, super::Network::Regtest);
+        let err = read_err(&bytes, crate::chain::network::Network::Regtest);
         assert!(matches!(err, super::Error::BadCommand(_)), "{err}");
         println!("`x` after the NUL padding of verack: {err}");
     }
@@ -454,22 +464,8 @@ mod tests {
         // Red if the empty-name check is missing.
         let mut bytes = fixture(VERACK);
         bytes[4..16].fill(0);
-        let err = read_err(&bytes, super::Network::Regtest);
+        let err = read_err(&bytes, crate::chain::network::Network::Regtest);
         assert!(matches!(err, super::Error::BadCommand(_)), "{err}");
         println!("twelve NUL bytes, which Core would accept: {err}");
-    }
-
-    #[test]
-    fn magic_matches_chainparams() {
-        // Red if a magic constant has a typo or is byte-swapped.
-        for (network, hex) in [
-            (super::Network::Mainnet, "f9beb4d9"),
-            (super::Network::Testnet3, "0b110907"),
-            (super::Network::Testnet4, "1c163f28"),
-            (super::Network::Regtest, "fabfb5da"),
-        ] {
-            assert_eq!(network.magic().to_vec(), fixture(hex), "{network:?}");
-        }
-        println!("four networks, four magics, all from chainparams.cpp");
     }
 }

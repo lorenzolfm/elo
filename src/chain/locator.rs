@@ -78,7 +78,7 @@ pub fn heights(tip: usize) -> Vec<usize> {
 /// reads one a peer shaped. Both hold the bound, so a `Locator` is always one
 /// Core will answer instead of hanging up.
 #[derive(Debug)]
-pub struct Locator(Vec<crate::block_header::BlockHash>);
+pub struct Locator(Vec<crate::chain::block_header::BlockHash>);
 
 impl Locator {
     /// Core's `GetLocator`, `chain.cpp:45`: the hash at each height that
@@ -96,9 +96,9 @@ impl Locator {
     /// reachable: `heights` ends at genesis and is bounded by `BUILT_MAX`.
     pub fn new(
         tip: usize,
-        hash_at: impl FnMut(usize) -> crate::block_header::BlockHash,
+        hash_at: impl FnMut(usize) -> crate::chain::block_header::BlockHash,
     ) -> Locator {
-        let hashes: Vec<crate::block_header::BlockHash> =
+        let hashes: Vec<crate::chain::block_header::BlockHash> =
             heights(tip).into_iter().map(hash_at).collect();
         assert!(!hashes.is_empty(), "a built locator names genesis at least");
         assert!(hashes.len() <= HASHES_MAX);
@@ -108,7 +108,7 @@ impl Locator {
     /// A locator in the shape someone else gave it. `GetHeaders::parse` has
     /// bounded the count before it read a hash, so the assertion is about our
     /// parser, not about the peer.
-    pub(crate) fn from_wire(hashes: Vec<crate::block_header::BlockHash>) -> Locator {
+    pub(crate) fn from_wire(hashes: Vec<crate::chain::block_header::BlockHash>) -> Locator {
         assert!(
             hashes.len() <= HASHES_MAX,
             "parse let {} hashes through",
@@ -118,7 +118,7 @@ impl Locator {
     }
 
     #[must_use]
-    pub fn as_slice(&self) -> &[crate::block_header::BlockHash] {
+    pub fn as_slice(&self) -> &[crate::chain::block_header::BlockHash] {
         &self.0
     }
 
@@ -190,10 +190,20 @@ mod tests {
             .collect()
     }
 
+    /// The hashes in Core's `getheaders` payload: after the four-byte
+    /// version and the one-byte count, 32 bytes each, up to the stop hash.
+    /// Read here by hand so that the chain's tests read nothing from `p2p`.
     fn core_locator() -> super::Locator {
-        crate::headers::GetHeaders::parse(&fixture(CORE_GETHEADERS))
-            .unwrap()
-            .locator
+        let payload = fixture(CORE_GETHEADERS);
+        let count = usize::from(payload[4]);
+        let hashes = payload[5..]
+            .chunks(crate::chain::block_header::HASH_BYTES)
+            .take(count)
+            .map(|chunk| {
+                crate::chain::block_header::BlockHash::from_bytes(chunk.try_into().unwrap())
+            })
+            .collect();
+        super::Locator::from_wire(hashes)
     }
 
     #[test]
@@ -219,26 +229,29 @@ mod tests {
     }
 
     #[test]
-    fn new_asks_for_each_height_and_rebuilds_core_locator_byte_for_byte() {
+    fn new_asks_for_each_height_and_rebuilds_core_locator() {
         // Red if `new` maps heights to hashes in another order, or skips one.
         // The lookup here is Core's own locator by position, which is a chain
         // only at the heights `heights(198)` names; a wrong height panics.
-        let core = fixture(CORE_GETHEADERS);
         let core_hashes = core_locator();
         let heights = super::heights(198);
         let mut asked = Vec::new();
         let ours = super::Locator::new(198, |height| {
             asked.push(height);
             let position = heights.iter().position(|&h| h == height).unwrap();
-            crate::block_header::BlockHash::from_bytes(*core_hashes.as_slice()[position].as_bytes())
+            crate::chain::block_header::BlockHash::from_bytes(
+                *core_hashes.as_slice()[position].as_bytes(),
+            )
         });
         assert_eq!(asked, heights, "asked once per height, newest first");
-        let request = crate::headers::GetHeaders {
-            locator: ours,
-            stop: None,
-        };
-        assert_eq!(request.encode(), core);
-        println!("{} bytes, identical to Core's", core.len());
+        let ours: Vec<String> = ours.as_slice().iter().map(ToString::to_string).collect();
+        let core: Vec<String> = core_hashes
+            .as_slice()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(ours, core);
+        println!("{} hashes, the same as Core's", core.len());
     }
 
     #[test]
@@ -288,7 +301,7 @@ mod tests {
     fn a_wire_locator_may_be_empty_or_full() {
         // Red if `from_wire` refuses the empty locator a stop-only request
         // carries, or the last count Core accepts.
-        let hash = || crate::block_header::BlockHash::from_bytes([0; 32]);
+        let hash = || crate::chain::block_header::BlockHash::from_bytes([0; 32]);
         let none = super::Locator::from_wire(Vec::new());
         assert!(none.is_empty());
         let full = super::Locator::from_wire((0..super::HASHES_MAX).map(|_| hash()).collect());
@@ -302,7 +315,7 @@ mod tests {
     fn a_wire_locator_over_core_limit_is_our_bug() {
         // Red if `from_wire` trusts its caller: `parse` bounds the count, and
         // this is the assertion that says so.
-        let hash = || crate::block_header::BlockHash::from_bytes([0; 32]);
+        let hash = || crate::chain::block_header::BlockHash::from_bytes([0; 32]);
         let _ = super::Locator::from_wire((0..=super::HASHES_MAX).map(|_| hash()).collect());
     }
 }

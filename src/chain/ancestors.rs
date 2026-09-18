@@ -18,8 +18,8 @@ const _: () = assert!(SPAN_HEADERS_MAX % 2 == 1);
 /// is one of the headers in it, so the height a header follows is a fact of
 /// the ancestors and not a number the caller brings beside it.
 pub(crate) struct Ancestors<'a> {
-    held: &'a [crate::pow::Checked],
-    batch: &'a [crate::pow::Checked],
+    held: &'a [crate::chain::pow::Checked],
+    batch: &'a [crate::chain::pow::Checked],
 }
 
 impl<'a> Ancestors<'a> {
@@ -34,8 +34,8 @@ impl<'a> Ancestors<'a> {
     /// the same invariant at the other end.
     #[must_use]
     pub(crate) fn new(
-        held: &'a [crate::pow::Checked],
-        batch: &'a [crate::pow::Checked],
+        held: &'a [crate::chain::pow::Checked],
+        batch: &'a [crate::chain::pow::Checked],
     ) -> Ancestors<'a> {
         assert!(!held.is_empty(), "ancestors start at genesis");
         Ancestors { held, batch }
@@ -61,7 +61,7 @@ impl<'a> Ancestors<'a> {
     /// If `height` is above `height_last`. As `Chain::at`: a height here
     /// is an index into our own chain, never a number a peer sends.
     #[must_use]
-    pub(crate) fn at(&self, height: usize) -> &crate::pow::Checked {
+    pub(crate) fn at(&self, height: usize) -> &crate::chain::pow::Checked {
         assert!(
             height <= self.height_last(),
             "height {height} is above the ancestors"
@@ -133,11 +133,11 @@ mod tests {
 
     /// A header with a time and bits, and nothing else the ancestors are
     /// read for.
-    fn header(time: u32, bits: u32) -> crate::block_header::Header {
-        crate::block_header::Header {
+    fn header(time: u32, bits: u32) -> crate::chain::block_header::Header {
+        crate::chain::block_header::Header {
             version: 1,
-            previous_block: crate::block_header::BlockHash::from_bytes([0; 32]),
-            merkle_root: crate::block_header::MerkleRoot::from_bytes([0; 32]),
+            previous_block: crate::chain::block_header::BlockHash::from_bytes([0; 32]),
+            merkle_root: crate::chain::block_header::MerkleRoot::from_bytes([0; 32]),
             time,
             bits,
             nonce: 0,
@@ -146,10 +146,10 @@ mod tests {
 
     /// Headers to build ancestors over, one per time given, all claiming
     /// the same bits. Nothing here is mined: `pow::unchecked` says why.
-    fn timeline(times: &[u32], bits: u32) -> Vec<crate::pow::Checked> {
+    fn timeline(times: &[u32], bits: u32) -> Vec<crate::chain::pow::Checked> {
         times
             .iter()
-            .map(|time| crate::pow::unchecked(header(*time, bits)))
+            .map(|time| crate::chain::pow::unchecked(header(*time, bits)))
             .collect()
     }
 
@@ -195,7 +195,7 @@ mod tests {
         // the middle is taken one off: Core's chain has no order to its
         // times, so the tip's own time is the answer at no height at all,
         // and a median read without sorting is wrong at almost every one.
-        let genesis = crate::chain::genesis(crate::message::Network::Regtest).time;
+        let genesis = crate::chain::genesis(crate::chain::network::Network::Regtest).time;
         let times: Vec<u32> = CORE_TIMES.iter().map(|after| genesis + after).collect();
         let headers = timeline(&times, 0x207f_ffff);
         for (height, after) in CORE_MEDIANS.iter().enumerate() {
@@ -219,7 +219,7 @@ mod tests {
         let afters = [
             0, 9000, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100,
         ];
-        let genesis = crate::chain::genesis(crate::message::Network::Regtest).time;
+        let genesis = crate::chain::genesis(crate::chain::network::Network::Regtest).time;
         let times: Vec<u32> = afters.iter().map(|after| genesis + after).collect();
         let headers = timeline(&times, 0x207f_ffff);
         let median = super::Ancestors::new(&headers, &[]).median_time_past();
@@ -237,7 +237,7 @@ mod tests {
         // Red if the walk reads a fixed eleven headers and takes the zeros
         // it did not fill: the median of a chain of one is the one time
         // there is, and every chain is that chain first.
-        let genesis = crate::chain::genesis(crate::message::Network::Regtest).time;
+        let genesis = crate::chain::genesis(crate::chain::network::Network::Regtest).time;
         let headers = timeline(&[genesis], 0x207f_ffff);
         let ancestors = super::Ancestors::new(&headers, &[]);
         assert_eq!(ancestors.median_time_past(), genesis);
