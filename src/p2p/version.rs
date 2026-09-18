@@ -4,6 +4,8 @@
 //! `Peer` is the peer as its `version` describes it, read the way Core reads ours
 //! (`net_processing.cpp:3585`).
 
+pub const COMMAND: crate::p2p::frame::Command = crate::p2p::frame::Command::from_static("version");
+
 /// `PROTOCOL_VERSION`, `../bitcoin/src/node/protocol_version.h:12` at v31.1.
 /// Announcing 70016 is what makes Core send `wtxidrelay` and `sendaddrv2`
 /// before its `verack` (`net_processing.cpp:3716` and `:3725`).

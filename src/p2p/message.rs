@@ -1,30 +1,21 @@
 //! What a frame means. The envelope (`frame.rs`) checks magic, length and
 //! checksum and hands over a command and a payload; this module turns that
-//! pair into a value, and a value back into the pair.
-
-const VERSION: crate::p2p::frame::Command = crate::p2p::frame::Command::from_static("version");
-const VERACK: crate::p2p::frame::Command = crate::p2p::frame::Command::from_static("verack");
-const PING: crate::p2p::frame::Command = crate::p2p::frame::Command::from_static("ping");
-const PONG: crate::p2p::frame::Command = crate::p2p::frame::Command::from_static("pong");
-const GETHEADERS: crate::p2p::frame::Command =
-    crate::p2p::frame::Command::from_static("getheaders");
-const HEADERS: crate::p2p::frame::Command = crate::p2p::frame::Command::from_static("headers");
-
-/// `ping` and `pong` carry one `u64` nonce since BIP31. Core reads exactly
-/// that from a `ping` (`../bitcoin/src/net_processing.cpp:4973` at v31.1)
-/// and echoes it in the `pong` (`:4985`).
-const NONCE_BYTES: usize = 8;
+//! pair into a value, and a value back into the pair. Each message has a
+//! file of its own beside this one, with its payload, its codec and, where
+//! it has one, its handler; this is the union of them and the one `match`
+//! on the command.
 
 #[derive(Debug)]
 pub enum Message {
-    /// The payload as it came. The one `version` that counts is parsed inside
-    /// the handshake; any other is a redundant one, which Core drops before it
-    /// reads a field (`net_processing.cpp:3586`), and so do we.
+    /// The payload as it came. The one `version` that counts is parsed by
+    /// its handler in the handshake; any other is a redundant one, which
+    /// Core drops before it reads a field (`net_processing.cpp:3586`), and
+    /// so do we.
     Version(Vec<u8>),
     Verack,
     Ping(u64),
     Pong(u64),
-    GetHeaders(crate::p2p::headers::GetHeaders),
+    GetHeaders(crate::p2p::getheaders::GetHeaders),
     Headers(crate::p2p::headers::Headers),
     /// A command we do not speak. Core logs it and carries on
     /// (`net_processing.cpp:5167`); a newer peer must not cost us the
@@ -40,11 +31,10 @@ pub enum Error {
         len_actual: usize,
         len_expected: usize,
     },
-    /// A command we know, with a payload that does not parse.
-    BadPayload {
-        command: crate::p2p::frame::Command,
-        error: crate::p2p::headers::Error,
-    },
+    /// A `getheaders` payload that does not parse.
+    GetHeaders(crate::p2p::getheaders::Error),
+    /// A `headers` payload that does not parse.
+    Headers(crate::p2p::headers::Error),
 }
 
 impl std::fmt::Display for Error {
@@ -58,7 +48,8 @@ impl std::fmt::Display for Error {
                 f,
                 "{command} payload is {len_actual} bytes, expected {len_expected}"
             ),
-            Error::BadPayload { command, error } => write!(f, "{command} payload: {error}"),
+            Error::GetHeaders(error) => write!(f, "getheaders payload: {error}"),
+            Error::Headers(error) => write!(f, "headers payload: {error}"),
         }
     }
 }
@@ -71,21 +62,28 @@ impl Message {
     /// # Errors
     ///
     /// `BadLength` if a command we know carries a payload of a size it
-    /// cannot have. `BadPayload` if a `getheaders` or `headers` payload does
-    /// not parse.
+    /// cannot have. `GetHeaders` or `Headers` if that payload does not
+    /// parse.
     pub fn decode(frame: crate::p2p::frame::Frame) -> Result<Message, Error> {
         match frame.command {
-            VERSION => Ok(Message::Version(frame.payload)),
-            VERACK if frame.payload.is_empty() => Ok(Message::Verack),
-            VERACK => Err(bad_length(&frame, 0)),
-            PING => Ok(Message::Ping(nonce(&frame)?)),
-            PONG => Ok(Message::Pong(nonce(&frame)?)),
-            GETHEADERS => crate::p2p::headers::GetHeaders::parse(&frame.payload)
-                .map(Message::GetHeaders)
-                .map_err(|error| bad_payload(&frame, error)),
-            HEADERS => crate::p2p::headers::Headers::parse(&frame.payload)
+            crate::p2p::version::COMMAND => Ok(Message::Version(frame.payload)),
+            crate::p2p::verack::COMMAND => crate::p2p::verack::parse(&frame.payload)
+                .map(|()| Message::Verack)
+                .ok_or_else(|| bad_length(&frame, 0)),
+            crate::p2p::ping::COMMAND => crate::p2p::ping::parse(&frame.payload)
+                .map(Message::Ping)
+                .ok_or_else(|| bad_length(&frame, crate::p2p::ping::NONCE_BYTES)),
+            crate::p2p::pong::COMMAND => crate::p2p::pong::parse(&frame.payload)
+                .map(Message::Pong)
+                .ok_or_else(|| bad_length(&frame, crate::p2p::ping::NONCE_BYTES)),
+            crate::p2p::getheaders::COMMAND => {
+                crate::p2p::getheaders::GetHeaders::parse(&frame.payload)
+                    .map(Message::GetHeaders)
+                    .map_err(Error::GetHeaders)
+            }
+            crate::p2p::headers::COMMAND => crate::p2p::headers::Headers::parse(&frame.payload)
                 .map(Message::Headers)
-                .map_err(|error| bad_payload(&frame, error)),
+                .map_err(Error::Headers),
             _ => Ok(Message::Unknown(frame)),
         }
     }
@@ -93,12 +91,12 @@ impl Message {
     #[must_use]
     pub fn encode(self) -> crate::p2p::frame::Frame {
         let (command, payload) = match self {
-            Message::Version(payload) => (VERSION, payload),
-            Message::Verack => (VERACK, Vec::new()),
-            Message::Ping(nonce) => (PING, nonce.to_le_bytes().to_vec()),
-            Message::Pong(nonce) => (PONG, nonce.to_le_bytes().to_vec()),
-            Message::GetHeaders(request) => (GETHEADERS, request.encode()),
-            Message::Headers(headers) => (HEADERS, headers.encode()),
+            Message::Version(payload) => (crate::p2p::version::COMMAND, payload),
+            Message::Verack => (crate::p2p::verack::COMMAND, Vec::new()),
+            Message::Ping(nonce) => (crate::p2p::ping::COMMAND, crate::p2p::ping::encode(nonce)),
+            Message::Pong(nonce) => (crate::p2p::pong::COMMAND, crate::p2p::pong::encode(nonce)),
+            Message::GetHeaders(request) => (crate::p2p::getheaders::COMMAND, request.encode()),
+            Message::Headers(headers) => (crate::p2p::headers::COMMAND, headers.encode()),
             Message::Unknown(frame) => return frame,
         };
         crate::p2p::frame::Frame { command, payload }
@@ -129,20 +127,6 @@ fn bad_length(frame: &crate::p2p::frame::Frame, len_expected: usize) -> Error {
         len_actual: frame.payload.len(),
         len_expected,
     }
-}
-
-fn bad_payload(frame: &crate::p2p::frame::Frame, error: crate::p2p::headers::Error) -> Error {
-    Error::BadPayload {
-        command: frame.command,
-        error,
-    }
-}
-
-fn nonce(frame: &crate::p2p::frame::Frame) -> Result<u64, Error> {
-    // `try_from` fails on exactly one condition: the slice is not 8 bytes.
-    <[u8; NONCE_BYTES]>::try_from(frame.payload.as_slice())
-        .map(u64::from_le_bytes)
-        .map_err(|_| bad_length(frame, NONCE_BYTES))
 }
 
 #[cfg(test)]
@@ -317,8 +301,7 @@ mod tests {
         assert!(
             matches!(
                 &err,
-                super::Error::BadPayload { command, error: crate::p2p::headers::Error::Truncated }
-                    if command.to_string() == "headers"
+                super::Error::Headers(crate::p2p::headers::Error::Truncated)
             ),
             "{err}"
         );

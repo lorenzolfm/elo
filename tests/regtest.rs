@@ -321,7 +321,7 @@ fn core_serves_the_headers_after_genesis() {
     let our_version = elo::p2p::version::build(peer, i64::try_from(now.as_secs()).unwrap(), 0);
     elo::handshake::run(&mut connection, &our_version).unwrap();
 
-    let request = elo::p2p::message::Message::GetHeaders(elo::p2p::headers::GetHeaders {
+    let request = elo::p2p::message::Message::GetHeaders(elo::p2p::getheaders::GetHeaders {
         locator: elo::chain::locator::Locator::new(0, |_| genesis.hash()),
         stop: None,
     });

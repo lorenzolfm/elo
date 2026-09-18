@@ -191,7 +191,7 @@ mod tests {
     }
 
     fn core_locator() -> super::Locator {
-        crate::p2p::headers::GetHeaders::parse(&fixture(CORE_GETHEADERS))
+        crate::p2p::getheaders::GetHeaders::parse(&fixture(CORE_GETHEADERS))
             .unwrap()
             .locator
     }
@@ -235,7 +235,7 @@ mod tests {
             )
         });
         assert_eq!(asked, heights, "asked once per height, newest first");
-        let request = crate::p2p::headers::GetHeaders {
+        let request = crate::p2p::getheaders::GetHeaders {
             locator: ours,
             stop: None,
         };

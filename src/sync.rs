@@ -135,11 +135,12 @@ pub fn run<L: crate::p2p::link::Link>(
     );
     let mut batches = 0;
     while batches < BATCHES_MAX {
-        let request = crate::p2p::message::Message::GetHeaders(crate::p2p::headers::GetHeaders {
-            locator: chain.locator(),
-            stop: None,
-        })
-        .encode();
+        let request =
+            crate::p2p::message::Message::GetHeaders(crate::p2p::getheaders::GetHeaders {
+                locator: chain.locator(),
+                stop: None,
+            })
+            .encode();
         connection.write_frame(request.command, &request.payload)?;
         report(Event::Asked {
             height: chain.height(),
@@ -326,7 +327,7 @@ mod tests {
     /// Our `getheaders` for a locator from `chain`'s tip, on the wire.
     fn getheaders(chain: &crate::chain::Chain) -> Vec<u8> {
         framed(crate::p2p::message::Message::GetHeaders(
-            crate::p2p::headers::GetHeaders {
+            crate::p2p::getheaders::GetHeaders {
                 locator: chain.locator(),
                 stop: None,
             },
@@ -523,7 +524,7 @@ mod tests {
         assert!(
             matches!(
                 &err,
-                super::Error::Wire(crate::p2p::message::Error::BadPayload { .. })
+                super::Error::Wire(crate::p2p::message::Error::Headers(_))
             ),
             "{err}"
         );
