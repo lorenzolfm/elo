@@ -61,6 +61,44 @@ impl From<crate::p2p::compact_size::Error> for Error {
     }
 }
 
+/// What the handler did with a batch.
+pub struct Taken {
+    /// How many headers the chain took.
+    pub count: usize,
+    /// Whether the peer may have more: a batch of `HEADERS_MAX` says so
+    /// (`ProcessHeadersMessage`, `net_processing.cpp:3106`); a shorter one
+    /// says the peer has nothing after our tip (`:2966`).
+    pub more: bool,
+}
+
+/// The handler: the chain takes the batch, and the answer says whether to
+/// ask again. This is the one place a `headers` reaches the chain, and the
+/// chain is the only thing it reaches.
+///
+/// # Errors
+///
+/// As `Chain::extend`: a header without the work it claims, a gap, a batch
+/// off our tip, the wrong `nBits`, or a time not after the median time past.
+/// The chain is unchanged on any of them.
+///
+/// # Panics
+///
+/// If the batch is longer than `HEADERS_MAX`, which `parse` rules out.
+pub fn handle(
+    headers: Headers,
+    chain: &mut crate::chain::Chain,
+) -> Result<Taken, crate::chain::Error> {
+    let count = headers.len();
+    // `parse` bounded the batch, so a short one is the only shape left that
+    // is not full.
+    assert!(count <= HEADERS_MAX);
+    chain.extend(headers.into_vec())?;
+    Ok(Taken {
+        count,
+        more: count == HEADERS_MAX,
+    })
+}
+
 /// A `headers` payload as one peer sent it: at most `HEADERS_MAX`. Only
 /// `parse` builds one, so the bound holds by construction; `encode` asserts
 /// it again, so a second constructor cannot break it in silence.
@@ -291,6 +329,57 @@ mod tests {
         payload.push(0);
         let err = super::Headers::parse(&payload).unwrap_err();
         assert!(matches!(err, super::Error::TrailingBytes(1)), "{err}");
+        println!("{err}");
+    }
+}
+
+#[cfg(test)]
+mod handler_tests {
+    // The handler with no socket and no loop: a `Headers` in, the chain
+    // grown, and the answer that says whether to ask again.
+    const FROM_GENESIS: &str = "030000002006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910fce25a9ef6a61909eadcc696fb71eb4d3216de17cc3731ecdd321a030e9213a1226cda96affff7f2000000000000000002034cf96da8f1b387300eaa047d30955fbaf1b0bb6f261f22425454a6b43b7b233650b72ea7da500a8429598a02571115bf2b6ee26da96be0378ff7cba4c98780e27cda96affff7f200300000000000000200e6ddccc471aeeb899ff667f7d55da0443769850872e6d44924d32d610f24c2869ee5ba689a2d757c652f917d12a43c9b24ba79dcff22abbea56c075d3d2bd7227cda96affff7f200000000000";
+    const BLOCK_3: &str = "08e1a659dc25965d0cdf6d093b9247b09e9ce97a22cc77bca0b510ba4b337d61";
+
+    fn fixture(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    #[test]
+    fn a_short_batch_grows_the_chain_and_asks_for_no_more() {
+        // Red if the handler does not reach the chain, or reads a short
+        // batch as a full one.
+        let mut chain = crate::chain::Chain::new(crate::chain::network::Network::Regtest);
+        let headers = super::Headers::parse(&fixture(FROM_GENESIS)).unwrap();
+        let taken = super::handle(headers, &mut chain).unwrap();
+        assert_eq!(taken.count, 3);
+        assert!(!taken.more);
+        assert_eq!(chain.height(), 3);
+        assert_eq!(chain.tip().to_string(), BLOCK_3);
+        println!("three headers taken, height 3, the peer has no more");
+    }
+
+    #[test]
+    fn a_batch_the_chain_refuses_is_the_chains_error_and_changes_nothing() {
+        // Red if the handler swallows the chain's refusal or keeps a batch
+        // the chain refused: the same three headers twice, the second time
+        // off the tip.
+        let mut chain = crate::chain::Chain::new(crate::chain::network::Network::Regtest);
+        super::handle(
+            super::Headers::parse(&fixture(FROM_GENESIS)).unwrap(),
+            &mut chain,
+        )
+        .unwrap();
+        let err = super::handle(
+            super::Headers::parse(&fixture(FROM_GENESIS)).unwrap(),
+            &mut chain,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(err, crate::chain::Error::NotOnTip { .. }), "{err}");
+        assert_eq!(chain.height(), 3);
         println!("{err}");
     }
 }

@@ -60,6 +60,20 @@ pub fn build(peer: std::net::SocketAddr, timestamp: i64, nonce: u64) -> Vec<u8> 
     out
 }
 
+/// The handler: the peer's `version` parsed, and the `verack` it earns.
+/// Only the first `version` of a session reaches here; the loop drops any
+/// other before it is read, as Core does (`net_processing.cpp:3586`).
+///
+/// # Errors
+///
+/// As `parse`: a `version` that does not parse, or is too old to keep,
+/// earns no `verack`. Core would log it and wait out its 60 s timer; with
+/// one peer we hang up.
+pub fn handle(payload: &[u8]) -> Result<(Peer, crate::p2p::message::Message), Error> {
+    let peer = parse(payload)?;
+    Ok((peer, crate::p2p::message::Message::Verack))
+}
+
 /// What the peer said about itself: the fields Core keeps from the message
 /// (`net_processing.cpp:3668` to `:3679`), minus three it keeps for features
 /// we do not have. The timestamp feeds Core's clock-skew warning (`:3793`);
@@ -398,5 +412,39 @@ mod tests {
         payload[97..101].copy_from_slice(&i32::MAX.to_le_bytes());
         let tallest = super::parse(&payload).unwrap();
         assert_eq!(tallest.start_height, 2_147_483_647, "the wire's ceiling");
+    }
+}
+
+#[cfg(test)]
+mod handler_tests {
+    // Core's `version` payload of 2026-09-13, with its frame header gone.
+    const CORE_VERSION: &str = "80110100090c00000000000028b0a66a000000000000000000000000000000000000000000000000000000000000090c000000000000000000000000000000000000000000000000d07dc58995aa90bc102f5361746f7368693a33312e312e302f0000000001";
+
+    fn fixture(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    #[test]
+    fn a_version_that_parses_earns_a_verack() {
+        // Red if the handler answers with anything but `verack`, or drops a
+        // field of the peer on the way.
+        let (peer, reply) = super::handle(&fixture(CORE_VERSION)).unwrap();
+        assert_eq!(peer.user_agent, b"/Satoshi:31.1.0/");
+        assert!(
+            matches!(reply, crate::p2p::message::Message::Verack),
+            "{reply}"
+        );
+        println!("{peer} -> {reply}");
+    }
+
+    #[test]
+    fn a_version_that_does_not_parse_earns_nothing() {
+        // Red if a truncated `version` still earns a `verack`.
+        let err = super::handle(&fixture(CORE_VERSION)[..80]).unwrap_err();
+        assert!(matches!(err, super::Error::Truncated), "{err}");
+        println!("{err}: no verack");
     }
 }

@@ -319,55 +319,30 @@ fn core_serves_the_headers_after_genesis() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap();
     let our_version = elo::p2p::version::build(peer, i64::try_from(now.as_secs()).unwrap(), 0);
-    elo::handshake::run(&mut connection, &our_version).unwrap();
-
-    let request = elo::p2p::message::Message::GetHeaders(elo::p2p::getheaders::GetHeaders {
-        locator: elo::chain::locator::Locator::new(0, |_| genesis.hash()),
-        stop: None,
-    });
-    println!("-> {request}");
-    let request = request.encode();
-    connection
-        .write_frame(request.command, &request.payload)
-        .unwrap();
-
-    // Core's post-verack burst comes first: `sendcmpct`, `ping`, `feefilter`.
-    let headers = (0..8)
-        .find_map(|_| {
-            let frame = connection.read_frame().unwrap();
-            match elo::p2p::message::Message::decode(frame).unwrap() {
-                elo::p2p::message::Message::Headers(headers) => Some(headers),
-                other => {
-                    println!("<- {other} skipped");
-                    None
-                }
-            }
-        })
-        .unwrap_or_else(|| panic!("no headers in eight frames"));
-
-    assert_eq!(headers.len(), 7, "getblockcount is 7");
-    let headers = headers.as_slice();
-    assert_eq!(headers[0].previous_block.to_string(), genesis_hash);
-    for pair in headers.windows(2) {
-        assert_eq!(
-            pair[1].previous_block.to_string(),
-            pair[0].hash().to_string(),
-            "each header names the one before"
-        );
-    }
-    let tip = headers.last().unwrap().hash();
-    assert_eq!(tip.to_string(), best, "getbestblockhash");
-    println!(
-        "<- headers ({}), tip {tip} = getbestblockhash",
-        headers.len()
+    let mut chain = elo::chain::Chain::new(elo::chain::network::Network::Regtest);
+    let mut events = Vec::new();
+    elo::peer::run(
+        &mut connection,
+        &mut chain,
+        &our_version,
+        std::time::Duration::ZERO,
+        |event| {
+            println!("{event}");
+            events.push(event.to_string());
+        },
+    )
+    .unwrap();
+    assert_eq!(chain.height(), 7, "getblockcount is 7");
+    assert_eq!(chain.at(1).previous_block.to_string(), genesis_hash);
+    assert_eq!(chain.at(0).hash().to_string(), genesis.hash().to_string());
+    assert_eq!(chain.tip().to_string(), best, "getbestblockhash");
+    assert!(
+        events.contains(&format!("synced: height 7, tip {best}")),
+        "{events:?}"
     );
+    println!("height 7, tip {best} = getbestblockhash");
 }
 
-/// The M2 gate, on regtest: after `generatetoaddress 2001`, elo's tip must
-/// be `getbestblockhash` and its height `getblockcount`. One block over a
-/// batch, so Core answers with a full batch and then a short one
-/// (`../bitcoin/src/net_processing.cpp:3106` at v31.1), and the second
-/// `getheaders` must carry a locator from the new tip.
 #[test]
 fn our_tip_is_core_best_block_after_a_full_batch_and_a_short_one() {
     // Red if the second request is built from the old tip (Core answers
