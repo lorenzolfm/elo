@@ -247,12 +247,11 @@ impl Chain {
     /// # Panics
     ///
     /// If the height after the append is not the height before plus the
-    /// count of the batch. `Vec::extend` rules it out. Or if the ancestors built
-    /// for a header does not end at the header before it.
+    /// count of the batch. `Vec::extend` rules it out.
     pub fn extend(&mut self, headers: crate::headers::Headers) -> Result<(), Error> {
         // The height of the first header of the batch: we hold heights 0
-        // to `held - 1`, so the batch starts at `held`. Both loops below
-        // report a height, and this is the one place it is derived.
+        // to `held - 1`, so the batch starts at `held`. The loop below has
+        // the ancestors and reads the height from them; this loop has none.
         let held = self.headers.len();
         // The work first, for the whole batch: `next_bits` reads a
         // `pow::Checked` and nothing else, so the difficulty check below
@@ -285,12 +284,11 @@ impl Chain {
             // from or takes a median time past over. Nothing has moved yet:
             // the ancestors are our headers and the batch side by side.
             let ancestors = crate::ancestors::Ancestors::new(&self.headers, &batch[..offset]);
-            let height = held + offset;
-            assert_eq!(
-                ancestors.height_last() + 1,
-                height,
-                "the ancestors end at the header before the one we check"
-            );
+            // The height the header would take, read from the ancestors
+            // and not counted a second time beside it: they end at the
+            // header before this one, as Core reads `pindexPrev->nHeight + 1`
+            // (`validation.cpp:4132`).
+            let height = ancestors.height_last() + 1;
             let required = crate::pow::next_bits(&ancestors, header.header(), self.network);
             if header.header().bits != required {
                 return Err(Error::Bits {
