@@ -31,11 +31,16 @@ const MESSAGES_BEFORE_VERACK_MAX: usize = 16;
 /// connection with no deadline.
 pub const RESPONSE_TIME: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// How many batches one run asks for. ROADMAP step 8 caps the sync at a
-/// couple; step 12, the full run from genesis, lifts the cap. Until then it
-/// is also what bounds the chain: `BATCHES_MAX * HEADERS_MAX` headers at
-/// most, each with the work it claims.
-pub const BATCHES_MAX: usize = 2;
+/// How many times one sync may ask. The chain bounds the sync: it refuses
+/// a batch past `HEIGHT_MAX`, and a batch that is not full ends the sync,
+/// so this many full batches is more than the chain will take. The loop
+/// is bounded here all the same, so that a reader of the loop does not
+/// have to read the chain to know that it ends.
+pub const BATCHES_MAX: usize = crate::chain::HEIGHT_MAX / crate::p2p::headers::HEADERS_MAX + 1;
+// This many full batches reach past the bound, and one fewer does not.
+const _: () = assert!(BATCHES_MAX * crate::p2p::headers::HEADERS_MAX > crate::chain::HEIGHT_MAX);
+const _: () =
+    assert!((BATCHES_MAX - 1) * crate::p2p::headers::HEADERS_MAX <= crate::chain::HEIGHT_MAX);
 
 /// What the session did, as it did it, for the caller to narrate. Every
 /// line a person reads about the session is one of these.
@@ -64,11 +69,6 @@ pub enum Event {
         height: usize,
         tip: crate::chain::block_header::BlockHash,
     },
-    /// `BATCHES_MAX` full batches came in. The peer may have more.
-    Capped {
-        height: usize,
-        tip: crate::chain::block_header::BlockHash,
-    },
     /// A message during the linger that earns no answer.
     Ignored(crate::p2p::message::Message),
     /// The peer closed the connection during the linger, which is its right.
@@ -89,10 +89,6 @@ impl std::fmt::Display for Event {
             Event::Took { count, height } => write!(f, "<- headers ({count}), height {height}"),
             Event::Ponged(nonce) => write!(f, "<- ping {nonce:#018x}\n-> pong"),
             Event::Synced { height, tip } => write!(f, "synced: height {height}, tip {tip}"),
-            Event::Capped { height, tip } => write!(
-                f,
-                "stopped at {BATCHES_MAX} batches (ROADMAP step 8): height {height}, tip {tip}; the peer may have more"
-            ),
             Event::Ignored(message) => write!(f, "<- {message} ignored"),
             Event::PeerHungUp => write!(f, "peer hung up"),
             Event::LingerOver(linger) => write!(f, "{linger:?} after the sync, hanging up"),
@@ -117,8 +113,8 @@ pub enum Error {
     VerackBeforeVersion,
     /// `MESSAGES_BEFORE_VERACK_MAX` frames came in and none was `verack`.
     NoVerackAfter,
-    /// A batch the chain refused: no work, a gap, off our tip, the wrong
-    /// `nBits`, or a time not after the median time past.
+    /// A batch the chain refused: past its bound, no work, a gap, off our
+    /// tip, the wrong `nBits`, or a time not after the median time past.
     Chain(crate::chain::Error),
 }
 
@@ -292,13 +288,13 @@ fn handshake<L: crate::p2p::link::Link>(
 }
 
 /// The headers sync: `getheaders` from our tip, `headers` back, the chain
-/// grows, and again while the batches come full and the cap allows. Core
-/// runs the same loop from `ProcessHeadersMessage` (`:3106`, `:2966`).
+/// grows, and again while the batches come full. Core runs the same loop
+/// from `ProcessHeadersMessage` (`:3106`, `:2966`).
 ///
 /// # Panics
 ///
-/// If the loop asks more than `BATCHES_MAX` times or returns without
-/// asking once; the loop condition rules both out.
+/// If `BATCHES_MAX` full batches went into the chain: the chain refuses a
+/// batch past `HEIGHT_MAX`, and that many full batches reach past it.
 fn sync<L: crate::p2p::link::Link>(
     connection: &mut crate::p2p::connection::Connection<L>,
     chain: &mut crate::chain::Chain,
@@ -330,12 +326,7 @@ fn sync<L: crate::p2p::link::Link>(
             return Ok(());
         }
     }
-    assert_eq!(batches, BATCHES_MAX);
-    report(Event::Capped {
-        height: chain.height(),
-        tip: chain.tip(),
-    });
-    Ok(())
+    unreachable!("{BATCHES_MAX} full batches reach past HEIGHT_MAX, which the chain refuses");
 }
 
 /// Reads until a `headers` arrives, or `RESPONSE_TIME` passes. The loop has
@@ -903,48 +894,60 @@ mod tests {
     }
 
     #[test]
-    fn stops_after_the_capped_number_of_full_batches() {
-        // Red if the cap is off by one in either direction: a third request
-        // would take the third batch into the chain, one fewer would leave
-        // the second unread. The third batch arrives during the linger,
-        // where nothing asked for it, and is named and dropped.
+    fn asks_again_after_every_full_batch_until_a_short_one() {
+        // Red if the loop stops at a count instead of at a short batch: three
+        // full batches, then five headers, and the chain holds all of them.
+        // Step 8 stopped at two; step 12 stops where the peer runs out.
         let mut script = Vec::new();
         let mut previous = crate::chain::Chain::new(NETWORK).tip();
         let mut height_first = 1;
-        for _ in 0..=super::BATCHES_MAX {
-            let batch = batch_after(&previous, height_first, crate::p2p::headers::HEADERS_MAX);
+        for count in [
+            crate::p2p::headers::HEADERS_MAX,
+            crate::p2p::headers::HEADERS_MAX,
+            crate::p2p::headers::HEADERS_MAX,
+            5,
+        ] {
+            let batch = batch_after(&previous, height_first, count);
             previous = headers_in(&batch).as_slice().last().unwrap().hash();
-            height_first += crate::p2p::headers::HEADERS_MAX;
+            height_first += count;
             script.push(batch);
         }
 
         let (chain, ran) = session(script);
         ran.result.as_ref().unwrap();
-        let height = super::BATCHES_MAX * crate::p2p::headers::HEADERS_MAX;
-        assert_eq!(chain.height(), height);
+        assert_eq!(chain.height(), 6005);
+        assert_eq!(chain.tip().to_string(), previous.to_string());
         assert_eq!(
             ran.after_handshake()
                 .iter()
-                .filter(|e| e.starts_with("->"))
+                .filter(|e| e.starts_with("-> getheaders"))
                 .count(),
-            super::BATCHES_MAX
+            4,
+            "one ask per batch, the last one answered short"
         );
-        let tip = chain.tip();
         assert!(
-            ran.events.contains(&format!(
-                "stopped at {} batches (ROADMAP step 8): height {height}, tip {tip}; the peer may have more",
-                super::BATCHES_MAX
-            )),
+            ran.events
+                .contains(&format!("synced: height 6005, tip {previous}")),
             "{:?}",
             ran.events
         );
-        assert_eq!(
-            ran.events[ran.events.len() - 2],
-            "<- headers (2000) ignored",
-            "the third batch was never asked for"
-        );
         assert_eq!(ran.unread, 0);
         println!("{}", ran.after_handshake().join("\n"));
+    }
+
+    #[test]
+    fn the_loop_bound_is_the_smallest_past_the_chain_bound() {
+        // Red if `BATCHES_MAX` is not the first count of full batches that
+        // reaches past `HEIGHT_MAX`. The `const` assertions beside it hold
+        // the same at compile time; this one names the number.
+        assert_eq!(super::BATCHES_MAX, 1049);
+        println!(
+            "{} batches of {} reach {}, past HEIGHT_MAX {}",
+            super::BATCHES_MAX,
+            crate::p2p::headers::HEADERS_MAX,
+            super::BATCHES_MAX * crate::p2p::headers::HEADERS_MAX,
+            crate::chain::HEIGHT_MAX
+        );
     }
 
     #[test]

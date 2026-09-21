@@ -60,8 +60,19 @@ pub fn genesis(network: crate::chain::network::Network) -> crate::chain::block_h
     }
 }
 
+/// The height a chain will not grow past. Core has no such bound: `nHeight`
+/// is an `int` (`chain.h:106`) and the chain grows as long as blocks come.
+/// Ours is a `Vec` that grows on every batch a peer sends, so it stops at a
+/// number that is ours: 2^21 blocks is 168 MiB of headers at the most, and
+/// at one block every ten minutes it is reached around 2048 (mainnet passed
+/// height 968 000 in September 2026).
+pub const HEIGHT_MAX: usize = 1 << 21;
+
 #[derive(Debug)]
 pub enum Error {
+    /// The batch would put the tip at `height`, past `height_max`. Nothing
+    /// in Core refuses a header for its height.
+    TooHigh { height: usize, height_max: usize },
     /// A header of the batch claims a target the network does not allow, or
     /// hashes above the one it claims. Core checks the work of the whole
     /// batch before it asks where the batch joins (`CheckHeadersPoW`,
@@ -105,6 +116,10 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::TooHigh { height, height_max } => write!(
+                f,
+                "headers would take the tip to height {height}, past the bound {height_max}"
+            ),
             Error::Pow { height, error } => write!(f, "header at height {height}: {error}"),
             Error::NotContinuous { index } => write!(
                 f,
@@ -144,10 +159,12 @@ impl std::error::Error for Error {}
 /// the join. Each header past genesis has the work it claims, at or below
 /// the limit of `network`, claims the `nBits` the retargeting rules require
 /// at its height, and comes after the median time past of the headers
-/// before it; `extend` checks all three.
+/// before it; `extend` checks all three. The tip is never past
+/// `height_max`; `extend` refuses a batch that would take it there.
 pub struct Chain {
     network: crate::chain::network::Network,
     headers: Vec<crate::chain::pow::Checked>,
+    height_max: usize,
 }
 
 impl Chain {
@@ -160,6 +177,13 @@ impl Chain {
     /// `chainparams.cpp` assertion on the genesis hash, in another form.
     #[must_use]
     pub fn new(network: crate::chain::network::Network) -> Chain {
+        Chain::bounded(network, HEIGHT_MAX)
+    }
+
+    /// A chain of genesis alone that will not grow past `height_max`. The
+    /// bound is `HEIGHT_MAX` everywhere but in a test of the bound itself,
+    /// which cannot wait for two million headers.
+    fn bounded(network: crate::chain::network::Network, height_max: usize) -> Chain {
         let genesis = match crate::chain::pow::checked(genesis(network), network) {
             Ok(header) => header,
             Err(error) => panic!("genesis has the work it claims: {error}"),
@@ -167,6 +191,7 @@ impl Chain {
         let chain = Chain {
             network,
             headers: vec![genesis],
+            height_max,
         };
         assert_eq!(chain.height(), 0, "genesis is at height 0");
         assert_eq!(
@@ -258,13 +283,14 @@ impl Chain {
     ///
     /// # Errors
     ///
-    /// `Pow` if a header claims a target above the limit of the network or
-    /// hashes above the target it claims. `NotContinuous` if a header does
-    /// not name the one before it. `NotOnTip` if the first header
-    /// names a block other than our tip. `Bits` if a header claims `nBits`
-    /// that the retargeting rules do not allow at its height. `TimeTooOld`
-    /// if a header does not come after the median time past of the headers
-    /// before it. On any of the five the chain is unchanged.
+    /// `TooHigh` if the batch would take the tip past the bound of the
+    /// chain. `Pow` if a header claims a target above the limit of the
+    /// network or hashes above the target it claims. `NotContinuous` if a
+    /// header does not name the one before it. `NotOnTip` if the first
+    /// header names a block other than our tip. `Bits` if a header claims
+    /// `nBits` that the retargeting rules do not allow at its height.
+    /// `TimeTooOld` if a header does not come after the median time past of
+    /// the headers before it. On any of the six the chain is unchanged.
     ///
     /// # Panics
     ///
@@ -279,6 +305,14 @@ impl Chain {
         // has no ancestors and names its errors by this; the loop below
         // has them and reads the height from them.
         let held = self.headers.len();
+        // The bound before any work: it is the one check that costs
+        // nothing, and it is the one that keeps the `Vec` ours.
+        if held + headers.len() > self.height_max + 1 {
+            return Err(Error::TooHigh {
+                height: held + headers.len() - 1,
+                height_max: self.height_max,
+            });
+        }
         // The work first, for the whole batch: `next_bits` reads a
         // `pow::Checked` and nothing else, so neither contextual check
         // below can run before every header of the batch has one.
@@ -554,6 +588,77 @@ mod tests {
         );
         assert_eq!(chain.tip().to_string(), BLOCK_3, "getbestblockhash");
         println!("height {}, tip {}", chain.height(), chain.tip());
+    }
+
+    #[test]
+    fn the_bound_is_two_million_headers() {
+        // Red if the bound moves. A mainnet chain of September 2026 is past
+        // 968 000 and fits; the number is the design call, not the code.
+        assert_eq!(super::HEIGHT_MAX, 2_097_152);
+    }
+
+    #[test]
+    fn a_batch_that_lands_on_the_bound_is_taken_and_one_past_it_is_refused() {
+        // Red if the bound is off by one in either direction: a tip *at*
+        // `height_max` is allowed, one past it is not. Then the chain stands
+        // where it was, and a batch that fits still goes in.
+        let network = crate::chain::network::Network::Regtest;
+        let mut chain = super::Chain::bounded(network, 5);
+        chain.extend(mined_after(&chain.tip(), 1, 5, None)).unwrap();
+        assert_eq!(chain.height(), 5, "the tip may sit on the bound");
+
+        let err = chain
+            .extend(mined_after(&chain.tip(), 6, 1, None))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                super::Error::TooHigh {
+                    height: 6,
+                    height_max: 5
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "headers would take the tip to height 6, past the bound 5"
+        );
+        assert_eq!(chain.height(), 5, "nothing was kept");
+        chain.extend(Vec::new()).unwrap();
+        assert_eq!(chain.height(), 5, "an empty batch still fits");
+        println!("{err}");
+    }
+
+    #[test]
+    fn the_bound_is_checked_before_the_work() {
+        // Red if a batch past the bound has its work checked first: the
+        // spoiled header would be reported as `Pow`, and two million hashes
+        // would be paid for headers the chain cannot take.
+        let network = crate::chain::network::Network::Regtest;
+        let mut chain = super::Chain::bounded(network, 2);
+        let err = chain
+            .extend(mined_after(&chain.tip(), 1, 3, Some(0)))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                super::Error::TooHigh {
+                    height: 3,
+                    height_max: 2
+                }
+            ),
+            "{err}"
+        );
+        assert_eq!(chain.height(), 0);
+        println!("{err}");
+    }
+
+    #[test]
+    fn new_is_bounded_at_height_max() {
+        // Red if `new` picks another bound than the constant.
+        let chain = super::Chain::new(crate::chain::network::Network::Regtest);
+        assert_eq!(chain.height_max, super::HEIGHT_MAX);
     }
 
     #[test]
