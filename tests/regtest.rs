@@ -147,6 +147,7 @@ fn run_elo_until(test: &str, done: fn(&str) -> bool) -> Option<Run> {
 
 fn run_elo(node: &Node, done: fn(&str) -> bool) -> Run {
     let mut elo = std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
+        .arg("regtest")
         .arg(format!("127.0.0.1:{}", node.p2p_port))
         .stdout(std::process::Stdio::piped())
         .spawn()
