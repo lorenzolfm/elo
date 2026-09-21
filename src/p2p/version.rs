@@ -4,6 +4,8 @@
 //! `Peer` is the peer as its `version` describes it, read the way Core reads ours
 //! (`net_processing.cpp:3585`).
 
+pub const COMMAND: crate::p2p::frame::Command = crate::p2p::frame::Command::from_static("version");
+
 /// `PROTOCOL_VERSION`, `../bitcoin/src/node/protocol_version.h:12` at v31.1.
 /// Announcing 70016 is what makes Core send `wtxidrelay` and `sendaddrv2`
 /// before its `verack` (`net_processing.cpp:3716` and `:3725`).
@@ -19,13 +21,19 @@ const USER_AGENT_BYTES_MAX: usize = 256;
 
 pub const USER_AGENT: &str = concat!("/elo:", env!("CARGO_PKG_VERSION"), "/");
 
-// The user agent is length-prefixed with a `CompactSize`. Below 0xfd that is
-// the length itself in one byte; `build` relies on it and encodes nothing else.
-const _: () = assert!(USER_AGENT.len() < 0xfd);
-
-/// Every field but the user agent: version 4, services 8, timestamp 8, two
-/// addresses of 26, nonce 8, agent length 1, height 4, relay 1.
-const FIXED_BYTES: usize = 4 + 8 + 8 + NET_ADDR_BYTES + NET_ADDR_BYTES + 8 + 1 + 4 + 1;
+/// The payload `build` writes: version 4, services 8, timestamp 8, two
+/// addresses of 26, nonce 8, the user agent behind its `CompactSize` length,
+/// height 4, relay 1.
+const PAYLOAD_BYTES: usize = 4
+    + 8
+    + 8
+    + NET_ADDR_BYTES
+    + NET_ADDR_BYTES
+    + 8
+    + crate::p2p::compact_size::encoded_len(USER_AGENT.len())
+    + USER_AGENT.len()
+    + 4
+    + 1;
 
 /// Services 8, IPv6 address 16, port 2. No timestamp: `version` carries the
 /// pre-31402 address form, `net_processing.cpp:1582`.
@@ -35,27 +43,37 @@ const NET_ADDR_BYTES: usize = 8 + 16 + 2;
 ///
 /// # Panics
 ///
-/// If `USER_AGENT` is 0xfd bytes or longer, or the payload does not come to
-/// `FIXED_BYTES + USER_AGENT.len()`. Both are facts about elo, fixed at
-/// compile time; a peer cannot reach them.
+/// If the payload does not come to `PAYLOAD_BYTES`. That is a fact about
+/// elo, fixed at compile time; a peer cannot reach it.
 #[must_use]
 pub fn build(peer: std::net::SocketAddr, timestamp: i64, nonce: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(FIXED_BYTES + USER_AGENT.len());
+    let mut out = Vec::with_capacity(PAYLOAD_BYTES);
     out.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
     out.extend_from_slice(&0u64.to_le_bytes()); // services: none
     out.extend_from_slice(&timestamp.to_le_bytes());
     push_net_addr(&mut out, Some(peer)); // addr_recv: the peer as we see it
     push_net_addr(&mut out, None); // addr_from: Core ignores it, sends zeros
     out.extend_from_slice(&nonce.to_le_bytes());
-    let Ok(agent_len) = u8::try_from(USER_AGENT.len()) else {
-        unreachable!("the compile-time assertion above bounds the agent below 0xfd")
-    };
-    out.push(agent_len);
+    crate::p2p::compact_size::write_len(&mut out, USER_AGENT.len());
     out.extend_from_slice(USER_AGENT.as_bytes());
     out.extend_from_slice(&0i32.to_le_bytes()); // start_height: we hold no chain
     out.push(0); // relay (BIP37): do not announce transactions to us
-    assert_eq!(out.len(), FIXED_BYTES + USER_AGENT.len());
+    assert_eq!(out.len(), PAYLOAD_BYTES);
     out
+}
+
+/// The handler: the peer's `version` parsed, and the `verack` it earns.
+/// Only the first `version` of a session reaches here; the loop drops any
+/// other before it is read, as Core does (`net_processing.cpp:3586`).
+///
+/// # Errors
+///
+/// As `parse`: a `version` that does not parse, or is too old to keep,
+/// earns no `verack`. Core would log it and wait out its 60 s timer; with
+/// one peer we hang up.
+pub fn handle(payload: &[u8]) -> Result<(Peer, crate::p2p::message::Message), Error> {
+    let peer = parse(payload)?;
+    Ok((peer, crate::p2p::message::Message::Verack))
 }
 
 /// What the peer said about itself: the fields Core keeps from the message
@@ -127,17 +145,19 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl From<crate::compact_size::Error> for Error {
+impl From<crate::p2p::compact_size::Error> for Error {
     /// The one `CompactSize` in a `version` is the user agent's length, so
     /// each of its errors is an error about that field. A prefix cut short
     /// is the payload cut short: one error, not two.
-    fn from(e: crate::compact_size::Error) -> Self {
+    fn from(e: crate::p2p::compact_size::Error) -> Self {
         match e {
-            crate::compact_size::Error::Truncated => Error::Truncated,
-            crate::compact_size::Error::NonCanonical(len) => {
+            crate::p2p::compact_size::Error::Truncated => Error::Truncated,
+            crate::p2p::compact_size::Error::NonCanonical(len) => {
                 Error::NonCanonicalUserAgentLength(len)
             }
-            crate::compact_size::Error::TooLarge { value, .. } => Error::UserAgentTooLong(value),
+            crate::p2p::compact_size::Error::TooLarge { value, .. } => {
+                Error::UserAgentTooLong(value)
+            }
         }
     }
 }
@@ -150,22 +170,22 @@ impl From<crate::compact_size::Error> for Error {
 /// height. `relay` alone stays optional: BIP37 added it, and Core takes an
 /// absent one as `true`. Bytes after it are ignored, as Core ignores them.
 pub(crate) fn parse(payload: &[u8]) -> Result<Peer, Error> {
-    let (protocol, rest) = crate::compact_size::take::<4>(payload)?;
+    let (protocol, rest) = crate::p2p::compact_size::take::<4>(payload)?;
     let protocol = i32::from_le_bytes(*protocol);
     if protocol < PEER_PROTOCOL_VERSION_MIN {
         return Err(Error::Obsolete(protocol));
     }
-    let (services, rest) = crate::compact_size::take::<8>(rest)?;
-    let (_timestamp, rest) = crate::compact_size::take::<8>(rest)?;
-    let (_addr_recv, rest) = crate::compact_size::take::<NET_ADDR_BYTES>(rest)?;
-    let (_addr_from, rest) = crate::compact_size::take::<NET_ADDR_BYTES>(rest)?;
-    let (_nonce, rest) = crate::compact_size::take::<8>(rest)?;
-    let (agent_len, rest) = crate::compact_size::read_len(rest, USER_AGENT_BYTES_MAX)?;
+    let (services, rest) = crate::p2p::compact_size::take::<8>(rest)?;
+    let (_timestamp, rest) = crate::p2p::compact_size::take::<8>(rest)?;
+    let (_addr_recv, rest) = crate::p2p::compact_size::take::<NET_ADDR_BYTES>(rest)?;
+    let (_addr_from, rest) = crate::p2p::compact_size::take::<NET_ADDR_BYTES>(rest)?;
+    let (_nonce, rest) = crate::p2p::compact_size::take::<8>(rest)?;
+    let (agent_len, rest) = crate::p2p::compact_size::read_len(rest, USER_AGENT_BYTES_MAX)?;
     if rest.len() < agent_len {
         return Err(Error::Truncated);
     }
     let (user_agent, rest) = rest.split_at(agent_len);
-    let (start_height, rest) = crate::compact_size::take::<4>(rest)?;
+    let (start_height, rest) = crate::p2p::compact_size::take::<4>(rest)?;
     let start_height = i32::from_le_bytes(*start_height);
     let start_height =
         u32::try_from(start_height).map_err(|_| Error::NegativeHeight(start_height))?;
@@ -334,12 +354,7 @@ mod tests {
     fn with_user_agent(agent: &[u8]) -> Vec<u8> {
         let core = fixture(CORE);
         let mut payload = core[..80].to_vec();
-        if agent.len() < 0xfd {
-            payload.push(u8::try_from(agent.len()).unwrap());
-        } else {
-            payload.push(0xfd);
-            payload.extend_from_slice(&u16::try_from(agent.len()).unwrap().to_le_bytes());
-        }
+        crate::p2p::compact_size::write_len(&mut payload, agent.len());
         payload.extend_from_slice(agent);
         payload.extend_from_slice(&core[97..]);
         payload
@@ -394,5 +409,39 @@ mod tests {
         payload[97..101].copy_from_slice(&i32::MAX.to_le_bytes());
         let tallest = super::parse(&payload).unwrap();
         assert_eq!(tallest.start_height, 2_147_483_647, "the wire's ceiling");
+    }
+}
+
+#[cfg(test)]
+mod handler_tests {
+    // Core's `version` payload of 2026-09-13, with its frame header gone.
+    const CORE_VERSION: &str = "80110100090c00000000000028b0a66a000000000000000000000000000000000000000000000000000000000000090c000000000000000000000000000000000000000000000000d07dc58995aa90bc102f5361746f7368693a33312e312e302f0000000001";
+
+    fn fixture(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    #[test]
+    fn a_version_that_parses_earns_a_verack() {
+        // Red if the handler answers with anything but `verack`, or drops a
+        // field of the peer on the way.
+        let (peer, reply) = super::handle(&fixture(CORE_VERSION)).unwrap();
+        assert_eq!(peer.user_agent, b"/Satoshi:31.1.0/");
+        assert!(
+            matches!(reply, crate::p2p::message::Message::Verack),
+            "{reply}"
+        );
+        println!("{peer} -> {reply}");
+    }
+
+    #[test]
+    fn a_version_that_does_not_parse_earns_nothing() {
+        // Red if a truncated `version` still earns a `verack`.
+        let err = super::handle(&fixture(CORE_VERSION)[..80]).unwrap_err();
+        assert!(matches!(err, super::Error::Truncated), "{err}");
+        println!("{err}: no verack");
     }
 }
