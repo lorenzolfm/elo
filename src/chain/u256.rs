@@ -1,8 +1,3 @@
-//! A 256-bit unsigned number: Core's `arith_uint256`
-//! (`../bitcoin/src/arith_uint256.h:31` at v31.1), as far as a target needs
-//! one. What `nBits` decodes to before the limit is asked, or a block hash
-//! read as one. The arithmetic is here; what the bits mean is `pow`'s.
-
 const BITS: usize = 256;
 const LIMB_BITS: usize = 64;
 const LIMBS: usize = BITS / LIMB_BITS;
@@ -10,21 +5,12 @@ const LIMBS: usize = BITS / LIMB_BITS;
 const _: () = assert!(LIMBS * LIMB_BITS == BITS);
 const _: () = assert!(LIMBS * (LIMB_BITS / 8) == crate::chain::block_header::HASH_BYTES);
 
-/// Core's `arith_uint256` (`arith_uint256.h:31`) is eight 32-bit limbs,
-/// least significant first. This is four 64-bit limbs, *most* significant
-/// first, so that the derived comparison of the array is the comparison of
-/// the number: two equal-length arrays compared limb by limb from the top
-/// compare as the numbers they spell.
 #[derive(PartialEq, PartialOrd)]
 pub struct U256([u64; LIMBS]);
 
 impl U256 {
     pub(crate) const ZERO: U256 = U256([0; LIMBS]);
 
-    /// How many bits above the top set one are clear: `u64::leading_zeros`
-    /// for the whole number, and `BITS` for zero. Core asks the same of a
-    /// target through `arith_uint256::bits()` (`arith_uint256.cpp:172`).
-    /// `const`, so a `const` assertion can ask it of a limit.
     pub(crate) const fn leading_zeros(&self) -> u32 {
         let mut zeros = 0;
         let mut index = 0;
@@ -39,14 +25,6 @@ impl U256 {
         zeros
     }
 
-    /// `UintToArith256`, `arith_uint256.cpp:225`: the 32 bytes of a hash read
-    /// as a little-endian number. That is the number Core prints, so a hash
-    /// and the number made from it print the same.
-    ///
-    /// # Panics
-    ///
-    /// If the hash does not split into whole limbs. The `const` assertion
-    /// beside `LIMBS` says it does.
     #[must_use]
     pub fn from_hash(hash: &crate::chain::block_header::BlockHash) -> U256 {
         let (chunks, rest) = hash.as_bytes().as_chunks::<{ LIMB_BITS / 8 }>();
@@ -59,8 +37,6 @@ impl U256 {
         U256(limbs)
     }
 
-    /// The limbs as they sit, most significant first. For the constants
-    /// `chainparams.cpp` writes out in full, the `powLimit` of each network.
     pub(crate) const fn from_limbs(limbs: [u64; LIMBS]) -> U256 {
         U256(limbs)
     }
@@ -71,14 +47,6 @@ impl U256 {
         U256(limbs)
     }
 
-    /// `operator<<=`, `arith_uint256.cpp:14`, for a shift below the width:
-    /// each limb moves up by whole limbs, and the bits it pushes past its
-    /// new place land in the limb above.
-    ///
-    /// # Panics
-    ///
-    /// If `shift` is the width or more: the overflow check in `from_compact`
-    /// rules it out, so reaching it is our bug.
     pub(crate) fn shl(self, shift: usize) -> U256 {
         assert!(shift < BITS, "a shift of {shift} clears every bit");
         let whole = shift / LIMB_BITS;
@@ -98,8 +66,6 @@ impl U256 {
         U256(limbs)
     }
 
-    /// The number as 32 bytes, most significant first: the order `Display`
-    /// prints and the order `to_compact` reads a mantissa in.
     pub(crate) fn to_be_bytes(&self) -> [u8; crate::chain::block_header::HASH_BYTES] {
         let mut bytes = [0; crate::chain::block_header::HASH_BYTES];
         let (chunks, rest) = bytes.as_chunks_mut::<{ LIMB_BITS / 8 }>();
@@ -111,17 +77,6 @@ impl U256 {
         bytes
     }
 
-    /// `operator*=(uint32_t)`, `arith_uint256.cpp:48`: each limb times the
-    /// factor, the overflow carried into the limb above.
-    ///
-    /// # Panics
-    ///
-    /// If the product passes 256 bits. Core lets it wrap. The one caller is
-    /// `retarget`, where the number is a target at or below a `powLimit` of
-    /// 224 bits and the factor is a clamped timespan below 2^23, so 247 bits
-    /// is the most the product takes. Only regtest has a wider limit, 255
-    /// bits, and regtest does not retarget: the `const` assertions beside
-    /// `Params` hold every network that does to a limit that fits.
     pub(crate) fn mul_u32(self, factor: u32) -> U256 {
         let mut limbs = [0; LIMBS];
         let mut carry: u128 = 0;
@@ -137,15 +92,6 @@ impl U256 {
         U256(limbs)
     }
 
-    /// `operator/=`, `arith_uint256.cpp:76`, for a divisor of one limb: long
-    /// division from the top, each limb joined to the remainder above it. The
-    /// remainder is below the divisor, so the pair is never wider than a
-    /// `u128` and the digit it yields is never wider than a limb.
-    ///
-    /// # Panics
-    ///
-    /// If `divisor` is zero. The one caller divides by a network's
-    /// `nPowTargetTimespan`, which is a constant above zero.
     pub(crate) fn div_u32(self, divisor: u32) -> U256 {
         assert!(divisor != 0, "a timespan is not zero");
         let divisor = u128::from(divisor);
@@ -163,8 +109,6 @@ impl U256 {
     }
 }
 
-/// Lowercase hex, most significant first: `GetHex`, `arith_uint256.cpp:140`,
-/// the form `chainparams.cpp` writes a `powLimit` in.
 impl std::fmt::Display for U256 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for limb in &self.0 {
@@ -174,7 +118,6 @@ impl std::fmt::Display for U256 {
     }
 }
 
-/// The same as `Display`: a number prints as one.
 impl std::fmt::Debug for U256 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(self, f)

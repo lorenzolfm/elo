@@ -1,39 +1,22 @@
-//! What a frame means. The envelope (`frame.rs`) checks magic, length and
-//! checksum and hands over a command and a payload; this module turns that
-//! pair into a value, and a value back into the pair. Each message has a
-//! file of its own beside this one, with its payload, its codec and, where
-//! it has one, its handler; this is the union of them and the one `match`
-//! on the command.
-
 #[derive(Debug)]
 pub enum Message {
-    /// The payload as it came. The one `version` that counts is parsed by
-    /// its handler in the handshake; any other is a redundant one, which
-    /// Core drops before it reads a field (`net_processing.cpp:3586`), and
-    /// so do we.
     Version(Vec<u8>),
     Verack,
     Ping(u64),
     Pong(u64),
     GetHeaders(crate::p2p::getheaders::GetHeaders),
     Headers(crate::p2p::headers::Headers),
-    /// A command we do not speak. Core logs it and carries on
-    /// (`net_processing.cpp:5167`); a newer peer must not cost us the
-    /// connection.
     Unknown(crate::p2p::frame::Frame),
 }
 
 #[derive(Debug)]
 pub enum Error {
-    /// A command we know, with a payload of a size it cannot have.
     BadLength {
         command: crate::p2p::frame::Command,
         len_actual: usize,
         len_expected: usize,
     },
-    /// A `getheaders` payload that does not parse.
     GetHeaders(crate::p2p::getheaders::Error),
-    /// A `headers` payload that does not parse.
     Headers(crate::p2p::headers::Error),
 }
 
@@ -57,13 +40,6 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Message {
-    /// Turns a frame into the message it carries.
-    ///
-    /// # Errors
-    ///
-    /// `BadLength` if a command we know carries a payload of a size it
-    /// cannot have. `GetHeaders` or `Headers` if that payload does not
-    /// parse.
     pub fn decode(frame: crate::p2p::frame::Frame) -> Result<Message, Error> {
         match frame.command {
             crate::p2p::version::COMMAND => Ok(Message::Version(frame.payload)),
@@ -131,10 +107,6 @@ fn bad_length(frame: &crate::p2p::frame::Frame, len_expected: usize) -> Error {
 
 #[cfg(test)]
 mod tests {
-    // Every frame below was sent by Bitcoin Core v31.1.0, `bitcoind -regtest`,
-    // on 2026-09-13, in this order, to a throwaway Python script over a raw
-    // TCP socket. The script sent `version`, then `verack` after Core's, then
-    // `ping` with nonce 0x0123456789abcdef; `pong` is Core's answer to it.
     const VERSION: &str = "fabfb5da76657273696f6e000000000066000000c975755780110100090c00000000000058efa66a000000000000000000000000000000000000000000000000000000000000090c000000000000000000000000000000000000000000000000c732f4e357ca9782102f5361746f7368693a33312e312e302f0000000001";
     const WTXIDRELAY: &str = "fabfb5da777478696472656c61790000000000005df6e0e2";
     const SENDADDRV2: &str = "fabfb5da73656e646164647276320000000000005df6e0e2";
@@ -143,10 +115,6 @@ mod tests {
     const PING: &str = "fabfb5da70696e670000000000000000080000000518a0f806d2e2149c8064fd";
     const FEEFILTER: &str = "fabfb5da66656566696c746572000000080000000a19f7997a9e970000000000";
     const PONG: &str = "fabfb5da706f6e6700000000000000000800000033bc15e5efcdab8967452301";
-    // Two more, from `bitcoind -regtest` after `generatetoaddress 3` on
-    // 2026-09-15: Core's `getheaders` to a listening script that claimed
-    // `NODE_NETWORK`, and Core's `headers` to a script that asked from
-    // genesis. `headers.rs` has the chain and the capture.
     const GETHEADERS: &str = "fabfb5da676574686561646572730000850000008c4a998480110100030e6ddccc471aeeb899ff667f7d55da0443769850872e6d44924d32d610f24c2834cf96da8f1b387300eaa047d30955fbaf1b0bb6f261f22425454a6b43b7b23306226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f0000000000000000000000000000000000000000000000000000000000000000";
     const HEADERS: &str = "fabfb5da686561646572730000000000f40000002f52e50d030000002006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910fce25a9ef6a61909eadcc696fb71eb4d3216de17cc3731ecdd321a030e9213a1226cda96affff7f2000000000000000002034cf96da8f1b387300eaa047d30955fbaf1b0bb6f261f22425454a6b43b7b233650b72ea7da500a8429598a02571115bf2b6ee26da96be0378ff7cba4c98780e27cda96affff7f200300000000000000200e6ddccc471aeeb899ff667f7d55da0443769850872e6d44924d32d610f24c2869ee5ba689a2d757c652f917d12a43c9b24ba79dcff22abbea56c075d3d2bd7227cda96affff7f200000000000";
 

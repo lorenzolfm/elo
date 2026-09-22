@@ -1,9 +1,3 @@
-//! The headers we hold, genesis first, each naming the one before it. Core
-//! keeps a tree of every header it has seen and a `CChain` of the best
-//! branch (`../bitcoin/src/chain.h:437` at v31.1); elo keeps the one branch
-//! its one peer serves. A reorg is out of scope (ROADMAP, "After"), so a
-//! header that does not extend the tip is an error, not a fork.
-
 pub(crate) mod ancestors;
 pub mod block_header;
 pub mod locator;
@@ -12,12 +6,6 @@ pub mod pow;
 pub(crate) mod retarget;
 pub mod u256;
 
-/// The version of every genesis header, and the roots of the two coinbase
-/// transactions there are: `CreateGenesisBlock`,
-/// `../bitcoin/src/kernel/chainparams.cpp:36`, `:68`. Mainnet, testnet3 and
-/// regtest share the 2009 coinbase; testnet4 has one of its own (`:368`).
-/// Both roots are in wire order, the reverse of what `chainparams.cpp`
-/// asserts.
 const GENESIS_VERSION: i32 = 1;
 const MERKLE_ROOT_2009: [u8; crate::chain::block_header::HASH_BYTES] = [
     0x3b, 0xa3, 0xed, 0xfd, 0x7a, 0x7b, 0x12, 0xb2, 0x7a, 0xc7, 0x2c, 0x3e, 0x67, 0x76, 0x8f, 0x61,
@@ -28,9 +16,6 @@ const MERKLE_ROOT_TESTNET4: [u8; crate::chain::block_header::HASH_BYTES] = [
     0x67, 0xe6, 0x57, 0xcd, 0x40, 0x7e, 0x80, 0xcb, 0x14, 0x34, 0x22, 0x1e, 0xae, 0xa7, 0xa0, 0x7a,
 ];
 
-/// The genesis header of `network`: what `chainparams.cpp` passes to
-/// `CreateGenesisBlock` as time, nonce and bits (`:134` mainnet, `:260`
-/// testnet3, `:370` testnet4, `:634` regtest), around the parts they share.
 #[must_use]
 pub fn genesis(network: crate::chain::network::Network) -> crate::chain::block_header::Header {
     let (time, nonce, bits, merkle_root) = match network {
@@ -62,39 +47,22 @@ pub fn genesis(network: crate::chain::network::Network) -> crate::chain::block_h
 
 #[derive(Debug)]
 pub enum Error {
-    /// A header of the batch claims a target the network does not allow, or
-    /// hashes above the one it claims. Core checks the work of the whole
-    /// batch before it asks where the batch joins (`CheckHeadersPoW`,
-    /// `net_processing.cpp:2619`, called at `:2987` before `:3028`), and so
-    /// do we. `height` is the one the header would take.
     Pow {
         height: usize,
         error: crate::chain::pow::Error,
     },
-    /// The first header of a batch names a block that is not our tip. Core
-    /// asks again from its best header and waits to see if they connect
-    /// (`HandleUnconnectingHeaders`, `net_processing.cpp:2654`); with one
-    /// branch and no reorg, we have nothing to connect them to.
-    /// The header at `index` of the batch does not name the one before it.
-    /// Core refuses the batch for this before it looks at its chain
-    /// (`CheckHeadersAreContinuous`, `net_processing.cpp:2673`, from
-    /// `CheckHeadersPoW`, `:2628`).
-    NotContinuous { index: usize },
+    NotContinuous {
+        index: usize,
+    },
     NotOnTip {
         previous_block: crate::chain::block_header::BlockHash,
         tip: crate::chain::block_header::BlockHash,
     },
-    /// A header claims `nBits` that are not the ones the retargeting rules
-    /// require at its height. Core's `bad-diffbits`,
-    /// `ContextualCheckBlockHeader`, `validation.cpp:4136`.
     Bits {
         height: usize,
         claimed: u32,
         required: u32,
     },
-    /// A header does not come after the median time past of the headers
-    /// before it. Core's `time-too-old`, `ContextualCheckBlockHeader`,
-    /// `validation.cpp:4140`.
     TimeTooOld {
         height: usize,
         time: u32,
@@ -138,26 +106,12 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// One branch of headers from genesis. Never empty: genesis is there from
-/// `new`, so there is always a tip and a locator. Each header names the one
-/// before it: `Headers` holds that within a batch, and `extend` checks it at
-/// the join. Each header past genesis has the work it claims, at or below
-/// the limit of `network`, claims the `nBits` the retargeting rules require
-/// at its height, and comes after the median time past of the headers
-/// before it; `extend` checks all three.
 pub struct Chain {
     network: crate::chain::network::Network,
     headers: Vec<crate::chain::pow::Checked>,
 }
 
 impl Chain {
-    /// A chain of genesis alone.
-    ///
-    /// # Panics
-    ///
-    /// If genesis is not at height 0, names a block before it, or lacks the
-    /// work it claims. `genesis` rules all three out; the third is the
-    /// `chainparams.cpp` assertion on the genesis hash, in another form.
     #[must_use]
     pub fn new(network: crate::chain::network::Network) -> Chain {
         let genesis = match crate::chain::pow::checked(genesis(network), network) {
@@ -177,42 +131,23 @@ impl Chain {
         chain
     }
 
-    /// The network whose genesis starts the chain and whose limit bounds
-    /// every target in it.
     #[must_use]
     pub fn network(&self) -> crate::chain::network::Network {
         self.network
     }
 
-    /// The height of the tip: genesis is 0, as `getblockcount` counts.
-    ///
-    /// # Panics
-    ///
-    /// If the chain is empty, which `new` rules out.
     #[must_use]
     pub fn height(&self) -> usize {
         assert!(!self.headers.is_empty(), "a chain starts at genesis");
         self.headers.len() - 1
     }
 
-    /// The header at `height`.
-    ///
-    /// # Panics
-    ///
-    /// If `height` is above the tip. A height is an index into our chain,
-    /// never a peer's number; every caller asks at or below `height()`.
     #[must_use]
     pub fn at(&self, height: usize) -> &crate::chain::block_header::Header {
         assert!(height <= self.height(), "height {height} is above the tip");
         self.headers[height].header()
     }
 
-    /// The hash of the header at `height`, computed on each call. A locator
-    /// asks for a few dozen at most.
-    ///
-    /// # Panics
-    ///
-    /// As [`Self::at`].
     #[must_use]
     pub fn hash_at(&self, height: usize) -> crate::chain::block_header::BlockHash {
         self.at(height).hash()
@@ -223,16 +158,6 @@ impl Chain {
         self.hash_at(self.height())
     }
 
-    /// The locator for a `getheaders` from our tip. Core starts one below
-    /// its best header (`net_processing.cpp:5807`) so that a peer at the same
-    /// tip still answers with one header, and learns the peer's best block
-    /// from it. We keep nothing about the peer, so we start at the tip, and a
-    /// peer with nothing after it answers with an empty `headers`.
-    ///
-    /// # Panics
-    ///
-    /// If the locator does not start with our tip. `Locator::new` rules it
-    /// out: the first height it asks for is the one it is given.
     #[must_use]
     pub fn locator(&self) -> crate::chain::locator::Locator {
         let locator =
@@ -245,43 +170,11 @@ impl Chain {
         locator
     }
 
-    /// Appends a batch whose every header has the work it claims, whose
-    /// first header names our tip, and whose every header claims the `nBits`
-    /// the rules require and comes after the median time past of the headers
-    /// before it. An empty batch is fine and changes nothing.
-    /// The batch comes as the headers themselves, in the order the peer sent
-    /// them: what a `headers` message carries, with the message gone. The
-    /// checks run in Core's order: the work of every header, that each names
-    /// the one before it, the join to our tip, then the difficulty and the
-    /// time of each (`CheckHeadersPoW`, `net_processing.cpp:2619`, at
-    /// `:2987`; `:3028`; then `validation.cpp:4136` and `:4140`).
-    ///
-    /// # Errors
-    ///
-    /// `Pow` if a header claims a target above the limit of the network or
-    /// hashes above the target it claims. `NotContinuous` if a header does
-    /// not name the one before it. `NotOnTip` if the first header
-    /// names a block other than our tip. `Bits` if a header claims `nBits`
-    /// that the retargeting rules do not allow at its height. `TimeTooOld`
-    /// if a header does not come after the median time past of the headers
-    /// before it. On any of the five the chain is unchanged.
-    ///
-    /// # Panics
-    ///
-    /// If the height after the append is not the height before plus the
-    /// count of the batch. `Vec::extend` rules it out.
     pub fn extend(
         &mut self,
         headers: Vec<crate::chain::block_header::Header>,
     ) -> Result<(), Error> {
-        // The height of the first header of the batch: we hold heights 0
-        // to `held - 1`, so the batch starts at `held`. `checked_batch`
-        // has no ancestors and names its errors by this; the loop below
-        // has them and reads the height from them.
         let held = self.headers.len();
-        // The work first, for the whole batch: `next_bits` reads a
-        // `pow::Checked` and nothing else, so neither contextual check
-        // below can run before every header of the batch has one.
         let batch = checked_batch(headers, held, self.network)?;
         let Some(first) = batch.first() else {
             return Ok(());
@@ -294,16 +187,8 @@ impl Chain {
             });
         }
         for (offset, header) in batch.iter().enumerate() {
-            // The chain as it would be with the batch up to here on it, so
-            // that a header of the batch can be one a later header retargets
-            // from or takes a median time past over. Nothing has moved yet:
-            // the ancestors are our headers and the batch side by side.
             let ancestors =
                 crate::chain::ancestors::Ancestors::new(&self.headers, &batch[..offset]);
-            // The height the header would take, read from the ancestors
-            // and not counted a second time beside it: they end at the
-            // header before this one, as Core reads `pindexPrev->nHeight + 1`
-            // (`validation.cpp:4132`).
             let height = ancestors.height_last() + 1;
             let required =
                 crate::chain::retarget::next_bits(&ancestors, header.header(), self.network);
@@ -314,13 +199,6 @@ impl Chain {
                     required,
                 });
             }
-            // `validation.cpp:4140`, after the difficulty as Core has it: a
-            // header must be *later* than the median, so a header that ties
-            // it is refused. Without this a miner could hold the chain's
-            // clock still, and the clock is what the next retarget divides
-            // by. The bound at the other end, `time-too-new`, needs a clock
-            // of our own and waits for one (`Link::wall`,
-            // `validation.cpp:4156`).
             let median_time_past = ancestors.median_time_past();
             if header.header().time <= median_time_past {
                 return Err(Error::TimeTooOld {
@@ -338,25 +216,6 @@ impl Chain {
     }
 }
 
-/// Every header of `headers` with the work it claims checked, in the order
-/// the peer sent them. Core checks the work of a whole batch before it asks
-/// where the batch joins (`CheckHeadersPoW`, `net_processing.cpp:2619`,
-/// called at `:2987` before `:3028`), and `Chain::extend` follows it.
-///
-/// `height_first` is the height the first header of the batch would take,
-/// and names the header that failed. The count is not bounded here: the
-/// headers are already in memory, so the length a peer chose has already
-/// been paid for by whoever read them off the wire and bounded it there.
-///
-/// After the work, continuity: each header names the one before it, as Core
-/// requires once it has the list (`:2673`). The hash it compares is the one
-/// the work check just computed, kept in the `Checked`.
-///
-/// # Errors
-///
-/// `Pow` if a header claims a target above the limit of `network`, or
-/// hashes above the target it claims. `NotContinuous` if a header does not
-/// name the one before it.
 fn checked_batch(
     headers: Vec<crate::chain::block_header::Header>,
     height_first: usize,
@@ -366,7 +225,6 @@ fn checked_batch(
     for (offset, header) in headers.into_iter().enumerate() {
         match crate::chain::pow::checked(header, network) {
             Ok(header) => {
-                // The first header has nothing before it to name.
                 let names_the_last =
                     batch
                         .last()
@@ -392,10 +250,6 @@ fn checked_batch(
 
 #[cfg(test)]
 mod tests {
-    // What `chainparams.cpp` asserts each genesis hashes to: `:136`, `:262`,
-    // `:378`, `:636`. Mainnet and regtest are also what `getblockhash 0`
-    // printed for `block_header.rs`; here the strings pin the values
-    // `genesis` builds from.
     const MAINNET_GENESIS_HASH: &str =
         "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
     const TESTNET3_GENESIS_HASH: &str =
@@ -405,10 +259,6 @@ mod tests {
     const REGTEST_GENESIS_HASH: &str =
         "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206";
 
-    // Core's `headers` after regtest genesis, blocks 1 to 3, captured for
-    // `headers.rs` on 2026-09-15 (`FROM_GENESIS` there, with the chain as
-    // `getblockhash` printed it): the batch that `extend` must accept from
-    // a fresh regtest chain and refuse from a mainnet one.
     const FROM_GENESIS: &str = "030000002006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910fce25a9ef6a61909eadcc696fb71eb4d3216de17cc3731ecdd321a030e9213a1226cda96affff7f2000000000000000002034cf96da8f1b387300eaa047d30955fbaf1b0bb6f261f22425454a6b43b7b233650b72ea7da500a8429598a02571115bf2b6ee26da96be0378ff7cba4c98780e27cda96affff7f200300000000000000200e6ddccc471aeeb899ff667f7d55da0443769850872e6d44924d32d610f24c2869ee5ba689a2d757c652f917d12a43c9b24ba79dcff22abbea56c075d3d2bd7227cda96affff7f200000000000";
     const BLOCK_3: &str = "08e1a659dc25965d0cdf6d093b9247b09e9ce97a22cc77bca0b510ba4b337d61";
 
@@ -419,9 +269,6 @@ mod tests {
             .collect()
     }
 
-    /// The headers in a `headers` payload: a one-byte count, then each
-    /// header and the zero transaction count after it. Read here by hand so
-    /// that the chain's tests read nothing from `p2p`.
     fn headers_in(payload: &[u8]) -> Vec<crate::chain::block_header::Header> {
         let (&count, rest) = payload.split_first().unwrap();
         let count = usize::from(count);
@@ -443,10 +290,6 @@ mod tests {
         headers_in(&fixture(FROM_GENESIS))
     }
 
-    /// One mined regtest header after `previous` that claims `time` and
-    /// `bits`, as a batch of its own. `mined_after` builds a whole batch and
-    /// picks both for itself; this one is for the tests where one of the two
-    /// is the thing under test.
     fn one_after(
         previous: &crate::chain::block_header::BlockHash,
         time: u32,
@@ -465,19 +308,11 @@ mod tests {
         vec![header]
     }
 
-    /// The time a header a test builds claims at `height`: one second a
-    /// block from the time regtest genesis claims. Times that rise put every
-    /// header after the median time past of the ones before it, which is
-    /// what a test that is not about time wants.
     fn time_at(height: usize) -> u32 {
         let genesis = super::genesis(crate::chain::network::Network::Regtest);
         genesis.time + u32::try_from(height).expect("a test height fits")
     }
 
-    /// `count` regtest headers from `height_first` on, after `previous`,
-    /// each naming the one before and each mined, as `peer.rs` builds a
-    /// batch. `spoil` is the offset of one header left at the nonce that
-    /// fails, if any.
     fn mined_after(
         previous: &crate::chain::block_header::BlockHash,
         height_first: usize,

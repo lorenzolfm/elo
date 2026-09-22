@@ -1,52 +1,14 @@
-//! The block locator: the hashes we put in `getheaders` so that the peer can
-//! find where its chain and ours part. Core builds it in `LocatorEntries`,
-//! `../bitcoin/src/chain.cpp:26` at v31.1, and searches it in
-//! `FindForkInGlobalIndex`, `validation.cpp:127`.
-//!
-//! The shape: the tip and the ten below it, one height apart, then the step
-//! doubles until it reaches genesis. The peer walks the list newest first and
-//! answers from the first hash on its chain (`net_processing.cpp:4441`), or
-//! from genesis if it knows none. The eleven dense hashes settle the common
-//! case, a peer a few blocks ahead of us, with no header sent twice. Below
-//! them the doubling makes the list grow with the logarithm of the height:
-//! forty-odd hashes for any chain a `u32` height can count, so one request
-//! finds a fork of any depth. The price is that a fork deeper than ten costs
-//! us headers we already have: the fork is somewhere in one step, and the
-//! peer answers from the hash below it, at most one step back. A fork at
-//! depth `d` costs at most `d` headers, so the waste is proportional to the
-//! problem.
-
-/// `MAX_LOCATOR_SZ`, `net_processing.cpp:124`. Core disconnects a peer whose
-/// locator is longer (`:4399`).
 pub const HASHES_MAX: usize = 101;
 
-// A locator count always fits one `CompactSize` byte; `GetHeaders::encode`
-// sizes its buffer on that.
 const _: () = assert!(HASHES_MAX < 0xfd);
 
-/// How many hashes below the tip are one height apart. Core doubles the step
-/// once the list holds more than this many (`chain.cpp:40`), so the tip and
-/// `DENSE` more come one apart, and the doubling starts under them.
 const DENSE: usize = 10;
 
-/// The most heights `heights` can name: the tip and the dense run, then one
-/// per power of two the step takes, then genesis. The step is a `usize`, so
-/// it takes fewer than `usize::BITS` powers before it passes any height. On
-/// a 64-bit target that is 11 + 63 + 1 = 75, and Core's limit is never near.
 const BUILT_MAX: usize = 1 + DENSE + (64 - 1) + 1;
 
 const _: () = assert!(usize::BITS <= 64);
 const _: () = assert!(BUILT_MAX <= HASHES_MAX);
 
-/// The heights a locator names for a chain whose tip is at `tip`, newest
-/// first, ending at genesis: `LocatorEntries` with the hash lookup taken out.
-/// The step is computed before it doubles, as Core computes it (`chain.cpp:37`
-/// before `:40`), so the twelfth height is one below the eleventh, not two.
-///
-/// # Panics
-///
-/// If the list grows past `BUILT_MAX`. The bound is arithmetic on our own
-/// height; no input reaches it.
 #[must_use]
 pub fn heights(tip: usize) -> Vec<usize> {
     let mut out = Vec::with_capacity(BUILT_MAX);
@@ -59,8 +21,6 @@ pub fn heights(tip: usize) -> Vec<usize> {
         }
         height = height.saturating_sub(step);
         if out.len() > DENSE {
-            // Past the last doubling a `usize` allows, the step is saturated
-            // and the next height is genesis; the loop ends on the line after.
             step = step.saturating_mul(2);
         }
     }
@@ -73,27 +33,10 @@ pub fn heights(tip: usize) -> Vec<usize> {
     out
 }
 
-/// The `CBlockLocator` in a `getheaders`: block hashes, newest first, at most
-/// `HASHES_MAX` of them. `new` gives it Core's shape; `GetHeaders::parse`
-/// reads one a peer shaped. Both hold the bound, so a `Locator` is always one
-/// Core will answer instead of hanging up.
 #[derive(Debug)]
 pub struct Locator(Vec<crate::chain::block_header::BlockHash>);
 
 impl Locator {
-    /// Core's `GetLocator`, `chain.cpp:45`: the hash at each height that
-    /// `heights(tip)` names. `hash_at` is asked once per height, newest
-    /// first, and never for a height above `tip`.
-    ///
-    /// `tip` is the caller's choice, not always the tip of its chain. Core
-    /// starts its headers sync one below its best header
-    /// (`net_processing.cpp:5807`), so that a peer at the same tip still
-    /// answers with one header and Core learns that the peer has it.
-    ///
-    /// # Panics
-    ///
-    /// If `heights` names nothing or more than `HASHES_MAX`. Neither is
-    /// reachable: `heights` ends at genesis and is bounded by `BUILT_MAX`.
     pub fn new(
         tip: usize,
         hash_at: impl FnMut(usize) -> crate::chain::block_header::BlockHash,
@@ -105,9 +48,6 @@ impl Locator {
         Locator(hashes)
     }
 
-    /// A locator in the shape someone else gave it. `GetHeaders::parse` has
-    /// bounded the count before it read a hash, so the assertion is about our
-    /// parser, not about the peer.
     pub(crate) fn from_wire(hashes: Vec<crate::chain::block_header::BlockHash>) -> Locator {
         assert!(
             hashes.len() <= HASHES_MAX,
@@ -135,17 +75,8 @@ impl Locator {
 
 #[cfg(test)]
 mod tests {
-    // Core's `getheaders` to a listening script, Bitcoin Core v31.1.0,
-    // `bitcoind -regtest`, 2026-09-16, after `generatetoaddress 199`. The
-    // script's `version` claimed `NODE_NETWORK`; `addnode 127.0.0.1:<port>
-    // onetry false` made Core connect to it, v1. Core's tip was 199, and its
-    // locator starts at 198 (`net_processing.cpp:5807`): nineteen hashes.
     const CORE_GETHEADERS: &str = "801101001357432727ae1ead6d3f9f2d4d648f0479111eecef28af7d251d17100700c41d3512b7a4295bb9903b2896a0a98f27b0e0c7a4f57187abb5e08a4fe536c79cef1fb6d8fef1eaa3ee9fe0cce5f7ab51d83702a7d720b07d3b69c15a773bbd97076b6b60e28cbe9d410d831e382bddc5139784a5c49e63899f0a1771911b7841ba68cc3a779adaedb4893385c25733557dfb600b5f7e1614dac02ea84840c28a5702cebabe31906bf7849f3c6f56a61df74c8f2a12cdd623396371748faf31576f71a8af5a27dd5d52379a3b2547356a5b9b731ff2d6623c2826cfad866ace0b0e5377cfafe4a8950c536dab4fd6341a28fdaabc7875b39c618af17c6656a6c77365aac6413e0cc05cfbe9746c4527cb2cc8902e4a89cf9bfacfe64d533c3702f80f81b50fcc2a83fcd9c9635485263ec01d4dec99c27823897c3b0f9f3b59b1063b28e5e4943faa04a5451cdbd7241b8edda545a397097b8f6c3191aa7d37c1a5115dc3cded6fae00409a49b68f733e7bd44d9f8f530806eeff1c10340ed7b1f21b54b5cde8bd8a7cafb8bc414d8e52c518c68ae53227dae42b6de750b6ace0b304e3a2815e330018eae36f1ae482a5fc294ff8ac06b03ffbbd398a682b39160f629431557d321881cd431e12287cd813e4d3bfd2a89bf9589519cc908329838e269cf56b8db46cb0b9b2983d65c361478330a91b3b64ae06ac9479d8d040623a05be604ff7c8bef1707f014846eb1d328e39b9ee9373b30c665a2e5d37a6d12a2ec172d92aab7869066116ff92737bb58906bc77f76aa126fb598d5b569c16144a06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f0000000000000000000000000000000000000000000000000000000000000000";
 
-    // `getblockhash <height>` on the same node, for the heights the shape
-    // names below the dense run. These eight are the doubling, where a wrong
-    // step lands on a hash Core did not send. The dense run is checked by its
-    // two ends, `BLOCK_198` and `BLOCK_188`, and by the count.
     const SPARSE: [(usize, &str); 8] = [
         (
             187,
@@ -190,9 +121,6 @@ mod tests {
             .collect()
     }
 
-    /// The hashes in Core's `getheaders` payload: after the four-byte
-    /// version and the one-byte count, 32 bytes each, up to the stop hash.
-    /// Read here by hand so that the chain's tests read nothing from `p2p`.
     fn core_locator() -> super::Locator {
         let payload = fixture(CORE_GETHEADERS);
         let count = usize::from(payload[4]);
@@ -261,7 +189,6 @@ mod tests {
         assert_eq!(super::heights(0), [0]);
         assert_eq!(super::heights(1), [1, 0]);
         assert_eq!(super::heights(10), (0..=10).rev().collect::<Vec<_>>());
-        // Eleven dense, then a step of two would skip genesis; it does not.
         assert_eq!(super::heights(11), (0..=11).rev().collect::<Vec<_>>());
         assert_eq!(
             super::heights(12),

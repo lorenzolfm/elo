@@ -1,37 +1,13 @@
-//! The chain a contextual check reads: the headers we hold, and after them
-//! the part of a batch already taken. Core gives such a check `pindexPrev`
-//! and lets it walk the `pprev` chain behind it (`ContextualCheckBlockHeader`,
-//! `../bitcoin/src/validation.cpp:4128` at v31.1); elo keeps one branch and
-//! no tree, so the ancestors of a header are the two slices side by side.
-
-/// How many headers a median time past is taken over: Core's
-/// `nMedianTimeSpan`, `../bitcoin/src/chain.h:231`.
 const SPAN_HEADERS_MAX: usize = 11;
 
-/// The span is odd, so the middle of a full window is one time and not the
-/// mean of two. `median_time_past` takes `window[count / 2]`, which is the
-/// median only while this holds; the even case it also handles is a chain
-/// shorter than the span, never the span itself.
 const _: () = assert!(SPAN_HEADERS_MAX % 2 == 1);
 
-/// The chain a contextual check reads. Every height from 0 to `height_last`
-/// is one of the headers in it, so the height a header follows is a fact of
-/// the ancestors and not a number the caller brings beside it.
 pub(crate) struct Ancestors<'a> {
     held: &'a [crate::chain::pow::Checked],
     batch: &'a [crate::chain::pow::Checked],
 }
 
 impl<'a> Ancestors<'a> {
-    /// The ancestors `held` with `batch` after them. `Chain::extend` builds
-    /// one for each header of a batch, over the headers in front of that one:
-    /// a header of the batch can be the one a later header retargets from.
-    ///
-    /// # Panics
-    ///
-    /// If `held` is empty. A chain holds genesis before it holds anything
-    /// else, so every header has genesis behind it. `height_last` reads
-    /// the same invariant at the other end.
     #[must_use]
     pub(crate) fn new(
         held: &'a [crate::chain::pow::Checked],
@@ -41,12 +17,6 @@ impl<'a> Ancestors<'a> {
         Ancestors { held, batch }
     }
 
-    /// The height of the last of the ancestors: the height the header a
-    /// peer offers would follow.
-    ///
-    /// # Panics
-    ///
-    /// If there are no ancestors. `new` asserts there is one.
     #[must_use]
     pub(crate) fn height_last(&self) -> usize {
         let count = self.held.len() + self.batch.len();
@@ -54,12 +24,6 @@ impl<'a> Ancestors<'a> {
         count - 1
     }
 
-    /// The header at `height`.
-    ///
-    /// # Panics
-    ///
-    /// If `height` is above `height_last`. As `Chain::at`: a height here
-    /// is an index into our own chain, never a number a peer sends.
     #[must_use]
     pub(crate) fn at(&self, height: usize) -> &crate::chain::pow::Checked {
         assert!(
@@ -72,30 +36,9 @@ impl<'a> Ancestors<'a> {
         }
     }
 
-    /// `GetMedianTimePast`, `../bitcoin/src/chain.h:233`: the median of the
-    /// times of the last `SPAN_HEADERS_MAX` of the ancestors. Core walks
-    /// back over `pprev` and stops where there is no header before
-    /// (`:240`), so ancestors shorter than the span give up every header
-    /// they hold.
-    ///
-    /// A miner writes its own clock into the header it mines, so block times
-    /// do not rise along the chain and one header alone says little. The
-    /// median of eleven is what a rule about time reads instead: to move it
-    /// by a second, a miner must move six of the eleven.
-    ///
-    /// With an even count the answer is the upper of the two middle times,
-    /// which is what `pbegin[(pend - pbegin) / 2]` takes (`:242`). Only the
-    /// first ten heights of a chain have an even count.
-    ///
-    /// # Panics
-    ///
-    /// If there are no ancestors. `new` rules it out.
     #[must_use]
     pub(crate) fn median_time_past(&self) -> u32 {
         let height_last = self.height_last();
-        // The walk is the shorter of the span and the ancestors:
-        // `height_last + 1` is how many headers there are, and it bounds the
-        // loop below where the ancestors are fewer than the span.
         let count = std::cmp::min(height_last + 1, SPAN_HEADERS_MAX);
         let mut times = [0; SPAN_HEADERS_MAX];
         for (offset, time) in times[..count].iter_mut().enumerate() {
@@ -104,9 +47,6 @@ impl<'a> Ancestors<'a> {
         let window = &mut times[..count];
         window.sort_unstable();
         let median = window[count / 2];
-        // The pair to the loop above, read back from the ancestors rather
-        // than from `times`: the answer is the time of a header the walk
-        // read, and never a slot of `times` the walk left at zero.
         assert!(
             (0..count).any(|offset| self.at(height_last - offset).header().time == median),
             "a median time past is the time of one of the ancestors"
@@ -117,13 +57,6 @@ impl<'a> Ancestors<'a> {
 
 #[cfg(test)]
 mod tests {
-    /// What Core answered for a regtest chain of sixteen blocks, generated
-    /// with `setmocktime` set high and low by turns so that the times do not
-    /// rise along the chain: five blocks jump far ahead and every block
-    /// after one of them is older than its own parent. `getblockheader`
-    /// prints both columns (`../bitcoin/src/rpc/blockchain.cpp:169` at
-    /// v31.1); they are seconds after the time regtest genesis claims,
-    /// genesis first.
     const CORE_TIMES: [u32; 17] = [
         0, 100, 200, 5000, 300, 400, 6000, 500, 700, 7000, 600, 800, 8000, 900, 1000, 9000, 1100,
     ];
@@ -131,8 +64,6 @@ mod tests {
         0, 100, 100, 200, 200, 300, 300, 400, 400, 500, 500, 600, 700, 800, 800, 900, 1000,
     ];
 
-    /// A header with a time and bits, and nothing else the ancestors are
-    /// read for.
     fn header(time: u32, bits: u32) -> crate::chain::block_header::Header {
         crate::chain::block_header::Header {
             version: 1,
@@ -144,8 +75,6 @@ mod tests {
         }
     }
 
-    /// Headers to build ancestors over, one per time given, all claiming
-    /// the same bits. Nothing here is mined: `pow::unchecked` says why.
     fn timeline(times: &[u32], bits: u32) -> Vec<crate::chain::pow::Checked> {
         times
             .iter()

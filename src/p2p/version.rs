@@ -1,29 +1,13 @@
-//! The `version` payload we send. The field order is the argument order of
-//! `PushNodeVersion`, `../bitcoin/src/net_processing.cpp:1576` at v31.1.
-//!
-//! `Peer` is the peer as its `version` describes it, read the way Core reads ours
-//! (`net_processing.cpp:3585`).
-
 pub const COMMAND: crate::p2p::frame::Command = crate::p2p::frame::Command::from_static("version");
 
-/// `PROTOCOL_VERSION`, `../bitcoin/src/node/protocol_version.h:12` at v31.1.
-/// Announcing 70016 is what makes Core send `wtxidrelay` and `sendaddrv2`
-/// before its `verack` (`net_processing.cpp:3716` and `:3725`).
 const PROTOCOL_VERSION: i32 = 70016;
 
-/// `MIN_PEER_PROTO_VERSION`, `protocol_version.h:18`. Core disconnects a
-/// peer below it (`net_processing.cpp:3623`); so do we.
 const PEER_PROTOCOL_VERSION_MIN: i32 = 31800;
 
-/// `MAX_SUBVERSION_LENGTH`, `../bitcoin/src/net.h:67`. Core rejects a longer
-/// user agent before it reads it (`net_processing.cpp:3640`, `serialize.h:621`).
 const USER_AGENT_BYTES_MAX: usize = 256;
 
 pub const USER_AGENT: &str = concat!("/elo:", env!("CARGO_PKG_VERSION"), "/");
 
-/// The payload `build` writes: version 4, services 8, timestamp 8, two
-/// addresses of 26, nonce 8, the user agent behind its `CompactSize` length,
-/// height 4, relay 1.
 const PAYLOAD_BYTES: usize = 4
     + 8
     + 8
@@ -35,62 +19,35 @@ const PAYLOAD_BYTES: usize = 4
     + 4
     + 1;
 
-/// Services 8, IPv6 address 16, port 2. No timestamp: `version` carries the
-/// pre-31402 address form, `net_processing.cpp:1582`.
 const NET_ADDR_BYTES: usize = 8 + 16 + 2;
 
-/// Builds the payload that announces us to `peer`.
-///
-/// # Panics
-///
-/// If the payload does not come to `PAYLOAD_BYTES`. That is a fact about
-/// elo, fixed at compile time; a peer cannot reach it.
 #[must_use]
 pub fn build(peer: std::net::SocketAddr, timestamp: i64, nonce: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(PAYLOAD_BYTES);
     out.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-    out.extend_from_slice(&0u64.to_le_bytes()); // services: none
+    out.extend_from_slice(&0u64.to_le_bytes());
     out.extend_from_slice(&timestamp.to_le_bytes());
-    push_net_addr(&mut out, Some(peer)); // addr_recv: the peer as we see it
-    push_net_addr(&mut out, None); // addr_from: Core ignores it, sends zeros
+    push_net_addr(&mut out, Some(peer));
+    push_net_addr(&mut out, None);
     out.extend_from_slice(&nonce.to_le_bytes());
     crate::p2p::compact_size::write_len(&mut out, USER_AGENT.len());
     out.extend_from_slice(USER_AGENT.as_bytes());
-    out.extend_from_slice(&0i32.to_le_bytes()); // start_height: we hold no chain
-    out.push(0); // relay (BIP37): do not announce transactions to us
+    out.extend_from_slice(&0i32.to_le_bytes());
+    out.push(0);
     assert_eq!(out.len(), PAYLOAD_BYTES);
     out
 }
 
-/// The handler: the peer's `version` parsed, and the `verack` it earns.
-/// Only the first `version` of a session reaches here; the loop drops any
-/// other before it is read, as Core does (`net_processing.cpp:3586`).
-///
-/// # Errors
-///
-/// As `parse`: a `version` that does not parse, or is too old to keep,
-/// earns no `verack`. Core would log it and wait out its 60 s timer; with
-/// one peer we hang up.
 pub fn handle(payload: &[u8]) -> Result<(Peer, crate::p2p::message::Message), Error> {
     let peer = parse(payload)?;
     Ok((peer, crate::p2p::message::Message::Verack))
 }
 
-/// What the peer said about itself: the fields Core keeps from the message
-/// (`net_processing.cpp:3668` to `:3679`), minus three it keeps for features
-/// we do not have. The timestamp feeds Core's clock-skew warning (`:3793`);
-/// the address is where the peer sees us (`:3674`); the nonce catches a
-/// connection to ourself, which only the inbound side checks (`:3649`).
 #[derive(Debug)]
 pub struct Peer {
     pub(crate) protocol: i32,
     pub(crate) services: u64,
-    /// Raw bytes. BIP14 says what a user agent should look like; a peer says
-    /// what it likes, so `Display` escapes anything outside printable ASCII.
     pub(crate) user_agent: Vec<u8>,
-    /// Core reads a signed height and keeps `-1` for "not sent"
-    /// (`net_processing.cpp:3597`). We require the field, so the sentinel has
-    /// no meaning here, and a height below zero is not a height.
     pub(crate) start_height: u32,
     pub(crate) relay: bool,
 }
@@ -111,7 +68,6 @@ impl std::fmt::Display for Peer {
 
 #[derive(Debug)]
 pub enum Error {
-    /// A required field runs past the end of the payload.
     Truncated,
     Obsolete(i32),
     UserAgentTooLong(u64),
@@ -146,9 +102,6 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl From<crate::p2p::compact_size::Error> for Error {
-    /// The one `CompactSize` in a `version` is the user agent's length, so
-    /// each of its errors is an error about that field. A prefix cut short
-    /// is the payload cut short: one error, not two.
     fn from(e: crate::p2p::compact_size::Error) -> Self {
         match e {
             crate::p2p::compact_size::Error::Truncated => Error::Truncated,
@@ -162,13 +115,6 @@ impl From<crate::p2p::compact_size::Error> for Error {
     }
 }
 
-/// Reads the peer's `version` payload.
-///
-/// Core reads the fields after the addresses only if bytes remain
-/// (`net_processing.cpp:3631` to `:3648`), a tolerance for peers older than
-/// the ones it disconnects at `:3623`. We require every field through the
-/// height. `relay` alone stays optional: BIP37 added it, and Core takes an
-/// absent one as `true`. Bytes after it are ignored, as Core ignores them.
 pub(crate) fn parse(payload: &[u8]) -> Result<Peer, Error> {
     let (protocol, rest) = crate::p2p::compact_size::take::<4>(payload)?;
     let protocol = i32::from_le_bytes(*protocol);
@@ -189,9 +135,7 @@ pub(crate) fn parse(payload: &[u8]) -> Result<Peer, Error> {
     let start_height = i32::from_le_bytes(*start_height);
     let start_height =
         u32::try_from(start_height).map_err(|_| Error::NegativeHeight(start_height))?;
-    // A serialized `bool` is one byte, nonzero for true (`serialize.h:277`).
     let relay = rest.first().is_none_or(|&byte| byte != 0);
-    // What the guards above promised, restated where the value is kept.
     assert!(protocol >= PEER_PROTOCOL_VERSION_MIN);
     assert!(user_agent.len() <= USER_AGENT_BYTES_MAX);
     Ok(Peer {
@@ -203,11 +147,8 @@ pub(crate) fn parse(payload: &[u8]) -> Result<Peer, Error> {
     })
 }
 
-/// The 26-byte address inside `version`: services, a 16-byte IPv6 address
-/// with IPv4 as `::ffff:a.b.c.d`, and the port, the one big-endian field in
-/// the protocol.
 fn push_net_addr(out: &mut Vec<u8>, addr: Option<std::net::SocketAddr>) {
-    out.extend_from_slice(&0u64.to_le_bytes()); // services: we know none
+    out.extend_from_slice(&0u64.to_le_bytes());
     match addr {
         Some(std::net::SocketAddr::V4(a)) => {
             out.extend_from_slice(&a.ip().to_ipv6_mapped().octets());
@@ -223,10 +164,6 @@ fn push_net_addr(out: &mut Vec<u8>, addr: Option<std::net::SocketAddr>) {
 
 #[cfg(test)]
 mod tests {
-    // Core's `version` to a peer at 127.0.0.1:28444, without the envelope.
-    // Bitcoin Core v31.1.0, `bitcoind -regtest`, captured on 2026-09-13 by a
-    // throwaway Python script that sent `version` over a raw TCP socket and
-    // hex-dumped the answer.
     const CORE: &str = "80110100090c00000000000028b0a66a000000000000000000000000000000000000000000000000000000000000090c000000000000000000000000000000000000000000000000d07dc58995aa90bc102f5361746f7368693a33312e312e302f0000000001";
 
     fn fixture(hex: &str) -> Vec<u8> {
@@ -236,8 +173,6 @@ mod tests {
             .collect()
     }
 
-    // The same, from a node after `generatetoaddress 300`, captured the same
-    // way on the same day. Bytes 97 to 100 are the height.
     const CORE_AT_300: &str = "80110100090c0000000000007d08a76a000000000000000000000000000000000000000000000000000000000000090c000000000000000000000000000000000000000000000000169ddf69497b1661102f5361746f7368693a33312e312e302f2c01000001";
 
     fn ours() -> Vec<u8> {
@@ -265,8 +200,6 @@ mod tests {
             "addr_recv: 127.0.0.1 as ::ffff:7f00:1"
         );
         assert_eq!(&ours[44..46], &28444u16.to_be_bytes(), "port, big-endian");
-        // Core zeroes addr_recv unless the peer is routable
-        // (net_processing.cpp:1570). 127.0.0.1 is not. We send it anyway.
         assert_eq!(&core[20..46], &[0; 26], "Core's addr_recv for loopback");
         assert_eq!(&ours[46..72], &[0; 26], "addr_from: zeros");
         assert_eq!(
@@ -349,8 +282,6 @@ mod tests {
         println!("31800 is the oldest Core keeps, so the oldest we keep");
     }
 
-    /// Core's payload with the user agent swapped for `agent`, its length
-    /// written as Core would write it.
     fn with_user_agent(agent: &[u8]) -> Vec<u8> {
         let core = fixture(CORE);
         let mut payload = core[..80].to_vec();
@@ -368,8 +299,6 @@ mod tests {
         assert!(matches!(err, super::Error::UserAgentTooLong(257)), "{err}");
         println!("256 bytes: read; 257: {err}");
 
-        // A length that promises more than the payload holds, well under the
-        // limit: truncated, not allocated.
         let mut promised = with_user_agent(b"/short/");
         promised[80] = 200;
         let err = super::parse(&promised).unwrap_err();
@@ -414,7 +343,6 @@ mod tests {
 
 #[cfg(test)]
 mod handler_tests {
-    // Core's `version` payload of 2026-09-13, with its frame header gone.
     const CORE_VERSION: &str = "80110100090c00000000000028b0a66a000000000000000000000000000000000000000000000000000000000000090c000000000000000000000000000000000000000000000000d07dc58995aa90bc102f5361746f7368693a33312e312e302f0000000001";
 
     fn fixture(hex: &str) -> Vec<u8> {
