@@ -1,37 +1,3 @@
-//! `GetNextWorkRequired`, `../bitcoin/src/pow.cpp:14` at v31.1: which
-//! `nBits` a header is allowed to claim at its height, and `retarget`, the
-//! arithmetic on a period boundary (`CalculateNextWorkRequired`, `:50`). The
-//! other half of proof of work: `pow::check` asks whether a header did the
-//! work it claims; `next_bits` asks whether it claimed the right amount. It
-//! reads `Checked` headers only, so the two questions come in that order.
-
-/// `CalculateNextWorkRequired`, `pow.cpp:50`, without the
-/// `fPowNoRetargeting` line that opens it: `target` scaled by
-/// `timespan_actual` over `timespan_target`, the seconds the period was
-/// meant to take, held at or below `limit`, and written back in compact
-/// form.
-///
-/// `timespan_actual` is the seconds the period really took, and it is
-/// signed: block times are not sorted, so the last block of a period can be
-/// older than the first. It is clamped to a quarter of the target timespan
-/// and to four times it (`pow.cpp:57`), so one period moves the target by
-/// four either way at most, and a span below zero is simply the low clamp.
-///
-/// The scaling drops the low bits, and `to_compact` keeps 23 of them, so the
-/// result is not the exact ratio. It is what every node computes, which is
-/// what consensus asks.
-///
-/// The caller brings the target of a header it already checked, so there is
-/// no decode here and no error to return. It also brings the
-/// `timespan_target` and the `limit`, and a `Retarget::Every` is the only
-/// source of a target timespan, so a network that does not retarget cannot
-/// reach here and cannot bring the 255-bit limit that would overflow the
-/// multiply.
-///
-/// # Panics
-///
-/// If the product passes 256 bits, which the `const` assertions beside
-/// `Params` rule out.
 fn retarget(
     target: crate::chain::pow::Target,
     timespan_actual: i64,
@@ -52,19 +18,6 @@ fn retarget(
     }
 }
 
-/// One answer from `next_bits`, held to what a header may claim. The rules
-/// must ask for `nBits` that decode to a target of `network`: if they ask
-/// for anything else, no header can meet both them and `check`, and the
-/// chain stops at that height for good with the refusal blamed on the peer.
-/// `check` decodes on the way in, this decodes on the way out, so the
-/// property is asserted at both ends of the pair. Every path here already
-/// holds it — a checked header's own claim, the limit, or a product held at
-/// or below the limit — and a decode is a few shifts beside the two hashes
-/// the header has already cost.
-///
-/// # Panics
-///
-/// If the bits do not decode to a target of `network`, which is our bug.
 fn next_bits_required(bits: u32, network: crate::chain::network::Network) -> u32 {
     if let Err(error) = crate::chain::pow::Target::from_compact(bits, network) {
         panic!("the rules require bits {bits:#010x} that no header may claim: {error}");
@@ -72,22 +25,6 @@ fn next_bits_required(bits: u32, network: crate::chain::network::Network) -> u32
     bits
 }
 
-/// `GetNextWorkRequired`, `pow.cpp:14`: the `nBits` the header after the
-/// last of `ancestors` must claim. `candidate` is the header the peer
-/// offers, and only a min-difficulty network reads it, for its time.
-///
-/// Away from a period boundary the answer is the last header's `nBits`, so
-/// the difficulty holds for a whole period. On the boundary the period is
-/// measured from the header `interval - 1` back, not `interval` back: the
-/// span covers one block interval less than the period it is divided by, so
-/// a period of 2016 blocks is timed as if it were 2015. The off-by-one has
-/// been consensus since 2009 and is copied here on purpose.
-///
-/// # Panics
-///
-/// If a boundary falls with fewer than `interval` headers under it. A chain
-/// starts at genesis and grows by one, so it cannot. Or if the answer is
-/// not bits a header may claim, as `next_bits_required` says.
 #[must_use]
 pub(crate) fn next_bits(
     ancestors: &crate::chain::ancestors::Ancestors,
@@ -101,18 +38,10 @@ pub(crate) fn next_bits(
             return next_bits_required(ancestors.at(height_last).header().bits, network);
         }
         let limit_bits = crate::chain::pow::to_compact(&params.limit.0);
-        // `pow.cpp:26`: on a test network a block more than two spacings
-        // after the one before it may claim the limit, so that a chain with
-        // no miner on it is never stuck.
         let gap = i64::from(candidate.time) - i64::from(ancestors.at(height_last).header().time);
         if gap > i64::from(crate::chain::pow::SPACING) * 2 {
             return next_bits_required(limit_bits, network);
         }
-        // `pow.cpp:32`: those blocks do not set the difficulty. Walk back
-        // over them, and stop at the first block of the period whatever it
-        // claims. The height falls by one each step and the walk stops at a
-        // multiple of the interval, so it takes `interval - 1` steps at
-        // most: 2015 on the networks that retarget, 143 on regtest.
         let mut height = height_last;
         while height > 0
             && !height.is_multiple_of(params.interval)
@@ -137,9 +66,6 @@ pub(crate) fn next_bits(
     };
     let timespan_actual = i64::from(ancestors.at(height_last).header().time)
         - i64::from(ancestors.at(height_first).header().time);
-    // BIP94, `pow.cpp:67`: testnet4 scales the period from the target its
-    // first block claims. A min-difficulty block cannot be that one, so the
-    // real difficulty of the period survives at its start.
     let height_source = match edge {
         crate::chain::pow::Edge::First => height_first,
         crate::chain::pow::Edge::Last => height_last,
@@ -155,14 +81,6 @@ pub(crate) fn next_bits(
 
 #[cfg(test)]
 mod tests {
-    // Core's four `CalculateNextWorkRequired` cases, `test/pow_tests.cpp:18`,
-    // `:36`, `:51` and `:67`, all on mainnet: the time of the last block of
-    // the period, the time of the first, the bits in force, and the bits
-    // Core computes. The first is a plain retarget (blocks 30240 and 32255),
-    // the second is held at `powLimit` (blocks 0 and 2015), the third has a
-    // span below a quarter of two weeks (blocks 66528 and 68543), the fourth
-    // a span above four times it (block 46367, and a first time Core made
-    // up).
     const CORE_RETARGETS: [(u32, u32, u32, u32); 4] = [
         (1_262_152_739, 1_261_130_161, 0x1d00_ffff, 0x1d00_d86a),
         (1_233_061_996, 1_231_006_505, 0x1d00_ffff, 0x1d00_ffff),
@@ -170,10 +88,8 @@ mod tests {
         (1_269_211_443, 1_263_163_443, 0x1c38_7f6f, 0x1d00_e1fd),
     ];
 
-    /// The seconds two weeks hold: `nPowTargetTimespan` on mainnet.
     const TWO_WEEKS: i64 = 14 * 24 * 60 * 60;
 
-    /// A header with a time and bits, and nothing else `next_bits` reads.
     fn header(time: u32, bits: u32) -> crate::chain::block_header::Header {
         crate::chain::block_header::Header {
             version: 1,
@@ -185,10 +101,6 @@ mod tests {
         }
     }
 
-    /// Headers for `next_bits` to read, one per time given, all claiming the
-    /// same bits. Nothing here is mined: `next_bits` asks what a header may
-    /// claim, and `check` is what asks whether it did the work, so the
-    /// tests fill the proof themselves.
     fn timeline(times: &[u32], bits: u32) -> Vec<crate::chain::pow::Checked> {
         times
             .iter()
@@ -196,13 +108,10 @@ mod tests {
             .collect()
     }
 
-    /// A header a peer offers, read only for its time.
     fn candidate(time: u32) -> crate::chain::block_header::Header {
         header(time, 0x1d00_ffff)
     }
 
-    /// `retarget` on mainnet, where Core's vectors come from: the target of
-    /// `bits` scaled over two weeks and held at the mainnet limit.
     fn mainnet_retarget(bits: u32, actual: i64) -> u32 {
         let network = crate::chain::network::Network::Mainnet;
         let target = crate::chain::pow::Target::from_compact(bits, network).unwrap();

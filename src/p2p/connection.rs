@@ -1,9 +1,3 @@
-//! One peer: the [`Link`](crate::p2p::link::Link) its bytes travel, and the
-//! network whose magic frames them. Every frame in or out goes through here.
-
-/// A connection to one peer. Holds the network so that a frame cannot be
-/// read with one magic and answered with another, and so callers stop
-/// passing it on every call (ROADMAP step 8).
 #[derive(Debug)]
 pub struct Connection<L: crate::p2p::link::Link> {
     link: L,
@@ -16,27 +10,15 @@ impl<L: crate::p2p::link::Link> Connection<L> {
         Connection { link, network }
     }
 
-    /// The network whose magic frames every message on this connection.
     #[must_use]
     pub fn network(&self) -> crate::chain::network::Network {
         self.network
     }
 
-    /// One frame from the peer.
-    ///
-    /// # Errors
-    ///
-    /// As [`crate::p2p::frame::read`]. `Io` with kind `TimedOut` when the
-    /// deadline from [`Self::set_read_deadline`] passes first.
     pub fn read_frame(&mut self) -> Result<crate::p2p::frame::Frame, crate::p2p::frame::Error> {
         crate::p2p::frame::read(&mut self.link, self.network)
     }
 
-    /// One frame to the peer.
-    ///
-    /// # Errors
-    ///
-    /// As [`crate::p2p::frame::write`].
     pub fn write_frame(
         &mut self,
         command: crate::p2p::frame::Command,
@@ -45,11 +27,6 @@ impl<L: crate::p2p::link::Link> Connection<L> {
         crate::p2p::frame::write(&mut self.link, self.network, command, payload)
     }
 
-    /// See [`crate::p2p::link::Link::set_read_deadline`].
-    ///
-    /// # Errors
-    ///
-    /// If the link refuses the bound.
     pub fn set_read_deadline(
         &mut self,
         deadline: Option<std::time::Instant>,
@@ -57,26 +34,20 @@ impl<L: crate::p2p::link::Link> Connection<L> {
         self.link.set_read_deadline(deadline)
     }
 
-    /// The link under the connection, for a test to read what the loop sent
-    /// it and what it has left to say.
     #[cfg(test)]
     pub(crate) fn link(&self) -> &L {
         &self.link
     }
 
-    /// The same, to drive the link itself: the tests of the scripted peer
-    /// read from it without a frame around the bytes.
     #[cfg(test)]
     pub(crate) fn link_mut(&mut self) -> &mut L {
         &mut self.link
     }
 
-    /// See [`crate::p2p::link::Link::now`].
     pub fn now(&self) -> std::time::Instant {
         self.link.now()
     }
 
-    /// See [`crate::p2p::link::Link::wall`].
     pub fn wall(&self) -> std::time::SystemTime {
         self.link.wall()
     }
@@ -84,7 +55,6 @@ impl<L: crate::p2p::link::Link> Connection<L> {
 
 #[cfg(test)]
 mod tests {
-    /// A peer that says nothing and keeps what we send.
     struct Mute(Vec<u8>);
 
     impl std::io::Read for Mute {
@@ -119,7 +89,6 @@ mod tests {
 
     #[test]
     fn frames_carry_the_connections_network() {
-        // Mutant: `write_frame` passes `Network::Regtest` instead of `self.network`.
         let mut connection =
             super::Connection::new(Mute(Vec::new()), crate::chain::network::Network::Mainnet);
         connection

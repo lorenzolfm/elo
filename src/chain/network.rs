@@ -1,13 +1,3 @@
-//! Which Bitcoin network a connection and a chain are on. The magic is what
-//! the network puts on the wire: the four bytes that open every frame
-//! (`pchMessageStart`, `../bitcoin/src/kernel/chainparams.cpp:114`, `:245`,
-//! `:352`, `:592` at v31.1), and the port is where its nodes listen by
-//! default (`nDefaultPort`, `:129`, `:255`, `:363`, `:603`). Everything else
-//! a network decides, its genesis, its `powLimit`, how its difficulty moves,
-//! lives beside the code that reads it: `chain::genesis`, `pow::Params`.
-
-/// `PartialEq` because `peer::run` asserts that the chain and the
-/// connection it syncs from are on one network.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Network {
     Mainnet,
@@ -26,7 +16,6 @@ impl Network {
         }
     }
 
-    /// The port a node of this network listens on unless told otherwise.
     #[must_use]
     pub fn port(self) -> u16 {
         match self {
@@ -38,7 +27,6 @@ impl Network {
     }
 }
 
-/// A word that names no network.
 #[derive(Debug)]
 pub struct UnknownNetwork(String);
 
@@ -54,9 +42,6 @@ impl std::fmt::Display for UnknownNetwork {
 
 impl std::error::Error for UnknownNetwork {}
 
-/// The names Core gives `-chain=` (`ChainTypeToString`,
-/// `../bitcoin/src/util/chaintype.cpp:11`): `main`, `test` for testnet3,
-/// `testnet4` and `regtest`.
 impl std::fmt::Display for Network {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -68,7 +53,6 @@ impl std::fmt::Display for Network {
     }
 }
 
-/// The same names read back (`ChainTypeFromString`, `:30`).
 impl std::str::FromStr for Network {
     type Err = UnknownNetwork;
 
@@ -126,8 +110,6 @@ mod tests {
 
     #[test]
     fn a_name_core_does_not_use_is_refused() {
-        // `mainnet` and `testnet3` are what people say; Core's `-chain=` takes
-        // neither, and so neither do we. The error names the word.
         for name in ["mainnet", "testnet3", "Main", ""] {
             let error = name.parse::<super::Network>().unwrap_err();
             assert_eq!(

@@ -1,20 +1,5 @@
-//! Spawns a `bitcoind -regtest`, points elo at it, and asks Core what it saw.
-//! `getpeerinfo` is the oracle for every claim about the binary; for the
-//! library over its own socket, the chain RPCs are.
-//!
-//! Fails when `bitcoind` or `bitcoin-cli` is not on `PATH`, unless
-//! `ELO_NO_BITCOIND` is set; then it skips, and says so past the harness's
-//! output capture. CI sets the variable; a developer should not have to.
-
-// This whole file is a test. Clippy's `allow-unwrap-in-tests` only sees
-// `#[test]` functions and `#[cfg(test)]` items, not the helpers here.
 #![allow(clippy::unwrap_used)]
 
-/// Ports are picked by binding and releasing, because `bitcoind` cannot bind
-/// port 0. Between the release and Core's own bind, another test picking the
-/// same way can be handed the same ports, and the datadir is named after one
-/// of them. Picking and starting under this lock closes the window: the next
-/// spawn picks only once this node holds its ports.
 static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct Node {
@@ -32,16 +17,11 @@ impl Node {
                 .output()
                 .ok()?;
         }
-        // A test that panicked while starting poisons the lock; the ports it
-        // was after are free again, so the next spawn goes ahead regardless.
         let _spawning = SPAWN
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (p2p_port, rpc_port) = free_ports();
         let datadir = std::env::temp_dir().join(format!("elo-handshake-{p2p_port}"));
-        // A run that was killed leaves its datadir behind, and a later run
-        // that draws the same port would inherit its chain. No datadir is
-        // the normal case; any other failure is this run's problem.
         if let Err(e) = std::fs::remove_dir_all(&datadir) {
             assert_eq!(
                 e.kind(),
@@ -105,7 +85,6 @@ impl Drop for Node {
     }
 }
 
-/// Two distinct ports: both listeners are alive when the second one binds.
 fn free_ports() -> (u16, u16) {
     let bind = || std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let (a, b) = (bind(), bind());
@@ -113,8 +92,6 @@ fn free_ports() -> (u16, u16) {
     (port(&a), port(&b))
 }
 
-/// The node, or `None` with the skip announced, or a panic saying what to
-/// install.
 fn node_or_skip(test: &str) -> Option<Node> {
     let node = Node::spawn();
     if node.is_none() {
@@ -122,7 +99,6 @@ fn node_or_skip(test: &str) -> Option<Node> {
             std::env::var_os("ELO_NO_BITCOIND").is_some(),
             "bitcoind or bitcoin-cli is not on PATH; set ELO_NO_BITCOIND=1 to skip this test"
         );
-        // The harness captures `eprintln!`, not the raw handle.
         std::io::Write::write_all(
             &mut std::io::stderr(),
             format!("SKIPPED {test}: ELO_NO_BITCOIND is set\n").as_bytes(),
@@ -132,9 +108,6 @@ fn node_or_skip(test: &str) -> Option<Node> {
     node
 }
 
-/// What Core saw and what elo printed, once `done` holds for `getpeerinfo`
-/// or ten seconds have passed. `None` when there is no `bitcoind` and
-/// `ELO_NO_BITCOIND` says that is fine.
 struct Run {
     peers: String,
     transcript: String,
@@ -153,7 +126,6 @@ fn run_elo(node: &Node, done: fn(&str) -> bool) -> Run {
         .spawn()
         .unwrap();
 
-    // elo lingers two seconds after the handshake; ask Core meanwhile.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let peers = loop {
         let peers = node.cli(&["getpeerinfo"]).unwrap();
@@ -162,8 +134,6 @@ fn run_elo(node: &Node, done: fn(&str) -> bool) -> Run {
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
-    // Drain the pipe before waiting: a child that fills it blocks on `println!`
-    // and a parent that waits first never reads. Reading to EOF is the wait.
     let transcript = std::io::read_to_string(elo.stdout.take().unwrap()).unwrap();
     let status = elo.wait().unwrap();
     println!("--- elo ---\n{transcript}");
@@ -193,22 +163,14 @@ fn run_elo(node: &Node, done: fn(&str) -> bool) -> Run {
     }
 }
 
-/// `ADDRESS_BCRT1_UNSPENDABLE`, `../bitcoin/test/functional/test_framework/address.py:35`:
-/// a witness program of all zeros, so `generatetoaddress` needs no wallet.
 const UNSPENDABLE: &str = "bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq3xueyj";
 
-/// Core puts its chain height in `version`: `my_height = m_best_height`,
-/// `../bitcoin/src/net_processing.cpp:1572` at v31.1. Mine a few blocks first so the number is not zero, then check the
-/// one elo prints against `getblockcount`.
 #[test]
 fn core_tells_us_its_height() {
     let Some(node) = node_or_skip("core_tells_us_its_height") else {
         return;
     };
     node.cli(&["generatetoaddress", "7", UNSPENDABLE]).unwrap();
-    // `m_best_height` is set by `UpdatedBlockTip` (`net_processing.cpp:2162`)
-    // on the scheduler thread, after `generatetoaddress` has returned. Wait
-    // for it, or the `version` can still say 6.
     node.cli(&["syncwithvalidationinterfacequeue"]).unwrap();
     let height = node.cli(&["getblockcount"]).unwrap();
     let height = height.trim();
@@ -255,9 +217,6 @@ fn core_lists_us_in_getpeerinfo() {
     );
 }
 
-/// Core pings a new peer as soon as the handshake is done, and reports
-/// `pingtime` only once a `pong` with the matching nonce came back
-/// (`../bitcoin/src/rpc/net.cpp:254` at v31.1).
 #[test]
 fn core_measures_our_pong() {
     let Some(run) = run_elo_until("core_measures_our_pong", |peers| {
@@ -274,7 +233,6 @@ fn core_measures_our_pong() {
     );
 }
 
-/// `getblockheader <hash> false`, as bytes.
 fn header_bytes(hex: &str) -> [u8; elo::chain::block_header::BYTES] {
     let mut out = [0u8; elo::chain::block_header::BYTES];
     assert_eq!(hex.len(), 2 * out.len(), "one header: {hex}");
@@ -284,10 +242,6 @@ fn header_bytes(hex: &str) -> [u8; elo::chain::block_header::BYTES] {
     out
 }
 
-/// Core answers `getheaders` with the headers after the first locator hash
-/// it knows, up to 2000 (`../bitcoin/src/net_processing.cpp:4441` and
-/// `:4453` at v31.1). A locator of genesis alone on a chain of seven must
-/// bring back seven, and the last must hash to `getbestblockhash`.
 #[test]
 fn core_serves_the_headers_after_genesis() {
     // Red if the transaction-count byte is not skipped between headers, or

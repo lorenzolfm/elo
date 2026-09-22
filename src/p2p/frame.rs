@@ -1,26 +1,15 @@
-//! The envelope every message travels in: network magic, a 12-byte
-//! NUL-padded command, the payload length, and `sha256d` of the payload cut
-//! to four bytes (`CMessageHeader`, `../bitcoin/src/protocol.h:32` at
-//! v31.1). `read` checks the magic, the length and the checksum and hands
-//! over a `Frame`, a command with its payload; `write` does the reverse.
-//! What the payload means is the next module's question (`frame.rs`).
-
-/// Core's `MAX_PROTOCOL_MESSAGE_LENGTH`, `src/net.h:65` at v31.1.
 const MAX_PAYLOAD_BYTES: usize = 4_000_000;
 
 pub(crate) const HEADER_BYTES: usize = 24;
 const COMMAND_BYTES: usize = 12;
 
-// The header is magic, command, length, checksum.
 const _: () = assert!(4 + COMMAND_BYTES + 4 + 4 == HEADER_BYTES);
 
-// The length field is a `u32`. `read` converts it to `usize` and treats failure as unreachable; this is why it is.
 const _: () = assert!(usize::BITS >= 32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Command([u8; COMMAND_BYTES]);
 
-/// Core's `IsMessageTypeValid`, `src/protocol.cpp:26` at v31.1: the name is printable ASCII, `0x20` to `0x7e`.
 const fn is_printable(byte: u8) -> bool {
     byte >= b' ' && byte <= b'~'
 }
@@ -120,12 +109,6 @@ fn checksum(payload: &[u8]) -> [u8; 4] {
     [hash[0], hash[1], hash[2], hash[3]]
 }
 
-/// Writes one frame: the header, then `payload`.
-///
-/// # Errors
-///
-/// `PayloadTooLong` if `payload` is longer than `MAX_PAYLOAD_BYTES`; nothing
-/// reaches `writer`. `Io` if `writer` fails.
 pub fn write(
     writer: &mut impl std::io::Write,
     network: crate::chain::network::Network,
@@ -149,19 +132,6 @@ pub fn write(
     Ok(())
 }
 
-/// Reads one frame. The length field is bounded by `MAX_PAYLOAD_BYTES`
-/// before the payload is allocated.
-///
-/// # Errors
-///
-/// `Io` if `reader` fails or ends early. `BadMagic`, `BadCommand`,
-/// `PayloadTooLong` and `BadChecksum` name the header field Core would
-/// reject.
-///
-/// # Panics
-///
-/// If `usize` is narrower than `u32`. The compile-time assertion beside
-/// `HEADER_BYTES` rules that out on every target elo builds for.
 pub fn read(
     reader: &mut impl std::io::Read,
     network: crate::chain::network::Network,
@@ -189,9 +159,6 @@ pub fn read(
         return Err(Error::PayloadTooLong(len));
     }
 
-    // A fresh allocation per frame, up to 4 MB. With one peer and blocking
-    // I/O the cost is not felt. When it is, the caller owns one buffer and
-    // `read` fills it; `Frame` changes with it.
     let mut payload = vec![0u8; len];
 
     reader.read_exact(&mut payload)?;
@@ -209,9 +176,6 @@ pub fn read(
 
 #[cfg(test)]
 mod tests {
-    // Both frames were sent by Bitcoin Core v31.1.0, `bitcoind -regtest`, on
-    // 2026-09-13. A throwaway Python script sent `version` and `verack` over a
-    // raw TCP socket and hex-dumped everything Core answered.
     const VERACK: &str = "fabfb5da76657261636b000000000000000000005df6e0e2";
     const PING: &str = "fabfb5da70696e670000000000000000080000008626b8926616846538060637";
 

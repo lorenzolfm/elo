@@ -1,26 +1,7 @@
-//! `CompactSize`, the length prefix in front of every list and string on the
-//! wire: one byte below 0xfd, else a marker byte and 2, 4 or 8 little-endian
-//! bytes. Core's `ReadCompactSize`, `../bitcoin/src/serialize.h:330` at v31.1.
-//!
-//! `read` returns the value unbounded: `u64::MAX` is a valid encoding, and a
-//! `CompactSize` is not always a length. `read_len` is for one that is: it
-//! takes the limit of the field it prefixes and returns a `usize` that is
-//! already under it, so the caller cannot allocate or slice before the bound.
-//! `write_len` is the other direction; every `CompactSize` elo writes is a
-//! length, so it takes a `usize`.
-//!
-//! `take` is the fixed-width neighbour: the next `N` bytes of a payload, or
-//! `Truncated`. It lives here so that the two errors a peer-sized payload
-//! can raise, a short prefix and a short field, are one type.
-
 #[derive(Debug)]
 pub enum Error {
-    /// The marker promised more bytes than the payload holds.
     Truncated,
-    /// A value in more bytes than it needs, which Core rejects
-    /// (`serialize.h:342`, `:348`, `:353`). One value, one encoding.
     NonCanonical(u64),
-    /// A well-formed value above the limit of the field it prefixes.
     TooLarge { value: u64, max: usize },
 }
 
@@ -36,17 +17,12 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// The next `N` bytes of `bytes`, and the rest.
 pub fn take<const N: usize>(bytes: &[u8]) -> Result<(&[u8; N], &[u8]), Error> {
     bytes.split_first_chunk().ok_or(Error::Truncated)
 }
 
-/// Decodes the `CompactSize` at the front of `bytes`. Returns the value and
-/// the bytes after it.
 pub fn read(bytes: &[u8]) -> Result<(u64, &[u8]), Error> {
     let (&marker, rest) = bytes.split_first().ok_or(Error::Truncated)?;
-    // The width of the value that follows, and the smallest value that
-    // needs it (`serialize.h:300`).
     let (width, floor) = match marker {
         one_byte @ 0..=0xfc => return Ok((u64::from(one_byte), rest)),
         0xfd => (2, 0xfd),
@@ -66,8 +42,6 @@ pub fn read(bytes: &[u8]) -> Result<(u64, &[u8]), Error> {
     Ok((value, rest))
 }
 
-/// Decodes the `CompactSize` at the front of `bytes` as a length of at most
-/// `max`. A value that does not fit `usize` is above `max` by definition.
 pub fn read_len(bytes: &[u8], max: usize) -> Result<(usize, &[u8]), Error> {
     let (value, rest) = read(bytes)?;
     match usize::try_from(value) {
@@ -76,17 +50,8 @@ pub fn read_len(bytes: &[u8], max: usize) -> Result<(usize, &[u8]), Error> {
     }
 }
 
-// `write_len` converts a `usize` to `u64` and treats failure as unreachable;
-// this is why it is.
 const _: () = assert!(usize::BITS <= 64);
 
-/// Appends `len` to `out` in the fewest bytes that hold it, Core's
-/// `WriteCompactSize` (`serialize.h:299`). `read` accepts nothing else.
-///
-/// # Panics
-///
-/// If `usize` is wider than `u64`. The compile-time assertion above rules
-/// that out on every target elo builds for.
 pub fn write_len(out: &mut Vec<u8>, len: usize) {
     let Ok(value) = u64::try_from(len) else {
         unreachable!("a usize fits in u64 on every target elo builds for")
@@ -96,9 +61,6 @@ pub fn write_len(out: &mut Vec<u8>, len: usize) {
     out.extend_from_slice(&value.to_le_bytes()[..width]);
 }
 
-/// The marker in front of `len`, if it needs one, and the width of the
-/// value behind it: the table in `read`, mirrored. The ranges are `u64`
-/// values; on a narrower `usize` the upper arms are simply never taken.
 const fn form(len: usize) -> (Option<u8>, usize) {
     match len {
         0..=0xfc => (None, 1),
@@ -108,8 +70,6 @@ const fn form(len: usize) -> (Option<u8>, usize) {
     }
 }
 
-/// How many bytes `write_len` appends for `len`: 1, 3, 5 or 9. Const, so a
-/// payload whose length prefix is fixed at compile time can size itself.
 #[must_use]
 pub const fn encoded_len(len: usize) -> usize {
     match form(len) {
@@ -120,14 +80,7 @@ pub const fn encoded_len(len: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    // Both were sent by Bitcoin Core v31.1.0, `bitcoind -regtest`, on
-    // 2026-09-13, to a throwaway Python script over a raw TCP socket.
-    //
-    // The first 17 bytes of Core's `version` payload from byte 80: the
-    // user-agent length, then `/Satoshi:31.1.0/`.
     const USER_AGENT: &str = "102f5361746f7368693a33312e312e302f";
-    // The first three bytes of a `headers` payload sent after
-    // `generatetoaddress 300`: the count of headers that follow.
     const THREE_HUNDRED_HEADERS: &str = "fd2c01";
 
     fn fixture(hex: &str) -> Vec<u8> {
@@ -159,8 +112,6 @@ mod tests {
         println!("{THREE_HUNDRED_HEADERS} -> {count} headers");
     }
 
-    /// Derived from `WriteCompactSize`, `serialize.h:300`, not captured: Core
-    /// never sends a list long enough to need four or eight bytes.
     #[test]
     fn fe_and_ff_forms() {
         for (bytes, value) in [
@@ -230,8 +181,6 @@ mod tests {
         );
         println!("{THREE_HUNDRED_HEADERS} under 300: {count}; under 299: {err}");
 
-        // The biggest value there is, against the smallest bound: no `usize`
-        // conversion is asked to hold it.
         let err = super::read_len(&[0xff; 9], 0).unwrap_err();
         assert!(
             matches!(
@@ -265,8 +214,6 @@ mod tests {
         );
     }
 
-    /// Derived from `WriteCompactSize`, `serialize.h:299`: the last value of
-    /// each width and the first of the next.
     #[test]
     fn encoded_len_is_what_write_len_appends() {
         for len in [

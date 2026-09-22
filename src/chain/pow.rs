@@ -1,38 +1,13 @@
-//! Proof of work: `nBits` decoded to a 256-bit target, and the block hash
-//! held against it. `CheckProofOfWork`, `../bitcoin/src/pow.cpp:140` at
-//! v31.1: `DeriveTarget` (`:146`) decodes `nBits` and refuses a negative,
-//! zero, overflowing or too-easy target; `CheckProofOfWorkImpl` (`:161`)
-//! then refuses a hash above it. Every refusal is the peer's, so every one
-//! is an error.
-//!
-//! `retarget::next_bits` is the other half: `GetNextWorkRequired` (`:14`)
-//! says which `nBits` a header is allowed to claim at its height. `check`
-//! asks whether a header did the work it claims; `next_bits` asks whether it
-//! claimed the right amount.
-
-/// The 23-bit mantissa of `nBits`, and the sign bit above it
-/// (`arith_uint256.cpp:178`, `:186`).
 const MANTISSA_MASK: u32 = 0x007f_ffff;
 const SIGN_BIT: u32 = 0x0080_0000;
 
-/// Where the mantissa sits when the exponent is 3: `SetCompact` shifts by
-/// `8 * (size - 3)` (`arith_uint256.cpp:180`, `:184`).
 const MANTISSA_BYTES: usize = 3;
 
-/// `nPowTargetSpacing`: the seconds one block is meant to take, ten minutes
-/// on every network (`chainparams.cpp:98`, `:229`, `:336`, `:577`).
 pub(super) const SPACING: u32 = 10 * 60;
 
-/// `nPowTargetTimespan`: the seconds one difficulty period is meant to take,
-/// two weeks on mainnet and the two testnets (`chainparams.cpp:97`, `:228`,
-/// `:335`), one day on regtest (`:576`).
 pub(super) const TIMESPAN_TWO_WEEKS: u32 = 14 * 24 * 60 * 60;
 const TIMESPAN_ONE_DAY: u32 = 24 * 60 * 60;
 
-/// `DifficultyAdjustmentInterval`, `params.h:126`: the blocks in one period,
-/// the timespan over the spacing. A height counts blocks, so an interval is
-/// a `usize`; the `const` assertions hold each one to the division it comes
-/// from.
 const INTERVAL_TWO_WEEKS: usize = 2016;
 const INTERVAL_ONE_DAY: usize = 144;
 
@@ -41,10 +16,6 @@ const _: () = assert!(TIMESPAN_ONE_DAY / SPACING == 144);
 const _: () = assert!(INTERVAL_TWO_WEEKS == 2016);
 const _: () = assert!(INTERVAL_ONE_DAY == 144);
 
-/// `powLimit`: the easiest target a header may claim. Mainnet, testnet3 and
-/// testnet4 share a limit of 224 bits (`chainparams.cpp:96`, `:227`, `:334`);
-/// regtest has one of 255 (`:575`). Not compact values: a compact target
-/// holds 23 significant bits, and a limit holds 224 or 255 of them.
 const LIMIT_224: Target = Target(crate::chain::u256::U256::from_limbs([
     0x0000_0000_ffff_ffff,
     u64::MAX,
@@ -58,41 +29,19 @@ const LIMIT_255: Target = Target(crate::chain::u256::U256::from_limbs([
     u64::MAX,
 ]));
 
-/// Which block of a period gives the target the next period is scaled from:
-/// the last one (`pow.cpp:50`), or the first one under BIP94 (`:67`), so
-/// that a min-difficulty block at the end of a period cannot drop the
-/// difficulty of the next one.
 pub(super) enum Edge {
     First,
     Last,
 }
 
-/// How a period ends. Core reads two booleans here, `fPowNoRetargeting` and
-/// `enforce_BIP94`, and only three of their four combinations are a network.
-/// This is the one question they answer: a network that does not retarget
-/// has no timespan to scale and no edge to scale from, and cannot be given
-/// either one.
 pub(super) enum Retarget {
-    /// `fPowNoRetargeting`, `pow.cpp:52`: the difficulty never moves.
-    /// Regtest only.
     Never,
-    /// The period is scaled from the target at `edge`, over
-    /// `timespan_target`, the seconds `nPowTargetTimespan` says it was meant
-    /// to take.
     Every { timespan_target: u32, edge: Edge },
 }
 
-/// How the difficulty moves on one network: the `Consensus::Params` fields
-/// that `GetNextWorkRequired` reads (`../bitcoin/src/consensus/params.h:113`),
-/// as `chainparams.cpp` sets them. One arm of `of` describes a network
-/// whole, the `powLimit` with the rest, so no second `match` on the network
-/// can disagree with this one.
 pub(super) struct Params {
     pub(super) interval: usize,
     pub(super) limit: Target,
-    /// `fPowAllowMinDifficultyBlocks`: a block more than two spacings after
-    /// the one before it may claim the limit (`pow.cpp:22`). Every network
-    /// but mainnet.
     pub(super) min_difficulty: bool,
     pub(super) retarget: Retarget,
 }
@@ -137,15 +86,10 @@ impl Params {
     }
 }
 
-/// Whether a target times a timespan stays inside 256 bits. A timespan
-/// clamped to four periods is below 2^23, and a limit of 224 bits leaves the
-/// 32 above it clear, so a target that reaches no higher fits.
 const fn leaves_room_for_a_timespan(target: &Target) -> bool {
     target.0.leading_zeros() >= 32
 }
 
-/// Whether the limit of `network` leaves `mul_u32` the room it needs. Only a
-/// network that retargets multiplies, so only those limits must fit.
 const fn the_product_fits(network: crate::chain::network::Network) -> bool {
     let params = Params::of(network);
     match params.retarget {
@@ -159,31 +103,23 @@ const _: () = assert!(the_product_fits(crate::chain::network::Network::Testnet3)
 const _: () = assert!(the_product_fits(crate::chain::network::Network::Testnet4));
 const _: () = assert!(the_product_fits(crate::chain::network::Network::Regtest));
 
-/// A target a header may claim on one network: `nBits` decoded to a number
-/// that is not zero, not negative, within 256 bits, and at or below the
-/// network's `powLimit`. What `DeriveTarget` (`pow.cpp:146`) returns when it
-/// returns anything. Only `from_compact` and `limit` build one, so a
-/// `Target` in hand has passed every check but the hash.
 pub struct Target(pub(super) crate::chain::u256::U256);
 
 #[derive(Debug)]
 pub enum Error {
-    /// A mantissa of zero, or one shifted out below the lowest byte: no
-    /// hash is below zero, `pow.cpp:155`.
-    Zero { bits: u32 },
-    /// The sign bit of `nBits` is set with a mantissa to sign. Core's
-    /// `fNegative`, `arith_uint256.cpp:186`.
-    Negative { bits: u32 },
-    /// The mantissa lands wholly above bit 255. Core's `fOverflow`,
-    /// `arith_uint256.cpp:188`.
-    Overflow { bits: u32 },
-    /// Easier than the network allows: `bnTarget > powLimit`, `pow.cpp:155`.
-    /// The number decoded is no target, so it is carried as the number.
+    Zero {
+        bits: u32,
+    },
+    Negative {
+        bits: u32,
+    },
+    Overflow {
+        bits: u32,
+    },
     AboveLimit {
         target: crate::chain::u256::U256,
         limit: Target,
     },
-    /// The hash is above the target the header claims: `pow.cpp:166`.
     NotMet {
         hash: crate::chain::block_header::BlockHash,
         target: Target,
@@ -206,28 +142,6 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// `SetCompact`, `arith_uint256.cpp:175`: the top byte of `nBits` is a
-/// size in bytes, the low 23 bits a mantissa, the bit between a sign.
-/// The top byte of the mantissa lands at byte `size - 1` of the number,
-/// counted from the least significant byte as 0: for a size of three or
-/// less the mantissa loses bytes at the bottom, for more it is shifted
-/// up. Core flags a negative and an overflow on the mantissa *after*
-/// the bytes at the bottom are gone (`:186`, `:188`), and `DeriveTarget`
-/// refuses on either flag or on a target of zero (`pow.cpp:155`). Here
-/// each refusal is its own error. Zero is the mantissa gone, and rules
-/// the other two out; both may hold at once, and the sign is named
-/// first as Core tests it first. The limit is `Target::from_compact`'s
-/// question: this is the number, whatever the network.
-///
-/// # Errors
-///
-/// `Zero`, `Negative` or `Overflow`, as above.
-///
-/// # Panics
-///
-/// If a mantissa that passed the overflow check shifts to zero. A size
-/// of 34 at most, with a mantissa of one byte, shifts by 248 at most:
-/// no bit is lost, so the number is not zero.
 fn from_compact(bits: u32) -> Result<crate::chain::u256::U256, Error> {
     let [size, ..] = bits.to_be_bytes();
     let size = usize::from(size);
@@ -257,21 +171,6 @@ fn from_compact(bits: u32) -> Result<crate::chain::u256::U256, Error> {
     Ok(number)
 }
 
-/// `GetCompact`, `arith_uint256.cpp:195`: the size is how many bytes the
-/// number takes, and the mantissa is its top three, or the whole of it
-/// padded on the right when it is shorter. A mantissa that reaches the
-/// sign bit gives a byte back to the size, so that no `nBits` this
-/// writes reads as negative (`:207`).
-///
-/// Not the inverse of `from_compact`: it returns the shortest form, and
-/// `0x01123456` is not one (`arith_uint256_tests.cpp:482`). It *is* the
-/// inverse for a number `from_compact` did not have to shift.
-///
-/// # Panics
-///
-/// If the mantissa keeps a bit above the low 23, or the size passes a
-/// byte. The sign step rules both out: 32 bytes and one given back is
-/// 33, and the width holds no more.
 pub(super) fn to_compact(number: &crate::chain::u256::U256) -> u32 {
     let bytes = number.to_be_bytes();
     let zeros = bytes.iter().take_while(|byte| **byte == 0).count();
@@ -300,13 +199,6 @@ pub(super) fn to_compact(number: &crate::chain::u256::U256) -> u32 {
 }
 
 impl Target {
-    /// `DeriveTarget`, `pow.cpp:146`: `nBits` decoded as `from_compact`
-    /// decodes it, then held at or below the limit of `network`. Equal
-    /// passes (`:155`).
-    ///
-    /// # Errors
-    ///
-    /// As `from_compact`, then `AboveLimit`.
     pub fn from_compact(
         bits: u32,
         network: crate::chain::network::Network,
@@ -319,15 +211,12 @@ impl Target {
         Ok(Target(target))
     }
 
-    /// `powLimit` of `network`: the easiest target a header may claim, and
-    /// so a target itself. `Params` holds it beside the rest of the network.
     #[must_use]
     pub fn limit(network: crate::chain::network::Network) -> Target {
         Params::of(network).limit
     }
 }
 
-/// A target prints as the number it is.
 impl std::fmt::Display for Target {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         std::fmt::Display::fmt(&self.0, f)
@@ -340,21 +229,6 @@ impl std::fmt::Debug for Target {
     }
 }
 
-/// `CheckProofOfWork`, `pow.cpp:140`, for one header: `bits` decodes to a
-/// target of `network`, and `hash` is at or below it. Equal passes
-/// (`pow.cpp:166`).
-///
-/// The target it decoded comes back with the `Ok`: the caller asked what
-/// the header claims, and that is the answer.
-///
-/// # Errors
-///
-/// As `Target::from_compact`, then `NotMet`.
-///
-/// # Panics
-///
-/// If the target decoded is above the limit: `Target::from_compact` holds
-/// it there, so reaching it is our bug.
 pub fn check(
     hash: &crate::chain::block_header::BlockHash,
     bits: u32,
@@ -374,32 +248,14 @@ pub fn check(
     Ok(target)
 }
 
-/// A header that `check` accepted on one network: its `nBits` decode to a
-/// target of that network, and its hash is at or below that target. The
-/// field is private, and outside tests `checked` is the only way to fill it,
-/// so a `Checked` in hand *is* the proof that the work was checked.
-/// `next_bits` takes these and nothing else, which is what keeps the two
-/// checks in order without a comment that says so. In test builds
-/// `unchecked` fills the field too, for the ancestors a test reads and
-/// never checks.
 pub struct Checked(crate::chain::block_header::Header);
 
 impl Checked {
-    /// The header itself, for everything that does not need the proof.
     #[must_use]
     pub fn header(&self) -> &crate::chain::block_header::Header {
         &self.0
     }
 
-    /// The target the header claims. A target is 32 bytes and one header in
-    /// a period is asked for its own, so it is decoded here rather than
-    /// kept beside every header we hold.
-    ///
-    /// # Panics
-    ///
-    /// If the `nBits` do not decode to a target of `network`, which says
-    /// the header was checked against another network. A chain holds one
-    /// network and checks every header it keeps against that one.
     pub(super) fn target(&self, network: crate::chain::network::Network) -> Target {
         match Target::from_compact(self.0.bits, network) {
             Ok(target) => target,
@@ -408,12 +264,6 @@ impl Checked {
     }
 }
 
-/// `check` for a whole header, with the header back inside the proof: this
-/// is how a chain takes a header in.
-///
-/// # Errors
-///
-/// As `check`.
 pub fn checked(
     header: crate::chain::block_header::Header,
     network: crate::chain::network::Network,
@@ -422,19 +272,9 @@ pub fn checked(
     Ok(Checked(header))
 }
 
-/// How many nonces `mine` and `spoil` try before they give up. On a regtest
-/// target a nonce works, or fails, every second try on average.
 #[cfg(test)]
 const TRIES_MAX: u32 = 1 << 16;
 
-/// The miner's side of `check`, for tests that build headers by hand: the
-/// smallest nonce whose hash meets the target the header claims, as
-/// `generatetoaddress` grinds one on regtest (`rpc/mining.cpp:142`).
-///
-/// # Panics
-///
-/// If no nonce in `TRIES_MAX` works: the header claims a target that is not
-/// within reach of a test, or one above the limit, which no nonce fixes.
 #[cfg(test)]
 pub(crate) fn mine(
     header: &mut crate::chain::block_header::Header,
@@ -452,13 +292,6 @@ pub(crate) fn mine(
     );
 }
 
-/// The opposite of `mine`, for a header that must lose its work: the
-/// smallest nonce above the one held whose hash does not meet the target.
-///
-/// # Panics
-///
-/// If no nonce in `TRIES_MAX` fails: the header claims a target every hash
-/// is below, which no test target is.
 #[cfg(test)]
 pub(crate) fn spoil(
     header: &mut crate::chain::block_header::Header,
@@ -477,10 +310,6 @@ pub(crate) fn spoil(
     );
 }
 
-/// A `Checked` whose proof is filled in by hand, for tests that read a
-/// chain rather than check one. Ancestors are read for the heights, times
-/// and bits of the headers before a candidate and never for their work, so
-/// a test that builds them has no reason to mine.
 #[cfg(test)]
 pub(crate) fn unchecked(header: crate::chain::block_header::Header) -> Checked {
     Checked(header)
@@ -488,11 +317,6 @@ pub(crate) fn unchecked(header: crate::chain::block_header::Header) -> Checked {
 
 #[cfg(test)]
 mod tests {
-    // Core's `SetCompact` vectors, `test/arith_uint256_tests.cpp:409`, as
-    // `GetHex` prints the result or as the flag Core raises. Every zero is
-    // a mantissa that the size shifted away, sign bit or not: `0x00923456`
-    // and `0x01803456` have the sign set and Core does not call them
-    // negative.
     const CORE_VECTORS: [(u32, Result<&str, &str>); 20] = [
         (0x0000_0000, Err("zero")),
         (0x0012_3456, Err("zero")),
@@ -534,13 +358,9 @@ mod tests {
         (0xff12_3456, Err("overflow")),
     ];
 
-    // The limits as `chainparams.cpp` writes them: `:96` and `:575`.
     const MAINNET_LIMIT: &str = "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
     const REGTEST_LIMIT: &str = "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 
-    // What genesis claims on mainnet (`chainparams.cpp:134`) and on regtest
-    // (`:634`), decoded: the mantissa `ffff` at bytes 26 to 28 and `7fffff`
-    // at bytes 29 to 31.
     const MAINNET_GENESIS_TARGET: &str =
         "00000000ffff0000000000000000000000000000000000000000000000000000";
     const REGTEST_GENESIS_TARGET: &str =
@@ -566,10 +386,6 @@ mod tests {
         }
     }
 
-    // `GetCompact` of each vector above that decodes, as
-    // `arith_uint256_tests.cpp:482` to `:528` expects it. Only the sizes of
-    // three and up come back as they went in: a compact value whose size
-    // shifted the mantissa is not the shortest form of its number.
     const CORE_COMPACT: [(u32, u32); 6] = [
         (0x0112_3456, 0x0112_0000),
         (0x0212_3456, 0x0212_3400),
@@ -597,8 +413,6 @@ mod tests {
                 super::to_compact(&number)
             );
         }
-        // `arith_uint256_tests.cpp:487`: 128 is one byte, and writing it as
-        // one would set the sign bit, so it is written as two.
         assert_eq!(
             super::to_compact(&crate::chain::u256::U256::from_u64(0x80)),
             0x0200_8000

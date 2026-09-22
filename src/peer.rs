@@ -1,79 +1,39 @@
-//! One session with one peer, from our `version` to the hang-up. Three
-//! phases, each a loop over frames: the handshake, the headers sync, and a
-//! linger after it. Every frame is decoded by `p2p::message` and routed to
-//! the handler in that message's file; the handler calls the chain and
-//! hands back what to send; this loop writes it. Nothing here reads a
-//! payload, and nothing below here reads a socket or a clock.
-//!
-//! What a message means depends on the phase, and that is this module's
-//! knowledge: a `verack` before a `version` is an error, a second `version`
-//! is dropped, a `headers` during the handshake is dropped, a `ping` is
-//! answered in every phase. So is every bound: how many frames a handshake
-//! may take, how long a `headers` may take to arrive, how many batches one
-//! run asks for, how long to stay after the sync.
-//!
-//! Core runs the same session from `ProcessMessage`
-//! (`../bitcoin/src/net_processing.cpp:3550` at v31.1), one `if` per
-//! command, with the chain behind `ChainstateManager`. This is that split
-//! with the commands in files.
-
-/// How many messages we read before we give up waiting for `verack`. Core
-/// sends at most four before it: `version`, `wtxidrelay`, `sendaddrv2` and
-/// `sendtxrcncl`. A peer that sends many more is not shaking hands; Core
-/// bounds the same wait with a 60 s timer instead. The read deadline the
-/// caller sets bounds the time.
 const MESSAGES_BEFORE_VERACK_MAX: usize = 16;
 
-/// `HEADERS_RESPONSE_TIME`, `net_processing.cpp:100`: how long a `headers`
-/// may take to arrive after our `getheaders`. Core keeps one request in
-/// flight for this long before it asks again (`:2831`). Set as the read
-/// deadline for each request and cleared after, so the sync leaves the
-/// connection with no deadline.
 pub const RESPONSE_TIME: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// How many batches one run asks for. ROADMAP step 8 caps the sync at a
-/// couple; step 12, the full run from genesis, lifts the cap. Until then it
-/// is also what bounds the chain: `BATCHES_MAX * HEADERS_MAX` headers at
-/// most, each with the work it claims.
 pub const BATCHES_MAX: usize = 2;
 
-/// What the session did, as it did it, for the caller to narrate. Every
-/// line a person reads about the session is one of these.
 pub enum Event {
-    /// Our `version` went out, this many payload bytes.
-    SentVersion { bytes: usize },
-    /// A frame arrived during the handshake. Everything up to the peer's
-    /// `verack` is reported, so a person can see what the peer sent first.
+    SentVersion {
+        bytes: usize,
+    },
     Seen {
         command: crate::p2p::frame::Command,
         bytes: usize,
     },
-    /// Both `version`s and both `verack`s have crossed.
     HandshakeComplete {
         peer: crate::p2p::version::Peer,
         elapsed: std::time::Duration,
     },
-    /// `getheaders` went out, with a locator from our tip at this height.
-    Asked { height: usize },
-    /// `headers` came in and the chain took it; `height` is the new tip.
-    Took { count: usize, height: usize },
-    /// A `ping` came in and was answered.
+    Asked {
+        height: usize,
+    },
+    Took {
+        count: usize,
+        height: usize,
+    },
     Ponged(u64),
-    /// The last batch was short: the peer has nothing after our tip.
     Synced {
         height: usize,
         tip: crate::chain::block_header::BlockHash,
     },
-    /// `BATCHES_MAX` full batches came in. The peer may have more.
     Capped {
         height: usize,
         tip: crate::chain::block_header::BlockHash,
     },
-    /// A message during the linger that earns no answer.
     Ignored(crate::p2p::message::Message),
-    /// The peer closed the connection during the linger, which is its right.
     PeerHungUp,
-    /// The linger passed and we are hanging up.
     LingerOver(std::time::Duration),
 }
 
@@ -102,23 +62,11 @@ impl std::fmt::Display for Event {
 
 #[derive(Debug)]
 pub enum Error {
-    /// A frame could not be read or written, a deadline passed, or the peer
-    /// hung up before the linger.
     Frame(crate::p2p::frame::Error),
-    /// A command we know with a payload we cannot read. Core penalizes a
-    /// `headers` with more than it sends (`:4829`) and logs one that does
-    /// not deserialize; with one peer we hang up on either.
     Message(crate::p2p::message::Error),
-    /// The peer's `version` did not parse, or is too old to keep.
     Version(crate::p2p::version::Error),
-    /// The peer acknowledged our `version` before it sent its own. Core drops
-    /// every message that arrives before `version` (`:3815`); with one peer
-    /// we have nothing to keep, so we hang up instead.
     VerackBeforeVersion,
-    /// `MESSAGES_BEFORE_VERACK_MAX` frames came in and none was `verack`.
     NoVerackAfter,
-    /// A batch the chain refused: no work, a gap, off our tip, the wrong
-    /// `nBits`, or a time not after the median time past.
     Chain(crate::chain::Error),
 }
 
@@ -145,7 +93,6 @@ impl From<crate::p2p::frame::Error> for Error {
     }
 }
 
-/// The link refusing a deadline is an I/O error like any other on it.
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Error::Frame(crate::p2p::frame::Error::from(e))
@@ -170,29 +117,6 @@ impl From<crate::chain::Error> for Error {
     }
 }
 
-/// Runs the session over `connection`: the handshake with `our_version`,
-/// the headers sync into `chain`, then `linger` long after the sync before
-/// we hang up, unless the peer does first. `report` is called once per
-/// event, in order, as it happens.
-///
-/// The read deadline on the way in is the caller's, and bounds the whole
-/// handshake (`main::TIMEOUT` today). The sync and the linger set their
-/// own. The connection comes back with no deadline.
-///
-/// # Errors
-///
-/// `Frame` if a frame cannot be read or written, including `Io` with kind
-/// `TimedOut` when a deadline passes first, and the peer hanging up before
-/// the linger. `Message` if a known command does not parse. `Version`,
-/// `VerackBeforeVersion` and `NoVerackAfter` if the handshake does not
-/// complete. `Chain` if the chain refuses a batch; it holds every batch
-/// taken before it.
-///
-/// # Panics
-///
-/// If the chain and the connection are on different networks: the magic
-/// that frames a `headers` and the limit that checks its work are one
-/// choice, made by whoever built the two.
 pub fn run<L: crate::p2p::link::Link>(
     connection: &mut crate::p2p::connection::Connection<L>,
     chain: &mut crate::chain::Chain,
@@ -210,7 +134,6 @@ pub fn run<L: crate::p2p::link::Link>(
     linger_for(connection, linger, &mut report)
 }
 
-/// One message to the peer.
 fn send<L: crate::p2p::link::Link>(
     connection: &mut crate::p2p::connection::Connection<L>,
     message: crate::p2p::message::Message,
@@ -219,28 +142,11 @@ fn send<L: crate::p2p::link::Link>(
     connection.write_frame(frame.command, &frame.payload)
 }
 
-/// Where the handshake is between our `version` and the peer's `verack`.
-/// The peer's `version` is parsed on the way into `AwaitingVerack`, so a
-/// `verack` we send is one that a parsed `version` earned.
 enum Handshake {
     AwaitingVersion,
     AwaitingVerack(crate::p2p::version::Peer),
 }
 
-/// The `version`/`verack` exchange, from the side that opened the
-/// connection. We send `version` first, whole, before we read anything: a
-/// Core with BIP324 on decides v1 or v2 from the first 16 bytes on the
-/// socket, the magic and `"version\0\0\0\0\0"` (`../bitcoin/src/net.cpp:1090`);
-/// anything else starts a v2 key exchange. The peer's `version` earns our
-/// `verack`; the peer's `verack` completes the handshake. Core, as the
-/// responder, sends both in that order, with feature negotiation in between
-/// (`net_processing.cpp:3664`, `:3716`, `:3725`, `:3744`), which is dropped
-/// here along with any second `version` (`:3586`).
-///
-/// # Panics
-///
-/// If more than `MESSAGES_BEFORE_VERACK_MAX` frames are read. The loop
-/// condition rules that out.
 fn handshake<L: crate::p2p::link::Link>(
     connection: &mut crate::p2p::connection::Connection<L>,
     our_version: &[u8],
@@ -282,8 +188,6 @@ fn handshake<L: crate::p2p::link::Link>(
                 });
                 return Ok(());
             }
-            // Feature negotiation we do not speak yet, a second `version`,
-            // and anything else a peer sends before its `verack`.
             (state, _) => state,
         };
     }
@@ -291,14 +195,6 @@ fn handshake<L: crate::p2p::link::Link>(
     Err(Error::NoVerackAfter)
 }
 
-/// The headers sync: `getheaders` from our tip, `headers` back, the chain
-/// grows, and again while the batches come full and the cap allows. Core
-/// runs the same loop from `ProcessHeadersMessage` (`:3106`, `:2966`).
-///
-/// # Panics
-///
-/// If the loop asks more than `BATCHES_MAX` times or returns without
-/// asking once; the loop condition rules both out.
 fn sync<L: crate::p2p::link::Link>(
     connection: &mut crate::p2p::connection::Connection<L>,
     chain: &mut crate::chain::Chain,
@@ -338,13 +234,6 @@ fn sync<L: crate::p2p::link::Link>(
     Ok(())
 }
 
-/// Reads until a `headers` arrives, or `RESPONSE_TIME` passes. The loop has
-/// no count: a peer may send any number of frames first, and time is the
-/// bound, set here as the read deadline so that the loop and its bound are
-/// in one place. The deadline is cleared before either return. A `ping` on
-/// the way is answered, so that a long wait does not cost us the peer
-/// (`TIMEOUT_INTERVAL`, `net.h:59`). Anything else is dropped, and named,
-/// so that a new message must decide here whether it too is dropped.
 fn await_headers<L: crate::p2p::link::Link>(
     connection: &mut crate::p2p::connection::Connection<L>,
     report: &mut impl FnMut(Event),
@@ -355,7 +244,6 @@ fn await_headers<L: crate::p2p::link::Link>(
     result
 }
 
-/// The read loop of `await_headers`, with the deadline already set.
 fn await_headers_until_deadline<L: crate::p2p::link::Link>(
     connection: &mut crate::p2p::connection::Connection<L>,
     report: &mut impl FnMut(Event),
@@ -377,15 +265,6 @@ fn await_headers_until_deadline<L: crate::p2p::link::Link>(
     }
 }
 
-/// Stays connected for `linger` after the sync, answering `ping`s and
-/// naming what else arrives, then hangs up; or returns when the peer hangs
-/// up first, which is its right. One deadline for every read, so a peer
-/// that keeps talking cannot keep us here.
-///
-/// Stricter than Core, which ignores the tail of a long `ping` and only
-/// logs a short one (`:5283`), staying connected either way: a known
-/// command with a length it cannot have is a peer we do not want, so a
-/// decode error ends the session.
 fn linger_for<L: crate::p2p::link::Link>(
     connection: &mut crate::p2p::connection::Connection<L>,
     linger: std::time::Duration,
@@ -397,7 +276,6 @@ fn linger_for<L: crate::p2p::link::Link>(
     result
 }
 
-/// The read loop of `linger_for`, with the deadline already set.
 fn linger_until_deadline<L: crate::p2p::link::Link>(
     connection: &mut crate::p2p::connection::Connection<L>,
     linger: std::time::Duration,
@@ -409,7 +287,6 @@ fn linger_until_deadline<L: crate::p2p::link::Link>(
                 crate::p2p::message::Message::Ping(nonce) => {
                     match send(connection, crate::p2p::ping::handle(nonce)) {
                         Ok(()) => report(Event::Ponged(nonce)),
-                        // The peer closed between its ping and our pong.
                         Err(crate::p2p::frame::Error::Io(e)) if peer_hung_up(&e) => {
                             report(Event::PeerHungUp);
                             return Ok(());
@@ -432,9 +309,6 @@ fn linger_until_deadline<L: crate::p2p::link::Link>(
     }
 }
 
-/// The peer closing first is its right, not our fault. A read sees it as an
-/// early end of stream; a write, as a broken pipe; either, as a reset. One
-/// predicate for both paths, so they cannot disagree about what a hang-up is.
 fn peer_hung_up(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
@@ -446,12 +320,6 @@ fn peer_hung_up(e: &std::io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    // Every frame below was sent by Bitcoin Core v31.1.0, `bitcoind -regtest`.
-    // The handshake burst of 2026-09-13, in this order, in answer to a
-    // `version` that a throwaway Python script sent over a raw TCP socket;
-    // `sendcmpct`, `ping` and `feefilter` came after the script's `verack`.
-    // `headers` is Core's answer to a locator of genesis alone after
-    // `generatetoaddress 3` on 2026-09-15; `p2p/headers.rs` prints the chain.
     const VERSION: &str = "fabfb5da76657273696f6e000000000066000000da70f6db80110100090c00000000000028b0a66a000000000000000000000000000000000000000000000000000000000000090c000000000000000000000000000000000000000000000000d07dc58995aa90bc102f5361746f7368693a33312e312e302f0000000001";
     const WTXIDRELAY: &str = "fabfb5da777478696472656c61790000000000005df6e0e2";
     const SENDADDRV2: &str = "fabfb5da73656e646164647276320000000000005df6e0e2";
@@ -460,7 +328,6 @@ mod tests {
     const PING: &str = "fabfb5da70696e670000000000000000080000000518a0f806d2e2149c8064fd";
     const FEEFILTER: &str = "fabfb5da66656566696c746572000000080000000a19f7997a9e970000000000";
     const HEADERS: &str = "fabfb5da686561646572730000000000f40000002f52e50d030000002006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910fce25a9ef6a61909eadcc696fb71eb4d3216de17cc3731ecdd321a030e9213a1226cda96affff7f2000000000000000002034cf96da8f1b387300eaa047d30955fbaf1b0bb6f261f22425454a6b43b7b233650b72ea7da500a8429598a02571115bf2b6ee26da96be0378ff7cba4c98780e27cda96affff7f200300000000000000200e6ddccc471aeeb899ff667f7d55da0443769850872e6d44924d32d610f24c2869ee5ba689a2d757c652f917d12a43c9b24ba79dcff22abbea56c075d3d2bd7227cda96affff7f200000000000";
-    /// The nonce in `PING`, little-endian on the wire.
     const PING_NONCE: u64 = 0xfd64_809c_14e2_d206;
 
     const GENESIS: &str = "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206";
@@ -468,9 +335,6 @@ mod tests {
 
     const NETWORK: crate::chain::network::Network = crate::chain::network::Network::Regtest;
     const OUR_VERSION: &[u8] = b"a version payload the peer does not read";
-    /// Long enough that a linger never ends on its own in a test: the
-    /// scripted peer hangs up when its script is done, and that is the end
-    /// of every session here unless a test says otherwise.
     const LINGER: std::time::Duration = std::time::Duration::from_secs(60);
 
     fn fixture(hex: &str) -> Vec<u8> {
@@ -480,7 +344,6 @@ mod tests {
             .collect()
     }
 
-    /// A frame as `frame::write` puts it on the wire.
     fn framed(message: crate::p2p::message::Message) -> Vec<u8> {
         let frame = message.encode();
         let mut out = Vec::new();
@@ -495,26 +358,14 @@ mod tests {
             .collect()
     }
 
-    /// Core's handshake, the two frames of it that matter, as a script
-    /// prefix for the tests that are about what comes after.
     fn handshake() -> Vec<Vec<u8>> {
         vec![fixture(VERSION), fixture(VERACK)]
     }
 
-    /// What we send during the handshake: our `version` and our `verack`.
-    /// The tests about the sync compare what was sent after this.
     fn our_handshake_bytes() -> usize {
         2 * crate::p2p::frame::HEADER_BYTES + OUR_VERSION.len()
     }
 
-    /// `count` headers from `height_first` on, after `previous`, each naming
-    /// the one before and each mined to the regtest target, which takes two
-    /// tries on average. Hand-built because no captured `headers` is 2000
-    /// long; Core's rule for a full batch is `net_processing.cpp:3106`.
-    ///
-    /// The time rises by one a block from the time regtest genesis claims,
-    /// so every header comes after the median time past of the ones before
-    /// it and the batch is about the loop and not about time.
     fn batch_after(
         previous: &crate::chain::block_header::BlockHash,
         height_first: usize,
@@ -543,14 +394,12 @@ mod tests {
         framed(crate::p2p::message::Message::Headers(headers))
     }
 
-    /// Our `getheaders` for a locator from `chain`'s tip, on the wire.
     fn getheaders(chain: &crate::chain::Chain) -> Vec<u8> {
         framed(crate::p2p::message::Message::GetHeaders(
             crate::p2p::getheaders::GetHeaders::from_tip(chain),
         ))
     }
 
-    /// The headers inside a framed `headers`.
     fn headers_in(batch: &[u8]) -> crate::p2p::headers::Headers {
         let frame = crate::p2p::frame::read(&mut &batch[..], NETWORK).unwrap();
         match crate::p2p::message::Message::decode(frame).unwrap() {
@@ -559,7 +408,6 @@ mod tests {
         }
     }
 
-    /// What one session left behind.
     struct Ran {
         result: Result<(), super::Error>,
         events: Vec<String>,
@@ -569,7 +417,6 @@ mod tests {
     }
 
     impl Ran {
-        /// The events after the handshake: what the sync and the linger did.
         fn after_handshake(&self) -> &[String] {
             let complete = self
                 .events
@@ -579,7 +426,6 @@ mod tests {
             &self.events[complete + 1..]
         }
 
-        /// The bytes we sent after our `version` and `verack`.
         fn sent_after_handshake(&self) -> &[u8] {
             &self.sent[our_handshake_bytes()..]
         }
@@ -620,7 +466,6 @@ mod tests {
         }
     }
 
-    /// A session on regtest from genesis: the handshake, then `script`.
     fn session(script: Vec<Vec<u8>>) -> (crate::chain::Chain, Ran) {
         let mut chain = crate::chain::Chain::new(NETWORK);
         let mut frames = handshake();
@@ -628,8 +473,6 @@ mod tests {
         let ran = run(&mut chain, sends(frames));
         (chain, ran)
     }
-
-    // --- the handshake
 
     #[test]
     fn a_whole_session_against_core_bytes() {
@@ -728,8 +571,6 @@ mod tests {
         println!("{err}");
     }
 
-    /// Core's `version` frame with its payload cut to `len` bytes, framed
-    /// again so the envelope passes and only the payload is wrong.
     fn version_cut_to(len: usize) -> Vec<u8> {
         let payload = &fixture(VERSION)[crate::p2p::frame::HEADER_BYTES..][..len];
         let mut bytes = Vec::new();
@@ -849,8 +690,6 @@ mod tests {
         println!("peer sent version then nothing: {io}");
     }
 
-    // --- the sync
-
     #[test]
     #[should_panic(expected = "the chain and the connection are on one network")]
     fn a_chain_on_another_network_than_the_connection_is_our_bug() {
@@ -872,8 +711,6 @@ mod tests {
             1,
             crate::p2p::headers::HEADERS_MAX,
         );
-        // The second request, built from a chain in the state the loop is
-        // in when it asks.
         let mut at_2000 = crate::chain::Chain::new(NETWORK);
         at_2000.extend(headers_in(&full).into_vec()).unwrap();
         let second_request = getheaders(&at_2000);
@@ -1082,8 +919,6 @@ mod tests {
         );
         println!("{}", ran.after_handshake().join("\n"));
     }
-
-    // --- the linger
 
     #[test]
     fn the_linger_answers_pings_names_the_rest_and_ends_on_the_clock() {

@@ -1,43 +1,21 @@
-//! `getheaders`: the request for the headers after the ones we have. Core
-//! answers it at `../bitcoin/src/net_processing.cpp:4394` at v31.1.
-//!
-//! elo sends the request and never serves one: a `getheaders` from the peer
-//! is decoded so that it is a value and not an unknown frame, then dropped.
-//! Core would answer it; we hold no chain a peer wants.
-
 pub const COMMAND: crate::p2p::frame::Command =
     crate::p2p::frame::Command::from_static("getheaders");
 
-/// `CBlockLocator::DUMMY_VERSION`, `../bitcoin/src/primitives/block.h:125`.
-/// Written in front of every locator, read by nobody (`block.h:118`).
 const LOCATOR_VERSION: i32 = 70016;
 
 const HASH_BYTES: usize = crate::chain::block_header::HASH_BYTES;
 
-/// A `getheaders` payload: a `CBlockLocator`, then `hashStop`
-/// (`net_processing.cpp:4397`).
 #[derive(Debug)]
 pub struct GetHeaders {
-    /// Hashes of blocks we have, newest first. The peer answers with the
-    /// headers after the first one it knows, and after genesis if it knows
-    /// none (`FindForkInGlobalIndex`, `:4441`). `locator::Locator::new`
-    /// gives it Core's shape.
     pub locator: crate::chain::locator::Locator,
-    /// The last header we want, or `None` for as many as the peer will send.
-    /// `None` is a zero hash on the wire: `uint256()` where Core asks
-    /// (`:2832`), `hashStop.IsNull()` where it answers (`:4448`).
     pub stop: Option<crate::chain::block_header::BlockHash>,
 }
 
 #[derive(Debug)]
 pub enum Error {
-    /// A field runs past the end of the payload.
     Truncated,
-    /// The count in front of the locator is not in its shortest form.
     NonCanonicalCount(u64),
-    /// More locator hashes than `locator::HASHES_MAX`.
     TooMany { count: u64, max: usize },
-    /// Bytes after the stop hash.
     TrailingBytes(usize),
 }
 
@@ -55,8 +33,6 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl From<crate::p2p::compact_size::Error> for Error {
-    /// The payload has one `CompactSize`, the count in front of the locator,
-    /// so each of its errors is an error about that count.
     fn from(e: crate::p2p::compact_size::Error) -> Self {
         match e {
             crate::p2p::compact_size::Error::Truncated => Error::Truncated,
@@ -69,9 +45,6 @@ impl From<crate::p2p::compact_size::Error> for Error {
 }
 
 impl GetHeaders {
-    /// The request the sync sends: everything after our tip, as far as the
-    /// peer will go. The locator is the chain's; this only puts it in a
-    /// payload.
     #[must_use]
     pub fn from_tip(chain: &crate::chain::Chain) -> GetHeaders {
         GetHeaders {
@@ -80,9 +53,6 @@ impl GetHeaders {
         }
     }
 
-    /// Reads a `getheaders` payload. Core reads the locator as a vector, so a
-    /// count above `locator::HASHES_MAX` is read whole and then disconnected
-    /// (`:4399`); here the count is refused before a hash is read.
     pub(crate) fn parse(payload: &[u8]) -> Result<GetHeaders, Error> {
         let (_version, rest) = crate::p2p::compact_size::take::<4>(payload)?;
         let (count, mut rest) =
@@ -104,12 +74,8 @@ impl GetHeaders {
         Ok(GetHeaders { locator, stop })
     }
 
-    /// The payload Core reads at `:4397`. A `Locator` holds Core's bound by
-    /// construction, so there is no request here that Core hangs up on.
     #[must_use]
     pub(crate) fn encode(&self) -> Vec<u8> {
-        // The version, a one-byte count (the `const` assertion beside
-        // `locator::HASHES_MAX`), the hashes, and the stop hash.
         let size = 4 + 1 + HASH_BYTES * (self.locator.len() + 1);
         let mut out = Vec::with_capacity(size);
         out.extend_from_slice(&LOCATOR_VERSION.to_le_bytes());
@@ -128,21 +94,10 @@ impl GetHeaders {
 
 #[cfg(test)]
 mod tests {
-    // Every payload below was captured from Bitcoin Core v31.1.0,
-    // `bitcoind -regtest`, after `generatetoaddress 3`, on 2026-09-15.
-    // `headers.rs` has the chain.
 
-    // Our `getheaders` with an empty locator and block 2 as the stop hash,
-    // and Core's answer to it: block 2 alone (`net_processing.cpp:4429`).
     const STOP_AT_TWO_REQUEST: &str =
         "80110100000e6ddccc471aeeb899ff667f7d55da0443769850872e6d44924d32d610f24c28";
     const STOP_AT_TWO: &str = "010000002034cf96da8f1b387300eaa047d30955fbaf1b0bb6f261f22425454a6b43b7b233650b72ea7da500a8429598a02571115bf2b6ee26da96be0378ff7cba4c98780e27cda96affff7f200300000000";
-    // Then the script listened, and `addnode 127.0.0.1:<port> onetry false`
-    // made Core connect to it, v1. The script's `version` claimed
-    // `NODE_NETWORK`, which is what makes Core start a headers sync
-    // (`CanServeBlocks`, `:1155`). Core's `getheaders`: blocks 2, 1 and 0.
-    // The locator starts one below the tip on purpose, so that a peer at the
-    // same tip still answers with one header (`:5801`).
     const CORE_GETHEADERS: &str = "80110100030e6ddccc471aeeb899ff667f7d55da0443769850872e6d44924d32d610f24c2834cf96da8f1b387300eaa047d30955fbaf1b0bb6f261f22425454a6b43b7b23306226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f0000000000000000000000000000000000000000000000000000000000000000";
 
     const GENESIS: &str = "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206";
@@ -196,8 +151,6 @@ mod tests {
             panic!("{} headers", answer.len());
         };
         assert_eq!(answer.hash().to_string(), BLOCK_2);
-        // An empty locator is a shape no chain of ours produces, so it is
-        // built the way `parse` builds one.
         let ours = super::GetHeaders {
             locator: crate::chain::locator::Locator::from_wire(Vec::new()),
             stop: Some(answer.hash()),

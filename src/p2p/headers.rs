@@ -1,33 +1,15 @@
-//! `headers`: the answer to a `getheaders`, at most `HEADERS_MAX` block
-//! headers, each followed by the transaction count of a block that carries
-//! none. Core sends it at `../bitcoin/src/net_processing.cpp:4453` at v31.1
-//! and reads it at `:4816`.
-//!
-//! elo reads the answer. Writing one is here so that the message is a value
-//! that `message::Message` can turn back into a frame; nothing in elo serves
-//! headers.
-
 pub const COMMAND: crate::p2p::frame::Command = crate::p2p::frame::Command::from_static("headers");
 
-/// `MAX_HEADERS_RESULTS`, `net_processing.h:51`. Core sends at most this many
-/// in one `headers` (`:4453`) and penalizes a peer that sends more (`:4829`).
 pub(crate) const HEADERS_MAX: usize = 2000;
 
 const HEADER_BYTES: usize = crate::chain::block_header::BYTES;
 
 #[derive(Debug)]
 pub enum Error {
-    /// A field runs past the end of the payload.
     Truncated,
-    /// The count in front of the list is not in its shortest form.
     NonCanonicalCount(u64),
-    /// More headers than `HEADERS_MAX`.
     TooMany { count: u64, max: usize },
-    /// The transaction count after a header is not zero. Core reads and
-    /// ignores it (`:4835`); a header on the wire has no transactions, so a
-    /// peer that counts some is not sending headers.
     TransactionCount(u8),
-    /// Bytes after the last header.
     TrailingBytes(usize),
 }
 
@@ -48,8 +30,6 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl From<crate::p2p::compact_size::Error> for Error {
-    /// The payload has one `CompactSize`, the count in front of the list, so
-    /// each of its errors is an error about that count.
     fn from(e: crate::p2p::compact_size::Error) -> Self {
         match e {
             crate::p2p::compact_size::Error::Truncated => Error::Truncated,
@@ -61,36 +41,16 @@ impl From<crate::p2p::compact_size::Error> for Error {
     }
 }
 
-/// What the handler did with a batch.
 pub struct Taken {
-    /// How many headers the chain took.
     pub count: usize,
-    /// Whether the peer may have more: a batch of `HEADERS_MAX` says so
-    /// (`ProcessHeadersMessage`, `net_processing.cpp:3106`); a shorter one
-    /// says the peer has nothing after our tip (`:2966`).
     pub more: bool,
 }
 
-/// The handler: the chain takes the batch, and the answer says whether to
-/// ask again. This is the one place a `headers` reaches the chain, and the
-/// chain is the only thing it reaches.
-///
-/// # Errors
-///
-/// As `Chain::extend`: a header without the work it claims, a gap, a batch
-/// off our tip, the wrong `nBits`, or a time not after the median time past.
-/// The chain is unchanged on any of them.
-///
-/// # Panics
-///
-/// If the batch is longer than `HEADERS_MAX`, which `parse` rules out.
 pub fn handle(
     headers: Headers,
     chain: &mut crate::chain::Chain,
 ) -> Result<Taken, crate::chain::Error> {
     let count = headers.len();
-    // `parse` bounded the batch, so a short one is the only shape left that
-    // is not full.
     assert!(count <= HEADERS_MAX);
     chain.extend(headers.into_vec())?;
     Ok(Taken {
@@ -99,22 +59,10 @@ pub fn handle(
     })
 }
 
-/// A `headers` payload as one peer sent it: at most `HEADERS_MAX`. Only
-/// `parse` builds one, so the bound holds by construction; `encode` asserts
-/// it again, so a second constructor cannot break it in silence.
-///
-/// Whether each header names the one before it, whether the first names a
-/// block we know, and whether each has the work it claims, are questions for
-/// the chain: `Chain::extend` asks them in Core's order.
 #[derive(Debug)]
 pub struct Headers(Vec<crate::chain::block_header::Header>);
 
 impl Headers {
-    /// Reads a `headers` payload: a count, then that many headers, each
-    /// followed by the transaction count of a block that carries none
-    /// (`:4446`). Core reads it the same way (`:4827` to `:4836`), but
-    /// accepts any transaction count; we accept the one byte a count of zero
-    /// takes.
     pub(crate) fn parse(payload: &[u8]) -> Result<Headers, Error> {
         let (count, mut rest) = crate::p2p::compact_size::read_len(payload, HEADERS_MAX)?;
         let mut headers: Vec<crate::chain::block_header::Header> = Vec::with_capacity(count);
@@ -135,8 +83,6 @@ impl Headers {
         Ok(Headers(headers))
     }
 
-    /// The payload Core writes at `:4469`: each header as a `CBlock` with no
-    /// transactions, which is the header and one zero byte.
     #[must_use]
     pub(crate) fn encode(&self) -> Vec<u8> {
         assert!(self.0.len() <= HEADERS_MAX);
@@ -155,7 +101,6 @@ impl Headers {
         &self.0
     }
 
-    /// The headers, for a chain to keep: what `Chain::extend` takes.
     #[must_use]
     pub fn into_vec(self) -> Vec<crate::chain::block_header::Header> {
         self.0
@@ -174,20 +119,7 @@ impl Headers {
 
 #[cfg(test)]
 mod tests {
-    // Every payload below was exchanged with Bitcoin Core v31.1.0, `bitcoind
-    // -regtest`, on 2026-09-15, after `generatetoaddress 3`, by a throwaway
-    // Python script over a raw TCP socket. The chain, as `getblockhash`
-    // printed it:
-    //
-    //   0  0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206
-    //   1  33b2b7436b4a452524f261f2b60b1baffb5509d347a0ea0073381b8fda96cf34
-    //   2  284cf210d6324d92446d2e875098764304da557d7f66ff99b8ee1a47ccdc6d0e
-    //   3  08e1a659dc25965d0cdf6d093b9247b09e9ce97a22cc77bca0b510ba4b337d61
-    //
-    // The script connected, shook hands, and sent three `getheaders`. Core's
-    // `headers` to a locator of genesis alone: blocks 1 to 3.
     const FROM_GENESIS: &str = "030000002006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910fce25a9ef6a61909eadcc696fb71eb4d3216de17cc3731ecdd321a030e9213a1226cda96affff7f2000000000000000002034cf96da8f1b387300eaa047d30955fbaf1b0bb6f261f22425454a6b43b7b233650b72ea7da500a8429598a02571115bf2b6ee26da96be0378ff7cba4c98780e27cda96affff7f200300000000000000200e6ddccc471aeeb899ff667f7d55da0443769850872e6d44924d32d610f24c2869ee5ba689a2d757c652f917d12a43c9b24ba79dcff22abbea56c075d3d2bd7227cda96affff7f200000000000";
-    // Core's answer to a locator of its own tip: nothing after it.
     const FROM_TIP: &str = "00";
     const GENESIS: &str = "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206";
     const BLOCK_1: &str = "33b2b7436b4a452524f261f2b60b1baffb5509d347a0ea0073381b8fda96cf34";
@@ -248,8 +180,6 @@ mod tests {
         );
     }
 
-    /// Core's three-header payload with its count rewritten as `count`,
-    /// in the `fd` form.
     fn with_count(count: u16) -> Vec<u8> {
         let mut payload = vec![0xfd];
         payload.extend_from_slice(&count.to_le_bytes());
@@ -272,8 +202,6 @@ mod tests {
             "{err}"
         );
         println!("2001: {err}");
-        // The last count Core accepts passes the bound; the payload behind it
-        // is then too short, which is a different error.
         let err = super::Headers::parse(&with_count(2000)).unwrap_err();
         assert!(matches!(err, super::Error::Truncated), "{err}");
         println!("2000 on a payload of three: {err}");
@@ -334,8 +262,6 @@ mod tests {
 
 #[cfg(test)]
 mod handler_tests {
-    // The handler with no socket and no loop: a `Headers` in, the chain
-    // grown, and the answer that says whether to ask again.
     const FROM_GENESIS: &str = "030000002006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910fce25a9ef6a61909eadcc696fb71eb4d3216de17cc3731ecdd321a030e9213a1226cda96affff7f2000000000000000002034cf96da8f1b387300eaa047d30955fbaf1b0bb6f261f22425454a6b43b7b233650b72ea7da500a8429598a02571115bf2b6ee26da96be0378ff7cba4c98780e27cda96affff7f200300000000000000200e6ddccc471aeeb899ff667f7d55da0443769850872e6d44924d32d610f24c2869ee5ba689a2d757c652f917d12a43c9b24ba79dcff22abbea56c075d3d2bd7227cda96affff7f200000000000";
     const BLOCK_3: &str = "08e1a659dc25965d0cdf6d093b9247b09e9ce97a22cc77bca0b510ba4b337d61";
 
