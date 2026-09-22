@@ -2,8 +2,6 @@ const MESSAGES_BEFORE_VERACK_MAX: usize = 16;
 
 pub const RESPONSE_TIME: std::time::Duration = std::time::Duration::from_secs(120);
 
-pub const BATCHES_MAX: usize = 2;
-
 pub enum Event {
     SentVersion {
         bytes: usize,
@@ -28,10 +26,6 @@ pub enum Event {
         height: usize,
         tip: crate::chain::block_header::BlockHash,
     },
-    Capped {
-        height: usize,
-        tip: crate::chain::block_header::BlockHash,
-    },
     Ignored(crate::p2p::message::Message),
     PeerHungUp,
     LingerOver(std::time::Duration),
@@ -49,10 +43,6 @@ impl std::fmt::Display for Event {
             Event::Took { count, height } => write!(f, "<- headers ({count}), height {height}"),
             Event::Ponged(nonce) => write!(f, "<- ping {nonce:#018x}\n-> pong"),
             Event::Synced { height, tip } => write!(f, "synced: height {height}, tip {tip}"),
-            Event::Capped { height, tip } => write!(
-                f,
-                "stopped at {BATCHES_MAX} batches (ROADMAP step 8): height {height}, tip {tip}; the peer may have more"
-            ),
             Event::Ignored(message) => write!(f, "<- {message} ignored"),
             Event::PeerHungUp => write!(f, "peer hung up"),
             Event::LingerOver(linger) => write!(f, "{linger:?} after the sync, hanging up"),
@@ -200,8 +190,7 @@ fn sync<L: crate::p2p::link::Link>(
     chain: &mut crate::chain::Chain,
     report: &mut impl FnMut(Event),
 ) -> Result<(), Error> {
-    let mut batches = 0;
-    while batches < BATCHES_MAX {
+    loop {
         let request = crate::p2p::getheaders::GetHeaders::from_tip(chain);
         send(
             connection,
@@ -213,7 +202,6 @@ fn sync<L: crate::p2p::link::Link>(
 
         let headers = await_headers(connection, report)?;
         let taken = crate::p2p::headers::handle(headers, chain)?;
-        batches += 1;
         report(Event::Took {
             count: taken.count,
             height: chain.height(),
@@ -226,12 +214,6 @@ fn sync<L: crate::p2p::link::Link>(
             return Ok(());
         }
     }
-    assert_eq!(batches, BATCHES_MAX);
-    report(Event::Capped {
-        height: chain.height(),
-        tip: chain.tip(),
-    });
-    Ok(())
 }
 
 fn await_headers<L: crate::p2p::link::Link>(
@@ -740,45 +722,42 @@ mod tests {
     }
 
     #[test]
-    fn stops_after_the_capped_number_of_full_batches() {
-        // Red if the cap is off by one in either direction: a third request
-        // would take the third batch into the chain, one fewer would leave
-        // the second unread. The third batch arrives during the linger,
-        // where nothing asked for it, and is named and dropped.
+    fn asks_again_after_every_full_batch_until_a_short_one() {
+        // Red if the sync stops at a count of batches instead of at a short
+        // one: three full batches, then five headers, and the chain holds
+        // all of them.
         let mut script = Vec::new();
         let mut previous = crate::chain::Chain::new(NETWORK).tip();
         let mut height_first = 1;
-        for _ in 0..=super::BATCHES_MAX {
-            let batch = batch_after(&previous, height_first, crate::p2p::headers::HEADERS_MAX);
+        for count in [
+            crate::p2p::headers::HEADERS_MAX,
+            crate::p2p::headers::HEADERS_MAX,
+            crate::p2p::headers::HEADERS_MAX,
+            5,
+        ] {
+            let batch = batch_after(&previous, height_first, count);
             previous = headers_in(&batch).as_slice().last().unwrap().hash();
-            height_first += crate::p2p::headers::HEADERS_MAX;
+            height_first += count;
             script.push(batch);
         }
 
         let (chain, ran) = session(script);
         ran.result.as_ref().unwrap();
-        let height = super::BATCHES_MAX * crate::p2p::headers::HEADERS_MAX;
-        assert_eq!(chain.height(), height);
+        assert_eq!(chain.height(), 6005);
+        assert_eq!(chain.tip().to_string(), previous.to_string());
         assert_eq!(
             ran.after_handshake()
                 .iter()
-                .filter(|e| e.starts_with("->"))
+                .filter(|e| e.starts_with("-> getheaders"))
                 .count(),
-            super::BATCHES_MAX
+            4,
+            "one ask per batch, the last one answered short"
         );
-        let tip = chain.tip();
         assert!(
-            ran.events.contains(&format!(
-                "stopped at {} batches (ROADMAP step 8): height {height}, tip {tip}; the peer may have more",
-                super::BATCHES_MAX
-            )),
+            ran.events
+                .contains(&format!("synced: height 6005, tip {previous}")),
             "{:?}",
             ran.events
-        );
-        assert_eq!(
-            ran.events[ran.events.len() - 2],
-            "<- headers (2000) ignored",
-            "the third batch was never asked for"
         );
         assert_eq!(ran.unread, 0);
         println!("{}", ran.after_handshake().join("\n"));
