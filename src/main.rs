@@ -45,5 +45,6 @@ fn run(network: Option<&str>, peer: Option<&str>) -> Result<(), Box<dyn std::err
     elo::peer::run(&mut connection, &mut chain, &our_version, LINGER, |event| {
         println!("{event}");
     })?;
+    println!("chainwork {}", chain.work());
     Ok(())
 }

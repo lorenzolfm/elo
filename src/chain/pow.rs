@@ -215,6 +215,22 @@ impl Target {
     pub fn limit(network: crate::chain::network::Network) -> Target {
         Params::of(network).limit
     }
+
+    #[must_use]
+    pub fn work(&self) -> crate::chain::u256::U256 {
+        let Some(divisor) = self.0.checked_add(&crate::chain::u256::U256::ONE) else {
+            unreachable!("a target is at or below the limit, below the width")
+        };
+        let Some(work) = self
+            .0
+            .not()
+            .div(&divisor)
+            .checked_add(&crate::chain::u256::U256::ONE)
+        else {
+            unreachable!("a target of one or more has work below the width")
+        };
+        work
+    }
 }
 
 impl std::fmt::Display for Target {
@@ -722,5 +738,36 @@ mod tests {
         let mut header = crate::chain::genesis(crate::chain::network::Network::Mainnet);
         header.time += 1;
         super::mine(&mut header, crate::chain::network::Network::Mainnet);
+    }
+
+    #[test]
+    fn the_work_of_a_target_is_the_chainwork_core_reports() {
+        // Red if the work is 2**256/target instead of 2**256/(target+1), or
+        // if the "+ 1" that turns the complement identity back into a
+        // division is missing. Every number here is Core's: the chainwork of
+        // the mainnet and regtest genesis blocks, and, for a target of a real
+        // difficulty, the step chainwork takes from height 968 200 to
+        // 968 201 (bits 0x17021ec5).
+        let mainnet = crate::chain::network::Network::Mainnet;
+        let genesis = super::Target::from_compact(0x1d00_ffff, mainnet).unwrap();
+        assert_eq!(
+            genesis.work(),
+            crate::chain::u256::U256::from_limbs([0, 0, 0, 0x0001_0001_0001])
+        );
+        assert_eq!(
+            genesis.work().to_string(),
+            "0000000000000000000000000000000000000000000000000000000100010001"
+        );
+
+        let real = super::Target::from_compact(0x1702_1ec5, mainnet).unwrap();
+        assert_eq!(
+            real.work(),
+            crate::chain::u256::U256::from_limbs([0, 0, 0x78be, 0x62f2_b502_3949_a486])
+        );
+
+        let regtest = crate::chain::network::Network::Regtest;
+        let easiest = super::Target::from_compact(0x207f_ffff, regtest).unwrap();
+        assert_eq!(easiest.work(), crate::chain::u256::U256::from_u64(2));
+        println!("{}\n{}\n{}", genesis.work(), real.work(), easiest.work());
     }
 }

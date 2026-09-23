@@ -192,6 +192,34 @@ fn core_tells_us_its_height() {
 }
 
 #[test]
+fn our_chainwork_is_the_chainwork_core_reports() {
+    // Red if the work of a header is wrong, or if the chain drops the work
+    // of genesis or of the header at a join: Core is the oracle, and it
+    // prints the same number for the same chain.
+    let Some(node) = node_or_skip("our_chainwork_is_the_chainwork_core_reports") else {
+        return;
+    };
+    node.cli(&["generatetoaddress", "7", UNSPENDABLE]).unwrap();
+    node.cli(&["syncwithvalidationinterfacequeue"]).unwrap();
+    let info = node.cli(&["getblockchaininfo"]).unwrap();
+    let chainwork = info
+        .lines()
+        .find(|line| line.contains("\"chainwork\""))
+        .and_then(|line| line.split('"').nth(3))
+        .unwrap_or_else(|| panic!("no chainwork:\n{info}"))
+        .to_string();
+
+    let run = run_elo(&node, |peers| peers.contains("/elo:"));
+    assert!(run.status.success(), "elo exited with {}", run.status);
+    assert!(
+        run.transcript.contains(&format!("chainwork {chainwork}")),
+        "getblockchaininfo says {chainwork}:\n{}",
+        run.transcript
+    );
+    println!("getblockchaininfo chainwork {chainwork}: ours agrees");
+}
+
+#[test]
 fn core_lists_us_in_getpeerinfo() {
     let Some(run) = run_elo_until("core_lists_us_in_getpeerinfo", |peers| {
         peers.contains("/elo:")

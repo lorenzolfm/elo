@@ -109,6 +109,7 @@ impl std::error::Error for Error {}
 pub struct Chain {
     network: crate::chain::network::Network,
     headers: Vec<crate::chain::pow::Checked>,
+    work: crate::chain::u256::U256,
 }
 
 impl Chain {
@@ -118,9 +119,11 @@ impl Chain {
             Ok(header) => header,
             Err(error) => panic!("genesis has the work it claims: {error}"),
         };
+        let work = genesis.target(network).work();
         let chain = Chain {
             network,
             headers: vec![genesis],
+            work,
         };
         assert_eq!(chain.height(), 0, "genesis is at height 0");
         assert_eq!(
@@ -151,6 +154,11 @@ impl Chain {
     #[must_use]
     pub fn hash_at(&self, height: usize) -> crate::chain::block_header::BlockHash {
         self.at(height).hash()
+    }
+
+    #[must_use]
+    pub fn work(&self) -> &crate::chain::u256::U256 {
+        &self.work
     }
 
     #[must_use]
@@ -186,6 +194,7 @@ impl Chain {
                 tip,
             });
         }
+        let mut added = crate::chain::u256::U256::ZERO;
         for (offset, header) in batch.iter().enumerate() {
             let ancestors =
                 crate::chain::ancestors::Ancestors::new(&self.headers, &batch[..offset]);
@@ -207,10 +216,18 @@ impl Chain {
                     median_time_past,
                 });
             }
+            let Some(sum) = added.checked_add(&header.target(self.network).work()) else {
+                unreachable!("the work of a batch is the work its peer paid for")
+            };
+            added = sum;
         }
+        let Some(work) = self.work.checked_add(&added) else {
+            unreachable!("the work of a chain is the work its peers paid for")
+        };
         let height_before = self.height();
         let count = batch.len();
         self.headers.extend(batch);
+        self.work = work;
         assert_eq!(self.height(), height_before + count);
         Ok(())
     }
@@ -389,6 +406,58 @@ mod tests {
         );
         assert_eq!(chain.tip().to_string(), BLOCK_3, "getbestblockhash");
         println!("height {}, tip {}", chain.height(), chain.tip());
+    }
+
+    #[test]
+    fn a_chain_of_genesis_alone_holds_the_work_of_genesis() {
+        // Red if the chain starts its work at zero, or counts genesis twice.
+        // Core reports both numbers as the chainwork of the genesis block.
+        let regtest = super::Chain::new(crate::chain::network::Network::Regtest);
+        assert_eq!(
+            regtest.work().to_string(),
+            "0000000000000000000000000000000000000000000000000000000000000002"
+        );
+        let mainnet = super::Chain::new(crate::chain::network::Network::Mainnet);
+        assert_eq!(
+            mainnet.work().to_string(),
+            "0000000000000000000000000000000000000000000000000000000100010001"
+        );
+        println!("regtest {}\nmainnet {}", regtest.work(), mainnet.work());
+    }
+
+    #[test]
+    fn a_batch_adds_the_work_of_every_header_it_brings() {
+        // Red if the work of the batch is counted once, or if the header at
+        // the join is skipped. Core's three headers after the regtest genesis
+        // block, where each header is worth two: `getblockheader` at height 3
+        // reports a chainwork of eight.
+        let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
+        chain.extend(after_genesis()).unwrap();
+        assert_eq!(chain.height(), 3);
+        assert_eq!(
+            chain.work().to_string(),
+            "0000000000000000000000000000000000000000000000000000000000000008"
+        );
+        println!("height {}, chainwork {}", chain.height(), chain.work());
+    }
+
+    #[test]
+    fn a_refused_batch_leaves_the_work_where_it_was() {
+        // Red if the work is summed before the batch is checked: a batch off
+        // the tip and a batch with the wrong bits both leave the chain as it
+        // was, work and all.
+        let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
+        chain.extend(after_genesis()).unwrap();
+        let before = chain.work().to_string();
+
+        chain.extend(after_genesis()).unwrap_err();
+        assert_eq!(chain.work().to_string(), before, "a batch off the tip");
+
+        let wrong_bits = one_after(&chain.tip(), time_at(4), 0x207f_fffe);
+        chain.extend(wrong_bits).unwrap_err();
+        assert_eq!(chain.work().to_string(), before, "a batch with wrong bits");
+        assert_eq!(chain.height(), 3);
+        println!("{}", chain.work());
     }
 
     #[test]
