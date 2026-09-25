@@ -311,6 +311,7 @@ mod tests {
     const FEEFILTER: &str = "fabfb5da66656566696c746572000000080000000a19f7997a9e970000000000";
     const HEADERS: &str = "fabfb5da686561646572730000000000f40000002f52e50d030000002006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910fce25a9ef6a61909eadcc696fb71eb4d3216de17cc3731ecdd321a030e9213a1226cda96affff7f2000000000000000002034cf96da8f1b387300eaa047d30955fbaf1b0bb6f261f22425454a6b43b7b233650b72ea7da500a8429598a02571115bf2b6ee26da96be0378ff7cba4c98780e27cda96affff7f200300000000000000200e6ddccc471aeeb899ff667f7d55da0443769850872e6d44924d32d610f24c2869ee5ba689a2d757c652f917d12a43c9b24ba79dcff22abbea56c075d3d2bd7227cda96affff7f200000000000";
     const PING_NONCE: u64 = 0xfd64_809c_14e2_d206;
+    const HEADER_VERSION: i32 = 0x2000_0000;
 
     const GENESIS: &str = "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206";
     const BLOCK_3: &str = "08e1a659dc25965d0cdf6d093b9247b09e9ce97a22cc77bca0b510ba4b337d61";
@@ -360,7 +361,7 @@ mod tests {
             crate::chain::block_header::BlockHash::from_bytes(*previous.as_bytes());
         for i in 0..count {
             let mut header = crate::chain::block_header::Header {
-                version: 1,
+                version: HEADER_VERSION,
                 previous_block,
                 merkle_root: crate::chain::block_header::MerkleRoot::from_bytes([0; 32]),
                 time: genesis.time + u32::try_from(height_first + i).unwrap(),

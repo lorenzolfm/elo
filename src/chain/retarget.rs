@@ -79,6 +79,19 @@ pub(crate) fn next_bits(
     next_bits_required(bits, network)
 }
 
+#[must_use]
+pub(crate) fn opens_a_bip94_period(height: usize, network: crate::chain::network::Network) -> bool {
+    let params = crate::chain::pow::Params::of(network);
+    let crate::chain::pow::Retarget::Every {
+        edge: crate::chain::pow::Edge::First,
+        ..
+    } = params.retarget
+    else {
+        return false;
+    };
+    height.is_multiple_of(params.interval)
+}
+
 #[cfg(test)]
 mod tests {
     const CORE_RETARGETS: [(u32, u32, u32, u32); 4] = [

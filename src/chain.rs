@@ -1,5 +1,6 @@
 pub(crate) mod ancestors;
 pub mod block_header;
+pub(crate) mod deployment;
 pub mod locator;
 pub mod network;
 pub mod pow;
@@ -7,6 +8,7 @@ pub(crate) mod retarget;
 pub mod u256;
 
 const GENESIS_VERSION: i32 = 1;
+const TIMEWARP_MAX: i64 = 600;
 const MERKLE_ROOT_2009: [u8; crate::chain::block_header::HASH_BYTES] = [
     0x3b, 0xa3, 0xed, 0xfd, 0x7a, 0x7b, 0x12, 0xb2, 0x7a, 0xc7, 0x2c, 0x3e, 0x67, 0x76, 0x8f, 0x61,
     0x7f, 0xc8, 0x1b, 0xc3, 0x88, 0x8a, 0x51, 0x32, 0x3a, 0x9f, 0xb8, 0xaa, 0x4b, 0x1e, 0x5e, 0x4a,
@@ -68,6 +70,16 @@ pub enum Error {
         time: u32,
         median_time_past: u32,
     },
+    TimeWarp {
+        height: usize,
+        time: u32,
+        previous_time: u32,
+    },
+    Version {
+        height: usize,
+        version: i32,
+        version_min: i32,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -99,6 +111,25 @@ impl std::fmt::Display for Error {
                 f,
                 "header at height {height} has time {time}, at or before the \
                  median time past {median_time_past} of the headers before it"
+            ),
+            Error::TimeWarp {
+                height,
+                time,
+                previous_time,
+            } => write!(
+                f,
+                "header at height {height} opens a difficulty period at time {time}, \
+                 more than {TIMEWARP_MAX} seconds before the time {previous_time} of \
+                 the header before it"
+            ),
+            Error::Version {
+                height,
+                version,
+                version_min,
+            } => write!(
+                f,
+                "header at height {height} claims version {version:#010x}, \
+                 the rules require {version_min} or more"
             ),
         }
     }
@@ -198,24 +229,7 @@ impl Chain {
         for (offset, header) in batch.iter().enumerate() {
             let ancestors =
                 crate::chain::ancestors::Ancestors::new(&self.headers, &batch[..offset]);
-            let height = ancestors.height_last() + 1;
-            let required =
-                crate::chain::retarget::next_bits(&ancestors, header.header(), self.network);
-            if header.header().bits != required {
-                return Err(Error::Bits {
-                    height,
-                    claimed: header.header().bits,
-                    required,
-                });
-            }
-            let median_time_past = ancestors.median_time_past();
-            if header.header().time <= median_time_past {
-                return Err(Error::TimeTooOld {
-                    height,
-                    time: header.header().time,
-                    median_time_past,
-                });
-            }
+            contextual_check(&ancestors, header.header(), self.network)?;
             let Some(sum) = added.checked_add(&header.target(self.network).work()) else {
                 unreachable!("the work of a batch is the work its peer paid for")
             };
@@ -231,6 +245,50 @@ impl Chain {
         assert_eq!(self.height(), height_before + count);
         Ok(())
     }
+}
+
+fn contextual_check(
+    ancestors: &crate::chain::ancestors::Ancestors,
+    header: &crate::chain::block_header::Header,
+    network: crate::chain::network::Network,
+) -> Result<(), Error> {
+    let height = ancestors.height_last() + 1;
+    let required = crate::chain::retarget::next_bits(ancestors, header, network);
+    if header.bits != required {
+        return Err(Error::Bits {
+            height,
+            claimed: header.bits,
+            required,
+        });
+    }
+    let median_time_past = ancestors.median_time_past();
+    if header.time <= median_time_past {
+        return Err(Error::TimeTooOld {
+            height,
+            time: header.time,
+            median_time_past,
+        });
+    }
+    if crate::chain::retarget::opens_a_bip94_period(height, network) {
+        let previous_time = ancestors.at(ancestors.height_last()).header().time;
+        if i64::from(header.time) < i64::from(previous_time) - TIMEWARP_MAX {
+            return Err(Error::TimeWarp {
+                height,
+                time: header.time,
+                previous_time,
+            });
+        }
+    }
+    if let Some(version_min) = crate::chain::deployment::version_min(height, network)
+        && header.version < version_min
+    {
+        return Err(Error::Version {
+            height,
+            version: header.version,
+            version_min,
+        });
+    }
+    Ok(())
 }
 
 fn checked_batch(
@@ -278,6 +336,7 @@ mod tests {
 
     const FROM_GENESIS: &str = "030000002006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910fce25a9ef6a61909eadcc696fb71eb4d3216de17cc3731ecdd321a030e9213a1226cda96affff7f2000000000000000002034cf96da8f1b387300eaa047d30955fbaf1b0bb6f261f22425454a6b43b7b233650b72ea7da500a8429598a02571115bf2b6ee26da96be0378ff7cba4c98780e27cda96affff7f200300000000000000200e6ddccc471aeeb899ff667f7d55da0443769850872e6d44924d32d610f24c2869ee5ba689a2d757c652f917d12a43c9b24ba79dcff22abbea56c075d3d2bd7227cda96affff7f200000000000";
     const BLOCK_3: &str = "08e1a659dc25965d0cdf6d093b9247b09e9ce97a22cc77bca0b510ba4b337d61";
+    const HEADER_VERSION: i32 = 0x2000_0000;
 
     fn fixture(hex: &str) -> Vec<u8> {
         (0..hex.len())
@@ -314,7 +373,7 @@ mod tests {
     ) -> Vec<crate::chain::block_header::Header> {
         let network = crate::chain::network::Network::Regtest;
         let mut header = crate::chain::block_header::Header {
-            version: 1,
+            version: HEADER_VERSION,
             previous_block: crate::chain::block_header::BlockHash::from_bytes(*previous.as_bytes()),
             merkle_root: crate::chain::block_header::MerkleRoot::from_bytes([0; 32]),
             time,
@@ -323,6 +382,31 @@ mod tests {
         };
         crate::chain::pow::mine(&mut header, network);
         vec![header]
+    }
+
+    fn at_the_limit(time: u32) -> crate::chain::block_header::Header {
+        crate::chain::block_header::Header {
+            version: HEADER_VERSION,
+            previous_block: crate::chain::block_header::BlockHash::from_bytes([0; 32]),
+            merkle_root: crate::chain::block_header::MerkleRoot::from_bytes([0; 32]),
+            time,
+            bits: 0x1d00_ffff,
+            nonce: 0,
+        }
+    }
+
+    fn a_period_of_two_weeks_at_the_limit() -> Vec<crate::chain::pow::Checked> {
+        let start = super::genesis(crate::chain::network::Network::Testnet4).time;
+        (0..2016u32)
+            .map(|height| {
+                let time = if height == 2015 {
+                    start + 1_209_600
+                } else {
+                    start + height * 600
+                };
+                crate::chain::pow::unchecked(at_the_limit(time))
+            })
+            .collect()
     }
 
     fn time_at(height: usize) -> u32 {
@@ -342,7 +426,7 @@ mod tests {
             crate::chain::block_header::BlockHash::from_bytes(*previous.as_bytes());
         for offset in 0..count {
             let mut header = crate::chain::block_header::Header {
-                version: 1,
+                version: HEADER_VERSION,
                 previous_block,
                 merkle_root: crate::chain::block_header::MerkleRoot::from_bytes([0; 32]),
                 time: time_at(height_first + offset),
@@ -620,6 +704,102 @@ mod tests {
         );
         assert_eq!(chain.height(), 1, "the wrong claim is not kept");
         println!("{err}");
+    }
+
+    #[test]
+    fn a_header_below_version_four_is_refused_where_bip65_is_buried() {
+        // Red if the rule is missing, compares with `<=`, reads the version
+        // unsigned, takes the least version of the active deployments in
+        // place of the greatest, or counts a deployment active one height
+        // late: regtest buries BIP34, BIP66 and BIP65 at height 1
+        // (`chainparams.cpp:568-571`), so the header after genesis must claim
+        // version 4 or more. Core 31.1 `submitheader` at that height refuses
+        // 3 and `0x80000000` with `bad-version` and accepts 4.
+        let network = crate::chain::network::Network::Regtest;
+        let with_version = |chain: &super::Chain, version| {
+            let mut batch = one_after(&chain.tip(), time_at(1), 0x207f_ffff);
+            batch[0].version = version;
+            crate::chain::pow::mine(&mut batch[0], network);
+            batch
+        };
+        for version in [3, i32::MIN] {
+            let mut chain = super::Chain::new(network);
+            let err = chain.extend(with_version(&chain, version)).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    super::Error::Version {
+                        height: 1,
+                        version: claimed,
+                        version_min: 4,
+                    } if claimed == version
+                ),
+                "{err}"
+            );
+            assert_eq!(chain.height(), 0, "nothing was kept");
+            println!("{err}");
+        }
+        let mut chain = super::Chain::new(network);
+        chain.extend(with_version(&chain, 4)).unwrap();
+        assert_eq!(chain.height(), 1, "version 4 is kept");
+    }
+
+    #[test]
+    fn a_testnet4_period_opens_600_seconds_before_its_parent_and_not_601() {
+        // Red if the rule is missing, compares with `<=`, allows a second
+        // more or less, reads the time of a header other than the parent,
+        // or asks whether the parent opens a period in place of the header:
+        // Core 31.1 with `-test=bip94` refuses a header that opens a period
+        // 601 seconds before its parent with `time-timewarp-attack` and
+        // keeps one 600 seconds before. The period ran exactly two weeks and
+        // every header claims the limit, so the bits and the median time
+        // past pass and the timewarp is the only rule in play.
+        let network = crate::chain::network::Network::Testnet4;
+        let held = a_period_of_two_weeks_at_the_limit();
+        let ancestors = crate::chain::ancestors::Ancestors::new(&held, &[]);
+        let parent = held[2015].header().time;
+        let err =
+            super::contextual_check(&ancestors, &at_the_limit(parent - 601), network).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                super::Error::TimeWarp {
+                    height: 2016,
+                    time,
+                    previous_time,
+                } if time == parent - 601 && previous_time == parent
+            ),
+            "{err}"
+        );
+        super::contextual_check(&ancestors, &at_the_limit(parent - 600), network).unwrap();
+        println!("{err}");
+    }
+
+    #[test]
+    fn the_timewarp_rule_binds_only_the_first_header_of_a_testnet4_period() {
+        // Red if the rule does not ask the network, or does not ask the
+        // height: mainnet and testnet3 do not enforce BIP94, and inside a
+        // period testnet4 does not look back. Core 31.1 with `-test=bip94`
+        // keeps the header after the first of a period 601 seconds before
+        // its parent.
+        let held = a_period_of_two_weeks_at_the_limit();
+        let ancestors = crate::chain::ancestors::Ancestors::new(&held, &[]);
+        let parent = held[2015].header().time;
+        for network in [
+            crate::chain::network::Network::Mainnet,
+            crate::chain::network::Network::Testnet3,
+        ] {
+            super::contextual_check(&ancestors, &at_the_limit(parent - 601), network).unwrap();
+        }
+        let ancestors = crate::chain::ancestors::Ancestors::new(&held[..2015], &[]);
+        let parent = held[2014].header().time;
+        super::contextual_check(
+            &ancestors,
+            &at_the_limit(parent - 601),
+            crate::chain::network::Network::Testnet4,
+        )
+        .unwrap();
+        println!("mainnet, testnet3 and height 2015 of testnet4 keep it");
     }
 
     #[test]
