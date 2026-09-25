@@ -1,5 +1,6 @@
 pub(crate) mod ancestors;
 pub mod block_header;
+pub(crate) mod deployment;
 pub mod locator;
 pub mod network;
 pub mod pow;
@@ -68,6 +69,11 @@ pub enum Error {
         time: u32,
         median_time_past: u32,
     },
+    Version {
+        height: usize,
+        version: i32,
+        version_min: i32,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -99,6 +105,15 @@ impl std::fmt::Display for Error {
                 f,
                 "header at height {height} has time {time}, at or before the \
                  median time past {median_time_past} of the headers before it"
+            ),
+            Error::Version {
+                height,
+                version,
+                version_min,
+            } => write!(
+                f,
+                "header at height {height} claims version {version:#010x}, \
+                 the rules require {version_min} or more"
             ),
         }
     }
@@ -238,6 +253,15 @@ fn contextual_check(
             median_time_past,
         });
     }
+    if let Some(version_min) = crate::chain::deployment::version_min(height, network)
+        && header.version < version_min
+    {
+        return Err(Error::Version {
+            height,
+            version: header.version,
+            version_min,
+        });
+    }
     Ok(())
 }
 
@@ -286,6 +310,7 @@ mod tests {
 
     const FROM_GENESIS: &str = "030000002006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910fce25a9ef6a61909eadcc696fb71eb4d3216de17cc3731ecdd321a030e9213a1226cda96affff7f2000000000000000002034cf96da8f1b387300eaa047d30955fbaf1b0bb6f261f22425454a6b43b7b233650b72ea7da500a8429598a02571115bf2b6ee26da96be0378ff7cba4c98780e27cda96affff7f200300000000000000200e6ddccc471aeeb899ff667f7d55da0443769850872e6d44924d32d610f24c2869ee5ba689a2d757c652f917d12a43c9b24ba79dcff22abbea56c075d3d2bd7227cda96affff7f200000000000";
     const BLOCK_3: &str = "08e1a659dc25965d0cdf6d093b9247b09e9ce97a22cc77bca0b510ba4b337d61";
+    const HEADER_VERSION: i32 = 0x2000_0000;
 
     fn fixture(hex: &str) -> Vec<u8> {
         (0..hex.len())
@@ -322,7 +347,7 @@ mod tests {
     ) -> Vec<crate::chain::block_header::Header> {
         let network = crate::chain::network::Network::Regtest;
         let mut header = crate::chain::block_header::Header {
-            version: 1,
+            version: HEADER_VERSION,
             previous_block: crate::chain::block_header::BlockHash::from_bytes(*previous.as_bytes()),
             merkle_root: crate::chain::block_header::MerkleRoot::from_bytes([0; 32]),
             time,
@@ -350,7 +375,7 @@ mod tests {
             crate::chain::block_header::BlockHash::from_bytes(*previous.as_bytes());
         for offset in 0..count {
             let mut header = crate::chain::block_header::Header {
-                version: 1,
+                version: HEADER_VERSION,
                 previous_block,
                 merkle_root: crate::chain::block_header::MerkleRoot::from_bytes([0; 32]),
                 time: time_at(height_first + offset),
@@ -628,6 +653,44 @@ mod tests {
         );
         assert_eq!(chain.height(), 1, "the wrong claim is not kept");
         println!("{err}");
+    }
+
+    #[test]
+    fn a_header_below_version_four_is_refused_where_bip65_is_buried() {
+        // Red if the rule is missing, compares with `<=`, reads the version
+        // unsigned, takes the least version of the active deployments in
+        // place of the greatest, or counts a deployment active one height
+        // late: regtest buries BIP34, BIP66 and BIP65 at height 1
+        // (`chainparams.cpp:568-571`), so the header after genesis must claim
+        // version 4 or more. Core 31.1 `submitheader` at that height refuses
+        // 3 and `0x80000000` with `bad-version` and accepts 4.
+        let network = crate::chain::network::Network::Regtest;
+        let with_version = |chain: &super::Chain, version| {
+            let mut batch = one_after(&chain.tip(), time_at(1), 0x207f_ffff);
+            batch[0].version = version;
+            crate::chain::pow::mine(&mut batch[0], network);
+            batch
+        };
+        for version in [3, i32::MIN] {
+            let mut chain = super::Chain::new(network);
+            let err = chain.extend(with_version(&chain, version)).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    super::Error::Version {
+                        height: 1,
+                        version: claimed,
+                        version_min: 4,
+                    } if claimed == version
+                ),
+                "{err}"
+            );
+            assert_eq!(chain.height(), 0, "nothing was kept");
+            println!("{err}");
+        }
+        let mut chain = super::Chain::new(network);
+        chain.extend(with_version(&chain, 4)).unwrap();
+        assert_eq!(chain.height(), 1, "version 4 is kept");
     }
 
     #[test]
