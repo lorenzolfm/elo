@@ -8,6 +8,7 @@ pub(crate) mod retarget;
 pub mod u256;
 
 const GENESIS_VERSION: i32 = 1;
+const TIMEWARP_MAX: i64 = 600;
 const MERKLE_ROOT_2009: [u8; crate::chain::block_header::HASH_BYTES] = [
     0x3b, 0xa3, 0xed, 0xfd, 0x7a, 0x7b, 0x12, 0xb2, 0x7a, 0xc7, 0x2c, 0x3e, 0x67, 0x76, 0x8f, 0x61,
     0x7f, 0xc8, 0x1b, 0xc3, 0x88, 0x8a, 0x51, 0x32, 0x3a, 0x9f, 0xb8, 0xaa, 0x4b, 0x1e, 0x5e, 0x4a,
@@ -69,6 +70,11 @@ pub enum Error {
         time: u32,
         median_time_past: u32,
     },
+    TimeWarp {
+        height: usize,
+        time: u32,
+        previous_time: u32,
+    },
     Version {
         height: usize,
         version: i32,
@@ -105,6 +111,16 @@ impl std::fmt::Display for Error {
                 f,
                 "header at height {height} has time {time}, at or before the \
                  median time past {median_time_past} of the headers before it"
+            ),
+            Error::TimeWarp {
+                height,
+                time,
+                previous_time,
+            } => write!(
+                f,
+                "header at height {height} opens a difficulty period at time {time}, \
+                 more than {TIMEWARP_MAX} seconds before the time {previous_time} of \
+                 the header before it"
             ),
             Error::Version {
                 height,
@@ -253,6 +269,16 @@ fn contextual_check(
             median_time_past,
         });
     }
+    if crate::chain::retarget::opens_a_bip94_period(height, network) {
+        let previous_time = ancestors.at(ancestors.height_last()).header().time;
+        if i64::from(header.time) < i64::from(previous_time) - TIMEWARP_MAX {
+            return Err(Error::TimeWarp {
+                height,
+                time: header.time,
+                previous_time,
+            });
+        }
+    }
     if let Some(version_min) = crate::chain::deployment::version_min(height, network)
         && header.version < version_min
     {
@@ -356,6 +382,31 @@ mod tests {
         };
         crate::chain::pow::mine(&mut header, network);
         vec![header]
+    }
+
+    fn at_the_limit(time: u32) -> crate::chain::block_header::Header {
+        crate::chain::block_header::Header {
+            version: HEADER_VERSION,
+            previous_block: crate::chain::block_header::BlockHash::from_bytes([0; 32]),
+            merkle_root: crate::chain::block_header::MerkleRoot::from_bytes([0; 32]),
+            time,
+            bits: 0x1d00_ffff,
+            nonce: 0,
+        }
+    }
+
+    fn a_period_of_two_weeks_at_the_limit() -> Vec<crate::chain::pow::Checked> {
+        let start = super::genesis(crate::chain::network::Network::Testnet4).time;
+        (0..2016u32)
+            .map(|height| {
+                let time = if height == 2015 {
+                    start + 1_209_600
+                } else {
+                    start + height * 600
+                };
+                crate::chain::pow::unchecked(at_the_limit(time))
+            })
+            .collect()
     }
 
     fn time_at(height: usize) -> u32 {
@@ -691,6 +742,64 @@ mod tests {
         let mut chain = super::Chain::new(network);
         chain.extend(with_version(&chain, 4)).unwrap();
         assert_eq!(chain.height(), 1, "version 4 is kept");
+    }
+
+    #[test]
+    fn a_testnet4_period_opens_600_seconds_before_its_parent_and_not_601() {
+        // Red if the rule is missing, compares with `<=`, allows a second
+        // more or less, reads the time of a header other than the parent,
+        // or asks whether the parent opens a period in place of the header:
+        // Core 31.1 with `-test=bip94` refuses a header that opens a period
+        // 601 seconds before its parent with `time-timewarp-attack` and
+        // keeps one 600 seconds before. The period ran exactly two weeks and
+        // every header claims the limit, so the bits and the median time
+        // past pass and the timewarp is the only rule in play.
+        let network = crate::chain::network::Network::Testnet4;
+        let held = a_period_of_two_weeks_at_the_limit();
+        let ancestors = crate::chain::ancestors::Ancestors::new(&held, &[]);
+        let parent = held[2015].header().time;
+        let err =
+            super::contextual_check(&ancestors, &at_the_limit(parent - 601), network).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                super::Error::TimeWarp {
+                    height: 2016,
+                    time,
+                    previous_time,
+                } if time == parent - 601 && previous_time == parent
+            ),
+            "{err}"
+        );
+        super::contextual_check(&ancestors, &at_the_limit(parent - 600), network).unwrap();
+        println!("{err}");
+    }
+
+    #[test]
+    fn the_timewarp_rule_binds_only_the_first_header_of_a_testnet4_period() {
+        // Red if the rule does not ask the network, or does not ask the
+        // height: mainnet and testnet3 do not enforce BIP94, and inside a
+        // period testnet4 does not look back. Core 31.1 with `-test=bip94`
+        // keeps the header after the first of a period 601 seconds before
+        // its parent.
+        let held = a_period_of_two_weeks_at_the_limit();
+        let ancestors = crate::chain::ancestors::Ancestors::new(&held, &[]);
+        let parent = held[2015].header().time;
+        for network in [
+            crate::chain::network::Network::Mainnet,
+            crate::chain::network::Network::Testnet3,
+        ] {
+            super::contextual_check(&ancestors, &at_the_limit(parent - 601), network).unwrap();
+        }
+        let ancestors = crate::chain::ancestors::Ancestors::new(&held[..2015], &[]);
+        let parent = held[2014].header().time;
+        super::contextual_check(
+            &ancestors,
+            &at_the_limit(parent - 601),
+            crate::chain::network::Network::Testnet4,
+        )
+        .unwrap();
+        println!("mainnet, testnet3 and height 2015 of testnet4 keep it");
     }
 
     #[test]
