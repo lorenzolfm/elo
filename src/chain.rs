@@ -198,24 +198,7 @@ impl Chain {
         for (offset, header) in batch.iter().enumerate() {
             let ancestors =
                 crate::chain::ancestors::Ancestors::new(&self.headers, &batch[..offset]);
-            let height = ancestors.height_last() + 1;
-            let required =
-                crate::chain::retarget::next_bits(&ancestors, header.header(), self.network);
-            if header.header().bits != required {
-                return Err(Error::Bits {
-                    height,
-                    claimed: header.header().bits,
-                    required,
-                });
-            }
-            let median_time_past = ancestors.median_time_past();
-            if header.header().time <= median_time_past {
-                return Err(Error::TimeTooOld {
-                    height,
-                    time: header.header().time,
-                    median_time_past,
-                });
-            }
+            contextual_check(&ancestors, header.header(), self.network)?;
             let Some(sum) = added.checked_add(&header.target(self.network).work()) else {
                 unreachable!("the work of a batch is the work its peer paid for")
             };
@@ -231,6 +214,31 @@ impl Chain {
         assert_eq!(self.height(), height_before + count);
         Ok(())
     }
+}
+
+fn contextual_check(
+    ancestors: &crate::chain::ancestors::Ancestors,
+    header: &crate::chain::block_header::Header,
+    network: crate::chain::network::Network,
+) -> Result<(), Error> {
+    let height = ancestors.height_last() + 1;
+    let required = crate::chain::retarget::next_bits(ancestors, header, network);
+    if header.bits != required {
+        return Err(Error::Bits {
+            height,
+            claimed: header.bits,
+            required,
+        });
+    }
+    let median_time_past = ancestors.median_time_past();
+    if header.time <= median_time_past {
+        return Err(Error::TimeTooOld {
+            height,
+            time: header.time,
+            median_time_past,
+        });
+    }
+    Ok(())
 }
 
 fn checked_batch(
