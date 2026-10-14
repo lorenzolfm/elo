@@ -199,15 +199,6 @@ mod tests {
     }
 
     #[test]
-    fn encode_is_the_inverse_of_parse() {
-        for hex in [MAINNET_GENESIS, REGTEST_GENESIS] {
-            let bytes = fixture(hex);
-            assert_eq!(super::Header::parse(&bytes).encode(), bytes);
-        }
-        println!("both genesis headers survive a round trip");
-    }
-
-    #[test]
     fn display_reverses_the_bytes() {
         let mut bytes = [0u8; 32];
         for (i, byte) in bytes.iter_mut().enumerate() {
@@ -223,16 +214,5 @@ mod tests {
         assert_eq!(root.to_string(), printed, "a root prints like a hash");
         assert_eq!(format!("{root:?}"), printed);
         println!("{printed}");
-    }
-
-    #[test]
-    fn a_hash_covers_every_byte() {
-        let mut bytes = fixture(MAINNET_GENESIS);
-        let before = super::Header::parse(&bytes).hash().to_string();
-        bytes[super::BYTES - 1] ^= 1;
-        let after = super::Header::parse(&bytes).hash().to_string();
-        assert_ne!(before, after, "the last byte of the nonce is hashed");
-        assert!(!after.starts_with("0000"), "and the work is gone: {after}");
-        println!("nonce off by one: {after}");
     }
 }

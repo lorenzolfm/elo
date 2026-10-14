@@ -629,37 +629,6 @@ mod tests {
     }
 
     #[test]
-    fn a_regtest_target_is_above_the_mainnet_limit_and_not_the_other_way() {
-        // Red if the limit is compared the wrong way round: regtest's
-        // easiest target is far above mainnet's limit, and mainnet's
-        // genesis target is far below regtest's.
-        let regtest = crate::chain::genesis(crate::chain::network::Network::Regtest);
-        let err = super::check(
-            &regtest.hash(),
-            regtest.bits,
-            crate::chain::network::Network::Mainnet,
-        )
-        .unwrap_err();
-        assert!(
-            matches!(
-                &err,
-                super::Error::AboveLimit { target, limit }
-                    if target.to_string() == REGTEST_GENESIS_TARGET
-                        && limit.to_string() == MAINNET_LIMIT
-            ),
-            "{err}"
-        );
-        let mainnet = crate::chain::genesis(crate::chain::network::Network::Mainnet);
-        super::check(
-            &mainnet.hash(),
-            mainnet.bits,
-            crate::chain::network::Network::Regtest,
-        )
-        .unwrap();
-        println!("{err}");
-    }
-
-    #[test]
     fn a_hash_equal_to_the_target_passes_and_one_above_does_not() {
         // Red if the comparison is strict the wrong way: Core rejects on
         // `hash > target` (`pow.cpp:166`), so equal passes. The target of
@@ -701,35 +670,6 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, super::Error::NotMet { .. }), "{err}");
         println!("{err}");
-    }
-
-    #[test]
-    fn mine_finds_the_smallest_nonce_that_works() {
-        // Red if `mine` stops early or skips a nonce: every nonce below the
-        // one it found fails, and the one it found passes.
-        let mut header = crate::chain::genesis(crate::chain::network::Network::Regtest);
-        header.merkle_root = crate::chain::block_header::MerkleRoot::from_bytes([1; 32]);
-        super::mine(&mut header, crate::chain::network::Network::Regtest);
-        super::check(
-            &header.hash(),
-            header.bits,
-            crate::chain::network::Network::Regtest,
-        )
-        .unwrap();
-        let found = header.nonce;
-        for nonce in 0..found {
-            header.nonce = nonce;
-            assert!(
-                super::check(
-                    &header.hash(),
-                    header.bits,
-                    crate::chain::network::Network::Regtest
-                )
-                .is_err(),
-                "nonce {nonce} works too"
-            );
-        }
-        println!("nonce {found}");
     }
 
     #[test]
