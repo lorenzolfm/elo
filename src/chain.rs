@@ -9,6 +9,7 @@ pub mod u256;
 
 const GENESIS_VERSION: i32 = 1;
 const TIMEWARP_MAX: i64 = 600;
+const FUTURE_BLOCK_TIME_MAX: std::time::Duration = std::time::Duration::from_hours(2);
 const MERKLE_ROOT_2009: [u8; crate::chain::block_header::HASH_BYTES] = [
     0x3b, 0xa3, 0xed, 0xfd, 0x7a, 0x7b, 0x12, 0xb2, 0x7a, 0xc7, 0x2c, 0x3e, 0x67, 0x76, 0x8f, 0x61,
     0x7f, 0xc8, 0x1b, 0xc3, 0x88, 0x8a, 0x51, 0x32, 0x3a, 0x9f, 0xb8, 0xaa, 0x4b, 0x1e, 0x5e, 0x4a,
@@ -75,6 +76,11 @@ pub enum Error {
         time: u32,
         previous_time: u32,
     },
+    TimeTooNew {
+        height: usize,
+        time: u32,
+        ahead: std::time::Duration,
+    },
     Version {
         height: usize,
         version: i32,
@@ -121,6 +127,15 @@ impl std::fmt::Display for Error {
                 "header at height {height} opens a difficulty period at time {time}, \
                  more than {TIMEWARP_MAX} seconds before the time {previous_time} of \
                  the header before it"
+            ),
+            Error::TimeTooNew {
+                height,
+                time,
+                ahead,
+            } => write!(
+                f,
+                "header at height {height} has time {time}, {ahead:?} ahead of our clock, \
+                 more than the {FUTURE_BLOCK_TIME_MAX:?} the rules allow"
             ),
             Error::Version {
                 height,
@@ -212,6 +227,7 @@ impl Chain {
     pub fn extend(
         &mut self,
         headers: Vec<crate::chain::block_header::Header>,
+        now: std::time::SystemTime,
     ) -> Result<(), Error> {
         let held = self.headers.len();
         let batch = checked_batch(headers, held, self.network)?;
@@ -229,7 +245,7 @@ impl Chain {
         for (offset, header) in batch.iter().enumerate() {
             let ancestors =
                 crate::chain::ancestors::Ancestors::new(&self.headers, &batch[..offset]);
-            contextual_check(&ancestors, header.header(), self.network)?;
+            contextual_check(&ancestors, header.header(), self.network, now)?;
             let Some(sum) = added.checked_add(&header.target(self.network).work()) else {
                 unreachable!("the work of a batch is the work its peer paid for")
             };
@@ -251,6 +267,7 @@ fn contextual_check(
     ancestors: &crate::chain::ancestors::Ancestors,
     header: &crate::chain::block_header::Header,
     network: crate::chain::network::Network,
+    now: std::time::SystemTime,
 ) -> Result<(), Error> {
     let height = ancestors.height_last() + 1;
     let required = crate::chain::retarget::next_bits(ancestors, header, network);
@@ -278,6 +295,16 @@ fn contextual_check(
                 previous_time,
             });
         }
+    }
+    let time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::from(header.time));
+    if let Ok(ahead) = time.duration_since(now)
+        && ahead > FUTURE_BLOCK_TIME_MAX
+    {
+        return Err(Error::TimeTooNew {
+            height,
+            time: header.time,
+            ahead,
+        });
     }
     if let Some(version_min) = crate::chain::deployment::version_min(height, network)
         && header.version < version_min
@@ -360,6 +387,10 @@ mod tests {
                 crate::chain::block_header::Header::parse(&bytes)
             })
             .collect()
+    }
+
+    fn after_every_header() -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::from(u32::MAX))
     }
 
     fn after_genesis() -> Vec<crate::chain::block_header::Header> {
@@ -480,7 +511,7 @@ mod tests {
         // the wrong end. Height and tip come from `getblockcount` and
         // `getbestblockhash` on the node that served the fixture.
         let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
-        chain.extend(after_genesis()).unwrap();
+        chain.extend(after_genesis(), after_every_header()).unwrap();
         assert_eq!(chain.height(), 3);
         assert_eq!(chain.hash_at(0).to_string(), REGTEST_GENESIS_HASH);
         assert_eq!(
@@ -516,7 +547,7 @@ mod tests {
         // block, where each header is worth two: `getblockheader` at height 3
         // reports a chainwork of eight.
         let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
-        chain.extend(after_genesis()).unwrap();
+        chain.extend(after_genesis(), after_every_header()).unwrap();
         assert_eq!(chain.height(), 3);
         assert_eq!(
             chain.work().to_string(),
@@ -531,14 +562,16 @@ mod tests {
         // the tip and a batch with the wrong bits both leave the chain as it
         // was, work and all.
         let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
-        chain.extend(after_genesis()).unwrap();
+        chain.extend(after_genesis(), after_every_header()).unwrap();
         let before = chain.work().to_string();
 
-        chain.extend(after_genesis()).unwrap_err();
+        chain
+            .extend(after_genesis(), after_every_header())
+            .unwrap_err();
         assert_eq!(chain.work().to_string(), before, "a batch off the tip");
 
         let wrong_bits = one_after(&chain.tip(), time_at(4), 0x207f_fffe);
-        chain.extend(wrong_bits).unwrap_err();
+        chain.extend(wrong_bits, after_every_header()).unwrap_err();
         assert_eq!(chain.work().to_string(), before, "a batch with wrong bits");
         assert_eq!(chain.height(), 3);
         println!("{}", chain.work());
@@ -552,7 +585,7 @@ mod tests {
         let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
         let elsewhere = super::Chain::new(crate::chain::network::Network::Mainnet).tip();
         let err = chain
-            .extend(mined_after(&elsewhere, 1, 2, None))
+            .extend(mined_after(&elsewhere, 1, 2, None), after_every_header())
             .unwrap_err();
         assert!(
             matches!(
@@ -574,7 +607,9 @@ mod tests {
         // to join a mainnet chain. The work is the error we name, as Core
         // does (`net_processing.cpp:2987` before `:3028`).
         let mut chain = super::Chain::new(crate::chain::network::Network::Mainnet);
-        let err = chain.extend(after_genesis()).unwrap_err();
+        let err = chain
+            .extend(after_genesis(), after_every_header())
+            .unwrap_err();
         assert!(
             matches!(
                 &err,
@@ -597,7 +632,7 @@ mod tests {
         let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
         let batch = mined_after(&chain.tip(), 1, 3, Some(1));
         let spoiled = batch.as_slice()[1].hash();
-        let err = chain.extend(batch).unwrap_err();
+        let err = chain.extend(batch, after_every_header()).unwrap_err();
         assert!(
             matches!(
                 &err,
@@ -609,7 +644,9 @@ mod tests {
             "{err}"
         );
         assert_eq!(chain.height(), 0, "nothing was kept");
-        chain.extend(mined_after(&chain.tip(), 1, 3, None)).unwrap();
+        chain
+            .extend(mined_after(&chain.tip(), 1, 3, None), after_every_header())
+            .unwrap();
         assert_eq!(chain.height(), 3, "and mined headers pass");
         println!("{err}");
     }
@@ -622,11 +659,14 @@ mod tests {
         // and a header that ties the one is nowhere near tying the other.
         let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
         chain
-            .extend(mined_after(&chain.tip(), 1, 11, None))
+            .extend(mined_after(&chain.tip(), 1, 11, None), after_every_header())
             .unwrap();
         let median = time_at(6);
         let err = chain
-            .extend(one_after(&chain.tip(), median, 0x207f_ffff))
+            .extend(
+                one_after(&chain.tip(), median, 0x207f_ffff),
+                after_every_header(),
+            )
             .unwrap_err();
         assert!(
             matches!(
@@ -651,13 +691,16 @@ mod tests {
         // accepts, as long as it comes after the median.
         let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
         chain
-            .extend(mined_after(&chain.tip(), 1, 11, None))
+            .extend(mined_after(&chain.tip(), 1, 11, None), after_every_header())
             .unwrap();
         let tip_time = chain.at(chain.height()).time;
         let time = time_at(7);
         assert!(time < tip_time, "the header is older than our tip");
         chain
-            .extend(one_after(&chain.tip(), time, 0x207f_ffff))
+            .extend(
+                one_after(&chain.tip(), time, 0x207f_ffff),
+                after_every_header(),
+            )
             .unwrap();
         assert_eq!(chain.height(), 12);
         println!("tip at {tip_time}, header at {time}, kept");
@@ -668,8 +711,10 @@ mod tests {
         // Red if `extend` accepts a batch that starts below the tip, which is
         // the shape a peer on a fork sends.
         let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
-        chain.extend(after_genesis()).unwrap();
-        let err = chain.extend(after_genesis()).unwrap_err();
+        chain.extend(after_genesis(), after_every_header()).unwrap();
+        let err = chain
+            .extend(after_genesis(), after_every_header())
+            .unwrap_err();
         assert!(matches!(err, super::Error::NotOnTip { .. }), "{err}");
         assert_eq!(chain.height(), 3);
         println!("{err}");
@@ -685,11 +730,17 @@ mod tests {
         // the claim is the only thing wrong with it.
         let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
         chain
-            .extend(one_after(&chain.tip(), time_at(1), 0x207f_ffff))
+            .extend(
+                one_after(&chain.tip(), time_at(1), 0x207f_ffff),
+                after_every_header(),
+            )
             .unwrap();
         assert_eq!(chain.height(), 1, "the right claim is kept");
         let err = chain
-            .extend(one_after(&chain.tip(), time_at(2), 0x207f_fffe))
+            .extend(
+                one_after(&chain.tip(), time_at(2), 0x207f_fffe),
+                after_every_header(),
+            )
             .unwrap_err();
         assert!(
             matches!(
@@ -724,7 +775,9 @@ mod tests {
         };
         for version in [3, i32::MIN] {
             let mut chain = super::Chain::new(network);
-            let err = chain.extend(with_version(&chain, version)).unwrap_err();
+            let err = chain
+                .extend(with_version(&chain, version), after_every_header())
+                .unwrap_err();
             assert!(
                 matches!(
                     err,
@@ -740,7 +793,9 @@ mod tests {
             println!("{err}");
         }
         let mut chain = super::Chain::new(network);
-        chain.extend(with_version(&chain, 4)).unwrap();
+        chain
+            .extend(with_version(&chain, 4), after_every_header())
+            .unwrap();
         assert_eq!(chain.height(), 1, "version 4 is kept");
     }
 
@@ -758,8 +813,13 @@ mod tests {
         let held = a_period_of_two_weeks_at_the_limit();
         let ancestors = crate::chain::ancestors::Ancestors::new(&held, &[]);
         let parent = held[2015].header().time;
-        let err =
-            super::contextual_check(&ancestors, &at_the_limit(parent - 601), network).unwrap_err();
+        let err = super::contextual_check(
+            &ancestors,
+            &at_the_limit(parent - 601),
+            network,
+            after_every_header(),
+        )
+        .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -771,7 +831,13 @@ mod tests {
             ),
             "{err}"
         );
-        super::contextual_check(&ancestors, &at_the_limit(parent - 600), network).unwrap();
+        super::contextual_check(
+            &ancestors,
+            &at_the_limit(parent - 600),
+            network,
+            after_every_header(),
+        )
+        .unwrap();
         println!("{err}");
     }
 
@@ -791,7 +857,13 @@ mod tests {
             crate::chain::network::Network::Testnet3,
             crate::chain::network::Network::Regtest,
         ] {
-            super::contextual_check(&ancestors, &at_the_limit(parent - 601), network).unwrap();
+            super::contextual_check(
+                &ancestors,
+                &at_the_limit(parent - 601),
+                network,
+                after_every_header(),
+            )
+            .unwrap();
         }
         let ancestors = crate::chain::ancestors::Ancestors::new(&held[..2015], &[]);
         let parent = held[2014].header().time;
@@ -799,9 +871,45 @@ mod tests {
             &ancestors,
             &at_the_limit(parent - 601),
             crate::chain::network::Network::Testnet4,
+            after_every_header(),
         )
         .unwrap();
         println!("mainnet, testnet3, regtest and height 2015 of testnet4 keep it");
+    }
+
+    #[test]
+    fn a_header_7200_seconds_ahead_of_our_clock_is_kept_and_7201_is_not() {
+        // Red if the rule is missing, compares with `>=`, allows a second
+        // more or less, or measures from a time other than our clock: the
+        // header is one second after genesis, so it beats the median time
+        // past and is far from any time but ours. Core 31.1 `submitheader`
+        // under `setmocktime` refuses the same header 7201 seconds ahead
+        // with `time-too-new` and keeps it 7200 seconds ahead.
+        let time = time_at(1);
+        let behind = |seconds: u64| {
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::from(time) - seconds)
+        };
+        let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
+        let err = chain
+            .extend(one_after(&chain.tip(), time, 0x207f_ffff), behind(7201))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                super::Error::TimeTooNew {
+                    height: 1,
+                    time: claimed,
+                    ahead,
+                } if claimed == time && ahead == std::time::Duration::from_secs(7201)
+            ),
+            "{err}"
+        );
+        assert_eq!(chain.height(), 0, "nothing was kept");
+        chain
+            .extend(one_after(&chain.tip(), time, 0x207f_ffff), behind(7200))
+            .unwrap();
+        assert_eq!(chain.height(), 1, "7200 seconds ahead is kept");
+        println!("{err}");
     }
 
     #[test]
@@ -817,7 +925,7 @@ mod tests {
         bytes[0] ^= 1;
         batch[1].previous_block = crate::chain::block_header::BlockHash::from_bytes(bytes);
         crate::chain::pow::mine(&mut batch[1], crate::chain::network::Network::Regtest);
-        let err = chain.extend(batch).unwrap_err();
+        let err = chain.extend(batch, after_every_header()).unwrap_err();
         assert!(
             matches!(err, super::Error::NotContinuous { index: 1 }),
             "{err}"
@@ -832,7 +940,7 @@ mod tests {
     fn an_empty_batch_changes_nothing() {
         // Red if `extend` reads a first header that is not there.
         let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
-        chain.extend(Vec::new()).unwrap();
+        chain.extend(Vec::new(), after_every_header()).unwrap();
         assert_eq!(chain.height(), 0);
         println!("still genesis alone");
     }
@@ -842,7 +950,7 @@ mod tests {
         // Red if `locator` starts one below the tip as Core does, or the
         // hashes are not the chain's.
         let mut chain = super::Chain::new(crate::chain::network::Network::Regtest);
-        chain.extend(after_genesis()).unwrap();
+        chain.extend(after_genesis(), after_every_header()).unwrap();
         let locator = chain.locator();
         let hashes = locator.as_slice();
         assert_eq!(hashes.len(), 4, "tip, two below, genesis");
