@@ -49,10 +49,11 @@ pub struct Taken {
 pub fn handle(
     headers: Headers,
     chain: &mut crate::chain::Chain,
+    now: std::time::SystemTime,
 ) -> Result<Taken, crate::chain::Error> {
     let count = headers.len();
     assert!(count <= HEADERS_MAX);
-    chain.extend(headers.into_vec())?;
+    chain.extend(headers.into_vec(), now)?;
     Ok(Taken {
         count,
         more: count == HEADERS_MAX,
@@ -272,13 +273,17 @@ mod handler_tests {
             .collect()
     }
 
+    fn after_every_header() -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::from(u32::MAX))
+    }
+
     #[test]
     fn a_short_batch_grows_the_chain_and_asks_for_no_more() {
         // Red if the handler does not reach the chain, or reads a short
         // batch as a full one.
         let mut chain = crate::chain::Chain::new(crate::chain::network::Network::Regtest);
         let headers = super::Headers::parse(&fixture(FROM_GENESIS)).unwrap();
-        let taken = super::handle(headers, &mut chain).unwrap();
+        let taken = super::handle(headers, &mut chain, after_every_header()).unwrap();
         assert_eq!(taken.count, 3);
         assert!(!taken.more);
         assert_eq!(chain.height(), 3);
@@ -295,11 +300,13 @@ mod handler_tests {
         super::handle(
             super::Headers::parse(&fixture(FROM_GENESIS)).unwrap(),
             &mut chain,
+            after_every_header(),
         )
         .unwrap();
         let err = super::handle(
             super::Headers::parse(&fixture(FROM_GENESIS)).unwrap(),
             &mut chain,
+            after_every_header(),
         )
         .err()
         .unwrap();

@@ -201,7 +201,7 @@ fn sync<L: crate::p2p::link::Link>(
         });
 
         let headers = await_headers(connection, report)?;
-        let taken = crate::p2p::headers::handle(headers, chain)?;
+        let taken = crate::p2p::headers::handle(headers, chain, connection.wall())?;
         report(Event::Took {
             count: taken.count,
             height: chain.height(),
@@ -327,6 +327,10 @@ mod tests {
             .collect()
     }
 
+    fn after_every_header() -> std::time::SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::from(u32::MAX))
+    }
+
     fn framed(message: crate::p2p::message::Message) -> Vec<u8> {
         let frame = message.encode();
         let mut out = Vec::new();
@@ -415,7 +419,7 @@ mod tests {
     }
 
     fn run(chain: &mut crate::chain::Chain, script: Vec<crate::p2p::scripted::Step>) -> Ran {
-        run_with(chain, script, None, None)
+        run_with(chain, script, None, None, after_every_header())
     }
 
     fn run_with(
@@ -423,12 +427,11 @@ mod tests {
         script: Vec<crate::p2p::scripted::Step>,
         chunk: Option<usize>,
         deadline: Option<std::time::Duration>,
+        wall: std::time::SystemTime,
     ) -> Ran {
         let mut connection = match chunk {
-            Some(chunk) => {
-                crate::p2p::scripted::connect_in_chunks(script, chunk, std::time::UNIX_EPOCH)
-            }
-            None => crate::p2p::scripted::connect(script, std::time::UNIX_EPOCH),
+            Some(chunk) => crate::p2p::scripted::connect_in_chunks(script, chunk, wall),
+            None => crate::p2p::scripted::connect(script, wall),
         };
         if let Some(deadline) = deadline {
             connection
@@ -532,6 +535,7 @@ mod tests {
             ]),
             Some(1),
             None,
+            after_every_header(),
         );
         ran.result.as_ref().unwrap();
         assert_eq!(chain.height(), 3);
@@ -659,6 +663,7 @@ mod tests {
             script,
             None,
             Some(std::time::Duration::from_secs(10)),
+            after_every_header(),
         );
         let super::Error::Frame(crate::p2p::frame::Error::Io(io)) = ran.result.unwrap_err() else {
             panic!("expected io");
@@ -695,7 +700,9 @@ mod tests {
             crate::p2p::headers::HEADERS_MAX,
         );
         let mut at_2000 = crate::chain::Chain::new(NETWORK);
-        at_2000.extend(headers_in(&full).into_vec()).unwrap();
+        at_2000
+            .extend(headers_in(&full).into_vec(), after_every_header())
+            .unwrap();
         let second_request = getheaders(&at_2000);
         let short = batch_after(&at_2000.tip(), crate::p2p::headers::HEADERS_MAX + 1, 5);
         let last = headers_in(&short).as_slice().last().unwrap().hash();
@@ -772,7 +779,10 @@ mod tests {
         // our tip.
         let mut chain = crate::chain::Chain::new(NETWORK);
         chain
-            .extend(headers_in(&fixture(HEADERS)).into_vec())
+            .extend(
+                headers_in(&fixture(HEADERS)).into_vec(),
+                after_every_header(),
+            )
             .unwrap();
         let mut frames = handshake();
         frames.push(fixture(HEADERS));
@@ -788,6 +798,30 @@ mod tests {
         );
         assert_eq!(chain.height(), 3);
         assert_eq!(ran.after_handshake(), ["-> getheaders (from height 3)"]);
+        println!("{err}");
+    }
+
+    #[test]
+    fn a_header_ahead_of_the_link_clock_ends_the_sync() {
+        // Red if the loop gives the chain a clock other than the link's:
+        // Core's three headers, on a link whose clock is 7201 seconds behind
+        // the first of them.
+        let first = headers_in(&fixture(HEADERS)).as_slice()[0].time;
+        let wall = std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::from(first) - 7201);
+        let mut chain = crate::chain::Chain::new(NETWORK);
+        let mut frames = handshake();
+        frames.push(fixture(HEADERS));
+        let ran = run_with(&mut chain, sends(frames), None, None, wall);
+        let err = ran.result.as_ref().err().unwrap();
+        assert!(
+            matches!(
+                &err,
+                super::Error::Chain(crate::chain::Error::TimeTooNew { height: 1, ahead, .. })
+                    if *ahead == std::time::Duration::from_secs(7201)
+            ),
+            "{err}"
+        );
+        assert_eq!(ran.after_handshake(), ["-> getheaders (from height 0)"]);
         println!("{err}");
     }
 
