@@ -6,13 +6,13 @@ use bitcoin_hashes::sha256d;
 
 use crate::chainparams::Network;
 use crate::protocol::{MessageHeader, MessageType};
-use crate::serialize::Encode;
+use crate::serialize::{Decode, Encode};
 
 /// Magic, message type, length and checksum.
-pub const HEADER_SIZE: usize = 24;
+pub const HEADER_SIZE: usize = 4 + 12 + 4 + 4;
 
 /// The longest payload a peer may send.
-pub const MAX_PROTOCOL_MESSAGE_LENGTH: u32 = 4_000_000;
+pub const PAYLOAD_LENGTH_MAX: u32 = 4_000_000;
 
 /// Why a frame was refused. Each one ends the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,7 +33,7 @@ impl fmt::Display for Error {
             Error::TooLarge(length) => {
                 write!(
                     f,
-                    "payload of {length} bytes is longer than {MAX_PROTOCOL_MESSAGE_LENGTH}"
+                    "payload of {length} bytes is longer than {PAYLOAD_LENGTH_MAX}"
                 )
             }
             Error::BadChecksum => write!(f, "bad checksum"),
@@ -45,55 +45,73 @@ impl std::error::Error for Error {}
 
 /// Checks the magic, the message type and the length.
 pub fn decode_header(network: Network, bytes: &[u8; HEADER_SIZE]) -> Result<MessageHeader, Error> {
-    let [m0, m1, m2, m3, rest @ ..] = *bytes;
-    let [msg_type @ .., l0, l1, l2, l3, c0, c1, c2, c3] = rest;
+    let mut input = bytes.as_slice();
+    let magic = <[u8; 4]>::decode(&mut input).expect("a header holds the magic");
+    let msg_type = <[u8; 12]>::decode(&mut input).expect("a header holds the message type");
+    let length = u32::decode(&mut input).expect("a header holds the length");
+    let checksum = <[u8; 4]>::decode(&mut input).expect("a header holds the checksum");
+    assert!(input.is_empty());
 
-    let magic = [m0, m1, m2, m3];
     if magic != network.magic() {
         return Err(Error::WrongMagic(magic));
     }
-    let msg_type = MessageType::new(msg_type).ok_or(Error::InvalidMessageType(msg_type))?;
-    let length = u32::from_le_bytes([l0, l1, l2, l3]);
-    if length > MAX_PROTOCOL_MESSAGE_LENGTH {
-        return Err(Error::TooLarge(length));
+    let Some(msg_type) = MessageType::new(msg_type) else {
+        return Err(Error::InvalidMessageType(msg_type));
+    };
+    if length <= PAYLOAD_LENGTH_MAX {
+        Ok(MessageHeader {
+            msg_type,
+            length,
+            checksum,
+        })
+    } else {
+        Err(Error::TooLarge(length))
     }
-    Ok(MessageHeader {
-        msg_type,
-        length,
-        checksum: [c0, c1, c2, c3],
-    })
 }
 
 /// Checks the payload against the checksum in its header.
+///
+/// Panics if the payload is not `header.length` bytes. The caller reads exactly that many.
 pub fn check_payload(header: &MessageHeader, payload: &[u8]) -> Result<(), Error> {
-    if checksum(payload) != header.checksum {
-        return Err(Error::BadChecksum);
+    assert!(header.length <= PAYLOAD_LENGTH_MAX);
+    assert_eq!(u32::try_from(payload.len()), Ok(header.length));
+
+    if checksum(payload) == header.checksum {
+        Ok(())
+    } else {
+        Err(Error::BadChecksum)
     }
-    Ok(())
 }
 
 /// A header, then the payload.
 ///
-/// Panics if the payload is longer than `MAX_PROTOCOL_MESSAGE_LENGTH`.
+/// Panics if the payload is longer than `PAYLOAD_LENGTH_MAX`, because a peer refuses it.
 pub fn encode(network: Network, msg_type: MessageType, payload: &[u8]) -> Vec<u8> {
-    let length = u32::try_from(payload.len())
-        .ok()
-        .filter(|&n| n <= MAX_PROTOCOL_MESSAGE_LENGTH)
-        .expect("elo sends no payload longer than MAX_PROTOCOL_MESSAGE_LENGTH");
+    let length = u32::try_from(payload.len()).expect("the payload is at most PAYLOAD_LENGTH_MAX");
+    assert!(length <= PAYLOAD_LENGTH_MAX);
+    let header = MessageHeader {
+        msg_type,
+        length,
+        checksum: checksum(payload),
+    };
 
-    let mut out = Vec::with_capacity(HEADER_SIZE + payload.len());
-    network.magic().encode(&mut out);
-    msg_type.as_bytes().encode(&mut out);
-    length.encode(&mut out);
-    checksum(payload).encode(&mut out);
-    out.extend_from_slice(payload);
-    out
+    let mut frame = Vec::with_capacity(HEADER_SIZE + payload.len());
+    network.magic().encode(&mut frame);
+    header.msg_type.as_bytes().encode(&mut frame);
+    header.length.encode(&mut frame);
+    header.checksum.encode(&mut frame);
+    // The header passes the same checks as a header elo reads.
+    let written = frame.first_chunk().expect("the header is written");
+    assert_eq!(decode_header(network, written), Ok(header));
+
+    frame.extend_from_slice(payload);
+    frame
 }
 
 /// The first four bytes of the sha256d.
 fn checksum(payload: &[u8]) -> [u8; 4] {
-    let [c0, c1, c2, c3, ..] = sha256d::Hash::hash(payload).to_byte_array();
-    [c0, c1, c2, c3]
+    let hash = sha256d::Hash::hash(payload).to_byte_array();
+    *hash.first_chunk().expect("a sha256d is 32 bytes")
 }
 
 #[cfg(test)]
@@ -159,13 +177,13 @@ mod tests {
     }
 
     #[test]
-    fn header_length_is_at_most_max_protocol_message_length() {
+    fn header_length_is_at_most_payload_length_max() {
         let mut frame = hex(VERACK_FRAME);
         for (length, expected) in [
-            (MAX_PROTOCOL_MESSAGE_LENGTH, Ok(MAX_PROTOCOL_MESSAGE_LENGTH)),
+            (PAYLOAD_LENGTH_MAX, Ok(PAYLOAD_LENGTH_MAX)),
             (
-                MAX_PROTOCOL_MESSAGE_LENGTH + 1,
-                Err(Error::TooLarge(MAX_PROTOCOL_MESSAGE_LENGTH + 1)),
+                PAYLOAD_LENGTH_MAX + 1,
+                Err(Error::TooLarge(PAYLOAD_LENGTH_MAX + 1)),
             ),
         ] {
             frame[16..20].copy_from_slice(&length.to_le_bytes());

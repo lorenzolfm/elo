@@ -33,13 +33,14 @@ mod tests {
     #[test]
     fn signet_magic_is_the_hash_of_the_default_challenge() {
         // The default signet challenge.
-        let challenge = hex(
-            "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae",
-        );
+        let challenge = hex(concat!(
+            "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be4",
+            "30210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae",
+        ));
         let mut serialized = Vec::new();
         write_string(&mut serialized, &challenge);
-        let [m0, m1, m2, m3, ..] = sha256d::Hash::hash(&serialized).to_byte_array();
+        let hash = sha256d::Hash::hash(&serialized).to_byte_array();
 
-        assert_eq!(Network::Signet.magic(), [m0, m1, m2, m3]);
+        assert_eq!(Network::Signet.magic(), *hash.first_chunk().unwrap());
     }
 }

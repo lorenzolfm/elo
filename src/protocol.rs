@@ -5,24 +5,37 @@ use std::net::Ipv6Addr;
 use crate::serialize::{Decode, Encode, Error, read_limited_string, write_string};
 
 /// The longest user agent a `version` may carry.
-pub const MAX_SUBVERSION_LENGTH: usize = 256;
+pub const USER_AGENT_LENGTH_MAX: usize = 256;
 
 /// The message type in a header: printable ASCII, then NUL padding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MessageType([u8; 12]);
 
-pub const VERSION: MessageType = MessageType(*b"version\0\0\0\0\0");
-
-pub const VERACK: MessageType = MessageType(*b"verack\0\0\0\0\0\0");
+// `new` runs at compile time here, so an invalid constant does not build.
+pub const VERSION: MessageType = MessageType::new(*b"version\0\0\0\0\0").expect("valid");
+pub const VERACK: MessageType = MessageType::new(*b"verack\0\0\0\0\0\0").expect("valid");
 
 impl MessageType {
     /// `None` unless the bytes are printable ASCII followed only by NULs.
-    pub fn new(bytes: [u8; 12]) -> Option<Self> {
-        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-        let (name, padding) = bytes.split_at(end);
-        let valid =
-            name.iter().all(|b| (b' '..=b'~').contains(b)) && padding.iter().all(|&b| b == 0);
-        valid.then_some(Self(bytes))
+    pub const fn new(bytes: [u8; 12]) -> Option<Self> {
+        let mut index = 0;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if byte == 0 {
+                break;
+            }
+            if !matches!(byte, b' '..=b'~') {
+                return None;
+            }
+            index += 1;
+        }
+        while index < bytes.len() {
+            if bytes[index] != 0 {
+                return None;
+            }
+            index += 1;
+        }
+        Some(Self(bytes))
     }
 
     /// The 12 bytes, with the padding.
@@ -99,8 +112,12 @@ pub struct Version {
     pub relay: bool,
 }
 
+/// Panics if the user agent is longer than `USER_AGENT_LENGTH_MAX`, because a
+/// peer refuses it.
 impl Encode for Version {
     fn encode(&self, out: &mut Vec<u8>) {
+        assert!(self.user_agent.len() <= USER_AGENT_LENGTH_MAX);
+
         self.version.encode(out);
         self.services.encode(out);
         self.timestamp.encode(out);
@@ -124,7 +141,7 @@ impl Decode for Version {
             addr_recv: Address::decode(input)?,
             addr_from: Address::decode(input)?,
             nonce: u64::decode(input)?,
-            user_agent: read_limited_string(input, MAX_SUBVERSION_LENGTH)?,
+            user_agent: read_limited_string(input, USER_AGENT_LENGTH_MAX)?,
             start_height: i32::decode(input)?,
             relay: if input.is_empty() {
                 true
@@ -139,6 +156,7 @@ impl Decode for Version {
 mod tests {
     use super::*;
     use crate::fixtures::{VERSION_FRAME, hex};
+    use crate::serialize::write_string;
     use crate::transport::HEADER_SIZE;
 
     fn core_payload() -> Vec<u8> {
@@ -166,6 +184,19 @@ mod tests {
             start_height: 0,
             relay: true,
         }
+    }
+
+    /// Core's payload with another user agent. It does not call `Version::encode`,
+    /// so the user agent can be longer than the limit.
+    fn payload_with_user_agent(user_agent: &[u8]) -> Vec<u8> {
+        let mut payload = core_payload();
+        let start_height_and_relay = payload.split_off(payload.len() - 5);
+        let core_user_agent = payload.split_off(payload.len() - 17);
+        assert_eq!(core_user_agent[1..], *b"/Satoshi:31.1.0/");
+
+        write_string(&mut payload, user_agent);
+        payload.extend(start_height_and_relay);
+        payload
     }
 
     #[test]
@@ -212,19 +243,19 @@ mod tests {
 
     #[test]
     fn version_user_agent_is_at_most_256_bytes() {
-        for (len, expected) in [
-            (256, Ok(())),
-            (257, Err(Error::StringTooLong { len: 257, max: 256 })),
-        ] {
-            let version = Version {
-                user_agent: vec![b'a'; len],
-                ..core_version()
-            };
-            let mut payload = Vec::new();
-            version.encode(&mut payload);
-            let decoded = Version::decode(&mut payload.as_slice());
-            assert_eq!(decoded.map(|_| ()), expected, "user agent of {len} bytes");
-        }
+        let user_agent = [b'a'; 257];
+        let payload = payload_with_user_agent(&user_agent[..256]);
+        let version = Version::decode(&mut payload.as_slice()).unwrap();
+        assert_eq!(version.user_agent, user_agent[..256]);
+
+        let payload = payload_with_user_agent(&user_agent);
+        assert_eq!(
+            Version::decode(&mut payload.as_slice()),
+            Err(Error::StringTooLong {
+                length: 257,
+                length_max: 256
+            })
+        );
     }
 
     #[test]
