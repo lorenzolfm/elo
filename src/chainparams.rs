@@ -2,7 +2,8 @@
 
 /// A network elo can connect to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Network {
+#[expect(dead_code, reason = "until main parses it")]
+pub(crate) enum Network {
     Mainnet,
     Testnet4,
     /// The default signet.
@@ -12,7 +13,7 @@ pub enum Network {
 
 impl Network {
     /// The four bytes that start every message.
-    pub const fn magic(self) -> [u8; 4] {
+    pub(crate) const fn magic(self) -> [u8; 4] {
         match self {
             Network::Mainnet => [0xf9, 0xbe, 0xb4, 0xd9],
             Network::Testnet4 => [0x1c, 0x16, 0x3f, 0x28],
@@ -24,23 +25,17 @@ impl Network {
 
 #[cfg(test)]
 mod tests {
-    use bitcoin_hashes::sha256d;
-
-    use super::*;
-    use crate::fixtures::hex;
-    use crate::serialize::write_string;
-
     #[test]
     fn signet_magic_is_the_hash_of_the_default_challenge() {
         // The default signet challenge.
-        let challenge = hex(concat!(
+        let challenge = crate::fixtures::hex(concat!(
             "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be4",
             "30210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae",
         ));
         let mut serialized = Vec::new();
-        write_string(&mut serialized, &challenge);
-        let hash = sha256d::Hash::hash(&serialized).to_byte_array();
+        crate::serialize::write_string(&mut serialized, &challenge);
+        let hash = bitcoin_hashes::sha256d::Hash::hash(&serialized).to_byte_array();
 
-        assert_eq!(Network::Signet.magic(), *hash.first_chunk().unwrap());
+        assert_eq!(super::Network::Signet.magic(), *hash.first_chunk().unwrap());
     }
 }

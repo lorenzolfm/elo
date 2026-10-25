@@ -1,9 +1,7 @@
 //! The wire encoding.
 
-use std::fmt;
-
 /// The largest value a CompactSize may hold.
-pub const COMPACT_SIZE_MAX: u64 = 0x0200_0000;
+const COMPACT_SIZE_MAX: u64 = 0x0200_0000;
 
 // A CompactSize elo accepts fits in four bytes, and so in a `usize`.
 const _: () = assert!(COMPACT_SIZE_MAX < 1 << 32);
@@ -11,7 +9,7 @@ const _: () = assert!(usize::BITS >= u32::BITS);
 
 /// Why a decode failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Error {
+pub(crate) enum Error {
     /// The input ended inside a field.
     UnexpectedEnd,
     /// A CompactSize used more bytes than its value needs.
@@ -22,8 +20,8 @@ pub enum Error {
     StringTooLong { length: usize, length_max: usize },
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::UnexpectedEnd => write!(f, "input ended inside a field"),
             Error::NonCanonicalCompactSize => write!(f, "non-canonical CompactSize"),
@@ -40,12 +38,12 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// Writes a value in the wire encoding.
-pub trait Encode {
+pub(crate) trait Encode {
     fn encode(&self, out: &mut Vec<u8>);
 }
 
 /// Reads a value in the wire encoding, and moves `input` past it.
-pub trait Decode: Sized {
+pub(crate) trait Decode: Sized {
     fn decode(input: &mut &[u8]) -> Result<Self, Error>;
 }
 
@@ -97,7 +95,7 @@ impl Decode for bool {
 /// One, three or five bytes: the shortest form that holds `value`.
 ///
 /// Panics if `value` is above `COMPACT_SIZE_MAX`, because a peer refuses it.
-pub fn write_compact_size(out: &mut Vec<u8>, value: u64) {
+fn write_compact_size(out: &mut Vec<u8>, value: u64) {
     assert!(value <= COMPACT_SIZE_MAX);
 
     match value {
@@ -121,7 +119,7 @@ pub fn write_compact_size(out: &mut Vec<u8>, value: u64) {
 }
 
 /// Refuses a form longer than the value needs, and a value above `COMPACT_SIZE_MAX`.
-pub fn read_compact_size(input: &mut &[u8]) -> Result<u64, Error> {
+fn read_compact_size(input: &mut &[u8]) -> Result<u64, Error> {
     let (value, value_min) = match u8::decode(input)? {
         0xfd => (u64::from(u16::decode(input)?), 0xfd),
         0xfe => (u64::from(u32::decode(input)?), 0x1_0000),
@@ -138,14 +136,14 @@ pub fn read_compact_size(input: &mut &[u8]) -> Result<u64, Error> {
 }
 
 /// A CompactSize length, then the bytes.
-pub fn write_string(out: &mut Vec<u8>, bytes: &[u8]) {
+pub(crate) fn write_string(out: &mut Vec<u8>, bytes: &[u8]) {
     let length = u64::try_from(bytes.len()).expect("a usize fits in a u64");
     write_compact_size(out, length);
     out.extend_from_slice(bytes);
 }
 
 /// Refuses a string longer than `length_max` bytes.
-pub fn read_limited_string(input: &mut &[u8], length_max: usize) -> Result<Vec<u8>, Error> {
+pub(crate) fn read_limited_string(input: &mut &[u8], length_max: usize) -> Result<Vec<u8>, Error> {
     let length =
         usize::try_from(read_compact_size(input)?).expect("COMPACT_SIZE_MAX fits in a usize");
     if length <= length_max {
@@ -159,7 +157,7 @@ pub fn read_limited_string(input: &mut &[u8], length_max: usize) -> Result<Vec<u
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::serialize::Decode;
 
     #[test]
     fn compact_size_uses_the_shortest_form() {
@@ -169,15 +167,19 @@ mod tests {
             (0xfd, &[0xfd, 0xfd, 0x00]),
             (0xffff, &[0xfd, 0xff, 0xff]),
             (0x1_0000, &[0xfe, 0x00, 0x00, 0x01, 0x00]),
-            (COMPACT_SIZE_MAX, &[0xfe, 0x00, 0x00, 0x00, 0x02]),
+            (super::COMPACT_SIZE_MAX, &[0xfe, 0x00, 0x00, 0x00, 0x02]),
         ];
         for (value, bytes) in cases {
             let mut out = Vec::new();
-            write_compact_size(&mut out, value);
+            super::write_compact_size(&mut out, value);
             assert_eq!(out, bytes, "write {value:#x}");
 
             let mut input = bytes;
-            assert_eq!(read_compact_size(&mut input), Ok(value), "read {value:#x}");
+            assert_eq!(
+                super::read_compact_size(&mut input),
+                Ok(value),
+                "read {value:#x}"
+            );
             assert!(input.is_empty());
         }
     }
@@ -191,8 +193,8 @@ mod tests {
         ];
         for mut input in cases {
             assert_eq!(
-                read_compact_size(&mut input),
-                Err(Error::NonCanonicalCompactSize)
+                super::read_compact_size(&mut input),
+                Err(super::Error::NonCanonicalCompactSize)
             );
         }
     }
@@ -201,23 +203,28 @@ mod tests {
     fn compact_size_refuses_above_compact_size_max() {
         let mut input: &[u8] = &[0xfe, 0x01, 0x00, 0x00, 0x02];
         assert_eq!(
-            read_compact_size(&mut input),
-            Err(Error::CompactSizeTooLarge(COMPACT_SIZE_MAX + 1))
+            super::read_compact_size(&mut input),
+            Err(super::Error::CompactSizeTooLarge(
+                super::COMPACT_SIZE_MAX + 1
+            ))
         );
     }
 
     #[test]
     fn truncated_input_is_unexpected_end() {
         let mut input: &[u8] = &[0xfd, 0x00];
-        assert_eq!(read_compact_size(&mut input), Err(Error::UnexpectedEnd));
+        assert_eq!(
+            super::read_compact_size(&mut input),
+            Err(super::Error::UnexpectedEnd)
+        );
 
         let mut input: &[u8] = &[0x01, 0x00, 0x00];
-        assert_eq!(u32::decode(&mut input), Err(Error::UnexpectedEnd));
+        assert_eq!(u32::decode(&mut input), Err(super::Error::UnexpectedEnd));
 
         let mut input: &[u8] = &[0x03, b'a', b'b'];
         assert_eq!(
-            read_limited_string(&mut input, 3),
-            Err(Error::UnexpectedEnd)
+            super::read_limited_string(&mut input, 3),
+            Err(super::Error::UnexpectedEnd)
         );
     }
 

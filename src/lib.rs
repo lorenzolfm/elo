@@ -2,10 +2,10 @@
 
 #![forbid(unsafe_code)]
 
-pub mod chainparams;
-pub mod protocol;
-pub mod serialize;
-pub mod transport;
+mod chainparams;
+mod protocol;
+mod serialize;
+mod transport;
 
 #[cfg(test)]
 mod fixtures;

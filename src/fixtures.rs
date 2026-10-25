@@ -5,7 +5,7 @@
 //! sent back until `verack`.
 
 /// The `version`. On loopback, the IPs and ports of both addresses are zero.
-pub const VERSION_FRAME: &str = concat!(
+pub(crate) const VERSION_FRAME: &str = concat!(
     "fabfb5da76657273696f6e000000000066000000b34372e3",
     "80110100090c0000000000002358de6a00000000",
     "0000000000000000000000000000000000000000000000000000",
@@ -14,9 +14,9 @@ pub const VERSION_FRAME: &str = concat!(
 );
 
 /// The `verack`: a header and no payload.
-pub const VERACK_FRAME: &str = "fabfb5da76657261636b000000000000000000005df6e0e2";
+pub(crate) const VERACK_FRAME: &str = "fabfb5da76657261636b000000000000000000005df6e0e2";
 
-pub fn hex(s: &str) -> Vec<u8> {
+pub(crate) fn hex(s: &str) -> Vec<u8> {
     (0..s.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
