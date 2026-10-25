@@ -285,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn address_is_ipv4_mapped_with_a_big_endian_port() {
+    fn address_writes_the_ip_in_order_and_the_port_big_endian() {
         let address = Address {
             services: ServiceFlags(1),
             ip: std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped(),

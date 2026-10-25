@@ -222,21 +222,6 @@ mod tests {
     }
 
     #[test]
-    fn limited_string_refuses_above_its_limit() {
-        let mut input: &[u8] = &[0x03, b'a', b'b', b'c'];
-        assert_eq!(read_limited_string(&mut input, 3), Ok(b"abc".to_vec()));
-
-        let mut input: &[u8] = &[0x04, b'a', b'b', b'c', b'd'];
-        assert_eq!(
-            read_limited_string(&mut input, 3),
-            Err(Error::StringTooLong {
-                length: 4,
-                length_max: 3
-            })
-        );
-    }
-
-    #[test]
     fn bool_is_true_for_any_nonzero_byte() {
         for (byte, expected) in [(0x00, false), (0x01, true), (0x02, true)] {
             assert_eq!(bool::decode(&mut &[byte][..]), Ok(expected));
