@@ -44,16 +44,6 @@ impl MessageType {
     }
 }
 
-/// A message header. `transport` checks the magic, so the header does not keep it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MessageHeader {
-    pub msg_type: MessageType,
-    /// The length of the payload in bytes.
-    pub length: u32,
-    /// The first four bytes of the sha256d of the payload.
-    pub checksum: [u8; 4],
-}
-
 /// The services a node offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ServiceFlags(pub u64);

@@ -5,7 +5,7 @@ use std::fmt;
 use bitcoin_hashes::sha256d;
 
 use crate::chainparams::Network;
-use crate::protocol::{MessageHeader, MessageType};
+use crate::protocol::MessageType;
 use crate::serialize::{Decode, Encode};
 
 /// Magic, message type, length and checksum.
@@ -42,6 +42,24 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// A message header that passed the checks of `decode_header`. It does not keep
+/// the magic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MessageHeader {
+    msg_type: MessageType,
+    /// The length of the payload in bytes.
+    length: u32,
+    /// The first four bytes of the sha256d of the payload.
+    checksum: [u8; 4],
+}
+
+impl MessageHeader {
+    /// The number of payload bytes to read next, at most `PAYLOAD_LENGTH_MAX`.
+    pub fn payload_length(&self) -> usize {
+        usize::try_from(self.length).expect("PAYLOAD_LENGTH_MAX fits in a usize")
+    }
+}
 
 /// Checks the magic, the message type and the length.
 pub fn decode_header(network: Network, bytes: &[u8; HEADER_SIZE]) -> Result<MessageHeader, Error> {
@@ -118,7 +136,7 @@ fn checksum(payload: &[u8]) -> [u8; 4] {
 mod tests {
     use super::*;
     use crate::fixtures::{VERACK_FRAME, VERSION_FRAME, hex};
-    use crate::protocol::{MessageHeader, VERACK, VERSION};
+    use crate::protocol::{VERACK, VERSION};
 
     fn split(frame: &[u8]) -> (&[u8; HEADER_SIZE], &[u8]) {
         frame.split_first_chunk().unwrap()
@@ -141,7 +159,7 @@ mod tests {
         let frame = hex(VERSION_FRAME);
         let (header, payload) = decode(&frame);
         assert_eq!(header.msg_type, VERSION);
-        assert_eq!(usize::try_from(header.length), Ok(payload.len()));
+        assert_eq!(header.payload_length(), payload.len());
         assert_eq!(check_payload(&header, payload), Ok(()));
     }
 
