@@ -11,7 +11,9 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # A new push to a pull request cancels the older run. A push to main does
+  # not, so each commit on main gets a result.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   gate:
@@ -29,13 +31,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
 
       # flake.lock pins each tool, and rust-toolchain.toml pins the compiler.
       # No installer step chooses a different version.
       - run: nix build --print-build-logs ".#${{ matrix.gate }}"
 
-      # Build the package a second time. Nix fails the step if the two
-      # outputs are not the same bytes.
+      # Build the package and its dependencies a second time. Nix fails the
+      # step if an output is not the same bytes. `--rebuild` does not rebuild
+      # inputs, so the dependencies are named on their own.
       - if: matrix.gate == 'elo'
-        run: nix build --print-build-logs --rebuild .#elo
+        run: nix build --print-build-logs --rebuild .#elo .#elo.cargoArtifacts

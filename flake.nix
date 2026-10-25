@@ -59,7 +59,8 @@
           strictDeps = true;
         };
 
-        # Build only the dependencies, so CI can cache that work.
+        # Build only the dependencies, so a change to the crate's own code does
+        # not build them again.
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
         elo = craneLib.buildPackage (commonArgs
@@ -90,7 +91,12 @@
 
           elo-test = craneLib.cargoNextest (commonArgs
             // {
-              inherit cargoArtifacts;
+              # Run the tests in the dev profile, as `cargo nextest run` does in
+              # the dev shell. The release profile turns off overflow checks
+              # and `debug_assert!`. The dev profile needs its own build of
+              # the dependencies.
+              CARGO_PROFILE = "dev";
+              cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {CARGO_PROFILE = "dev";});
               # The crate has no tests yet, and nextest fails a run with no
               # tests. Remove this argument with the first test.
               cargoNextestExtraArgs = "--no-tests=warn";
@@ -117,6 +123,7 @@
         apps.default = {
           type = "app";
           program = "${pkgs.lib.getExe elo}";
+          meta.description = "A Bitcoin node daemon";
         };
 
         devShells.default = craneLibDev.devShell {

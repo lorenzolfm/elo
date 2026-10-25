@@ -16,7 +16,10 @@ nix develop        # a shell with the pinned toolchain (direnv: `direnv allow`)
 ## Reproducibility
 
 ```sh
-nix build --rebuild    # builds again, and fails if the output bytes differ
+nix build .#elo .#elo.cargoArtifacts              # the package and its dependencies
+nix build --rebuild .#elo .#elo.cargoArtifacts    # builds both again, and fails if the bytes differ
 ```
+
+`--rebuild` compares with an earlier build, so run the first command once.
 
 CI runs this check on every pull request.
