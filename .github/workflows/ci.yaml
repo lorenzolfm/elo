@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # A new push to a pull request cancels the older run. A push to main does
+  # not, so each commit on main gets a result.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gate:
+    name: ${{ matrix.gate }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      # One job for each derivation, so the runners work in parallel. A single
+      # `nix flake check` puts every gate behind one log and one runner.
+      matrix:
+        gate: [elo, elo-clippy, elo-test, elo-fmt]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+
+      # flake.lock pins each tool, and rust-toolchain.toml pins the compiler.
+      # No installer step chooses a different version.
+      - run: nix build --print-build-logs ".#${{ matrix.gate }}"
+
+      # Build the package and its dependencies a second time. Nix fails the
+      # step if an output is not the same bytes. `--rebuild` does not rebuild
+      # inputs, so the dependencies are named on their own.
+      - if: matrix.gate == 'elo'
+        run: nix build --print-build-logs --rebuild .#elo .#elo.cargoArtifacts
