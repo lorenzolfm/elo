@@ -87,6 +87,44 @@ impl Decode for Address {
     }
 }
 
+/// Raw bytes, which need not be UTF-8. At most `USER_AGENT_LENGTH_MAX`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserAgent(Vec<u8>);
+
+impl UserAgent {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl TryFrom<Vec<u8>> for UserAgent {
+    type Error = Error;
+
+    fn try_from(bytes: Vec<u8>) -> Result<Self, Error> {
+        if bytes.len() <= USER_AGENT_LENGTH_MAX {
+            Ok(Self(bytes))
+        } else {
+            Err(Error::StringTooLong {
+                length: bytes.len(),
+                length_max: USER_AGENT_LENGTH_MAX,
+            })
+        }
+    }
+}
+
+impl Encode for UserAgent {
+    fn encode(&self, out: &mut Vec<u8>) {
+        assert!(self.0.len() <= USER_AGENT_LENGTH_MAX);
+        write_string(out, &self.0);
+    }
+}
+
+impl Decode for UserAgent {
+    fn decode(input: &mut &[u8]) -> Result<Self, Error> {
+        read_limited_string(input, USER_AGENT_LENGTH_MAX).map(Self)
+    }
+}
+
 /// The `version` payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Version {
@@ -96,25 +134,20 @@ pub struct Version {
     pub addr_recv: Address,
     pub addr_from: Address,
     pub nonce: u64,
-    /// Raw bytes, which need not be UTF-8.
-    pub user_agent: Vec<u8>,
+    pub user_agent: UserAgent,
     pub start_height: i32,
     pub relay: bool,
 }
 
-/// Panics if the user agent is longer than `USER_AGENT_LENGTH_MAX`, because a
-/// peer refuses it.
 impl Encode for Version {
     fn encode(&self, out: &mut Vec<u8>) {
-        assert!(self.user_agent.len() <= USER_AGENT_LENGTH_MAX);
-
         self.version.encode(out);
         self.services.encode(out);
         self.timestamp.encode(out);
         self.addr_recv.encode(out);
         self.addr_from.encode(out);
         self.nonce.encode(out);
-        write_string(out, &self.user_agent);
+        self.user_agent.encode(out);
         self.start_height.encode(out);
         self.relay.encode(out);
     }
@@ -131,7 +164,7 @@ impl Decode for Version {
             addr_recv: Address::decode(input)?,
             addr_from: Address::decode(input)?,
             nonce: u64::decode(input)?,
-            user_agent: read_limited_string(input, USER_AGENT_LENGTH_MAX)?,
+            user_agent: UserAgent::decode(input)?,
             start_height: i32::decode(input)?,
             relay: if input.is_empty() {
                 true
@@ -170,7 +203,7 @@ mod tests {
                 ..zero
             },
             nonce: 0x7119_7797_ae81_f0c9,
-            user_agent: b"/Satoshi:31.1.0/".to_vec(),
+            user_agent: UserAgent::try_from(b"/Satoshi:31.1.0/".to_vec()).unwrap(),
             start_height: 0,
             relay: true,
         }
@@ -232,20 +265,23 @@ mod tests {
     }
 
     #[test]
-    fn version_user_agent_is_at_most_256_bytes() {
+    fn user_agent_is_at_most_256_bytes() {
         let user_agent = [b'a'; 257];
         let payload = payload_with_user_agent(&user_agent[..256]);
         let version = Version::decode(&mut payload.as_slice()).unwrap();
-        assert_eq!(version.user_agent, user_agent[..256]);
-
-        let payload = payload_with_user_agent(&user_agent);
+        assert_eq!(version.user_agent.as_bytes(), &user_agent[..256]);
         assert_eq!(
-            Version::decode(&mut payload.as_slice()),
-            Err(Error::StringTooLong {
-                length: 257,
-                length_max: 256
-            })
+            UserAgent::try_from(user_agent[..256].to_vec()),
+            Ok(version.user_agent)
         );
+
+        let too_long = Error::StringTooLong {
+            length: 257,
+            length_max: 256,
+        };
+        let payload = payload_with_user_agent(&user_agent);
+        assert_eq!(Version::decode(&mut payload.as_slice()), Err(too_long));
+        assert_eq!(UserAgent::try_from(user_agent.to_vec()), Err(too_long));
     }
 
     #[test]
