@@ -1,26 +1,22 @@
-//! Message types and payloads. Core: `protocol.h`.
+//! Message types and payloads.
 
 use std::net::Ipv6Addr;
 
 use crate::serialize::{Decode, Encode, Error, read_limited_string, write_string};
 
-/// The longest user agent a `version` may carry. Core: `MAX_SUBVERSION_LENGTH` (`net.h`).
+/// The longest user agent a `version` may carry.
 pub const MAX_SUBVERSION_LENGTH: usize = 256;
 
 /// The message type in a header: printable ASCII, then NUL padding.
-/// Core: `CMessageHeader::m_msg_type` (`protocol.h`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MessageType([u8; 12]);
 
-/// Core: `NetMsgType::VERSION` (`protocol.h`).
 pub const VERSION: MessageType = MessageType(*b"version\0\0\0\0\0");
 
-/// Core: `NetMsgType::VERACK` (`protocol.h`).
 pub const VERACK: MessageType = MessageType(*b"verack\0\0\0\0\0\0");
 
 impl MessageType {
     /// `None` unless the bytes are printable ASCII followed only by NULs.
-    /// Core: `CMessageHeader::IsMessageTypeValid` (`protocol.cpp`).
     pub fn new(bytes: [u8; 12]) -> Option<Self> {
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         let (name, padding) = bytes.split_at(end);
@@ -29,14 +25,13 @@ impl MessageType {
         valid.then_some(Self(bytes))
     }
 
-    /// The 12 bytes, with the padding. Core: `CMessageHeader::m_msg_type` (`protocol.h`).
+    /// The 12 bytes, with the padding.
     pub const fn as_bytes(&self) -> &[u8; 12] {
         &self.0
     }
 }
 
 /// A message header. `transport` checks the magic, so the header does not keep it.
-/// Core: `CMessageHeader` (`protocol.h`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MessageHeader {
     pub msg_type: MessageType,
@@ -46,7 +41,7 @@ pub struct MessageHeader {
     pub checksum: [u8; 4],
 }
 
-/// The services a node offers. Core: `ServiceFlags` (`protocol.h`).
+/// The services a node offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ServiceFlags(pub u64);
 
@@ -63,7 +58,6 @@ impl Decode for ServiceFlags {
 }
 
 /// An address as a `version` carries it. An IPv4 address is IPv4-mapped.
-/// Core: `CAddress` (`protocol.h`) without `nTime`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Address {
     pub services: ServiceFlags,
@@ -71,7 +65,7 @@ pub struct Address {
     pub port: u16,
 }
 
-/// The port is big-endian. Core: `CService` (`netaddress.h`).
+/// The port is big-endian.
 impl Encode for Address {
     fn encode(&self, out: &mut Vec<u8>) {
         self.services.encode(out);
@@ -90,8 +84,7 @@ impl Decode for Address {
     }
 }
 
-/// The `version` payload. Core: `PeerManagerImpl::PushNodeVersion` writes it,
-/// and `PeerManagerImpl::ProcessMessage` reads it (`net_processing.cpp`).
+/// The `version` payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Version {
     pub version: i32,
@@ -100,7 +93,7 @@ pub struct Version {
     pub addr_recv: Address,
     pub addr_from: Address,
     pub nonce: u64,
-    /// Raw bytes: Core does not require UTF-8.
+    /// Raw bytes, which need not be UTF-8.
     pub user_agent: Vec<u8>,
     pub start_height: i32,
     pub relay: bool,

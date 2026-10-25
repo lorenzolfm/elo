@@ -1,4 +1,4 @@
-//! The v1 message framing. Core: `V1Transport` (`net.h`).
+//! The v1 message framing.
 
 use std::fmt;
 
@@ -9,24 +9,17 @@ use crate::protocol::{MessageHeader, MessageType};
 use crate::serialize::Encode;
 
 /// Magic, message type, length and checksum.
-/// Core: `CMessageHeader::HEADER_SIZE` (`protocol.h`).
 pub const HEADER_SIZE: usize = 24;
 
-/// The longest payload a peer may send. Core: `MAX_PROTOCOL_MESSAGE_LENGTH` (`net.h`).
+/// The longest payload a peer may send.
 pub const MAX_PROTOCOL_MESSAGE_LENGTH: u32 = 4_000_000;
 
 /// Why a frame was refused. Each one ends the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// Core: "Wrong MessageStart" in `V1Transport::readHeader` (`net.cpp`).
     WrongMagic([u8; 4]),
-    /// Core drops only the message: "Invalid message type" in
-    /// `V1Transport::GetReceivedMessage` (`net.cpp`).
     InvalidMessageType([u8; 12]),
-    /// Core: "Size too large" in `V1Transport::readHeader` (`net.cpp`).
     TooLarge(u32),
-    /// Core drops only the message: "Wrong checksum" in
-    /// `V1Transport::GetReceivedMessage` (`net.cpp`).
     BadChecksum,
 }
 
@@ -50,8 +43,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Checks the magic, the message type and the length. Core: `V1Transport::readHeader`,
-/// and the message type in `V1Transport::GetReceivedMessage` (`net.cpp`).
+/// Checks the magic, the message type and the length.
 pub fn decode_header(network: Network, bytes: &[u8; HEADER_SIZE]) -> Result<MessageHeader, Error> {
     let [m0, m1, m2, m3, rest @ ..] = *bytes;
     let [msg_type @ .., l0, l1, l2, l3, c0, c1, c2, c3] = rest;
@@ -72,7 +64,7 @@ pub fn decode_header(network: Network, bytes: &[u8; HEADER_SIZE]) -> Result<Mess
     })
 }
 
-/// Core: `V1Transport::GetReceivedMessage` (`net.cpp`).
+/// Checks the payload against the checksum in its header.
 pub fn check_payload(header: &MessageHeader, payload: &[u8]) -> Result<(), Error> {
     if checksum(payload) != header.checksum {
         return Err(Error::BadChecksum);
@@ -80,7 +72,7 @@ pub fn check_payload(header: &MessageHeader, payload: &[u8]) -> Result<(), Error
     Ok(())
 }
 
-/// A header, then the payload. Core: `V1Transport::SetMessageToSend` (`net.cpp`).
+/// A header, then the payload.
 ///
 /// Panics if the payload is longer than `MAX_PROTOCOL_MESSAGE_LENGTH`.
 pub fn encode(network: Network, msg_type: MessageType, payload: &[u8]) -> Vec<u8> {
@@ -98,7 +90,7 @@ pub fn encode(network: Network, msg_type: MessageType, payload: &[u8]) -> Vec<u8
     out
 }
 
-/// The first four bytes of the sha256d. Core: `V1Transport::GetMessageHash` (`net.cpp`).
+/// The first four bytes of the sha256d.
 fn checksum(payload: &[u8]) -> [u8; 4] {
     let [c0, c1, c2, c3, ..] = sha256d::Hash::hash(payload).to_byte_array();
     [c0, c1, c2, c3]

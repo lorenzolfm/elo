@@ -1,18 +1,17 @@
-//! The parameters of each network. Core: `kernel/chainparams.cpp`.
+//! The parameters of each network.
 
-/// A network elo can connect to. Core: `ChainType` (`util/chaintype.h`).
+/// A network elo can connect to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Network {
     Mainnet,
     Testnet4,
-    /// The default signet, with Core's default challenge.
+    /// The default signet.
     Signet,
     Regtest,
 }
 
 impl Network {
     /// The four bytes that start every message.
-    /// Core: `CChainParams::MessageStart` (`kernel/chainparams.h`).
     pub const fn magic(self) -> [u8; 4] {
         match self {
             Network::Mainnet => [0xf9, 0xbe, 0xb4, 0xd9],
@@ -33,7 +32,7 @@ mod tests {
 
     #[test]
     fn signet_magic_is_the_hash_of_the_default_challenge() {
-        // Core: `SigNetParams`, the default `signet_challenge`.
+        // The default signet challenge.
         let challenge = hex(
             "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae",
         );

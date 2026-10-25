@@ -1,21 +1,20 @@
-//! The wire encoding. Core: `serialize.h`.
+//! The wire encoding.
 
 use std::fmt;
 
-/// The largest value a CompactSize may hold. Core: `MAX_SIZE` (`serialize.h`).
+/// The largest value a CompactSize may hold.
 pub const MAX_SIZE: u64 = 0x0200_0000;
 
-/// Why a decode failed. Core throws `std::ios_base::failure` (`serialize.h`).
+/// Why a decode failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The input ended inside a field.
     UnexpectedEnd,
     /// A CompactSize used more bytes than its value needs.
-    /// Core: `ReadCompactSize` (`serialize.h`).
     NonCanonicalCompactSize,
-    /// A CompactSize above `MAX_SIZE`. Core: `ReadCompactSize` (`serialize.h`).
+    /// A CompactSize above `MAX_SIZE`.
     CompactSizeTooLarge(u64),
-    /// A string longer than its limit. Core: `LimitedStringFormatter` (`serialize.h`).
+    /// A string longer than its limit.
     StringTooLong { len: u64, max: usize },
 }
 
@@ -34,13 +33,12 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Writes a value in the wire encoding. Core: `Serialize` (`serialize.h`).
+/// Writes a value in the wire encoding.
 pub trait Encode {
     fn encode(&self, out: &mut Vec<u8>);
 }
 
 /// Reads a value in the wire encoding, and moves `input` past it.
-/// Core: `Unserialize` (`serialize.h`).
 pub trait Decode: Sized {
     fn decode(input: &mut &[u8]) -> Result<Self, Error>;
 }
@@ -59,7 +57,6 @@ impl<const N: usize> Decode for [u8; N] {
     }
 }
 
-/// Little-endian, as in Core's `ser_writedata*` and `ser_readdata*`.
 macro_rules! little_endian {
     ($($t:ty),*) => {$(
         impl Encode for $t {
@@ -84,14 +81,14 @@ impl Encode for bool {
     }
 }
 
-/// Any byte other than zero is true, as in Core.
+/// Any byte other than zero is true.
 impl Decode for bool {
     fn decode(input: &mut &[u8]) -> Result<Self, Error> {
         Ok(u8::decode(input)? != 0)
     }
 }
 
-/// Core: `WriteCompactSize` (`serialize.h`).
+/// One, three, five or nine bytes: the shortest form that holds `n`.
 pub fn write_compact_size(out: &mut Vec<u8>, n: u64) {
     if let Ok(byte) = u8::try_from(n)
         && byte < 0xfd
@@ -109,7 +106,7 @@ pub fn write_compact_size(out: &mut Vec<u8>, n: u64) {
     }
 }
 
-/// Core: `ReadCompactSize` (`serialize.h`), with its range check.
+/// Refuses a form longer than the value needs, and a value above `MAX_SIZE`.
 pub fn read_compact_size(input: &mut &[u8]) -> Result<u64, Error> {
     let (n, min) = match u8::decode(input)? {
         0xfd => (u64::from(u16::decode(input)?), 0xfd),
@@ -126,14 +123,14 @@ pub fn read_compact_size(input: &mut &[u8]) -> Result<u64, Error> {
     Ok(n)
 }
 
-/// A CompactSize length, then the bytes. Core: `Serialize` for `std::string` (`serialize.h`).
+/// A CompactSize length, then the bytes.
 pub fn write_string(out: &mut Vec<u8>, bytes: &[u8]) {
     let len = u64::try_from(bytes.len()).expect("a usize fits in a u64");
     write_compact_size(out, len);
     out.extend_from_slice(bytes);
 }
 
-/// Core: `LIMITED_STRING` (`serialize.h`).
+/// Refuses a string longer than `max` bytes.
 pub fn read_limited_string(input: &mut &[u8], max: usize) -> Result<Vec<u8>, Error> {
     let len = read_compact_size(input)?;
     let Some(n) = usize::try_from(len).ok().filter(|&n| n <= max) else {
