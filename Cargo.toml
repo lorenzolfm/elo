@@ -7,3 +7,4 @@ repository = "https://github.com/lorenzolfm/elo"
 publish = false
 
 [dependencies]
+bitcoin_hashes = { version = "1.2.0", default-features = false }
