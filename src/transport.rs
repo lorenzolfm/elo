@@ -61,6 +61,24 @@ impl MessageHeader {
     }
 }
 
+/// A payload whose checksum matched its header. Only `check_payload` makes one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Message {
+    msg_type: MessageType,
+    payload: Vec<u8>,
+}
+
+impl Message {
+    pub fn msg_type(&self) -> MessageType {
+        self.msg_type
+    }
+
+    /// The whole payload of the frame, and nothing after it.
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
 /// Checks the magic, the message type and the length.
 pub fn decode_header(network: Network, bytes: &[u8; HEADER_SIZE]) -> Result<MessageHeader, Error> {
     let mut input = bytes.as_slice();
@@ -90,12 +108,15 @@ pub fn decode_header(network: Network, bytes: &[u8; HEADER_SIZE]) -> Result<Mess
 /// Checks the payload against the checksum in its header.
 ///
 /// Panics if the payload is not `header.length` bytes. The caller reads exactly that many.
-pub fn check_payload(header: &MessageHeader, payload: &[u8]) -> Result<(), Error> {
+pub fn check_payload(header: MessageHeader, payload: Vec<u8>) -> Result<Message, Error> {
     assert!(header.length <= PAYLOAD_LENGTH_MAX);
     assert_eq!(u32::try_from(payload.len()), Ok(header.length));
 
-    if checksum(payload) == header.checksum {
-        Ok(())
+    if checksum(&payload) == header.checksum {
+        Ok(Message {
+            msg_type: header.msg_type,
+            payload,
+        })
     } else {
         Err(Error::BadChecksum)
     }
@@ -152,15 +173,17 @@ mod tests {
     fn core_frames_decode() {
         let frame = hex(VERACK_FRAME);
         let (header, payload) = decode(&frame);
-        assert_eq!(header.msg_type, VERACK);
         assert_eq!(header.length, 0);
-        assert_eq!(check_payload(&header, payload), Ok(()));
+        let message = check_payload(header, payload.to_vec()).unwrap();
+        assert_eq!(message.msg_type(), VERACK);
+        assert_eq!(message.payload(), payload);
 
         let frame = hex(VERSION_FRAME);
         let (header, payload) = decode(&frame);
-        assert_eq!(header.msg_type, VERSION);
         assert_eq!(header.payload_length(), payload.len());
-        assert_eq!(check_payload(&header, payload), Ok(()));
+        let message = check_payload(header, payload.to_vec()).unwrap();
+        assert_eq!(message.msg_type(), VERSION);
+        assert_eq!(message.payload(), payload);
     }
 
     #[test]
@@ -217,6 +240,9 @@ mod tests {
         let last = frame.len() - 1;
         frame[last] ^= 1;
         let (header, payload) = decode(&frame);
-        assert_eq!(check_payload(&header, payload), Err(Error::BadChecksum));
+        assert_eq!(
+            check_payload(header, payload.to_vec()),
+            Err(Error::BadChecksum)
+        );
     }
 }
