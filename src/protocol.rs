@@ -11,11 +11,25 @@ pub const USER_AGENT_LENGTH_MAX: usize = 256;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MessageType([u8; 12]);
 
-// `new` runs at compile time here, so an invalid constant does not build.
-pub const VERSION: MessageType = MessageType::new(*b"version\0\0\0\0\0").expect("valid");
-pub const VERACK: MessageType = MessageType::new(*b"verack\0\0\0\0\0\0").expect("valid");
+// `from_name` runs at compile time here, so an invalid name does not build.
+pub const VERSION: MessageType = MessageType::from_name("version");
+pub const VERACK: MessageType = MessageType::from_name("verack");
 
 impl MessageType {
+    /// Pads `name` with NULs to 12 bytes. Panics if the name is longer or
+    /// `new` rejects the padded bytes.
+    pub const fn from_name(name: &str) -> Self {
+        let name = name.as_bytes();
+        assert!(name.len() <= 12);
+        let mut bytes = [0; 12];
+        let mut index = 0;
+        while index < name.len() {
+            bytes[index] = name[index];
+            index += 1;
+        }
+        Self::new(bytes).expect("a printable ASCII name")
+    }
+
     /// `None` unless the bytes are printable ASCII followed only by NULs.
     pub const fn new(bytes: [u8; 12]) -> Option<Self> {
         let mut index = 0;
