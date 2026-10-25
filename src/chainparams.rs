@@ -11,9 +11,12 @@ pub(crate) enum Network {
     Regtest,
 }
 
+/// The size of the magic that starts every message.
+pub(crate) const MAGIC_SIZE: usize = 4;
+
 impl Network {
-    /// The four bytes that start every message.
-    pub(crate) const fn magic(self) -> [u8; 4] {
+    /// The bytes that start every message.
+    pub(crate) const fn magic(self) -> [u8; MAGIC_SIZE] {
         match self {
             Network::Mainnet => [0xf9, 0xbe, 0xb4, 0xd9],
             Network::Testnet4 => [0x1c, 0x16, 0x3f, 0x28],

@@ -5,9 +5,12 @@ use crate::serialize::{Decode, Encode};
 /// The longest user agent a `version` may carry.
 const USER_AGENT_LENGTH_MAX: usize = 256;
 
+/// The size of a message type, with the padding.
+pub(crate) const MESSAGE_TYPE_SIZE: usize = 12;
+
 /// The message type in a header: printable ASCII, then NUL padding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct MessageType([u8; 12]);
+pub(crate) struct MessageType([u8; MESSAGE_TYPE_SIZE]);
 
 // `from_name` runs at compile time here, so an invalid name does not build.
 #[cfg_attr(not(test), expect(dead_code, reason = "until net_processing uses it"))]
@@ -16,12 +19,12 @@ pub(crate) const VERSION: MessageType = MessageType::from_name("version");
 pub(crate) const VERACK: MessageType = MessageType::from_name("verack");
 
 impl MessageType {
-    /// Pads `name` with NULs to 12 bytes. Panics if the name is longer or
-    /// `new` rejects the padded bytes.
+    /// Pads `name` with NULs to `MESSAGE_TYPE_SIZE` bytes. Panics if the name
+    /// is longer or `new` rejects the padded bytes.
     const fn from_name(name: &str) -> Self {
         let name = name.as_bytes();
-        assert!(name.len() <= 12);
-        let mut bytes = [0; 12];
+        assert!(name.len() <= MESSAGE_TYPE_SIZE);
+        let mut bytes = [0; MESSAGE_TYPE_SIZE];
         let mut index = 0;
         while index < name.len() {
             bytes[index] = name[index];
@@ -31,7 +34,7 @@ impl MessageType {
     }
 
     /// `None` unless the bytes are printable ASCII followed only by NULs.
-    pub(crate) const fn new(bytes: [u8; 12]) -> Option<Self> {
+    pub(crate) const fn new(bytes: [u8; MESSAGE_TYPE_SIZE]) -> Option<Self> {
         let mut index = 0;
         while index < bytes.len() {
             let byte = bytes[index];
@@ -52,8 +55,8 @@ impl MessageType {
         Some(Self(bytes))
     }
 
-    /// The 12 bytes, with the padding.
-    pub(crate) const fn as_bytes(&self) -> &[u8; 12] {
+    /// All the bytes, with the padding.
+    pub(crate) const fn as_bytes(&self) -> &[u8; MESSAGE_TYPE_SIZE] {
         &self.0
     }
 }
@@ -95,7 +98,7 @@ impl Decode for Address {
     fn decode(input: &mut &[u8]) -> Result<Self, crate::serialize::Error> {
         Ok(Self {
             services: ServiceFlags::decode(input)?,
-            ip: std::net::Ipv6Addr::from(<[u8; 16]>::decode(input)?),
+            ip: std::net::Ipv6Addr::from_octets(Decode::decode(input)?),
             port: u16::from_be_bytes(Decode::decode(input)?),
         })
     }
@@ -227,9 +230,12 @@ mod tests {
     /// so the user agent can be longer than the limit.
     fn payload_with_user_agent(user_agent: &[u8]) -> Vec<u8> {
         let mut payload = core_payload();
-        let start_height_and_relay = payload.split_off(payload.len() - 5);
-        let core_user_agent = payload.split_off(payload.len() - 17);
-        assert_eq!(core_user_agent[1..], *b"/Satoshi:31.1.0/");
+        let start_height_and_relay =
+            payload.split_off(payload.len() - size_of::<i32>() - size_of::<bool>());
+        let mut core_user_agent = Vec::new();
+        crate::serialize::write_string(&mut core_user_agent, b"/Satoshi:31.1.0/");
+        let tail = payload.split_off(payload.len() - core_user_agent.len());
+        assert_eq!(tail, core_user_agent);
 
         crate::serialize::write_string(&mut payload, user_agent);
         payload.extend(start_height_and_relay);
@@ -271,7 +277,7 @@ mod tests {
     #[test]
     fn version_requires_start_height() {
         let mut payload = core_payload();
-        payload.truncate(payload.len() - 5);
+        payload.truncate(payload.len() - size_of::<i32>() - size_of::<bool>());
         assert_eq!(
             super::Version::decode(&mut payload.as_slice()),
             Err(crate::serialize::Error::UnexpectedEnd)
@@ -279,19 +285,20 @@ mod tests {
     }
 
     #[test]
-    fn user_agent_is_at_most_256_bytes() {
-        let user_agent = [b'a'; 257];
-        let payload = payload_with_user_agent(&user_agent[..256]);
+    fn user_agent_is_at_most_user_agent_length_max() {
+        let user_agent = [b'a'; super::USER_AGENT_LENGTH_MAX + 1];
+        let longest = &user_agent[..super::USER_AGENT_LENGTH_MAX];
+        let payload = payload_with_user_agent(longest);
         let version = super::Version::decode(&mut payload.as_slice()).unwrap();
-        assert_eq!(version.user_agent.as_bytes(), &user_agent[..256]);
+        assert_eq!(version.user_agent.as_bytes(), longest);
         assert_eq!(
-            super::UserAgent::try_from(user_agent[..256].to_vec()),
+            super::UserAgent::try_from(longest.to_vec()),
             Ok(version.user_agent)
         );
 
         let too_long = crate::serialize::Error::StringTooLong {
-            length: 257,
-            length_max: 256,
+            length: user_agent.len(),
+            length_max: super::USER_AGENT_LENGTH_MAX,
         };
         let payload = payload_with_user_agent(&user_agent);
         assert_eq!(
@@ -324,7 +331,7 @@ mod tests {
 
     #[test]
     fn message_type_is_printable_ascii_then_nul_padding() {
-        let cases: [(&[u8; 12], bool); 6] = [
+        let cases: [(&[u8; super::MESSAGE_TYPE_SIZE], bool); 6] = [
             (b"verack\0\0\0\0\0\0", true),
             (b"\0\0\0\0\0\0\0\0\0\0\0\0", true),
             (b" ~\0\0\0\0\0\0\0\0\0\0", true),

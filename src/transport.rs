@@ -2,8 +2,14 @@
 
 use crate::serialize::{Decode, Encode};
 
+/// The size of the checksum in a header.
+const CHECKSUM_SIZE: usize = 4;
+
 /// Magic, message type, length and checksum.
-pub(crate) const HEADER_SIZE: usize = 4 + 12 + 4 + 4;
+pub(crate) const HEADER_SIZE: usize = crate::chainparams::MAGIC_SIZE
+    + crate::protocol::MESSAGE_TYPE_SIZE
+    + size_of::<u32>()
+    + CHECKSUM_SIZE;
 
 /// The longest payload a peer may send.
 const PAYLOAD_LENGTH_MAX: u32 = 4_000_000;
@@ -11,8 +17,8 @@ const PAYLOAD_LENGTH_MAX: u32 = 4_000_000;
 /// Why a frame was refused. Each one ends the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Error {
-    WrongMagic([u8; 4]),
-    InvalidMessageType([u8; 12]),
+    WrongMagic([u8; crate::chainparams::MAGIC_SIZE]),
+    InvalidMessageType([u8; crate::protocol::MESSAGE_TYPE_SIZE]),
     TooLarge(u32),
     BadChecksum,
 }
@@ -44,8 +50,8 @@ struct MessageHeader {
     msg_type: crate::protocol::MessageType,
     /// The length of the payload in bytes.
     length: u32,
-    /// The first four bytes of the sha256d of the payload.
-    checksum: [u8; 4],
+    /// The start of the sha256d of the payload.
+    checksum: [u8; CHECKSUM_SIZE],
 }
 
 impl MessageHeader {
@@ -83,10 +89,12 @@ fn decode_header(
     bytes: &[u8; HEADER_SIZE],
 ) -> Result<MessageHeader, Error> {
     let mut input = bytes.as_slice();
-    let magic = <[u8; 4]>::decode(&mut input).expect("a header holds the magic");
-    let msg_type = <[u8; 12]>::decode(&mut input).expect("a header holds the message type");
+    let magic = <[u8; crate::chainparams::MAGIC_SIZE]>::decode(&mut input)
+        .expect("a header holds the magic");
+    let msg_type = <[u8; crate::protocol::MESSAGE_TYPE_SIZE]>::decode(&mut input)
+        .expect("a header holds the message type");
     let length = u32::decode(&mut input).expect("a header holds the length");
-    let checksum = <[u8; 4]>::decode(&mut input).expect("a header holds the checksum");
+    let checksum = <[u8; CHECKSUM_SIZE]>::decode(&mut input).expect("a header holds the checksum");
     assert!(input.is_empty());
 
     if magic != network.magic() {
@@ -154,8 +162,8 @@ fn encode(
     frame
 }
 
-/// The first four bytes of the sha256d.
-fn checksum(payload: &[u8]) -> [u8; 4] {
+/// The start of the sha256d.
+fn checksum(payload: &[u8]) -> [u8; CHECKSUM_SIZE] {
     let hash = bitcoin_hashes::sha256d::Hash::hash(payload).to_byte_array();
     *hash.first_chunk().expect("a sha256d is 32 bytes")
 }
@@ -231,7 +239,7 @@ mod tests {
     #[test]
     fn header_with_invalid_message_type_is_refused() {
         let mut frame = crate::fixtures::hex(crate::fixtures::VERACK_FRAME);
-        frame[4 + 3] = 0;
+        frame[crate::chainparams::MAGIC_SIZE + "ver".len()] = 0;
         let (header, _) = split(&frame);
         assert_eq!(
             super::decode_header(crate::chainparams::Network::Regtest, header),
@@ -242,6 +250,7 @@ mod tests {
     #[test]
     fn header_length_is_at_most_payload_length_max() {
         let mut frame = crate::fixtures::hex(crate::fixtures::VERACK_FRAME);
+        let length_start = crate::chainparams::MAGIC_SIZE + crate::protocol::MESSAGE_TYPE_SIZE;
         for (length, expected) in [
             (super::PAYLOAD_LENGTH_MAX, Ok(super::PAYLOAD_LENGTH_MAX)),
             (
@@ -249,7 +258,8 @@ mod tests {
                 Err(super::Error::TooLarge(super::PAYLOAD_LENGTH_MAX + 1)),
             ),
         ] {
-            frame[16..20].copy_from_slice(&length.to_le_bytes());
+            frame[length_start..length_start + size_of::<u32>()]
+                .copy_from_slice(&length.to_le_bytes());
             let (header, _) = split(&frame);
             let decoded = super::decode_header(crate::chainparams::Network::Regtest, header)
                 .map(|h| h.length);
