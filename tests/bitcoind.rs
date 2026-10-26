@@ -44,6 +44,8 @@ impl Bitcoind {
             .arg(format!("-datadir={}", datadir.0.display()))
             .arg(format!("-bind={peer}"))
             .arg("-listenonion=0")
+            // bitcoind asks the router to map its port by default. A test must not.
+            .arg("-natpmp=0")
             .arg("-server=0")
             .arg("-printtoconsole=0")
             .stdout(std::process::Stdio::null())
