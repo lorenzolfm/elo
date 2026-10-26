@@ -11,6 +11,11 @@ const PROTOCOL_VERSION_MIN: i32 = 70016;
 // elo accepts its own `version`.
 const _: () = assert!(PROTOCOL_VERSION >= PROTOCOL_VERSION_MIN);
 
+/// The most messages a peer may send in a handshake, its `verack` included. A peer needs five
+/// at most: `version`, `wtxidrelay`, `sendaddrv2`, `sendtxrcncl` and `verack`. The rest is room
+/// for messages that later BIPs add.
+const MESSAGE_COUNT_MAX: u32 = 16;
+
 /// Why the handshake failed. Each one ends the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -18,6 +23,8 @@ pub enum Error {
     Version(crate::serialize::Error),
     /// Their protocol version is below `PROTOCOL_VERSION_MIN`.
     Obsolete(i32),
+    /// The peer sent `MESSAGE_COUNT_MAX` messages without its `verack`.
+    TooManyMessages,
 }
 
 impl std::fmt::Display for Error {
@@ -28,6 +35,12 @@ impl std::fmt::Display for Error {
                 write!(
                     f,
                     "protocol version {version} is below {PROTOCOL_VERSION_MIN}"
+                )
+            }
+            Error::TooManyMessages => {
+                write!(
+                    f,
+                    "the peer sent {MESSAGE_COUNT_MAX} messages without its verack"
                 )
             }
         }
@@ -65,7 +78,11 @@ enum State {
 /// The handshake with one peer. It does no I/O: the driver gives it each message and sends
 /// what it returns.
 #[derive(Debug)]
-pub(crate) struct Handshake(State);
+pub(crate) struct Handshake {
+    state: State,
+    /// The messages that came, fewer than `MESSAGE_COUNT_MAX`.
+    message_count: u32,
+}
 
 /// A message to send: one of the two that elo sends.
 #[derive(Debug)]
@@ -103,24 +120,29 @@ impl Handshake {
         assert!(input.is_empty());
 
         (
-            Handshake(State::AwaitingVersion),
+            Handshake {
+                state: State::AwaitingVersion,
+                message_count: 0,
+            },
             Outbound::Version(payload),
         )
     }
 
     /// Before their `version`, each other message is skipped. After it, each message is
-    /// skipped until their `verack`, a second `version` too.
+    /// skipped until their `verack`, a second `version` too. Message `MESSAGE_COUNT_MAX` must
+    /// be their `verack`.
     pub(crate) fn receive(self, message: &crate::transport::Message) -> Result<Step, Error> {
-        match self.0 {
+        assert!(self.message_count < MESSAGE_COUNT_MAX);
+        let message_count = self.message_count + 1;
+
+        match self.state {
             State::AwaitingVersion => {
                 if message.msg_type() == crate::protocol::VERSION {
                     let theirs = receive_version(message)?;
-                    Ok(Step::Reply(
-                        Handshake(State::AwaitingVerack(theirs)),
-                        Outbound::Verack,
-                    ))
+                    let handshake = next(State::AwaitingVerack(theirs), message_count)?;
+                    Ok(Step::Reply(handshake, Outbound::Verack))
                 } else {
-                    Ok(Step::Wait(Handshake(State::AwaitingVersion)))
+                    Ok(Step::Wait(next(State::AwaitingVersion, message_count)?))
                 }
             }
             State::AwaitingVerack(theirs) => {
@@ -129,10 +151,23 @@ impl Handshake {
                 if message.msg_type() == crate::protocol::VERACK {
                     Ok(Step::Done(theirs))
                 } else {
-                    Ok(Step::Wait(Handshake(State::AwaitingVerack(theirs))))
+                    let handshake = next(State::AwaitingVerack(theirs), message_count)?;
+                    Ok(Step::Wait(handshake))
                 }
             }
         }
+    }
+}
+
+/// The handshake after `message_count` messages, if the peer may send one more.
+fn next(state: State, message_count: u32) -> Result<Handshake, Error> {
+    if message_count < MESSAGE_COUNT_MAX {
+        Ok(Handshake {
+            state,
+            message_count,
+        })
+    } else {
+        Err(Error::TooManyMessages)
     }
 }
 
@@ -218,6 +253,28 @@ mod tests {
             Ok(super::Step::Done(version)) => assert_eq!(Ok(version), theirs),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn peer_without_its_verack_in_message_count_max_is_too_many_messages() {
+        // The peer sends `MESSAGE_COUNT_MAX` messages: their `version`, `wtxidrelay` frames
+        // and a last one. A `verack` as the last completes the handshake. One more
+        // `wtxidrelay` in its place is refused.
+        let wtxidrelay = core_message(crate::fixtures::WTXIDRELAY_FRAME);
+        let before_the_last = || {
+            let (mut handshake, _) =
+                reply(start().receive(&core_message(crate::fixtures::VERSION_FRAME)));
+            for _ in 2..super::MESSAGE_COUNT_MAX {
+                handshake = wait(handshake.receive(&wtxidrelay));
+            }
+            handshake
+        };
+
+        let verack = core_message(crate::fixtures::VERACK_FRAME);
+        let done = before_the_last().receive(&verack);
+        assert!(matches!(done, Ok(super::Step::Done(_))), "{done:?}");
+        let refused = before_the_last().receive(&wtxidrelay).err();
+        assert_eq!(refused, Some(super::Error::TooManyMessages));
     }
 
     #[test]
