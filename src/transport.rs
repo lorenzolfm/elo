@@ -57,6 +57,9 @@ pub(crate) struct MessageHeader {
 impl MessageHeader {
     /// The number of payload bytes to read next, at most `PAYLOAD_LENGTH_MAX`.
     pub(crate) fn payload_length(&self) -> usize {
+        // `decode_header` and `encode` make the only headers, and both check the length. The
+        // driver sizes its payload buffer with this, so it checks again before the allocation.
+        assert!(self.length <= PAYLOAD_LENGTH_MAX);
         usize::try_from(self.length).expect("PAYLOAD_LENGTH_MAX fits in a usize")
     }
 }
