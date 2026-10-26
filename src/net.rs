@@ -111,7 +111,14 @@ async fn send(
     network: crate::chainparams::Network,
     outbound: &crate::net_processing::Outbound,
 ) -> Result<(), Error> {
-    let frame = crate::transport::encode(network, outbound.msg_type, &outbound.payload);
+    let frame = match outbound {
+        crate::net_processing::Outbound::Version(payload) => {
+            crate::transport::encode(network, crate::protocol::VERSION, payload)
+        }
+        crate::net_processing::Outbound::Verack => {
+            crate::transport::encode(network, crate::protocol::VERACK, &[])
+        }
+    };
     stream.write_all(&frame).await.map_err(Error::Io)
 }
 

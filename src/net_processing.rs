@@ -71,11 +71,13 @@ enum State {
 #[derive(Debug)]
 pub(crate) struct Handshake(State);
 
-/// A message to send.
+/// A message to send: one of the two that elo sends.
 #[derive(Debug)]
-pub(crate) struct Outbound {
-    pub(crate) msg_type: crate::protocol::MessageType,
-    pub(crate) payload: Vec<u8>,
+pub(crate) enum Outbound {
+    /// Our `version`, encoded.
+    Version(Vec<u8>),
+    /// A `verack`, which has no payload.
+    Verack,
 }
 
 /// What the handshake does after a message.
@@ -104,11 +106,10 @@ impl Handshake {
         );
         assert!(input.is_empty());
 
-        let outbound = Outbound {
-            msg_type: crate::protocol::VERSION,
-            payload,
-        };
-        (Handshake(State::AwaitingVersion), outbound)
+        (
+            Handshake(State::AwaitingVersion),
+            Outbound::Version(payload),
+        )
     }
 
     /// Before their `version`, each other message is skipped. After it, each message is
@@ -118,13 +119,9 @@ impl Handshake {
             State::AwaitingVersion => {
                 if message.msg_type() == crate::protocol::VERSION {
                     let theirs = receive_version(message)?;
-                    let verack = Outbound {
-                        msg_type: crate::protocol::VERACK,
-                        payload: Vec::new(),
-                    };
                     Ok(Step::Reply(
                         Handshake(State::AwaitingVerack(theirs)),
-                        verack,
+                        Outbound::Verack,
                     ))
                 } else {
                     Ok(Step::Wait(Handshake(State::AwaitingVersion)))
@@ -207,17 +204,18 @@ mod tests {
         let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 18444));
         let ours = super::our_version(peer, 0, 0);
         let (handshake, outbound) = super::Handshake::start(&ours);
-        assert_eq!(outbound.msg_type, crate::protocol::VERSION);
+        let super::Outbound::Version(payload) = outbound else {
+            panic!("{outbound:?}");
+        };
         assert_eq!(
-            crate::protocol::Version::decode(&mut outbound.payload.as_slice()),
+            crate::protocol::Version::decode(&mut payload.as_slice()),
             Ok(ours)
         );
 
         let handshake = wait(handshake.receive(&core_message(crate::fixtures::VERACK_FRAME)));
         let (mut handshake, outbound) =
             reply(handshake.receive(&core_message(crate::fixtures::VERSION_FRAME)));
-        assert_eq!(outbound.msg_type, crate::protocol::VERACK);
-        assert_eq!(outbound.payload, []);
+        assert!(matches!(outbound, super::Outbound::Verack), "{outbound:?}");
 
         // A peer may send `wtxidrelay` and `sendaddrv2` before its `verack`. A second `version` is
         // skipped without a decode, so an empty payload passes.
