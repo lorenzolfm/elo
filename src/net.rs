@@ -102,7 +102,7 @@ async fn handshake_stream_exchange(
                 send(&mut stream, network, &outbound).await?;
                 handshake = next;
             }
-            crate::net_processing::Step::Done(theirs) => return Ok(theirs),
+            crate::net_processing::Step::Done(_peer, theirs) => return Ok(theirs),
         }
     }
 }
@@ -118,6 +118,9 @@ async fn send(
         }
         crate::net_processing::Outbound::Verack => {
             crate::transport::encode(network, crate::protocol::VERACK, &[])
+        }
+        crate::net_processing::Outbound::Pong(nonce) => {
+            crate::transport::encode(network, crate::protocol::PONG, &nonce.to_le_bytes())
         }
     };
     stream.write_all(&frame).await.map_err(Error::Io)
