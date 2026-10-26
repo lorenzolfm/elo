@@ -8,3 +8,7 @@ publish = false
 
 [dependencies]
 bitcoin_hashes = { version = "1.2.0", default-features = false }
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "io-util", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1.54.1", default-features = false, features = ["test-util"] }

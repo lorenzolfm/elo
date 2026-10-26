@@ -1,6 +1,11 @@
 # elo
 
-A Bitcoin node daemon. Work in progress: the binary does nothing yet.
+A Bitcoin node daemon. Work in progress: the binary dials one peer, does the
+v1 `version`/`verack` handshake, prints the peer's `version` and exits.
+
+```sh
+elo <mainnet|testnet4|signet|regtest> <ip>[:port]    # IPv6 as [::1]:8333
+```
 
 ## Build
 

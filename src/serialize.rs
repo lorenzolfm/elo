@@ -9,7 +9,7 @@ const _: () = assert!(usize::BITS >= u32::BITS);
 
 /// Why a decode failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Error {
+pub enum Error {
     /// The input ended inside a field.
     UnexpectedEnd,
     /// A CompactSize used more bytes than its value needs.

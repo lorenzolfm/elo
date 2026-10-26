@@ -2,7 +2,9 @@
 
 #![forbid(unsafe_code)]
 
-mod chainparams;
+pub mod chainparams;
+pub mod net;
+mod net_processing;
 mod protocol;
 mod serialize;
 mod transport;
