@@ -23,6 +23,8 @@ pub enum Error {
     Version(crate::serialize::Error),
     /// Their protocol version is below `PROTOCOL_VERSION_MIN`.
     Obsolete(i32),
+    /// Their `version` has our nonce, so the socket is connected to itself.
+    SelfConnection,
     /// The peer sent `MESSAGE_COUNT_MAX` messages without its `verack`.
     TooManyMessages,
 }
@@ -37,6 +39,7 @@ impl std::fmt::Display for Error {
                     "protocol version {version} is below {PROTOCOL_VERSION_MIN}"
                 )
             }
+            Error::SelfConnection => write!(f, "connected to self: their version has our nonce"),
             Error::TooManyMessages => {
                 write!(
                     f,
@@ -80,6 +83,8 @@ enum State {
 #[derive(Debug)]
 pub(crate) struct Handshake {
     state: State,
+    /// The nonce in our `version`.
+    nonce: u64,
     /// The messages that came, fewer than `MESSAGE_COUNT_MAX`.
     message_count: u32,
 }
@@ -122,6 +127,7 @@ impl Handshake {
         (
             Handshake {
                 state: State::AwaitingVersion,
+                nonce,
                 message_count: 0,
             },
             Outbound::Version(payload),
@@ -138,20 +144,22 @@ impl Handshake {
         match self.state {
             State::AwaitingVersion => {
                 if message.msg_type() == crate::protocol::VERSION {
-                    let theirs = receive_version(message)?;
-                    let handshake = next(State::AwaitingVerack(theirs), message_count)?;
+                    let theirs = receive_version(message, self.nonce)?;
+                    let handshake = next(State::AwaitingVerack(theirs), self.nonce, message_count)?;
                     Ok(Step::Reply(handshake, Outbound::Verack))
                 } else {
-                    Ok(Step::Wait(next(State::AwaitingVersion, message_count)?))
+                    let handshake = next(State::AwaitingVersion, self.nonce, message_count)?;
+                    Ok(Step::Wait(handshake))
                 }
             }
             State::AwaitingVerack(theirs) => {
                 assert!(theirs.version >= PROTOCOL_VERSION_MIN);
+                assert_ne!(theirs.nonce, self.nonce);
 
                 if message.msg_type() == crate::protocol::VERACK {
                     Ok(Step::Done(theirs))
                 } else {
-                    let handshake = next(State::AwaitingVerack(theirs), message_count)?;
+                    let handshake = next(State::AwaitingVerack(theirs), self.nonce, message_count)?;
                     Ok(Step::Wait(handshake))
                 }
             }
@@ -160,10 +168,11 @@ impl Handshake {
 }
 
 /// The handshake after `message_count` messages, if the peer may send one more.
-fn next(state: State, message_count: u32) -> Result<Handshake, Error> {
+fn next(state: State, nonce: u64, message_count: u32) -> Result<Handshake, Error> {
     if message_count < MESSAGE_COUNT_MAX {
         Ok(Handshake {
             state,
+            nonce,
             message_count,
         })
     } else {
@@ -171,16 +180,22 @@ fn next(state: State, message_count: u32) -> Result<Handshake, Error> {
     }
 }
 
-/// Every field up to `start_height` is required. The bytes after `relay` are ignored.
-fn receive_version(message: &crate::transport::Message) -> Result<crate::protocol::Version, Error> {
+/// Every field up to `start_height` is required. The bytes after `relay` are ignored. A
+/// `version` with our `nonce` is our own.
+fn receive_version(
+    message: &crate::transport::Message,
+    nonce: u64,
+) -> Result<crate::protocol::Version, Error> {
     assert_eq!(message.msg_type(), crate::protocol::VERSION);
 
     let mut input = message.payload();
     let theirs = crate::protocol::Version::decode(&mut input).map_err(Error::Version)?;
-    if theirs.version >= PROTOCOL_VERSION_MIN {
-        Ok(theirs)
-    } else {
+    if theirs.version < PROTOCOL_VERSION_MIN {
         Err(Error::Obsolete(theirs.version))
+    } else if theirs.nonce == nonce {
+        Err(Error::SelfConnection)
+    } else {
+        Ok(theirs)
     }
 }
 
@@ -294,6 +309,25 @@ mod tests {
             });
             assert_eq!(outcome, expected, "version {version}");
         }
+    }
+
+    #[test]
+    fn their_version_with_our_nonce_is_self_connection() {
+        // A socket that is connected to itself reads our `version` back.
+        let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 18444));
+        let (handshake, outbound) = super::Handshake::start(peer, 0, 0x0123_4567_89ab_cdef);
+        let super::Outbound::Version(payload) = outbound else {
+            panic!("{outbound:?}");
+        };
+        let ours = message(&crate::transport::encode(
+            crate::chainparams::Network::Regtest,
+            crate::protocol::VERSION,
+            &payload,
+        ));
+        assert_eq!(
+            handshake.receive(&ours).err(),
+            Some(super::Error::SelfConnection)
+        );
     }
 
     #[test]

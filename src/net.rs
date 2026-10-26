@@ -24,7 +24,8 @@ pub enum Error {
     Closed,
     /// The peer sent a frame that elo refuses.
     Transport(crate::transport::Error),
-    /// The handshake refused the peer: a bad `version`, or too many messages.
+    /// The handshake refused the peer: a bad `version`, our own `version`, or too many
+    /// messages.
     Handshake(crate::net_processing::Error),
 }
 
