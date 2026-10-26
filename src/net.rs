@@ -9,6 +9,11 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// How long the handshake may take, from the connect to their `verack`.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The most messages elo reads in a handshake, their `verack` included. A peer needs five at
+/// most: `version`, `wtxidrelay`, `sendaddrv2`, `sendtxrcncl` and `verack`. The rest is room
+/// for messages that later BIPs add.
+const MESSAGE_COUNT_MAX: u32 = 16;
+
 /// Why the connection failed.
 #[derive(Debug)]
 pub enum Error {
@@ -18,6 +23,8 @@ pub enum Error {
     ConnectTimeout,
     /// The handshake took longer than `HANDSHAKE_TIMEOUT`.
     HandshakeTimeout,
+    /// The peer sent `MESSAGE_COUNT_MAX` messages without its `verack`.
+    TooManyMessages,
     /// A read or a write on the socket failed.
     Io(std::io::Error),
     /// The peer closed the connection before its `verack`.
@@ -44,6 +51,12 @@ impl std::fmt::Display for Error {
                     f,
                     "handshake took longer than {} s",
                     HANDSHAKE_TIMEOUT.as_secs()
+                )
+            }
+            Error::TooManyMessages => {
+                write!(
+                    f,
+                    "the peer sent {MESSAGE_COUNT_MAX} messages without its verack"
                 )
             }
             Error::Io(error) => write!(f, "socket: {error}"),
@@ -83,8 +96,8 @@ async fn handshake_stream(
     }
 }
 
-/// Sends our `version`, then reads messages until the handshake is done. The loop has no
-/// count bound: `HANDSHAKE_TIMEOUT` bounds it in time.
+/// Sends our `version`, then reads at most `MESSAGE_COUNT_MAX` messages until the handshake
+/// is done.
 async fn handshake_stream_exchange(
     network: crate::chainparams::Network,
     peer: std::net::SocketAddr,
@@ -93,7 +106,7 @@ async fn handshake_stream_exchange(
     let ours = crate::net_processing::our_version(peer, timestamp(), nonce());
     let (mut handshake, outbound) = crate::net_processing::Handshake::start(&ours);
     send(&mut stream, network, &outbound).await?;
-    loop {
+    for _ in 0..MESSAGE_COUNT_MAX {
         let message = receive(&mut stream, network).await?;
         match handshake.receive(&message).map_err(Error::Handshake)? {
             crate::net_processing::Step::Wait(next) => handshake = next,
@@ -104,6 +117,7 @@ async fn handshake_stream_exchange(
             crate::net_processing::Step::Done(theirs) => return Ok(theirs),
         }
     }
+    Err(Error::TooManyMessages)
 }
 
 async fn send(
@@ -194,33 +208,69 @@ mod tests {
         frame
     }
 
-    #[test]
-    fn their_version_gets_our_verack() {
-        // The peer sends Core's frames and keeps what the driver sends after their `version`.
-        // A peer may send its `verack` before ours comes, so the bitcoind test cannot see this.
+    /// Runs the handshake against a peer that reads our `version`, sends `frames`, then reads
+    /// one more frame and returns it. The peer reads all that the driver sends, so its close
+    /// does not reset the connection before the driver reads `frames`.
+    fn handshake_with_peer(
+        frames: &[&str],
+    ) -> (Result<crate::protocol::Version, super::Error>, Vec<u8>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
+        let frames: Vec<u8> = frames
+            .iter()
+            .flat_map(|frame| crate::fixtures::hex(frame))
+            .collect();
         let peer_thread = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            // A driver that sends no `verack` fails the test fast.
+            // A driver that sends too few frames fails the test fast.
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
             read_frame(&mut stream);
-            stream
-                .write_all(&crate::fixtures::hex(crate::fixtures::VERSION_FRAME))
-                .unwrap();
-            let verack = read_frame(&mut stream);
-            stream
-                .write_all(&crate::fixtures::hex(crate::fixtures::VERACK_FRAME))
-                .unwrap();
-            verack
+            stream.write_all(&frames).unwrap();
+            read_frame(&mut stream)
         });
 
         let result = block_on(super::handshake(crate::chainparams::Network::Regtest, peer));
-        let verack = peer_thread.join().unwrap();
+        let frame = peer_thread.join().unwrap();
+        (result, frame)
+    }
+
+    #[test]
+    fn their_version_gets_our_verack() {
+        // A peer may send its `verack` before ours comes, so the bitcoind test cannot see this.
+        let (result, verack) = handshake_with_peer(&[
+            crate::fixtures::VERSION_FRAME,
+            crate::fixtures::VERACK_FRAME,
+        ]);
         assert_eq!(verack, crate::fixtures::hex(crate::fixtures::VERACK_FRAME));
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn peer_without_its_verack_in_message_count_max_is_too_many_messages() {
+        // The peer sends `MESSAGE_COUNT_MAX` messages: their `version`, `wtxidrelay` frames
+        // and a last one. A `verack` as the last completes the handshake. One more
+        // `wtxidrelay` in its place is refused, before a read past the bound.
+        let skipped = usize::try_from(super::MESSAGE_COUNT_MAX - 2).unwrap();
+        let frames = |last| {
+            let mut frames = vec![crate::fixtures::VERSION_FRAME];
+            frames.extend(std::iter::repeat_n(
+                crate::fixtures::WTXIDRELAY_FRAME,
+                skipped,
+            ));
+            frames.push(last);
+            frames
+        };
+
+        let (result, _) = handshake_with_peer(&frames(crate::fixtures::VERACK_FRAME));
+        assert!(result.is_ok(), "{result:?}");
+
+        let (result, _) = handshake_with_peer(&frames(crate::fixtures::WTXIDRELAY_FRAME));
+        assert!(
+            matches!(result, Err(super::Error::TooManyMessages)),
+            "{result:?}"
+        );
     }
 
     #[test]
