@@ -174,6 +174,48 @@ mod tests {
             .block_on(future)
     }
 
+    /// Reads one frame on the peer's side of the socket.
+    fn read_frame(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        let mut frame = vec![0; crate::transport::HEADER_SIZE];
+        stream.read_exact(&mut frame).unwrap();
+        let header = frame.first_chunk().unwrap();
+        let header =
+            crate::transport::decode_header(crate::chainparams::Network::Regtest, header).unwrap();
+        let mut payload = vec![0; header.payload_length()];
+        stream.read_exact(&mut payload).unwrap();
+        frame.extend(payload);
+        frame
+    }
+
+    #[test]
+    fn their_version_gets_our_verack() {
+        // The peer sends Core's frames and keeps what the driver sends after their `version`.
+        // Core sends its `verack` without ours, so the bitcoind test cannot see this.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+        let peer_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // A driver that sends no `verack` fails the test fast.
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            read_frame(&mut stream);
+            stream
+                .write_all(&crate::fixtures::hex(crate::fixtures::VERSION_FRAME))
+                .unwrap();
+            let verack = read_frame(&mut stream);
+            stream
+                .write_all(&crate::fixtures::hex(crate::fixtures::VERACK_FRAME))
+                .unwrap();
+            verack
+        });
+
+        let result = block_on(super::handshake(crate::chainparams::Network::Regtest, peer));
+        let verack = peer_thread.join().unwrap();
+        assert_eq!(verack, crate::fixtures::hex(crate::fixtures::VERACK_FRAME));
+        assert!(result.is_ok(), "{result:?}");
+    }
+
     #[test]
     fn silent_peer_is_handshake_timeout() {
         // The listener never accepts, so no `version` comes. The clock is paused after the
@@ -204,15 +246,7 @@ mod tests {
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut header = [0; crate::transport::HEADER_SIZE];
-            stream.read_exact(&mut header).unwrap();
-            let header =
-                crate::transport::decode_header(crate::chainparams::Network::Regtest, &header)
-                    .unwrap();
-            stream
-                .read_exact(&mut vec![0; header.payload_length()])
-                .unwrap();
-
+            read_frame(&mut stream);
             let frame = crate::fixtures::hex(crate::fixtures::VERSION_FRAME);
             stream.write_all(&frame[..frame.len() - 1]).unwrap();
         });
