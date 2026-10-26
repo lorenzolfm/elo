@@ -103,8 +103,8 @@ async fn handshake_stream_exchange(
     peer: std::net::SocketAddr,
     mut stream: tokio::net::TcpStream,
 ) -> Result<crate::protocol::Version, Error> {
-    let ours = crate::net_processing::our_version(peer, timestamp(), nonce());
-    let (mut handshake, outbound) = crate::net_processing::Handshake::start(&ours);
+    let (mut handshake, outbound) =
+        crate::net_processing::Handshake::start(peer, timestamp(), nonce());
     send(&mut stream, network, &outbound).await?;
     for _ in 0..MESSAGE_COUNT_MAX {
         let message = receive(&mut stream, network).await?;

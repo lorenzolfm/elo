@@ -38,11 +38,7 @@ impl std::error::Error for Error {}
 
 /// The `version` that elo sends to `peer`. elo serves no blocks and relays nothing, so it
 /// claims no services and asks for no transactions.
-pub(crate) fn our_version(
-    peer: std::net::SocketAddr,
-    timestamp: i64,
-    nonce: u64,
-) -> crate::protocol::Version {
+fn our_version(peer: std::net::SocketAddr, timestamp: i64, nonce: u64) -> crate::protocol::Version {
     let unspecified = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0));
     crate::protocol::Version {
         version: PROTOCOL_VERSION,
@@ -92,18 +88,18 @@ pub(crate) enum Step {
 }
 
 impl Handshake {
-    /// Returns our `version`, to send first.
-    pub(crate) fn start(ours: &crate::protocol::Version) -> (Handshake, Outbound) {
-        assert!(ours.version >= PROTOCOL_VERSION_MIN);
-
+    /// Returns our `version` to `peer`, to send first.
+    pub(crate) fn start(
+        peer: std::net::SocketAddr,
+        timestamp: i64,
+        nonce: u64,
+    ) -> (Handshake, Outbound) {
+        let ours = our_version(peer, timestamp, nonce);
         let mut payload = Vec::new();
         ours.encode(&mut payload);
         // The payload decodes to the same `version`, with no bytes left.
         let mut input = payload.as_slice();
-        assert_eq!(
-            crate::protocol::Version::decode(&mut input).as_ref(),
-            Ok(ours)
-        );
+        assert_eq!(crate::protocol::Version::decode(&mut input), Ok(ours));
         assert!(input.is_empty());
 
         (
@@ -182,7 +178,7 @@ mod tests {
 
     fn start() -> super::Handshake {
         let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 18444));
-        super::Handshake::start(&super::our_version(peer, 0, 0)).0
+        super::Handshake::start(peer, 0, 0).0
     }
 
     fn wait(step: Result<super::Step, super::Error>) -> super::Handshake {
@@ -201,18 +197,7 @@ mod tests {
 
     #[test]
     fn handshake_skips_until_their_version_and_then_until_their_verack() {
-        let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 18444));
-        let ours = super::our_version(peer, 0, 0);
-        let (handshake, outbound) = super::Handshake::start(&ours);
-        let super::Outbound::Version(payload) = outbound else {
-            panic!("{outbound:?}");
-        };
-        assert_eq!(
-            crate::protocol::Version::decode(&mut payload.as_slice()),
-            Ok(ours)
-        );
-
-        let handshake = wait(handshake.receive(&core_message(crate::fixtures::VERACK_FRAME)));
+        let handshake = wait(start().receive(&core_message(crate::fixtures::VERACK_FRAME)));
         let (mut handshake, outbound) =
             reply(handshake.receive(&core_message(crate::fixtures::VERSION_FRAME)));
         assert!(matches!(outbound, super::Outbound::Verack), "{outbound:?}");
