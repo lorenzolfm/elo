@@ -1,4 +1,5 @@
-//! The handshake: the `version` and `verack` messages before a peer is ready.
+//! The handshake: the `version` and `verack` messages before a peer is ready. Then the
+//! messages after it.
 
 use crate::serialize::{Decode, Encode};
 
@@ -16,7 +17,7 @@ const _: () = assert!(PROTOCOL_VERSION >= PROTOCOL_VERSION_MIN);
 /// for messages that later BIPs add.
 const MESSAGE_COUNT_MAX: u32 = 16;
 
-/// Why the handshake failed. Each one ends the connection.
+/// Why elo refuses the peer. Each one ends the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// Their `version` payload did not decode.
@@ -27,6 +28,8 @@ pub enum Error {
     SelfConnection,
     /// The peer sent `MESSAGE_COUNT_MAX` messages without its `verack`.
     TooManyMessages,
+    /// Their `ping` payload did not decode.
+    Ping(crate::serialize::Error),
 }
 
 impl std::fmt::Display for Error {
@@ -46,6 +49,7 @@ impl std::fmt::Display for Error {
                     "the peer sent {MESSAGE_COUNT_MAX} messages without its verack"
                 )
             }
+            Error::Ping(error) => write!(f, "ping payload: {error}"),
         }
     }
 }
@@ -89,13 +93,15 @@ pub(crate) struct Handshake {
     message_count: u32,
 }
 
-/// A message to send: one of the two that elo sends.
+/// A message to send: one of those that elo sends.
 #[derive(Debug)]
 pub(crate) enum Outbound {
     /// Our `version`, encoded.
     Version(Vec<u8>),
     /// A `verack`, which has no payload.
     Verack,
+    /// A `pong` with the nonce of their `ping`.
+    Pong(u64),
 }
 
 /// What the handshake does after a message.
@@ -105,8 +111,9 @@ pub(crate) enum Step {
     Wait(Handshake),
     /// Send the message, then read the next one.
     Reply(Handshake, Outbound),
-    /// The handshake is complete. It holds their `version`.
-    Done(crate::protocol::Version),
+    /// The handshake is complete. It holds the peer for the messages after it, and their
+    /// `version`.
+    Done(Peer, crate::protocol::Version),
 }
 
 impl Handshake {
@@ -157,7 +164,7 @@ impl Handshake {
                 assert_ne!(theirs.nonce, self.nonce);
 
                 if message.msg_type() == crate::protocol::VERACK {
-                    Ok(Step::Done(theirs))
+                    Ok(Step::Done(Peer(()), theirs))
                 } else {
                     let handshake = next(State::AwaitingVerack(theirs), self.nonce, message_count)?;
                     Ok(Step::Wait(handshake))
@@ -199,6 +206,30 @@ fn receive_version(
     }
 }
 
+/// The peer after the handshake. Only `Handshake` makes one, so no message reaches it before
+/// the handshake is complete. It does no I/O: the driver gives it each message and sends what
+/// it returns.
+#[derive(Debug)]
+pub(crate) struct Peer(());
+
+impl Peer {
+    /// A `ping` gets a `pong` with its nonce, and the bytes after the nonce are ignored. Each
+    /// other message is skipped.
+    #[cfg_attr(not(test), expect(dead_code, reason = "until net calls it"))]
+    pub(crate) fn receive(
+        &self,
+        message: &crate::transport::Message,
+    ) -> Result<Option<Outbound>, Error> {
+        if message.msg_type() == crate::protocol::PING {
+            let mut input = message.payload();
+            let nonce = u64::decode(&mut input).map_err(Error::Ping)?;
+            Ok(Some(Outbound::Pong(nonce)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::serialize::Decode;
@@ -222,6 +253,18 @@ mod tests {
         message(&crate::transport::encode(
             crate::chainparams::Network::Regtest,
             crate::protocol::VERSION,
+            &payload,
+        ))
+    }
+
+    /// A `ping` with Core's payload after `change`.
+    fn ping_message(change: impl FnOnce(&mut Vec<u8>)) -> crate::transport::Message {
+        let mut payload = crate::fixtures::hex(crate::fixtures::PING_FRAME)
+            .split_off(crate::transport::HEADER_SIZE);
+        change(&mut payload);
+        message(&crate::transport::encode(
+            crate::chainparams::Network::Regtest,
+            crate::protocol::PING,
             &payload,
         ))
     }
@@ -265,7 +308,7 @@ mod tests {
         let theirs =
             crate::protocol::Version::decode(&mut crate::fixtures::version_payload().as_slice());
         match handshake.receive(&core_message(crate::fixtures::VERACK_FRAME)) {
-            Ok(super::Step::Done(version)) => assert_eq!(Ok(version), theirs),
+            Ok(super::Step::Done(_, version)) => assert_eq!(Ok(version), theirs),
             other => panic!("{other:?}"),
         }
     }
@@ -287,7 +330,7 @@ mod tests {
 
         let verack = core_message(crate::fixtures::VERACK_FRAME);
         let done = before_the_last().receive(&verack);
-        assert!(matches!(done, Ok(super::Step::Done(_))), "{done:?}");
+        assert!(matches!(done, Ok(super::Step::Done(..))), "{done:?}");
         let refused = before_the_last().receive(&wtxidrelay).err();
         assert_eq!(refused, Some(super::Error::TooManyMessages));
     }
@@ -344,5 +387,59 @@ mod tests {
 
         let longer = version_message(|payload| payload.push(0xaa));
         reply(start().receive(&longer));
+    }
+
+    #[test]
+    fn their_ping_gets_a_pong_with_its_nonce() {
+        let outbound = super::Peer(()).receive(&core_message(crate::fixtures::PING_FRAME));
+        assert!(
+            matches!(
+                outbound,
+                Ok(Some(super::Outbound::Pong(0x34e9_3229_8920_45d8)))
+            ),
+            "{outbound:?}"
+        );
+    }
+
+    #[test]
+    fn their_ping_needs_a_nonce_and_may_have_bytes_after_it() {
+        let short = ping_message(|payload| payload.truncate(size_of::<u64>() - 1));
+        assert_eq!(
+            super::Peer(()).receive(&short).err(),
+            Some(super::Error::Ping(crate::serialize::Error::UnexpectedEnd))
+        );
+
+        let longer = ping_message(|payload| payload.push(0xaa));
+        let outbound = super::Peer(()).receive(&longer);
+        assert!(
+            matches!(
+                outbound,
+                Ok(Some(super::Outbound::Pong(0x34e9_3229_8920_45d8)))
+            ),
+            "{outbound:?}"
+        );
+    }
+
+    #[test]
+    fn peer_skips_every_message_but_ping() {
+        // Core sends `sendcmpct` and `feefilter` after the handshake, and a block `inv` for each
+        // new tip. The messages of the handshake are skipped too. A `version` is skipped without
+        // a decode, so an empty payload passes.
+        for message in [
+            core_message(crate::fixtures::SENDCMPCT_FRAME),
+            core_message(crate::fixtures::FEEFILTER_FRAME),
+            core_message(crate::fixtures::BLOCK_INV_FRAME),
+            version_message(Vec::clear),
+            core_message(crate::fixtures::VERACK_FRAME),
+            core_message(crate::fixtures::WTXIDRELAY_FRAME),
+            core_message(crate::fixtures::SENDADDRV2_FRAME),
+        ] {
+            let outbound = super::Peer(()).receive(&message);
+            assert!(
+                matches!(outbound, Ok(None)),
+                "{:?}: {outbound:?}",
+                message.msg_type()
+            );
+        }
     }
 }
