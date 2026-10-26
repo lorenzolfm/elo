@@ -190,7 +190,7 @@ mod tests {
     #[test]
     fn their_version_gets_our_verack() {
         // The peer sends Core's frames and keeps what the driver sends after their `version`.
-        // Core sends its `verack` without ours, so the bitcoind test cannot see this.
+        // A peer may send its `verack` before ours comes, so the bitcoind test cannot see this.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || {

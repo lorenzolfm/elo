@@ -22,6 +22,11 @@ pub(crate) const SENDADDRV2_FRAME: &str = "fabfb5da73656e64616464727632000000000
 /// The `verack`: a header and no payload.
 pub(crate) const VERACK_FRAME: &str = "fabfb5da76657261636b000000000000000000005df6e0e2";
 
+/// The payload of `VERSION_FRAME`.
+pub(crate) fn version_payload() -> Vec<u8> {
+    hex(VERSION_FRAME).split_off(crate::transport::HEADER_SIZE)
+}
+
 pub(crate) fn hex(s: &str) -> Vec<u8> {
     (0..s.len())
         .step_by(2)

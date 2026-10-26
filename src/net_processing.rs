@@ -85,7 +85,7 @@ pub(crate) enum Step {
     Wait(Handshake),
     /// Send the message, then read the next one.
     Reply(Handshake, Outbound),
-    /// The handshake is complete. Their `version`.
+    /// The handshake is complete. It holds their `version`.
     Done(crate::protocol::Version),
 }
 
@@ -172,14 +172,9 @@ mod tests {
         message(&crate::fixtures::hex(frame))
     }
 
-    fn core_version_payload() -> Vec<u8> {
-        crate::fixtures::hex(crate::fixtures::VERSION_FRAME)
-            .split_off(crate::transport::HEADER_SIZE)
-    }
-
     /// A `version` with Core's payload after `change`.
     fn version_message(change: impl FnOnce(&mut Vec<u8>)) -> crate::transport::Message {
-        let mut payload = core_version_payload();
+        let mut payload = crate::fixtures::version_payload();
         change(&mut payload);
         message(&crate::transport::encode(
             crate::chainparams::Network::Regtest,
@@ -224,7 +219,7 @@ mod tests {
         assert_eq!(outbound.msg_type, crate::protocol::VERACK);
         assert_eq!(outbound.payload, []);
 
-        // Core sends `wtxidrelay` and `sendaddrv2` before its `verack`. A second `version` is
+        // A peer may send `wtxidrelay` and `sendaddrv2` before its `verack`. A second `version` is
         // skipped without a decode, so an empty payload passes.
         for message in [
             core_message(crate::fixtures::WTXIDRELAY_FRAME),
@@ -234,7 +229,8 @@ mod tests {
             handshake = wait(handshake.receive(&message));
         }
 
-        let theirs = crate::protocol::Version::decode(&mut core_version_payload().as_slice());
+        let theirs =
+            crate::protocol::Version::decode(&mut crate::fixtures::version_payload().as_slice());
         match handshake.receive(&core_message(crate::fixtures::VERACK_FRAME)) {
             Ok(super::Step::Done(version)) => assert_eq!(Ok(version), theirs),
             other => panic!("{other:?}"),
@@ -253,10 +249,10 @@ mod tests {
             let message = version_message(|payload| {
                 payload[..size_of::<i32>()].copy_from_slice(&version.to_le_bytes());
             });
-            let step = start().receive(&message).map(|step| {
+            let outcome = start().receive(&message).map(|step| {
                 reply(Ok(step));
             });
-            assert_eq!(step, expected, "version {version}");
+            assert_eq!(outcome, expected, "version {version}");
         }
     }
 

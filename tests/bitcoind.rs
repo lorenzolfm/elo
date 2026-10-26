@@ -3,11 +3,25 @@
 /// How long `bitcoind` may take to listen.
 const LISTEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// A `bitcoind -regtest` in its own datadir. The drop kills it and removes the datadir.
+/// A directory that the drop removes.
+struct TempDir(std::path::PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        // A panic in a drop during a panic aborts the tests, so a failure is only printed.
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            eprintln!("remove {}: {error}", self.0.display());
+        }
+    }
+}
+
+/// A `bitcoind -regtest` in its own datadir. The drop kills it. Then the fields drop, so the
+/// datadir goes after the kill.
 struct Bitcoind {
     child: std::process::Child,
-    datadir: std::path::PathBuf,
     peer: std::net::SocketAddr,
+    /// Only its drop reads it.
+    _datadir: TempDir,
 }
 
 impl Bitcoind {
@@ -18,16 +32,16 @@ impl Bitcoind {
             .unwrap()
             .local_addr()
             .unwrap();
-        let datadir = std::env::temp_dir().join(format!(
+        let datadir = TempDir(std::env::temp_dir().join(format!(
             "elo-bitcoind-{}-{}",
             std::process::id(),
             peer.port()
-        ));
-        std::fs::create_dir(&datadir).unwrap();
+        )));
+        std::fs::create_dir(&datadir.0).unwrap();
 
         let child = std::process::Command::new(path)
             .arg("-regtest")
-            .arg(format!("-datadir={}", datadir.display()))
+            .arg(format!("-datadir={}", datadir.0.display()))
             .arg(format!("-bind={peer}"))
             .arg("-listenonion=0")
             .arg("-server=0")
@@ -37,8 +51,8 @@ impl Bitcoind {
             .unwrap();
         let mut bitcoind = Self {
             child,
-            datadir,
             peer,
+            _datadir: datadir,
         };
         bitcoind.wait_until_listening();
         bitcoind
@@ -63,9 +77,6 @@ impl Drop for Bitcoind {
         }
         if let Err(error) = self.child.wait() {
             eprintln!("wait for bitcoind: {error}");
-        }
-        if let Err(error) = std::fs::remove_dir_all(&self.datadir) {
-            eprintln!("remove {}: {error}", self.datadir.display());
         }
     }
 }

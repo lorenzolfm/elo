@@ -136,7 +136,7 @@ impl Decode for Address {
 pub struct UserAgent(Vec<u8>);
 
 impl UserAgent {
-    /// `/elo:<version>/`.
+    /// The user agent that elo sends: `/elo:<version>/`.
     pub(crate) fn elo() -> Self {
         Self(USER_AGENT_ELO.as_bytes().to_vec())
     }
@@ -261,11 +261,6 @@ impl Decode for Version {
 mod tests {
     use crate::serialize::{Decode, Encode};
 
-    fn core_payload() -> Vec<u8> {
-        crate::fixtures::hex(crate::fixtures::VERSION_FRAME)
-            .split_off(crate::transport::HEADER_SIZE)
-    }
-
     /// The fields of `VERSION_FRAME`, read by hand.
     fn core_version() -> super::Version {
         let zero = super::Address {
@@ -292,7 +287,7 @@ mod tests {
     /// Core's payload with another user agent. It does not call `Version::encode`,
     /// so the user agent can be longer than the limit.
     fn payload_with_user_agent(user_agent: &[u8]) -> Vec<u8> {
-        let mut payload = core_payload();
+        let mut payload = crate::fixtures::version_payload();
         let start_height_and_relay =
             payload.split_off(payload.len() - size_of::<i32>() - size_of::<bool>());
         let mut core_user_agent = Vec::new();
@@ -307,7 +302,7 @@ mod tests {
 
     #[test]
     fn version_decodes_core_bytes() {
-        let payload = core_payload();
+        let payload = crate::fixtures::version_payload();
         let mut input = payload.as_slice();
         assert_eq!(super::Version::decode(&mut input), Ok(core_version()));
         assert!(input.is_empty());
@@ -317,12 +312,12 @@ mod tests {
     fn version_encodes_to_core_bytes() {
         let mut out = Vec::new();
         core_version().encode(&mut out);
-        assert_eq!(out, core_payload());
+        assert_eq!(out, crate::fixtures::version_payload());
     }
 
     #[test]
     fn version_without_relay_relays() {
-        let mut payload = core_payload();
+        let mut payload = crate::fixtures::version_payload();
         payload.pop();
         let version = super::Version::decode(&mut payload.as_slice()).unwrap();
         assert!(version.relay);
@@ -330,7 +325,7 @@ mod tests {
 
     #[test]
     fn version_leaves_the_bytes_after_relay() {
-        let mut payload = core_payload();
+        let mut payload = crate::fixtures::version_payload();
         payload.push(0xaa);
         let mut input = payload.as_slice();
         assert_eq!(super::Version::decode(&mut input), Ok(core_version()));
@@ -339,7 +334,7 @@ mod tests {
 
     #[test]
     fn version_requires_start_height() {
-        let mut payload = core_payload();
+        let mut payload = crate::fixtures::version_payload();
         payload.truncate(payload.len() - size_of::<i32>() - size_of::<bool>());
         assert_eq!(
             super::Version::decode(&mut payload.as_slice()),
