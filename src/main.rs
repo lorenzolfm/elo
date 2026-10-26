@@ -66,6 +66,10 @@ fn parse(args: &[std::ffi::OsString]) -> Option<(elo::chainparams::Network, std:
         let ip = peer.parse::<std::net::Ipv4Addr>().ok()?;
         std::net::SocketAddr::from((ip, network.default_port()))
     };
+    // Port 0, `0.0.0.0` and `[::]` name no peer.
+    if peer.port() == 0 || peer.ip().is_unspecified() {
+        return None;
+    }
     Some((network, peer))
 }
 
@@ -106,6 +110,9 @@ mod tests {
                 Some(std::net::SocketAddr::from((localhost_v6, 1))),
             ),
             ("::1:8333", None),
+            ("127.0.0.1:0", None),
+            ("0.0.0.0", None),
+            ("[::]", None),
             ("localhost", None),
             ("localhost:18444", None),
         ] {
