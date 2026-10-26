@@ -16,7 +16,7 @@ const PAYLOAD_LENGTH_MAX: u32 = 4_000_000;
 
 /// Why a frame was refused. Each one ends the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Error {
+pub enum Error {
     WrongMagic([u8; crate::chainparams::MAGIC_SIZE]),
     InvalidMessageType([u8; crate::protocol::MESSAGE_TYPE_SIZE]),
     TooLarge(u32),
@@ -46,7 +46,7 @@ impl std::error::Error for Error {}
 /// A message header that passed the checks of `decode_header`. It does not keep
 /// the magic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct MessageHeader {
+pub(crate) struct MessageHeader {
     msg_type: crate::protocol::MessageType,
     /// The length of the payload in bytes.
     length: u32,
@@ -56,35 +56,34 @@ struct MessageHeader {
 
 impl MessageHeader {
     /// The number of payload bytes to read next, at most `PAYLOAD_LENGTH_MAX`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "until net calls it"))]
-    fn payload_length(&self) -> usize {
+    pub(crate) fn payload_length(&self) -> usize {
+        // `decode_header` and `encode` make the only headers, and both check the length. The
+        // driver sizes its payload buffer with this, so it checks again before the allocation.
+        assert!(self.length <= PAYLOAD_LENGTH_MAX);
         usize::try_from(self.length).expect("PAYLOAD_LENGTH_MAX fits in a usize")
     }
 }
 
 /// A payload whose checksum matched its header. Only `check_payload` makes one.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Message {
+pub(crate) struct Message {
     msg_type: crate::protocol::MessageType,
     payload: Vec<u8>,
 }
 
 impl Message {
-    #[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
-    fn msg_type(&self) -> crate::protocol::MessageType {
+    pub(crate) fn msg_type(&self) -> crate::protocol::MessageType {
         self.msg_type
     }
 
     /// The whole payload of the frame, and nothing after it.
-    #[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
-    fn payload(&self) -> &[u8] {
+    pub(crate) fn payload(&self) -> &[u8] {
         &self.payload
     }
 }
 
 /// Checks the magic, the message type and the length.
-#[cfg_attr(not(test), expect(dead_code, reason = "until net calls it"))]
-fn decode_header(
+pub(crate) fn decode_header(
     network: crate::chainparams::Network,
     bytes: &[u8; HEADER_SIZE],
 ) -> Result<MessageHeader, Error> {
@@ -117,8 +116,7 @@ fn decode_header(
 /// Checks the payload against the checksum in its header.
 ///
 /// Panics if the payload is not `header.length` bytes. The caller reads exactly that many.
-#[cfg_attr(not(test), expect(dead_code, reason = "until net calls it"))]
-fn check_payload(header: MessageHeader, payload: Vec<u8>) -> Result<Message, Error> {
+pub(crate) fn check_payload(header: MessageHeader, payload: Vec<u8>) -> Result<Message, Error> {
     assert!(header.length <= PAYLOAD_LENGTH_MAX);
     assert_eq!(u32::try_from(payload.len()), Ok(header.length));
 
@@ -135,8 +133,7 @@ fn check_payload(header: MessageHeader, payload: Vec<u8>) -> Result<Message, Err
 /// A header, then the payload.
 ///
 /// Panics if the payload is longer than `PAYLOAD_LENGTH_MAX`, because a peer refuses it.
-#[cfg_attr(not(test), expect(dead_code, reason = "until net calls it"))]
-fn encode(
+pub(crate) fn encode(
     network: crate::chainparams::Network,
     msg_type: crate::protocol::MessageType,
     payload: &[u8],

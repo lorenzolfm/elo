@@ -59,6 +59,10 @@
           strictDeps = true;
         };
 
+        # The L3 tests run the handshake against this bitcoind. Its version is
+        # the one in their asserts.
+        bitcoind = pkgs.lib.getExe' pkgs.bitcoind "bitcoind";
+
         # Build only the dependencies, so a change to the crate's own code does
         # not build them again.
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
@@ -100,7 +104,13 @@
               cargoClippyExtraArgs = "--all-targets -- --deny warnings";
             });
 
-          elo-test = craneLib.cargoNextest devArgs;
+          elo-test = craneLib.cargoNextest (devArgs
+            // {
+              BITCOIND = bitcoind;
+              # The tests listen and connect on loopback. The macOS sandbox
+              # blocks that without this flag.
+              __darwinAllowLocalNetworking = true;
+            });
 
           # nextest does not run doctests.
           elo-doctest = craneLib.cargoDocTest devArgs;
@@ -131,6 +141,7 @@
 
         devShells.default = craneLibDev.devShell {
           packages = [pkgs.cargo-nextest];
+          BITCOIND = bitcoind;
         };
 
         formatter = pkgs.alejandra;

@@ -5,6 +5,10 @@ use crate::serialize::{Decode, Encode};
 /// The longest user agent a `version` may carry.
 const USER_AGENT_LENGTH_MAX: usize = 256;
 
+/// The user agent elo sends (BIP14).
+const USER_AGENT_ELO: &str = concat!("/elo:", env!("CARGO_PKG_VERSION"), "/");
+const _: () = assert!(USER_AGENT_ELO.len() <= USER_AGENT_LENGTH_MAX);
+
 /// The size of a message type, with the padding.
 pub(crate) const MESSAGE_TYPE_SIZE: usize = 12;
 
@@ -13,9 +17,7 @@ pub(crate) const MESSAGE_TYPE_SIZE: usize = 12;
 pub(crate) struct MessageType([u8; MESSAGE_TYPE_SIZE]);
 
 // `from_name` runs at compile time here, so an invalid name does not build.
-#[cfg_attr(not(test), expect(dead_code, reason = "until net_processing uses it"))]
 pub(crate) const VERSION: MessageType = MessageType::from_name("version");
-#[cfg_attr(not(test), expect(dead_code, reason = "until net_processing uses it"))]
 pub(crate) const VERACK: MessageType = MessageType::from_name("verack");
 
 impl MessageType {
@@ -63,7 +65,18 @@ impl MessageType {
 
 /// The services a node offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ServiceFlags(u64);
+pub struct ServiceFlags(u64);
+
+impl ServiceFlags {
+    /// No services.
+    pub(crate) const NONE: Self = Self(0);
+}
+
+impl std::fmt::LowerHex for ServiceFlags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::LowerHex::fmt(&self.0, f)
+    }
+}
 
 impl Encode for ServiceFlags {
     fn encode(&self, out: &mut Vec<u8>) {
@@ -79,10 +92,24 @@ impl Decode for ServiceFlags {
 
 /// An address as a `version` carries it. An IPv4 address is IPv4-mapped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Address {
+pub(crate) struct Address {
     services: ServiceFlags,
     ip: std::net::Ipv6Addr,
     port: u16,
+}
+
+impl Address {
+    pub(crate) fn new(services: ServiceFlags, address: std::net::SocketAddr) -> Self {
+        let ip = match address.ip() {
+            std::net::IpAddr::V4(ip) => ip.to_ipv6_mapped(),
+            std::net::IpAddr::V6(ip) => ip,
+        };
+        Self {
+            services,
+            ip,
+            port: address.port(),
+        }
+    }
 }
 
 /// The port is big-endian.
@@ -106,12 +133,24 @@ impl Decode for Address {
 
 /// Raw bytes, which need not be UTF-8. At most `USER_AGENT_LENGTH_MAX`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct UserAgent(Vec<u8>);
+pub struct UserAgent(Vec<u8>);
 
 impl UserAgent {
-    #[cfg_attr(not(test), expect(dead_code, reason = "until main prints it"))]
-    fn as_bytes(&self) -> &[u8] {
+    /// The user agent that elo sends: `/elo:<version>/`.
+    pub(crate) fn elo() -> Self {
+        Self(USER_AGENT_ELO.as_bytes().to_vec())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+}
+
+/// Escapes each byte that is not printable ASCII, so a peer cannot send control codes to a
+/// terminal.
+impl std::fmt::Display for UserAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.escape_ascii())
     }
 }
 
@@ -145,17 +184,41 @@ impl Decode for UserAgent {
 
 /// The `version` payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "until net_processing uses it"))]
-struct Version {
-    version: i32,
-    services: ServiceFlags,
-    timestamp: i64,
-    addr_recv: Address,
-    addr_from: Address,
-    nonce: u64,
-    user_agent: UserAgent,
-    start_height: i32,
-    relay: bool,
+pub struct Version {
+    pub(crate) version: i32,
+    pub(crate) services: ServiceFlags,
+    pub(crate) timestamp: i64,
+    pub(crate) addr_recv: Address,
+    pub(crate) addr_from: Address,
+    pub(crate) nonce: u64,
+    pub(crate) user_agent: UserAgent,
+    pub(crate) start_height: i32,
+    pub(crate) relay: bool,
+}
+
+impl Version {
+    /// The protocol version.
+    pub fn version(&self) -> i32 {
+        self.version
+    }
+
+    pub fn services(&self) -> ServiceFlags {
+        self.services
+    }
+
+    pub fn user_agent(&self) -> &UserAgent {
+        &self.user_agent
+    }
+
+    /// The height of the sender's best chain.
+    pub fn start_height(&self) -> i32 {
+        self.start_height
+    }
+
+    /// Whether the sender wants to get transactions (BIP37).
+    pub fn relay(&self) -> bool {
+        self.relay
+    }
 }
 
 impl Encode for Version {
@@ -198,11 +261,6 @@ impl Decode for Version {
 mod tests {
     use crate::serialize::{Decode, Encode};
 
-    fn core_payload() -> Vec<u8> {
-        crate::fixtures::hex(crate::fixtures::VERSION_FRAME)
-            .split_off(crate::transport::HEADER_SIZE)
-    }
-
     /// The fields of `VERSION_FRAME`, read by hand.
     fn core_version() -> super::Version {
         let zero = super::Address {
@@ -229,7 +287,7 @@ mod tests {
     /// Core's payload with another user agent. It does not call `Version::encode`,
     /// so the user agent can be longer than the limit.
     fn payload_with_user_agent(user_agent: &[u8]) -> Vec<u8> {
-        let mut payload = core_payload();
+        let mut payload = crate::fixtures::version_payload();
         let start_height_and_relay =
             payload.split_off(payload.len() - size_of::<i32>() - size_of::<bool>());
         let mut core_user_agent = Vec::new();
@@ -244,7 +302,7 @@ mod tests {
 
     #[test]
     fn version_decodes_core_bytes() {
-        let payload = core_payload();
+        let payload = crate::fixtures::version_payload();
         let mut input = payload.as_slice();
         assert_eq!(super::Version::decode(&mut input), Ok(core_version()));
         assert!(input.is_empty());
@@ -254,12 +312,12 @@ mod tests {
     fn version_encodes_to_core_bytes() {
         let mut out = Vec::new();
         core_version().encode(&mut out);
-        assert_eq!(out, core_payload());
+        assert_eq!(out, crate::fixtures::version_payload());
     }
 
     #[test]
     fn version_without_relay_relays() {
-        let mut payload = core_payload();
+        let mut payload = crate::fixtures::version_payload();
         payload.pop();
         let version = super::Version::decode(&mut payload.as_slice()).unwrap();
         assert!(version.relay);
@@ -267,7 +325,7 @@ mod tests {
 
     #[test]
     fn version_leaves_the_bytes_after_relay() {
-        let mut payload = core_payload();
+        let mut payload = crate::fixtures::version_payload();
         payload.push(0xaa);
         let mut input = payload.as_slice();
         assert_eq!(super::Version::decode(&mut input), Ok(core_version()));
@@ -276,7 +334,7 @@ mod tests {
 
     #[test]
     fn version_requires_start_height() {
-        let mut payload = core_payload();
+        let mut payload = crate::fixtures::version_payload();
         payload.truncate(payload.len() - size_of::<i32>() - size_of::<bool>());
         assert_eq!(
             super::Version::decode(&mut payload.as_slice()),
@@ -312,12 +370,11 @@ mod tests {
     }
 
     #[test]
-    fn address_writes_the_ip_in_order_and_the_port_big_endian() {
-        let address = super::Address {
-            services: super::ServiceFlags(1),
-            ip: std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped(),
-            port: 18444,
-        };
+    fn address_is_ipv4_mapped_with_a_big_endian_port() {
+        let address = super::Address::new(
+            super::ServiceFlags(1),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 18444)),
+        );
         let bytes = crate::fixtures::hex(concat!(
             "0100000000000000",
             "00000000000000000000ffff7f000001",
@@ -327,6 +384,13 @@ mod tests {
         address.encode(&mut out);
         assert_eq!(out, bytes);
         assert_eq!(super::Address::decode(&mut bytes.as_slice()), Ok(address));
+    }
+
+    #[test]
+    fn user_agent_display_escapes_control_bytes() {
+        // An ANSI escape that would turn the terminal text red.
+        let user_agent = super::UserAgent::try_from(b"/evil:\x1b[31m/".to_vec()).unwrap();
+        assert_eq!(user_agent.to_string(), r"/evil:\x1b[31m/");
     }
 
     #[test]
