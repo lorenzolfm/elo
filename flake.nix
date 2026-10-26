@@ -63,6 +63,17 @@
         # not build them again.
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
+        # The test gates run in the dev profile, as `cargo test` does in the
+        # dev shell. The release profile turns off overflow checks and
+        # `debug_assert!`. The dev profile needs its own build of the
+        # dependencies.
+        devArgs =
+          commonArgs
+          // {
+            CARGO_PROFILE = "dev";
+            cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {CARGO_PROFILE = "dev";});
+          };
+
         elo = craneLib.buildPackage (commonArgs
           // {
             inherit cargoArtifacts;
@@ -89,18 +100,10 @@
               cargoClippyExtraArgs = "--all-targets -- --deny warnings";
             });
 
-          elo-test = craneLib.cargoNextest (commonArgs
-            // {
-              # Run the tests in the dev profile, as `cargo nextest run` does in
-              # the dev shell. The release profile turns off overflow checks
-              # and `debug_assert!`. The dev profile needs its own build of
-              # the dependencies.
-              CARGO_PROFILE = "dev";
-              cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {CARGO_PROFILE = "dev";});
-              # The crate has no tests yet, and nextest fails a run with no
-              # tests. Remove this argument with the first test.
-              cargoNextestExtraArgs = "--no-tests=warn";
-            });
+          elo-test = craneLib.cargoNextest devArgs;
+
+          # nextest does not run doctests.
+          elo-doctest = craneLib.cargoDocTest devArgs;
 
           elo-fmt = craneLib.cargoFmt {inherit src;};
         };

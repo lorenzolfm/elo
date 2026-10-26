@@ -25,7 +25,7 @@ jobs:
       # One job for each derivation, so the runners work in parallel. A single
       # `nix flake check` puts every gate behind one log and one runner.
       matrix:
-        gate: [elo, elo-clippy, elo-test, elo-fmt]
+        gate: [elo, elo-clippy, elo-test, elo-doctest, elo-fmt]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
