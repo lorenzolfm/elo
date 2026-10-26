@@ -1,9 +1,11 @@
 //! `elo <network> <ip>[:port]`: dials one peer, does the handshake, and prints the peer's
 //! `version`.
 
+use std::io::Write;
+
 const USAGE: &str = "usage: elo <mainnet|testnet4|signet|regtest> <ip>[:port]";
 
-/// The exit code for bad usage. A failed connection or handshake exits with 1.
+/// The exit code for bad usage. A failed connection, handshake or print exits with 1.
 const EXIT_USAGE: u8 = 2;
 
 fn main() -> std::process::ExitCode {
@@ -24,20 +26,32 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(elo::net::handshake(network, peer)) {
-        Ok(version) => {
-            println!("version {}", version.version());
-            println!("services {:016x}", version.services());
-            println!("user_agent {}", version.user_agent());
-            println!("start_height {}", version.start_height());
-            println!("relay {}", version.relay());
-            std::process::ExitCode::SUCCESS
-        }
+    let version = match runtime.block_on(elo::net::handshake(network, peer)) {
+        Ok(version) => version,
         Err(error) => {
             eprintln!("elo: {error}");
-            std::process::ExitCode::FAILURE
+            return std::process::ExitCode::FAILURE;
         }
+    };
+
+    // `println!` panics when stdout fails, for example on a full disk or a closed pipe.
+    let mut stdout = std::io::stdout().lock();
+    let printed = writeln!(
+        stdout,
+        "version {}\nservices {:016x}\nuser_agent {}\nstart_height {}\nrelay {}",
+        version.version(),
+        version.services(),
+        version.user_agent(),
+        version.start_height(),
+        version.relay(),
+    )
+    // stdout is not always line buffered, and the exit ignores a failed flush.
+    .and_then(|()| stdout.flush());
+    if let Err(error) = printed {
+        eprintln!("elo: stdout: {error}");
+        return std::process::ExitCode::FAILURE;
     }
+    std::process::ExitCode::SUCCESS
 }
 
 /// The args after the program name. `None` is bad usage.

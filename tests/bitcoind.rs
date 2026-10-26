@@ -106,3 +106,22 @@ fn handshake_with_bitcoind_returns_its_version() {
     );
     assert_eq!(version.start_height(), 0);
 }
+
+#[test]
+fn stdout_error_after_the_handshake_exits_with_1() {
+    let bitcoind = Bitcoind::start();
+    // The pipe has no reader, so the first write to stdout fails.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
+        .arg("regtest")
+        .arg(bitcoind.peer.to_string())
+        .stdout(writer)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    // A failed handshake also exits with 1.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.starts_with("elo: stdout: "), "{stderr}");
+}
