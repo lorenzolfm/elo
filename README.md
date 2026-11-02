@@ -1,11 +1,16 @@
 # elo
 
 A Bitcoin node daemon. Work in progress: the binary dials one peer, does the
-v1 `version`/`verack` handshake, prints the peer's `version` and exits.
+v1 `version`/`verack` handshake and prints the peer's `version`. Then it stays
+connected and answers each `ping` with a `pong`.
 
 ```sh
 elo <mainnet|testnet4|signet|regtest> <ip>[:port]    # IPv6 as [::1]:8333
 ```
+
+When the connection ends, elo prints the reason to stderr and exits with 1.
+Ctrl-C stops it, and the shell shows its signal code (130). elo never exits
+with 0. Bad usage exits with 2.
 
 ## Build
 

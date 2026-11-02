@@ -59,9 +59,11 @@
           strictDeps = true;
         };
 
-        # The L3 tests run the handshake against this bitcoind. Its version is
-        # the one in their asserts.
+        # The L3 tests run elo against this bitcoind. They use bitcoin-cli from
+        # the same package to see when it is ready and to read its peer info.
+        # Its version is the one in their asserts.
         bitcoind = pkgs.lib.getExe' pkgs.bitcoind "bitcoind";
+        bitcoinCli = pkgs.lib.getExe' pkgs.bitcoind "bitcoin-cli";
 
         # Build only the dependencies, so a change to the crate's own code does
         # not build them again.
@@ -107,6 +109,7 @@
           elo-test = craneLib.cargoNextest (devArgs
             // {
               BITCOIND = bitcoind;
+              BITCOIN_CLI = bitcoinCli;
               # The tests listen and connect on loopback. The macOS sandbox
               # blocks that without this flag.
               __darwinAllowLocalNetworking = true;
@@ -142,6 +145,7 @@
         devShells.default = craneLibDev.devShell {
           packages = [pkgs.cargo-nextest];
           BITCOIND = bitcoind;
+          BITCOIN_CLI = bitcoinCli;
         };
 
         formatter = pkgs.alejandra;

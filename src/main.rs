@@ -1,11 +1,12 @@
 //! `elo <network> <ip>[:port]`: dials one peer, does the handshake, and prints the peer's
-//! `version`.
+//! `version`. Then it answers the peer's `ping` messages until the connection ends.
 
 use std::io::Write;
 
 const USAGE: &str = "usage: elo <mainnet|testnet4|signet|regtest> <ip>[:port]";
 
-/// The exit code for bad usage. A failed connection, handshake or print exits with 1.
+/// The exit code for bad usage. Every other exit is 1, because the connection has no
+/// successful end. elo has no signal handler, so Ctrl-C ends it with the shell's signal code.
 const EXIT_USAGE: u8 = 2;
 
 fn main() -> std::process::ExitCode {
@@ -26,8 +27,8 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    let version = match runtime.block_on(elo::net::handshake(network, peer)) {
-        Ok(version) => version,
+    let (connection, version) = match runtime.block_on(elo::net::handshake(network, peer)) {
+        Ok(handshake) => handshake,
         Err(error) => {
             eprintln!("elo: {error}");
             return std::process::ExitCode::FAILURE;
@@ -51,7 +52,10 @@ fn main() -> std::process::ExitCode {
         eprintln!("elo: stdout: {error}");
         return std::process::ExitCode::FAILURE;
     }
-    std::process::ExitCode::SUCCESS
+
+    let error = runtime.block_on(connection.run());
+    eprintln!("elo: {error}");
+    std::process::ExitCode::FAILURE
 }
 
 /// The args after the program name. `None` is bad usage.
