@@ -235,7 +235,9 @@ fn our_ping_gets_a_pong_from_bitcoind() {
         {
             break;
         }
-        assert_eq!(elo.0.try_wait().unwrap(), None, "elo exited");
+        if let Some(status) = elo.0.try_wait().unwrap() {
+            panic!("elo exited with {status}: {}", stderr(&mut elo.0));
+        }
         assert!(
             start.elapsed() < PEER_INFO_TIMEOUT,
             "bitcoind shows no pong for our ping: {peer_info}"
@@ -255,10 +257,15 @@ fn our_ping_gets_a_pong_from_bitcoind() {
         assert!(start.elapsed() < EXIT_TIMEOUT, "elo did not exit");
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
-    let mut stderr = String::new();
-    std::io::Read::read_to_string(&mut elo.0.stderr.take().unwrap(), &mut stderr).unwrap();
     assert_eq!(status.code(), Some(1));
-    assert_eq!(stderr, "elo: the peer closed the connection\n");
+    assert_eq!(stderr(&mut elo.0), "elo: the peer closed the connection\n");
+}
+
+/// What `child` wrote to its stderr pipe. Call it only after the exit, or it blocks.
+fn stderr(child: &mut std::process::Child) -> String {
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    stderr
 }
 
 /// The text of the `field` object in `getpeerinfo`, or nothing before elo connects. elo is the

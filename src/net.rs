@@ -231,8 +231,9 @@ impl Connection {
     /// Runs one turn after the other. The loop has no count bound, because a peer sends
     /// messages for as long as it is connected. It ends only on an error: the peer closes, a
     /// read or a write fails, a write takes longer than `SEND_TIMEOUT`, our `ping` gets no
-    /// `pong` in time, or elo refuses a frame or a message. Each wait in a turn ends at the
-    /// wake from `tick`, and the frame length limit bounds each message.
+    /// `pong` in time, or elo refuses a frame or a message. Each wait for a message ends at the
+    /// wake from `tick`, each write within `SEND_TIMEOUT`, and the frame length limit bounds
+    /// each message.
     pub async fn run(self) -> RunError {
         let Connection {
             mut socket,
