@@ -232,8 +232,8 @@ impl Connection {
     /// messages for as long as it is connected. It ends only on an error: the peer closes, a
     /// read or a write fails, a write takes longer than `SEND_TIMEOUT`, our `ping` gets no
     /// `pong` in time, or elo refuses a frame or a message. Each wait for a message ends at the
-    /// wake from `tick`, each write within `SEND_TIMEOUT`, and the frame length limit bounds
-    /// each message.
+    /// wake from `tick`, each write ends within `SEND_TIMEOUT`, and the frame length limit
+    /// bounds each message.
     pub async fn run(self) -> RunError {
         let Connection {
             mut socket,
@@ -258,7 +258,8 @@ async fn run_turn(
     socket: &mut Socket,
     peer: crate::net_processing::Peer,
 ) -> Result<crate::net_processing::Peer, RunError> {
-    // The tokio clock, so that a paused clock in a test also moves the time of the peer.
+    // The wake goes to a tokio timer, so `now` comes from the same clock. Then a paused clock
+    // in a test also moves the time of the peer.
     let now = tokio::time::Instant::now().into_std();
     let (peer, outbound, wake) = peer.tick(now, nonce()).map_err(RunError::NetProcessing)?;
     if let Some(outbound) = outbound {
@@ -269,8 +270,8 @@ async fn run_turn(
         ));
         run_send(socket, &outbound).await?;
     }
-    // The wait covers only the read, which is cancel safe, so the peer stays here. A wait that
-    // ends at the wake loses no bytes: the next turn continues the same frame.
+    // The wait covers only the read, which is cancel safe, so the turn keeps the peer when the
+    // wait ends. A wait that ends at the wake loses no bytes: the next turn continues the frame.
     let receive = socket.receive();
     match tokio::time::timeout_at(tokio::time::Instant::from_std(wake), receive).await {
         Ok(message) => run_exchange(socket, peer, &message?).await,
@@ -468,7 +469,7 @@ fn timestamp() -> i64 {
 }
 
 /// A SipHash with keys from the OS. The nonce in our `version` only detects a connection to
-/// self, and the nonce in our `ping` only matches its `pong`. So neither need be secret.
+/// self, and the nonce in our `ping` only matches its `pong`. So neither needs to be secret.
 fn nonce() -> u64 {
     std::hash::RandomState::new().build_hasher().finish()
 }
@@ -621,7 +622,7 @@ mod tests {
             ),
             "{error:?}"
         );
-        // The ping timeout of #7. tokio rounds a deadline up to the next millisecond.
+        // 20 min, the ping timeout. tokio rounds a deadline up to the next millisecond.
         assert_eq!(
             elapsed.as_secs(),
             std::time::Duration::from_mins(20).as_secs()
@@ -688,8 +689,8 @@ mod tests {
             ),
             "{error:?}"
         );
-        // The ping interval and the ping timeout of #7. tokio rounds a deadline up to the next
-        // millisecond.
+        // 2 min to the second `ping`, then 20 min to its timeout. tokio rounds a deadline up to
+        // the next millisecond.
         assert_eq!(
             elapsed.as_secs(),
             std::time::Duration::from_mins(2 + 20).as_secs()

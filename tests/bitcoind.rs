@@ -227,8 +227,8 @@ fn our_ping_gets_a_pong_from_bitcoind() {
     let start = std::time::Instant::now();
     loop {
         let peer_info = bitcoind.cli(&["getpeerinfo"]);
-        let received = per_msg(&peer_info, "bytesrecv_per_msg");
-        let sent = per_msg(&peer_info, "bytessent_per_msg");
+        let received = object_text(&peer_info, "bytesrecv_per_msg");
+        let sent = object_text(&peer_info, "bytessent_per_msg");
         if received.contains("\"ping\"")
             && received.contains("\"pong\"")
             && sent.contains("\"pong\"")
@@ -270,7 +270,7 @@ fn stderr(child: &mut std::process::Child) -> String {
 
 /// The text of the `field` object in `getpeerinfo`, or nothing before elo connects. elo is the
 /// only peer, and the object holds no other object, so it ends at its first `}`.
-fn per_msg<'a>(peer_info: &'a str, field: &str) -> &'a str {
+fn object_text<'a>(peer_info: &'a str, field: &str) -> &'a str {
     let key = format!("\"{field}\": {{");
     let Some((_, rest)) = peer_info.split_once(&key) else {
         return "";
