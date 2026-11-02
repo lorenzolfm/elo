@@ -23,7 +23,8 @@ const PING_INTERVAL: std::time::Duration = std::time::Duration::from_mins(2);
 /// How long our `ping` may wait for its `pong`.
 const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(20);
 
-// The tick that returns a `ping` wakes `PING_TIMEOUT` later. So it wakes after itself.
+// `tick_ping` wakes `PING_TIMEOUT` after `now`. So the `wake > now` assert in `tick` holds
+// for it.
 const _: () = assert!(!PING_TIMEOUT.is_zero());
 
 /// Why elo refuses the peer in the handshake. Each one ends the connection.
