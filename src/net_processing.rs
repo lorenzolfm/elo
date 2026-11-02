@@ -310,10 +310,15 @@ impl Peer {
         let mut input = message.payload();
         let theirs = u64::decode(&mut input).map_err(PeerError::Pong)?;
         match self.ping {
-            PingState::Outstanding { nonce, sent } if theirs == nonce => Ok(Peer {
-                ping: PingState::Answered { sent },
-            }),
-            PingState::Outstanding { .. } => Err(PeerError::PongNonce),
+            PingState::Outstanding { nonce: ours, sent } => {
+                if theirs == ours {
+                    Ok(Peer {
+                        ping: PingState::Answered { sent },
+                    })
+                } else {
+                    Err(PeerError::PongNonce)
+                }
+            }
             PingState::Unsent | PingState::Answered { .. } => Err(PeerError::UnsolicitedPong),
         }
     }
@@ -332,26 +337,38 @@ impl Peer {
         nonce: u64,
     ) -> Result<(Peer, Option<PeerOutbound>, std::time::Instant), PeerError> {
         let (peer, outbound, wake) = match self.ping {
+            PingState::Unsent => Peer::tick_ping(now, nonce),
             PingState::Outstanding { sent, .. } => {
                 let timeout = sent + PING_TIMEOUT;
-                if now >= timeout {
+                if now < timeout {
+                    (self, None, timeout)
+                } else {
                     return Err(PeerError::PingTimeout);
                 }
-                (self, None, timeout)
             }
-            PingState::Answered { sent } if now < sent + PING_INTERVAL => {
-                (self, None, sent + PING_INTERVAL)
-            }
-            PingState::Unsent | PingState::Answered { .. } => {
-                let peer = Peer {
-                    ping: PingState::Outstanding { nonce, sent: now },
-                };
-                (peer, Some(PeerOutbound::Ping(nonce)), now + PING_TIMEOUT)
+            PingState::Answered { sent } => {
+                let due = sent + PING_INTERVAL;
+                if now < due {
+                    (self, None, due)
+                } else {
+                    Peer::tick_ping(now, nonce)
+                }
             }
         };
         // A wake at or before `now` would make the driver tick again with no wait.
         assert!(wake > now);
         Ok((peer, outbound, wake))
+    }
+
+    /// Our `ping` with `nonce` goes at `now`, and the next tick is at its timeout.
+    fn tick_ping(
+        now: std::time::Instant,
+        nonce: u64,
+    ) -> (Peer, Option<PeerOutbound>, std::time::Instant) {
+        let peer = Peer {
+            ping: PingState::Outstanding { nonce, sent: now },
+        };
+        (peer, Some(PeerOutbound::Ping(nonce)), now + PING_TIMEOUT)
     }
 }
 
