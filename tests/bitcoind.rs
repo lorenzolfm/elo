@@ -1,8 +1,8 @@
 //! elo against a real `bitcoind -regtest`. `BITCOIND` and `BITCOIN_CLI` hold the paths of the
 //! binaries.
 
-/// How long `bitcoind` may take to listen, and its RPC server to start.
-const LISTEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long `bitcoind` may take to answer RPC after its warmup.
+const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long `bitcoin-cli` may wait for the reply to one request.
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -49,6 +49,12 @@ struct Bitcoind {
 impl Bitcoind {
     fn start() -> Self {
         let path = std::env::var_os("BITCOIND").expect("BITCOIND holds the path of bitcoind");
+        // The tests run in parallel, and the OS can give the same free port to two of them. So
+        // each test holds this lock from the pick of its ports until its `bitcoind` listens on
+        // them. The OS does not give a port with a listener again.
+        let lock = std::fs::File::create(std::env::temp_dir().join("elo-bitcoind.lock")).unwrap();
+        lock.lock().unwrap();
+
         // Two ports that were free a moment ago. Both listeners are open at the same time, so
         // the ports differ.
         let peer_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -74,6 +80,11 @@ impl Bitcoind {
             .arg("-natpmp=0")
             // RPC uses cookie auth. The cookie is in the datadir, where `bitcoin-cli` reads it.
             .arg("-server=1")
+            // `-rpcbind` needs `-rpcallowip`, which adds nothing: loopback is always allowed.
+            // With one RPC address, a port that another process took makes `bitcoind` exit, as
+            // a taken P2P port does.
+            .arg("-rpcallowip=127.0.0.1")
+            .arg("-rpcbind=127.0.0.1")
             .arg(format!("-rpcport={rpc_port}"))
             .arg("-printtoconsole=0")
             .stdout(std::process::Stdio::null())
@@ -85,40 +96,43 @@ impl Bitcoind {
             rpc_port,
             datadir,
         };
-        bitcoind.wait_until_listening();
+        bitcoind.wait_until_ready();
+        drop(lock);
         bitcoind
     }
 
-    /// `bitcoind` is ready when a TCP connect succeeds.
-    fn wait_until_listening(&mut self) {
+    /// Waits until an RPC call with the cookie in our datadir succeeds. Each call fails until
+    /// the warmup ends, and the warmup ends only after the P2P bind. So a success proves that
+    /// both ports belong to this `bitcoind`, and not to another process that took a port first.
+    fn wait_until_ready(&mut self) {
         let start = std::time::Instant::now();
-        while std::net::TcpStream::connect(self.peer).is_err() {
+        while !self.rpc("uptime").status.success() {
             assert_eq!(self.process.0.try_wait().unwrap(), None, "bitcoind exited");
-            assert!(start.elapsed() < LISTEN_TIMEOUT, "bitcoind does not listen");
+            assert!(start.elapsed() < READY_TIMEOUT, "bitcoind is not ready");
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 
-    /// Runs the RPC `command` with `bitcoin-cli` and returns its output. `-rpcwait` waits until
-    /// the RPC server is up and out of its warmup. It also retries a request with no reply
-    /// after `RPC_TIMEOUT`, until `LISTEN_TIMEOUT` passes. So one call takes at most about the
-    /// sum of the two.
+    /// Runs the RPC `command` with `bitcoin-cli` and returns its output.
     fn cli(&self, command: &str) -> String {
-        let path =
-            std::env::var_os("BITCOIN_CLI").expect("BITCOIN_CLI holds the path of bitcoin-cli");
-        let output = std::process::Command::new(path)
-            .arg("-regtest")
-            .arg(format!("-datadir={}", self.datadir.0.display()))
-            .arg(format!("-rpcport={}", self.rpc_port))
-            .arg("-rpcwait")
-            .arg(format!("-rpcwaittimeout={}", LISTEN_TIMEOUT.as_secs()))
-            .arg(format!("-rpcclienttimeout={}", RPC_TIMEOUT.as_secs()))
-            .arg(command)
-            .output()
-            .unwrap();
+        let output = self.rpc(command);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "bitcoin-cli {command}: {stderr}");
         String::from_utf8(output.stdout).unwrap()
+    }
+
+    /// One `bitcoin-cli` request, with no retry. It waits at most `RPC_TIMEOUT` for the reply.
+    fn rpc(&self, command: &str) -> std::process::Output {
+        let path =
+            std::env::var_os("BITCOIN_CLI").expect("BITCOIN_CLI holds the path of bitcoin-cli");
+        std::process::Command::new(path)
+            .arg("-regtest")
+            .arg(format!("-datadir={}", self.datadir.0.display()))
+            .arg(format!("-rpcport={}", self.rpc_port))
+            .arg(format!("-rpcclienttimeout={}", RPC_TIMEOUT.as_secs()))
+            .arg(command)
+            .output()
+            .unwrap()
     }
 }
 
