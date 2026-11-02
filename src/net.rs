@@ -95,7 +95,7 @@ struct Socket {
 /// frame still needs, so the bytes of the next frame stay in the stream.
 #[derive(Debug)]
 enum PartialFrame {
-    /// The header is not complete: at most `HEADER_SIZE` bytes.
+    /// The header has not passed its checks: the bytes so far, at most `HEADER_SIZE`.
     Header(Vec<u8>),
     /// The header passed its checks: the payload so far, at most its length.
     Payload(crate::transport::MessageHeader, Vec<u8>),
@@ -149,8 +149,9 @@ async fn handshake_stream_exchange(
                 handshake = next;
             }
             crate::net_processing::Step::Done(peer, theirs) => {
-                // The peer can send more frames in the same segment as its `verack`. The socket
-                // goes into the connection, so `run` reads them next.
+                // The peer can send more frames in the same segment as its `verack`. Each read
+                // stops at the end of a frame, so they are still in the stream, and `run` reads
+                // them next.
                 let connection = Connection {
                     network,
                     socket,
@@ -260,6 +261,8 @@ impl Socket {
         // `HEADER_SIZE` + `PAYLOAD_LENGTH_MAX` bytes. So the loop ends.
         loop {
             if let Some(message) = self.frame.cut(network).map_err(Error::Transport)? {
+                // The next frame starts empty, so no byte of this frame goes into it.
+                assert!(matches!(&self.frame, PartialFrame::Header(bytes) if bytes.is_empty()));
                 return Ok(message);
             }
             self.read().await?;
@@ -504,7 +507,7 @@ mod tests {
             let stream = tokio::net::TcpStream::connect(peer).await.unwrap();
             let mut socket = super::Socket::new(stream);
             // The runtime has no other task, so this wait blocks nothing. The clock is paused
-            // only when the first half is in the socket.
+            // only when the first half is in the stream.
             first_sent_receiver.recv().unwrap();
             tokio::time::pause();
             let receive = socket.receive(crate::chainparams::Network::Regtest);
@@ -522,7 +525,7 @@ mod tests {
 
     #[test]
     fn ping_in_one_write_with_their_verack_gets_a_pong() {
-        // The peer sends Core's `verack` and `ping` in one write, so both can be in the socket
+        // The peer sends Core's `verack` and `ping` in one write, so both can be in the stream
         // when the handshake ends. `run` must still read the `ping` and answer it. Then the
         // peer closes.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -552,16 +555,13 @@ mod tests {
             connection.run().await
         });
         let pong = peer_thread.join().unwrap();
-        let ping = crate::fixtures::hex(crate::fixtures::PING_FRAME);
-        let nonce = &ping[crate::transport::HEADER_SIZE..];
-        assert_eq!(
-            pong,
-            crate::transport::encode(
-                crate::chainparams::Network::Regtest,
-                crate::protocol::PONG,
-                nonce
-            )
-        );
+        // A `pong` has the payload of the `ping`, so only the message type differs.
+        let mut expected = crate::fixtures::hex(crate::fixtures::PING_FRAME);
+        let msg_type =
+            crate::chainparams::MAGIC_SIZE..crate::chainparams::MAGIC_SIZE + "ping".len();
+        assert_eq!(&expected[msg_type.clone()], b"ping");
+        expected[msg_type].copy_from_slice(b"pong");
+        assert_eq!(pong, expected);
         assert!(matches!(error, super::Error::Closed), "{error:?}");
     }
 
