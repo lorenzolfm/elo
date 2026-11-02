@@ -1,5 +1,6 @@
 //! The driver: it dials one peer and runs the handshake on the socket.
 
+use crate::serialize::Encode;
 use std::hash::{BuildHasher, Hasher};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -120,7 +121,9 @@ async fn send(
             crate::transport::encode(network, crate::protocol::VERACK, &[])
         }
         crate::net_processing::Outbound::Pong(nonce) => {
-            crate::transport::encode(network, crate::protocol::PONG, &nonce.to_le_bytes())
+            let mut payload = Vec::new();
+            nonce.encode(&mut payload);
+            crate::transport::encode(network, crate::protocol::PONG, &payload)
         }
     };
     stream.write_all(&frame).await.map_err(Error::Io)
