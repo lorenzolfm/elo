@@ -216,7 +216,6 @@ impl Peer {
     /// A `ping` gets a `pong` with its nonce, and the bytes after the nonce are ignored. Each
     /// other message is skipped. Each result but an error returns the peer, because an error
     /// ends the connection.
-    #[cfg_attr(not(test), expect(dead_code, reason = "until net calls it"))]
     pub(crate) fn receive(
         self,
         message: &crate::transport::Message,
