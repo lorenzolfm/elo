@@ -16,63 +16,120 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60
 /// reply, because a write to a peer that does not read can block forever.
 const RECEIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(20);
 
-/// Why the connection failed.
+/// Why the connect or the handshake failed.
 #[derive(Debug)]
-pub enum Error {
+pub enum HandshakeError {
     /// The TCP connect failed.
     Connect(std::io::Error),
     /// The TCP connect took longer than `CONNECT_TIMEOUT`.
     ConnectTimeout,
     /// The handshake took longer than `HANDSHAKE_TIMEOUT`.
     HandshakeTimeout,
-    /// A message after the handshake, with our reply to it, took longer than
-    /// `RECEIVE_TIMEOUT`.
-    ReceiveTimeout,
     /// A read or a write on the socket failed.
     Io(std::io::Error),
-    /// The peer closed the connection, before or after the handshake.
+    /// The peer closed the connection.
     Closed,
     /// The peer sent a frame that elo refuses.
     Transport(crate::transport::Error),
-    /// elo refused the peer: a bad `version`, our own `version`, too many messages in the
-    /// handshake, or a bad `ping`.
-    NetProcessing(crate::net_processing::Error),
+    /// elo refused the peer: a bad `version`, our own `version`, or too many messages.
+    NetProcessing(crate::net_processing::HandshakeError),
 }
 
-impl std::fmt::Display for Error {
+impl std::fmt::Display for HandshakeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Connect(error) => write!(f, "connect: {error}"),
-            Error::ConnectTimeout => {
+            HandshakeError::Connect(error) => write!(f, "connect: {error}"),
+            HandshakeError::ConnectTimeout => {
                 write!(
                     f,
                     "connect took longer than {} s",
                     CONNECT_TIMEOUT.as_secs()
                 )
             }
-            Error::HandshakeTimeout => {
+            HandshakeError::HandshakeTimeout => {
                 write!(
                     f,
                     "handshake took longer than {} s",
                     HANDSHAKE_TIMEOUT.as_secs()
                 )
             }
-            Error::ReceiveTimeout => {
+            HandshakeError::Io(error) => write!(f, "socket: {error}"),
+            HandshakeError::Closed => write!(f, "the peer closed the connection"),
+            HandshakeError::Transport(error) => write!(f, "frame: {error}"),
+            HandshakeError::NetProcessing(error) => write!(f, "peer: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for HandshakeError {}
+
+impl From<ReceiveError> for HandshakeError {
+    fn from(error: ReceiveError) -> HandshakeError {
+        match error {
+            ReceiveError::Io(error) => HandshakeError::Io(error),
+            ReceiveError::Closed => HandshakeError::Closed,
+            ReceiveError::Transport(error) => HandshakeError::Transport(error),
+        }
+    }
+}
+
+/// Why the connection ended after the handshake.
+#[derive(Debug)]
+pub enum RunError {
+    /// A message after the handshake, with our reply to it, took longer than
+    /// `RECEIVE_TIMEOUT`.
+    ReceiveTimeout,
+    /// A read or a write on the socket failed.
+    Io(std::io::Error),
+    /// The peer closed the connection.
+    Closed,
+    /// The peer sent a frame that elo refuses.
+    Transport(crate::transport::Error),
+    /// elo refused the peer: a bad `ping` or `pong`, or no `pong` within the ping timeout.
+    NetProcessing(crate::net_processing::PeerError),
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunError::ReceiveTimeout => {
                 write!(
                     f,
                     "a message and our reply took longer than {} s",
                     RECEIVE_TIMEOUT.as_secs()
                 )
             }
-            Error::Io(error) => write!(f, "socket: {error}"),
-            Error::Closed => write!(f, "the peer closed the connection"),
-            Error::Transport(error) => write!(f, "frame: {error}"),
-            Error::NetProcessing(error) => write!(f, "peer: {error}"),
+            RunError::Io(error) => write!(f, "socket: {error}"),
+            RunError::Closed => write!(f, "the peer closed the connection"),
+            RunError::Transport(error) => write!(f, "frame: {error}"),
+            RunError::NetProcessing(error) => write!(f, "peer: {error}"),
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for RunError {}
+
+impl From<ReceiveError> for RunError {
+    fn from(error: ReceiveError) -> RunError {
+        match error {
+            ReceiveError::Io(error) => RunError::Io(error),
+            ReceiveError::Closed => RunError::Closed,
+            ReceiveError::Transport(error) => RunError::Transport(error),
+        }
+    }
+}
+
+/// Why `Socket::receive` returned no message. Each one ends the connection, in the handshake
+/// or after it.
+#[derive(Debug)]
+enum ReceiveError {
+    /// A read on the socket failed.
+    Io(std::io::Error),
+    /// The peer closed the connection, inside a frame or between two frames.
+    Closed,
+    /// The peer sent a frame that elo refuses.
+    Transport(crate::transport::Error),
+}
 
 /// One peer after the handshake: the socket and the machine for its messages. Only
 /// `handshake` makes one, so `run` cannot start before the handshake is complete.
@@ -114,12 +171,12 @@ enum PartialFrame {
 pub async fn handshake(
     network: crate::chainparams::Network,
     peer: std::net::SocketAddr,
-) -> Result<(Connection, crate::protocol::Version), Error> {
+) -> Result<(Connection, crate::protocol::Version), HandshakeError> {
     let connect = tokio::net::TcpStream::connect(peer);
     let stream = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
         Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => return Err(Error::Connect(error)),
-        Err(_elapsed) => return Err(Error::ConnectTimeout),
+        Ok(Err(error)) => return Err(HandshakeError::Connect(error)),
+        Err(_elapsed) => return Err(HandshakeError::ConnectTimeout),
     };
     handshake_stream(network, peer, stream).await
 }
@@ -129,11 +186,11 @@ async fn handshake_stream(
     network: crate::chainparams::Network,
     peer: std::net::SocketAddr,
     stream: tokio::net::TcpStream,
-) -> Result<(Connection, crate::protocol::Version), Error> {
+) -> Result<(Connection, crate::protocol::Version), HandshakeError> {
     let exchange = handshake_stream_exchange(network, peer, stream);
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, exchange).await {
         Ok(result) => result,
-        Err(_elapsed) => Err(Error::HandshakeTimeout),
+        Err(_elapsed) => Err(HandshakeError::HandshakeTimeout),
     }
 }
 
@@ -143,17 +200,26 @@ async fn handshake_stream_exchange(
     network: crate::chainparams::Network,
     peer: std::net::SocketAddr,
     stream: tokio::net::TcpStream,
-) -> Result<(Connection, crate::protocol::Version), Error> {
+) -> Result<(Connection, crate::protocol::Version), HandshakeError> {
     let mut socket = Socket::new(stream, network);
     let (mut handshake, outbound) =
         crate::net_processing::Handshake::start(peer, timestamp(), nonce());
-    socket.send(&outbound).await?;
+    socket
+        .send_handshake_outbound(&outbound)
+        .await
+        .map_err(HandshakeError::Io)?;
     loop {
         let message = socket.receive().await?;
-        match handshake.receive(&message).map_err(Error::NetProcessing)? {
+        match handshake
+            .receive(&message)
+            .map_err(HandshakeError::NetProcessing)?
+        {
             crate::net_processing::Step::Wait(next) => handshake = next,
             crate::net_processing::Step::Reply(next, outbound) => {
-                socket.send(&outbound).await?;
+                socket
+                    .send_handshake_outbound(&outbound)
+                    .await
+                    .map_err(HandshakeError::Io)?;
                 handshake = next;
             }
             crate::net_processing::Step::Done(peer, theirs) => {
@@ -172,7 +238,7 @@ impl Connection {
     /// bound, because a peer sends messages for as long as it is connected. It ends only on an
     /// error: the peer closes, a read or a write fails, `RECEIVE_TIMEOUT` passes, or elo refuses
     /// a frame or a message. The frame length limit bounds each message.
-    pub async fn run(self) -> Error {
+    pub async fn run(self) -> RunError {
         let Connection {
             mut socket,
             mut peer,
@@ -183,21 +249,20 @@ impl Connection {
             peer = match tokio::time::timeout(RECEIVE_TIMEOUT, exchange).await {
                 Ok(Ok(next)) => next,
                 Ok(Err(error)) => {
-                    // After the handshake, only the socket, a frame or a message can fail. The
-                    // connect and handshake errors come only from `handshake`.
+                    // Only the timeout here gives `ReceiveTimeout`.
                     assert!(
                         matches!(
                             error,
-                            Error::Io(_)
-                                | Error::Closed
-                                | Error::Transport(_)
-                                | Error::NetProcessing(_)
+                            RunError::Io(_)
+                                | RunError::Closed
+                                | RunError::Transport(_)
+                                | RunError::NetProcessing(_)
                         ),
                         "{error:?}"
                     );
                     return error;
                 }
-                Err(_elapsed) => return Error::ReceiveTimeout,
+                Err(_elapsed) => return RunError::ReceiveTimeout,
             };
         }
     }
@@ -208,15 +273,22 @@ impl Connection {
 async fn run_exchange(
     socket: &mut Socket,
     peer: crate::net_processing::Peer,
-) -> Result<crate::net_processing::Peer, Error> {
+) -> Result<crate::net_processing::Peer, RunError> {
     let message = socket.receive().await?;
-    let (peer, outbound) = peer.receive(&message).map_err(Error::NetProcessing)?;
+    let (peer, outbound) = peer.receive(&message).map_err(RunError::NetProcessing)?;
     match outbound {
         Some(outbound) => {
-            // After the handshake, the peer replies only with a `pong`, and only to a `ping`.
-            assert!(matches!(outbound, crate::net_processing::Outbound::Pong(_)));
+            // The peer replies only with a `pong`, and only to a `ping`. Only `tick` sends a
+            // `ping`.
+            assert!(matches!(
+                outbound,
+                crate::net_processing::PeerOutbound::Pong(_)
+            ));
             assert_eq!(message.msg_type(), crate::protocol::PING);
-            socket.send(&outbound).await?;
+            socket
+                .send_peer_outbound(&outbound)
+                .await
+                .map_err(RunError::Io)?;
         }
         // Each `ping` that the peer accepts gets a `pong`.
         None => assert_ne!(message.msg_type(), crate::protocol::PING),
@@ -233,30 +305,58 @@ impl Socket {
         }
     }
 
-    async fn send(&mut self, outbound: &crate::net_processing::Outbound) -> Result<(), Error> {
-        let frame = match outbound {
-            crate::net_processing::Outbound::Version(payload) => {
-                crate::transport::encode(self.network, crate::protocol::VERSION, payload)
+    /// Writes a message of the handshake.
+    async fn send_handshake_outbound(
+        &mut self,
+        outbound: &crate::net_processing::HandshakeOutbound,
+    ) -> Result<(), std::io::Error> {
+        match outbound {
+            crate::net_processing::HandshakeOutbound::Version(payload) => {
+                self.send(crate::protocol::VERSION, payload).await
             }
-            crate::net_processing::Outbound::Verack => {
-                crate::transport::encode(self.network, crate::protocol::VERACK, &[])
+            crate::net_processing::HandshakeOutbound::Verack => {
+                self.send(crate::protocol::VERACK, &[]).await
             }
-            crate::net_processing::Outbound::Pong(nonce) => {
-                let mut payload = Vec::new();
-                nonce.encode(&mut payload);
-                crate::transport::encode(self.network, crate::protocol::PONG, &payload)
-            }
+        }
+    }
+
+    /// Writes a message after the handshake. The payload of each one is a nonce.
+    async fn send_peer_outbound(
+        &mut self,
+        outbound: &crate::net_processing::PeerOutbound,
+    ) -> Result<(), std::io::Error> {
+        let (msg_type, nonce) = match outbound {
+            crate::net_processing::PeerOutbound::Ping(nonce) => (crate::protocol::PING, nonce),
+            crate::net_processing::PeerOutbound::Pong(nonce) => (crate::protocol::PONG, nonce),
         };
-        self.stream.write_all(&frame).await.map_err(Error::Io)
+        let mut payload = Vec::with_capacity(size_of::<u64>());
+        nonce.encode(&mut payload);
+        // The payload is only the nonce, the `u64` that the peer decodes.
+        assert_eq!(payload.len(), size_of::<u64>());
+        self.send(msg_type, &payload).await
+    }
+
+    /// Writes one frame with `msg_type` and `payload`.
+    async fn send(
+        &mut self,
+        msg_type: crate::protocol::MessageType,
+        payload: &[u8],
+    ) -> Result<(), std::io::Error> {
+        let frame = crate::transport::encode(self.network, msg_type, payload);
+        self.stream.write_all(&frame).await
     }
 
     /// Reads until one frame is complete, and returns its message. A wait that ends early,
     /// for example at a timeout, loses no bytes: the next call continues the same frame.
-    async fn receive(&mut self) -> Result<crate::transport::Message, Error> {
+    async fn receive(&mut self) -> Result<crate::transport::Message, ReceiveError> {
         // Each turn returns or reads at least one byte, and a frame has at most
         // `HEADER_SIZE` + `PAYLOAD_LENGTH_MAX` bytes. So the loop ends.
         loop {
-            if let Some(message) = self.frame.cut(self.network).map_err(Error::Transport)? {
+            if let Some(message) = self
+                .frame
+                .cut(self.network)
+                .map_err(ReceiveError::Transport)?
+            {
                 // The next frame starts empty, so no byte of this frame goes into it.
                 assert!(matches!(self.frame, PartialFrame::Header { filled: 0, .. }));
                 return Ok(message);
@@ -267,16 +367,16 @@ impl Socket {
 
     /// Reads at least one byte, and at most the bytes that the part still needs. A wait that
     /// ends early reads nothing, because `read` is cancel safe.
-    async fn read(&mut self) -> Result<(), Error> {
+    async fn read(&mut self) -> Result<(), ReceiveError> {
         let (missing, filled) = self.frame.missing();
         // `cut` takes each complete part, so this part still needs a byte. An empty slice
         // would read nothing, and the zero would look like the end of the stream.
         assert!(!missing.is_empty());
         // A read returns at most the length of its slice, so it stops at the end of the part.
-        let count = self.stream.read(missing).await.map_err(Error::Io)?;
+        let count = self.stream.read(missing).await.map_err(ReceiveError::Io)?;
         if count == 0 {
             // The end of the stream, inside a frame or between two frames.
-            return Err(Error::Closed);
+            return Err(ReceiveError::Closed);
         }
         *filled += count;
         Ok(())
@@ -423,7 +523,7 @@ mod tests {
             (result, start.elapsed())
         });
         assert!(
-            matches!(result, Err(super::Error::HandshakeTimeout)),
+            matches!(result, Err(super::HandshakeError::HandshakeTimeout)),
             "{result:?}"
         );
         // tokio rounds a deadline up to the next millisecond.
@@ -462,7 +562,10 @@ mod tests {
             (error, start.elapsed())
         });
         peer_thread.join().unwrap();
-        assert!(matches!(error, super::Error::ReceiveTimeout), "{error:?}");
+        assert!(
+            matches!(error, super::RunError::ReceiveTimeout),
+            "{error:?}"
+        );
         // tokio rounds a deadline up to the next millisecond.
         assert_eq!(elapsed.as_secs(), super::RECEIVE_TIMEOUT.as_secs());
     }
@@ -482,7 +585,10 @@ mod tests {
 
         let result = block_on(super::handshake(crate::chainparams::Network::Regtest, peer));
         peer_thread.join().unwrap();
-        assert!(matches!(result, Err(super::Error::Closed)), "{result:?}");
+        assert!(
+            matches!(result, Err(super::HandshakeError::Closed)),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -565,7 +671,7 @@ mod tests {
         assert_eq!(&expected[msg_type.clone()], b"ping");
         expected[msg_type].copy_from_slice(b"pong");
         assert_eq!(pong, expected);
-        assert!(matches!(error, super::Error::Closed), "{error:?}");
+        assert!(matches!(error, super::RunError::Closed), "{error:?}");
     }
 
     #[test]
@@ -579,7 +685,7 @@ mod tests {
         assert!(
             matches!(
                 result,
-                Err(super::Error::Connect(ref error))
+                Err(super::HandshakeError::Connect(ref error))
                     if error.kind() == std::io::ErrorKind::ConnectionRefused
             ),
             "{result:?}"
