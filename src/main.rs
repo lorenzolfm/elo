@@ -1,5 +1,6 @@
 //! `elo <network> <ip>[:port]`: dials one peer, does the handshake, and prints the peer's
-//! `version`. Then it answers the peer's `ping` messages until the connection ends.
+//! `version`. Then it pings the peer and answers its `ping` messages until the connection
+//! ends.
 
 use std::io::Write;
 

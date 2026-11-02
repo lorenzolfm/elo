@@ -328,10 +328,6 @@ impl Peer {
     /// is due at once after the handshake. Then it is due `PING_INTERVAL` after the last `ping`
     /// went, if its `pong` came. When our outstanding `ping` is `PING_TIMEOUT` old, the tick
     /// fails. Each deadline is due at its instant, not after it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "until `Connection::run` calls it")
-    )]
     pub(crate) fn tick(
         self,
         now: std::time::Instant,

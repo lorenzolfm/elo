@@ -7,8 +7,11 @@ const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long `bitcoin-cli` may wait for the reply to one request.
 const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How long `bitcoind` may take to show a `pingtime` for elo.
-const PINGTIME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long `getpeerinfo` may take to show what a test waits for.
+const PEER_INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long elo may take to exit after `bitcoind` closes the connection.
+const EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A directory that the drop removes.
 struct TempDir(std::path::PathBuf);
@@ -106,7 +109,7 @@ impl Bitcoind {
     /// both ports belong to this `bitcoind`, and not to another process that took a port first.
     fn wait_until_ready(&mut self) {
         let start = std::time::Instant::now();
-        while !self.rpc("uptime").status.success() {
+        while !self.rpc(&["uptime"]).status.success() {
             assert_eq!(self.process.0.try_wait().unwrap(), None, "bitcoind exited");
             assert!(start.elapsed() < READY_TIMEOUT, "bitcoind is not ready");
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -114,15 +117,15 @@ impl Bitcoind {
     }
 
     /// Runs the RPC `command` with `bitcoin-cli` and returns its output.
-    fn cli(&self, command: &str) -> String {
+    fn cli(&self, command: &[&str]) -> String {
         let output = self.rpc(command);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "bitcoin-cli {command}: {stderr}");
+        assert!(output.status.success(), "bitcoin-cli {command:?}: {stderr}");
         String::from_utf8(output.stdout).unwrap()
     }
 
     /// One `bitcoin-cli` request, with no retry. It waits at most `RPC_TIMEOUT` for the reply.
-    fn rpc(&self, command: &str) -> std::process::Output {
+    fn rpc(&self, command: &[&str]) -> std::process::Output {
         let path =
             std::env::var_os("BITCOIN_CLI").expect("BITCOIN_CLI holds the path of bitcoin-cli");
         std::process::Command::new(path)
@@ -130,7 +133,7 @@ impl Bitcoind {
             .arg(format!("-datadir={}", self.datadir.0.display()))
             .arg(format!("-rpcport={}", self.rpc_port))
             .arg(format!("-rpcclienttimeout={}", RPC_TIMEOUT.as_secs()))
-            .arg(command)
+            .args(command)
             .output()
             .unwrap()
     }
@@ -195,12 +198,75 @@ fn ping_from_bitcoind_gets_a_pong() {
     // bitcoind pings right after the handshake. It shows a `pingtime` only after a `pong` with
     // the nonce of its `ping`. elo is its only peer, so a match on the text is enough.
     let start = std::time::Instant::now();
-    while !bitcoind.cli("getpeerinfo").contains("\"pingtime\"") {
+    while !bitcoind.cli(&["getpeerinfo"]).contains("\"pingtime\"") {
         assert_eq!(elo.0.try_wait().unwrap(), None, "elo exited");
         assert!(
-            start.elapsed() < PINGTIME_TIMEOUT,
+            start.elapsed() < PEER_INFO_TIMEOUT,
             "bitcoind shows no pingtime"
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+}
+
+#[test]
+fn our_ping_gets_a_pong_from_bitcoind() {
+    let bitcoind = Bitcoind::start();
+    let mut elo = Process(
+        std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
+            .arg("regtest")
+            .arg(bitcoind.peer.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+
+    // elo pings right after the handshake, and bitcoind sends a `pong` only to a `ping`. The
+    // wait also needs our `pong` to the `ping` of bitcoind, the last message that elo sends. A
+    // close with bytes that bitcoind has not read is a reset, and not the end of the stream.
+    let start = std::time::Instant::now();
+    loop {
+        let peer_info = bitcoind.cli(&["getpeerinfo"]);
+        let received = per_msg(&peer_info, "bytesrecv_per_msg");
+        let sent = per_msg(&peer_info, "bytessent_per_msg");
+        if received.contains("\"ping\"")
+            && received.contains("\"pong\"")
+            && sent.contains("\"pong\"")
+        {
+            break;
+        }
+        assert_eq!(elo.0.try_wait().unwrap(), None, "elo exited");
+        assert!(
+            start.elapsed() < PEER_INFO_TIMEOUT,
+            "bitcoind shows no pong for our ping: {peer_info}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // elo is the only peer of bitcoind, so it is node 0. TCP delivers the `pong` before the
+    // close, so elo checks the `pong` first. A `pong` that elo refuses ends with its reason,
+    // and so does a second `pong` for a stray `ping`.
+    bitcoind.cli(&["-named", "disconnectnode", "nodeid=0"]);
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = elo.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(start.elapsed() < EXIT_TIMEOUT, "elo did not exit");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut elo.0.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert_eq!(status.code(), Some(1));
+    assert_eq!(stderr, "elo: the peer closed the connection\n");
+}
+
+/// The text of the `field` object in `getpeerinfo`, or nothing before elo connects. elo is the
+/// only peer, and the object holds no other object, so it ends at its first `}`.
+fn per_msg<'a>(peer_info: &'a str, field: &str) -> &'a str {
+    let key = format!("\"{field}\": {{");
+    let Some((_, rest)) = peer_info.split_once(&key) else {
+        return "";
+    };
+    rest.split_once('}').unwrap().0
 }
