@@ -611,7 +611,8 @@ mod tests {
         });
         let (ping, rest) = peer_thread.join().unwrap();
         assert_ping(&ping);
-        // No second `ping` while the first is outstanding.
+        // The driver sends only what `tick` returns, so no second `ping` while the first is
+        // outstanding.
         assert!(rest.is_empty(), "{rest:?}");
         assert!(
             matches!(
