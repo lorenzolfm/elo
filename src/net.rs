@@ -91,14 +91,22 @@ struct Socket {
     frame: PartialFrame,
 }
 
-/// The bytes of one frame, kept across waits. Each read asks only for the bytes that this
-/// frame still needs, so the bytes of the next frame stay in the stream.
+/// The bytes of one frame, kept across waits. Each part has room for its exact size, and each
+/// read goes into the bytes that the part still needs. So a read cannot take a byte of the
+/// next frame.
 #[derive(Debug)]
 enum PartialFrame {
-    /// The header has not passed its checks: the bytes so far, at most `HEADER_SIZE`.
-    Header(Vec<u8>),
-    /// The header passed its checks: the payload so far, at most its length.
-    Payload(crate::transport::MessageHeader, Vec<u8>),
+    /// The header has not passed its checks. The bytes so far are `bytes[..filled]`.
+    Header {
+        bytes: [u8; crate::transport::HEADER_SIZE],
+        filled: usize,
+    },
+    /// The header passed its checks. The payload so far is `payload[..filled]`.
+    Payload {
+        header: crate::transport::MessageHeader,
+        payload: Vec<u8>,
+        filled: usize,
+    },
 }
 
 /// Dials `peer` and runs the handshake. Returns the connection for the messages after it, and
@@ -262,47 +270,46 @@ impl Socket {
         loop {
             if let Some(message) = self.frame.cut(network).map_err(Error::Transport)? {
                 // The next frame starts empty, so no byte of this frame goes into it.
-                assert!(matches!(&self.frame, PartialFrame::Header(bytes) if bytes.is_empty()));
+                assert!(matches!(self.frame, PartialFrame::Header { filled: 0, .. }));
                 return Ok(message);
             }
             self.read().await?;
         }
     }
 
-    /// Reads at least one byte, and at most the bytes that the frame still needs. A wait that
-    /// ends early reads nothing, because `read_buf` is cancel safe.
+    /// Reads at least one byte, and at most the bytes that the part still needs. A wait that
+    /// ends early reads nothing, because `read` is cancel safe.
     async fn read(&mut self) -> Result<(), Error> {
-        let (bytes, size) = self.frame.part();
-        // `cut` takes each complete part, so this part still needs a byte. A limit of zero
+        let (missing, filled) = self.frame.missing();
+        // `cut` takes each complete part, so this part still needs a byte. An empty slice
         // would read nothing, and the zero would look like the end of the stream.
-        assert!(bytes.len() < size);
-        let needed = size - bytes.len();
-        const _: () = assert!(usize::BITS <= u64::BITS);
-        let count = (&mut self.stream)
-            .take(needed as u64)
-            .read_buf(bytes)
-            .await
-            .map_err(Error::Io)?;
+        assert!(!missing.is_empty());
+        // A read returns at most the length of its slice, so it stops at the end of the part.
+        let count = self.stream.read(missing).await.map_err(Error::Io)?;
         if count == 0 {
             // The end of the stream, inside a frame or between two frames.
             return Err(Error::Closed);
         }
-        assert!(count <= needed);
-        assert!(bytes.len() <= size);
+        *filled += count;
         Ok(())
     }
 }
 
 impl PartialFrame {
     fn new() -> PartialFrame {
-        PartialFrame::Header(Vec::with_capacity(crate::transport::HEADER_SIZE))
+        PartialFrame::Header {
+            bytes: [0; crate::transport::HEADER_SIZE],
+            filled: 0,
+        }
     }
 
-    /// The bytes of the part that is not complete yet, and the size that completes it.
-    fn part(&mut self) -> (&mut Vec<u8>, usize) {
+    /// The bytes that the part still needs, and the count of the bytes that it has.
+    fn missing(&mut self) -> (&mut [u8], &mut usize) {
         match self {
-            PartialFrame::Header(bytes) => (bytes, crate::transport::HEADER_SIZE),
-            PartialFrame::Payload(header, payload) => (payload, header.payload_length()),
+            PartialFrame::Header { bytes, filled } => (&mut bytes[*filled..], filled),
+            PartialFrame::Payload {
+                payload, filled, ..
+            } => (&mut payload[*filled..], filled),
         }
     }
 
@@ -313,24 +320,32 @@ impl PartialFrame {
         &mut self,
         network: crate::chainparams::Network,
     ) -> Result<Option<crate::transport::Message>, crate::transport::Error> {
-        if let PartialFrame::Header(bytes) = self {
-            assert!(bytes.len() <= crate::transport::HEADER_SIZE);
-            if let Ok(header) = <&[u8; crate::transport::HEADER_SIZE]>::try_from(bytes.as_slice()) {
-                let header = crate::transport::decode_header(network, header)?;
-                // The room is made only after the header passes its checks, so it is at most
-                // the length limit.
-                let payload = Vec::with_capacity(header.payload_length());
-                *self = PartialFrame::Payload(header, payload);
-            }
+        if let PartialFrame::Header {
+            bytes,
+            filled: crate::transport::HEADER_SIZE,
+        } = self
+        {
+            let header = crate::transport::decode_header(network, bytes)?;
+            // The room is made only after the header passes its checks, so it is at most the
+            // length limit.
+            let payload = vec![0; header.payload_length()];
+            *self = PartialFrame::Payload {
+                header,
+                payload,
+                filled: 0,
+            };
         }
-        if let PartialFrame::Payload(header, payload) = self {
-            assert!(payload.len() <= header.payload_length());
-            if payload.len() == header.payload_length() {
-                let header = *header;
-                let payload = std::mem::take(payload);
-                *self = PartialFrame::new();
-                return crate::transport::check_payload(header, payload).map(Some);
-            }
+        if let PartialFrame::Payload {
+            header,
+            payload,
+            filled,
+        } = self
+            && *filled == payload.len()
+        {
+            let header = *header;
+            let payload = std::mem::take(payload);
+            *self = PartialFrame::new();
+            return crate::transport::check_payload(header, payload).map(Some);
         }
         Ok(None)
     }
