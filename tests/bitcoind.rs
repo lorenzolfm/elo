@@ -4,6 +4,9 @@
 /// How long `bitcoind` may take to listen, and its RPC server to start.
 const LISTEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long `bitcoin-cli` may wait for the reply to one request.
+const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How long `bitcoind` may take to show a `pingtime` for elo.
 const PINGTIME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -97,7 +100,9 @@ impl Bitcoind {
     }
 
     /// Runs the RPC `command` with `bitcoin-cli` and returns its output. `-rpcwait` waits until
-    /// the RPC server is up and out of its warmup.
+    /// the RPC server is up and out of its warmup. It also retries a request with no reply
+    /// after `RPC_TIMEOUT`, until `LISTEN_TIMEOUT` passes. So one call takes at most about the
+    /// sum of the two.
     fn cli(&self, command: &str) -> String {
         let path =
             std::env::var_os("BITCOIN_CLI").expect("BITCOIN_CLI holds the path of bitcoin-cli");
@@ -107,6 +112,7 @@ impl Bitcoind {
             .arg(format!("-rpcport={}", self.rpc_port))
             .arg("-rpcwait")
             .arg(format!("-rpcwaittimeout={}", LISTEN_TIMEOUT.as_secs()))
+            .arg(format!("-rpcclienttimeout={}", RPC_TIMEOUT.as_secs()))
             .arg(command)
             .output()
             .unwrap();
