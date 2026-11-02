@@ -14,7 +14,7 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60
 /// How long each message after the handshake may take, with our reply to it. A live peer pings
 /// far more often, so a longer silence means that it is gone. The deadline also covers the
 /// reply, because a write to a peer that does not read can block forever.
-const RECEIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+const RECEIVE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(20);
 
 /// Why the connection failed.
 #[derive(Debug)]
@@ -174,6 +174,9 @@ async fn run_exchange(
     let message = receive(stream, network).await?;
     let (peer, outbound) = peer.receive(&message).map_err(Error::NetProcessing)?;
     if let Some(outbound) = outbound {
+        // After the handshake, the peer replies only with a `pong`, and only to a `ping`.
+        assert!(matches!(outbound, crate::net_processing::Outbound::Pong(_)));
+        assert_eq!(message.msg_type(), crate::protocol::PING);
         send(stream, network, &outbound).await?;
     }
     Ok(peer)
