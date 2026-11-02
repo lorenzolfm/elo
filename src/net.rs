@@ -78,9 +78,35 @@ impl std::error::Error for Error {}
 /// `handshake` makes one, so `run` cannot start before the handshake is complete.
 #[derive(Debug)]
 pub struct Connection {
-    network: crate::chainparams::Network,
-    stream: tokio::net::TcpStream,
+    socket: Socket,
     peer: crate::net_processing::Peer,
+}
+
+/// The stream to one peer, its network, and the bytes of the frame that is not complete yet.
+/// Only `receive` reads the stream, so each byte that comes goes into a frame.
+#[derive(Debug)]
+struct Socket {
+    stream: tokio::net::TcpStream,
+    network: crate::chainparams::Network,
+    frame: PartialFrame,
+}
+
+/// The bytes of one frame, kept across waits. Each part has room for its exact size, and each
+/// read goes into the bytes that the part still needs. So a read cannot take a byte of the
+/// next frame.
+#[derive(Debug)]
+enum PartialFrame {
+    /// The header has not passed its checks. The bytes so far are `bytes[..filled]`.
+    Header {
+        bytes: [u8; crate::transport::HEADER_SIZE],
+        filled: usize,
+    },
+    /// The header passed its checks. The payload so far is `payload[..filled]`.
+    Payload {
+        header: crate::transport::MessageHeader,
+        payload: Vec<u8>,
+        filled: usize,
+    },
 }
 
 /// Dials `peer` and runs the handshake. Returns the connection for the messages after it, and
@@ -116,25 +142,25 @@ async fn handshake_stream(
 async fn handshake_stream_exchange(
     network: crate::chainparams::Network,
     peer: std::net::SocketAddr,
-    mut stream: tokio::net::TcpStream,
+    stream: tokio::net::TcpStream,
 ) -> Result<(Connection, crate::protocol::Version), Error> {
+    let mut socket = Socket::new(stream, network);
     let (mut handshake, outbound) =
         crate::net_processing::Handshake::start(peer, timestamp(), nonce());
-    send(&mut stream, network, &outbound).await?;
+    socket.send(&outbound).await?;
     loop {
-        let message = receive(&mut stream, network).await?;
+        let message = socket.receive().await?;
         match handshake.receive(&message).map_err(Error::NetProcessing)? {
             crate::net_processing::Step::Wait(next) => handshake = next,
             crate::net_processing::Step::Reply(next, outbound) => {
-                send(&mut stream, network, &outbound).await?;
+                socket.send(&outbound).await?;
                 handshake = next;
             }
             crate::net_processing::Step::Done(peer, theirs) => {
-                let connection = Connection {
-                    network,
-                    stream,
-                    peer,
-                };
+                // The peer can send more frames in the same segment as its `verack`. Each read
+                // stops at the end of a frame, so they are still in the stream, and `run` reads
+                // them next.
+                let connection = Connection { socket, peer };
                 return Ok((connection, theirs));
             }
         }
@@ -148,13 +174,12 @@ impl Connection {
     /// a frame or a message. The frame length limit bounds each message.
     pub async fn run(self) -> Error {
         let Connection {
-            network,
-            mut stream,
+            mut socket,
             mut peer,
         } = self;
         // The loop has no `break`, so the only way out is a `return` with an error.
         loop {
-            let exchange = run_exchange(&mut stream, network, peer);
+            let exchange = run_exchange(&mut socket, peer);
             peer = match tokio::time::timeout(RECEIVE_TIMEOUT, exchange).await {
                 Ok(Ok(next)) => next,
                 Ok(Err(error)) => {
@@ -181,18 +206,17 @@ impl Connection {
 /// Reads one message, gives it to `peer`, and sends the reply if there is one. Returns the
 /// peer for the next message.
 async fn run_exchange(
-    stream: &mut tokio::net::TcpStream,
-    network: crate::chainparams::Network,
+    socket: &mut Socket,
     peer: crate::net_processing::Peer,
 ) -> Result<crate::net_processing::Peer, Error> {
-    let message = receive(stream, network).await?;
+    let message = socket.receive().await?;
     let (peer, outbound) = peer.receive(&message).map_err(Error::NetProcessing)?;
     match outbound {
         Some(outbound) => {
             // After the handshake, the peer replies only with a `pong`, and only to a `ping`.
             assert!(matches!(outbound, crate::net_processing::Outbound::Pong(_)));
             assert_eq!(message.msg_type(), crate::protocol::PING);
-            send(stream, network, &outbound).await?;
+            socket.send(&outbound).await?;
         }
         // Each `ping` that the peer accepts gets a `pong`.
         None => assert_ne!(message.msg_type(), crate::protocol::PING),
@@ -200,56 +224,118 @@ async fn run_exchange(
     Ok(peer)
 }
 
-async fn send(
-    stream: &mut tokio::net::TcpStream,
-    network: crate::chainparams::Network,
-    outbound: &crate::net_processing::Outbound,
-) -> Result<(), Error> {
-    let frame = match outbound {
-        crate::net_processing::Outbound::Version(payload) => {
-            crate::transport::encode(network, crate::protocol::VERSION, payload)
+impl Socket {
+    fn new(stream: tokio::net::TcpStream, network: crate::chainparams::Network) -> Socket {
+        Socket {
+            stream,
+            network,
+            frame: PartialFrame::new(),
         }
-        crate::net_processing::Outbound::Verack => {
-            crate::transport::encode(network, crate::protocol::VERACK, &[])
+    }
+
+    async fn send(&mut self, outbound: &crate::net_processing::Outbound) -> Result<(), Error> {
+        let frame = match outbound {
+            crate::net_processing::Outbound::Version(payload) => {
+                crate::transport::encode(self.network, crate::protocol::VERSION, payload)
+            }
+            crate::net_processing::Outbound::Verack => {
+                crate::transport::encode(self.network, crate::protocol::VERACK, &[])
+            }
+            crate::net_processing::Outbound::Pong(nonce) => {
+                let mut payload = Vec::new();
+                nonce.encode(&mut payload);
+                crate::transport::encode(self.network, crate::protocol::PONG, &payload)
+            }
+        };
+        self.stream.write_all(&frame).await.map_err(Error::Io)
+    }
+
+    /// Reads until one frame is complete, and returns its message. A wait that ends early,
+    /// for example at a timeout, loses no bytes: the next call continues the same frame.
+    async fn receive(&mut self) -> Result<crate::transport::Message, Error> {
+        // Each turn returns or reads at least one byte, and a frame has at most
+        // `HEADER_SIZE` + `PAYLOAD_LENGTH_MAX` bytes. So the loop ends.
+        loop {
+            if let Some(message) = self.frame.cut(self.network).map_err(Error::Transport)? {
+                // The next frame starts empty, so no byte of this frame goes into it.
+                assert!(matches!(self.frame, PartialFrame::Header { filled: 0, .. }));
+                return Ok(message);
+            }
+            self.read().await?;
         }
-        crate::net_processing::Outbound::Pong(nonce) => {
-            let mut payload = Vec::new();
-            nonce.encode(&mut payload);
-            crate::transport::encode(network, crate::protocol::PONG, &payload)
+    }
+
+    /// Reads at least one byte, and at most the bytes that the part still needs. A wait that
+    /// ends early reads nothing, because `read` is cancel safe.
+    async fn read(&mut self) -> Result<(), Error> {
+        let (missing, filled) = self.frame.missing();
+        // `cut` takes each complete part, so this part still needs a byte. An empty slice
+        // would read nothing, and the zero would look like the end of the stream.
+        assert!(!missing.is_empty());
+        // A read returns at most the length of its slice, so it stops at the end of the part.
+        let count = self.stream.read(missing).await.map_err(Error::Io)?;
+        if count == 0 {
+            // The end of the stream, inside a frame or between two frames.
+            return Err(Error::Closed);
         }
-    };
-    stream.write_all(&frame).await.map_err(Error::Io)
+        *filled += count;
+        Ok(())
+    }
 }
 
-/// Reads one frame. The payload buffer is made only after the header passes its checks, so
-/// it is at most the length limit.
-async fn receive(
-    stream: &mut tokio::net::TcpStream,
-    network: crate::chainparams::Network,
-) -> Result<crate::transport::Message, Error> {
-    let mut header = [0; crate::transport::HEADER_SIZE];
-    stream
-        .read_exact(&mut header)
-        .await
-        .map_err(receive_error)?;
-    let header = crate::transport::decode_header(network, &header).map_err(Error::Transport)?;
+impl PartialFrame {
+    fn new() -> PartialFrame {
+        PartialFrame::Header {
+            bytes: [0; crate::transport::HEADER_SIZE],
+            filled: 0,
+        }
+    }
 
-    // `check_payload` needs exactly the length in the header, and `read_exact` reads that
-    // many bytes or fails.
-    let mut payload = vec![0; header.payload_length()];
-    stream
-        .read_exact(&mut payload)
-        .await
-        .map_err(receive_error)?;
-    crate::transport::check_payload(header, payload).map_err(Error::Transport)
-}
+    /// The bytes that the part still needs, and the count of the bytes that it has.
+    fn missing(&mut self) -> (&mut [u8], &mut usize) {
+        match self {
+            PartialFrame::Header { bytes, filled } => (&mut bytes[*filled..], filled),
+            PartialFrame::Payload {
+                payload, filled, ..
+            } => (&mut payload[*filled..], filled),
+        }
+    }
 
-/// The end of the stream inside a frame means that the peer closed the connection.
-fn receive_error(error: std::io::Error) -> Error {
-    if error.kind() == std::io::ErrorKind::UnexpectedEof {
-        Error::Closed
-    } else {
-        Error::Io(error)
+    /// Takes each complete part. A complete header gets its checks and then room for its
+    /// payload. A complete payload gets its checksum and becomes the message, and the next
+    /// frame starts empty.
+    fn cut(
+        &mut self,
+        network: crate::chainparams::Network,
+    ) -> Result<Option<crate::transport::Message>, crate::transport::Error> {
+        if let PartialFrame::Header {
+            bytes,
+            filled: crate::transport::HEADER_SIZE,
+        } = self
+        {
+            let header = crate::transport::decode_header(network, bytes)?;
+            // The room is made only after the header passes its checks, so it is at most the
+            // length limit.
+            let payload = vec![0; header.payload_length()];
+            *self = PartialFrame::Payload {
+                header,
+                payload,
+                filled: 0,
+            };
+        }
+        if let PartialFrame::Payload {
+            header,
+            payload,
+            filled,
+        } = self
+            && *filled == payload.len()
+        {
+            let header = *header;
+            let payload = std::mem::take(payload);
+            *self = PartialFrame::new();
+            return crate::transport::check_payload(header, payload).map(Some);
+        }
+        Ok(None)
     }
 }
 
@@ -397,6 +483,89 @@ mod tests {
         let result = block_on(super::handshake(crate::chainparams::Network::Regtest, peer));
         peer_thread.join().unwrap();
         assert!(matches!(result, Err(super::Error::Closed)), "{result:?}");
+    }
+
+    #[test]
+    fn frame_split_by_a_timeout_is_received_whole() {
+        // The peer sends the first half of Core's `version` and blocks. A `receive` under a
+        // timeout reads that half and times out. The peer then sends the rest, and the next
+        // `receive` must return the whole message, so the wait that ended kept the first half.
+        // The peer sends the rest only after the timeout: bytes on their way do not stop a
+        // paused clock, so the clock could jump before they come.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+        let (first_sent, first_sent_receiver) = std::sync::mpsc::channel();
+        let (timed_out, timed_out_receiver) = std::sync::mpsc::channel();
+        let peer_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut first = crate::fixtures::hex(crate::fixtures::VERSION_FRAME);
+            let rest = first.split_off(first.len() / 2);
+            stream.write_all(&first).unwrap();
+            first_sent.send(()).unwrap();
+            timed_out_receiver.recv().unwrap();
+            stream.write_all(&rest).unwrap();
+        });
+
+        let (timeout, message) = block_on(async {
+            let stream = tokio::net::TcpStream::connect(peer).await.unwrap();
+            let mut socket = super::Socket::new(stream, crate::chainparams::Network::Regtest);
+            // The runtime has no other task, so this wait blocks nothing. The clock is paused
+            // only when the first half is in the stream.
+            first_sent_receiver.recv().unwrap();
+            tokio::time::pause();
+            let receive = socket.receive();
+            let timeout = tokio::time::timeout(std::time::Duration::from_secs(1), receive).await;
+            timed_out.send(()).unwrap();
+            let message = socket.receive().await;
+            (timeout, message)
+        });
+        peer_thread.join().unwrap();
+        assert!(timeout.is_err(), "{timeout:?}");
+        let message = message.unwrap();
+        assert_eq!(message.msg_type(), crate::protocol::VERSION);
+        assert_eq!(message.payload(), crate::fixtures::version_payload());
+    }
+
+    #[test]
+    fn ping_in_one_write_with_their_verack_gets_a_pong() {
+        // The peer sends Core's `verack` and `ping` in one write, so both can be in the stream
+        // when the handshake ends. `run` must still read the `ping` and answer it. Then the
+        // peer closes.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+        let peer_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            // A driver that sends no `pong` fails the test fast.
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            read_frame(&mut stream);
+            stream
+                .write_all(&crate::fixtures::hex(crate::fixtures::VERSION_FRAME))
+                .unwrap();
+            read_frame(&mut stream);
+            let mut frames = crate::fixtures::hex(crate::fixtures::VERACK_FRAME);
+            frames.extend(crate::fixtures::hex(crate::fixtures::PING_FRAME));
+            stream.write_all(&frames).unwrap();
+            read_frame(&mut stream)
+        });
+
+        let error = block_on(async {
+            let (connection, _theirs) =
+                super::handshake(crate::chainparams::Network::Regtest, peer)
+                    .await
+                    .unwrap();
+            connection.run().await
+        });
+        let pong = peer_thread.join().unwrap();
+        // A `pong` has the payload of the `ping`, so only the message type differs.
+        let mut expected = crate::fixtures::hex(crate::fixtures::PING_FRAME);
+        let msg_type =
+            crate::chainparams::MAGIC_SIZE..crate::chainparams::MAGIC_SIZE + "ping".len();
+        assert_eq!(&expected[msg_type.clone()], b"ping");
+        expected[msg_type].copy_from_slice(b"pong");
+        assert_eq!(pong, expected);
+        assert!(matches!(error, super::Error::Closed), "{error:?}");
     }
 
     #[test]
