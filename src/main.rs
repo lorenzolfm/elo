@@ -5,8 +5,8 @@ use std::io::Write;
 
 const USAGE: &str = "usage: elo <mainnet|testnet4|signet|regtest> <ip>[:port]";
 
-/// The exit code for bad usage. Each other end exits with 1, because the connection has no
-/// successful end.
+/// The exit code for bad usage. Every other exit is 1, because the connection has no
+/// successful end. elo has no signal handler, so Ctrl-C ends it with the shell's signal code.
 const EXIT_USAGE: u8 = 2;
 
 fn main() -> std::process::ExitCode {
