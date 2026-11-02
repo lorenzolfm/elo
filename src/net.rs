@@ -329,8 +329,10 @@ impl Socket {
             crate::net_processing::PeerOutbound::Ping(nonce) => (crate::protocol::PING, nonce),
             crate::net_processing::PeerOutbound::Pong(nonce) => (crate::protocol::PONG, nonce),
         };
-        let mut payload = Vec::new();
+        let mut payload = Vec::with_capacity(size_of::<u64>());
         nonce.encode(&mut payload);
+        // The payload is only the nonce, the `u64` that the peer decodes.
+        assert_eq!(payload.len(), size_of::<u64>());
         self.send(msg_type, &payload).await
     }
 
