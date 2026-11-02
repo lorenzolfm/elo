@@ -157,7 +157,21 @@ impl Connection {
             let exchange = run_exchange(&mut stream, network, peer);
             peer = match tokio::time::timeout(RECEIVE_TIMEOUT, exchange).await {
                 Ok(Ok(next)) => next,
-                Ok(Err(error)) => return error,
+                Ok(Err(error)) => {
+                    // After the handshake, only the socket, a frame or a message can fail. The
+                    // connect and handshake errors come only from `handshake`.
+                    assert!(
+                        matches!(
+                            error,
+                            Error::Io(_)
+                                | Error::Closed
+                                | Error::Transport(_)
+                                | Error::NetProcessing(_)
+                        ),
+                        "{error:?}"
+                    );
+                    return error;
+                }
                 Err(_elapsed) => return Error::ReceiveTimeout,
             };
         }
@@ -173,11 +187,15 @@ async fn run_exchange(
 ) -> Result<crate::net_processing::Peer, Error> {
     let message = receive(stream, network).await?;
     let (peer, outbound) = peer.receive(&message).map_err(Error::NetProcessing)?;
-    if let Some(outbound) = outbound {
-        // After the handshake, the peer replies only with a `pong`, and only to a `ping`.
-        assert!(matches!(outbound, crate::net_processing::Outbound::Pong(_)));
-        assert_eq!(message.msg_type(), crate::protocol::PING);
-        send(stream, network, &outbound).await?;
+    match outbound {
+        Some(outbound) => {
+            // After the handshake, the peer replies only with a `pong`, and only to a `ping`.
+            assert!(matches!(outbound, crate::net_processing::Outbound::Pong(_)));
+            assert_eq!(message.msg_type(), crate::protocol::PING);
+            send(stream, network, &outbound).await?;
+        }
+        // Each `ping` that the peer accepts gets a `pong`.
+        None => assert_ne!(message.msg_type(), crate::protocol::PING),
     }
     Ok(peer)
 }
