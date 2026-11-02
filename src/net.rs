@@ -85,7 +85,7 @@ pub enum RunError {
     Closed,
     /// The peer sent a frame that elo refuses.
     Transport(crate::transport::Error),
-    /// elo refused the peer: a bad `ping` or `pong`.
+    /// elo refused the peer: a bad `ping` or `pong`, or no `pong` within the ping timeout.
     NetProcessing(crate::net_processing::PeerError),
 }
 
@@ -205,7 +205,7 @@ async fn handshake_stream_exchange(
     let (mut handshake, outbound) =
         crate::net_processing::Handshake::start(peer, timestamp(), nonce());
     socket
-        .send_handshake(&outbound)
+        .send_handshake_outbound(&outbound)
         .await
         .map_err(HandshakeError::Io)?;
     loop {
@@ -217,7 +217,7 @@ async fn handshake_stream_exchange(
             crate::net_processing::Step::Wait(next) => handshake = next,
             crate::net_processing::Step::Reply(next, outbound) => {
                 socket
-                    .send_handshake(&outbound)
+                    .send_handshake_outbound(&outbound)
                     .await
                     .map_err(HandshakeError::Io)?;
                 handshake = next;
@@ -285,7 +285,10 @@ async fn run_exchange(
                 crate::net_processing::PeerOutbound::Pong(_)
             ));
             assert_eq!(message.msg_type(), crate::protocol::PING);
-            socket.send_peer(&outbound).await.map_err(RunError::Io)?;
+            socket
+                .send_peer_outbound(&outbound)
+                .await
+                .map_err(RunError::Io)?;
         }
         // Each `ping` that the peer accepts gets a `pong`.
         None => assert_ne!(message.msg_type(), crate::protocol::PING),
@@ -303,7 +306,7 @@ impl Socket {
     }
 
     /// Writes a message of the handshake.
-    async fn send_handshake(
+    async fn send_handshake_outbound(
         &mut self,
         outbound: &crate::net_processing::HandshakeOutbound,
     ) -> Result<(), std::io::Error> {
@@ -318,7 +321,7 @@ impl Socket {
     }
 
     /// Writes a message after the handshake. The payload of each one is a nonce.
-    async fn send_peer(
+    async fn send_peer_outbound(
         &mut self,
         outbound: &crate::net_processing::PeerOutbound,
     ) -> Result<(), std::io::Error> {

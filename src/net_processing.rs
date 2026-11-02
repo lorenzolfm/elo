@@ -23,7 +23,7 @@ const PING_INTERVAL: std::time::Duration = std::time::Duration::from_mins(2);
 /// How long our `ping` may wait for its `pong`.
 const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(20);
 
-// The tick that sends a `ping` wakes `PING_TIMEOUT` later, so after itself.
+// The tick that returns a `ping` wakes `PING_TIMEOUT` later. So it wakes after itself.
 const _: () = assert!(!PING_TIMEOUT.is_zero());
 
 /// Why elo refuses the peer in the handshake. Each one ends the connection.
@@ -141,7 +141,7 @@ pub(crate) enum HandshakeOutbound {
     Verack,
 }
 
-/// A message that the peer sends after the handshake.
+/// A message that elo sends after the handshake.
 #[derive(Debug)]
 pub(crate) enum PeerOutbound {
     /// Our `ping` with a new nonce.
@@ -213,7 +213,9 @@ impl Handshake {
                 assert_ne!(theirs.nonce, self.nonce);
 
                 if message.msg_type() == crate::protocol::VERACK {
-                    let peer = Peer { ping: Ping::Unsent };
+                    let peer = Peer {
+                        ping: PingState::Unsent,
+                    };
                     Ok(Step::Done(peer, theirs))
                 } else {
                     let handshake = next(State::AwaitingVerack(theirs), self.nonce, message_count)?;
@@ -261,20 +263,20 @@ fn receive_version(
 /// message and the time, and sends what it returns.
 #[derive(Debug)]
 pub(crate) struct Peer {
-    ping: Ping,
+    ping: PingState,
 }
 
 /// Where our `ping` is. At most one is outstanding.
 #[derive(Debug)]
-enum Ping {
+enum PingState {
     /// No `ping` went yet. The next tick sends one.
     Unsent,
-    /// Our `ping` with `nonce` went at `sent`, and its `pong` has not come.
+    /// Our `ping` with `nonce` went at `sent`. Its `pong` has not come.
     Outstanding {
         nonce: u64,
         sent: std::time::Instant,
     },
-    /// Our last `ping` went at `sent`, and its `pong` came.
+    /// Our last `ping` went at `sent`. Its `pong` came.
     Answered { sent: std::time::Instant },
 }
 
@@ -300,26 +302,26 @@ impl Peer {
         }
     }
 
-    /// The `pong` must have the nonce of our outstanding `ping`, and then no `ping` is
-    /// outstanding. The bytes after the nonce are ignored.
+    /// The `pong` must have the nonce of our outstanding `ping`. Then no `ping` is outstanding.
+    /// The bytes after the nonce are ignored.
     fn receive_pong(self, message: &crate::transport::Message) -> Result<Peer, PeerError> {
         assert_eq!(message.msg_type(), crate::protocol::PONG);
 
         let mut input = message.payload();
         let theirs = u64::decode(&mut input).map_err(PeerError::Pong)?;
         match self.ping {
-            Ping::Outstanding { nonce, sent } if theirs == nonce => Ok(Peer {
-                ping: Ping::Answered { sent },
+            PingState::Outstanding { nonce, sent } if theirs == nonce => Ok(Peer {
+                ping: PingState::Answered { sent },
             }),
-            Ping::Outstanding { .. } => Err(PeerError::PongNonce),
-            Ping::Unsent | Ping::Answered { .. } => Err(PeerError::UnsolicitedPong),
+            PingState::Outstanding { .. } => Err(PeerError::PongNonce),
+            PingState::Unsent | PingState::Answered { .. } => Err(PeerError::UnsolicitedPong),
         }
     }
 
-    /// Sends a `ping` with `nonce` when one is due, and fails when our outstanding `ping` is
-    /// `PING_TIMEOUT` old. Returns the peer, the `ping` if one is due, and when to tick next.
-    /// A `ping` is due at once after the handshake, then `PING_INTERVAL` after the last `ping`
-    /// went, when its `pong` came. Each deadline is due at its instant, not after it.
+    /// Returns the peer, a `ping` with `nonce` if one is due, and when to tick next. A `ping`
+    /// is due at once after the handshake. Then it is due `PING_INTERVAL` after the last `ping`
+    /// went, if its `pong` came. When our outstanding `ping` is `PING_TIMEOUT` old, the tick
+    /// fails. Each deadline is due at its instant, not after it.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "until `Connection::run` calls it")
@@ -330,19 +332,19 @@ impl Peer {
         nonce: u64,
     ) -> Result<(Peer, Option<PeerOutbound>, std::time::Instant), PeerError> {
         let (peer, outbound, wake) = match self.ping {
-            Ping::Outstanding { sent, .. } => {
+            PingState::Outstanding { sent, .. } => {
                 let timeout = sent + PING_TIMEOUT;
                 if now >= timeout {
                     return Err(PeerError::PingTimeout);
                 }
                 (self, None, timeout)
             }
-            Ping::Answered { sent } if now < sent + PING_INTERVAL => {
+            PingState::Answered { sent } if now < sent + PING_INTERVAL => {
                 (self, None, sent + PING_INTERVAL)
             }
-            Ping::Unsent | Ping::Answered { .. } => {
+            PingState::Unsent | PingState::Answered { .. } => {
                 let peer = Peer {
-                    ping: Ping::Outstanding { nonce, sent: now },
+                    ping: PingState::Outstanding { nonce, sent: now },
                 };
                 (peer, Some(PeerOutbound::Ping(nonce)), now + PING_TIMEOUT)
             }
@@ -430,7 +432,7 @@ mod tests {
     /// The peer as the handshake makes it.
     fn peer() -> super::Peer {
         super::Peer {
-            ping: super::Ping::Unsent,
+            ping: super::PingState::Unsent,
         }
     }
 
@@ -668,13 +670,16 @@ mod tests {
     #[test]
     fn their_pong_needs_a_nonce_and_may_have_bytes_after_it() {
         let start = std::time::Instant::now();
+        // The payload is checked first, also when no `ping` is outstanding.
         let short = pong_message(&7_u64.to_le_bytes()[..size_of::<u64>() - 1]);
-        assert_eq!(
-            pinged(start, 7).receive(&short).err(),
-            Some(super::PeerError::Pong(
-                crate::serialize::Error::UnexpectedEnd
-            ))
-        );
+        for peer in [peer(), pinged(start, 7)] {
+            assert_eq!(
+                peer.receive(&short).err(),
+                Some(super::PeerError::Pong(
+                    crate::serialize::Error::UnexpectedEnd
+                ))
+            );
+        }
 
         let mut longer = 7_u64.to_le_bytes().to_vec();
         longer.push(0xaa);
