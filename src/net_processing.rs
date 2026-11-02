@@ -214,18 +214,19 @@ pub(crate) struct Peer(());
 
 impl Peer {
     /// A `ping` gets a `pong` with its nonce, and the bytes after the nonce are ignored. Each
-    /// other message is skipped.
+    /// other message is skipped. Each result but an error returns the peer, because an error
+    /// ends the connection.
     #[cfg_attr(not(test), expect(dead_code, reason = "until net calls it"))]
     pub(crate) fn receive(
-        &self,
+        self,
         message: &crate::transport::Message,
-    ) -> Result<Option<Outbound>, Error> {
+    ) -> Result<(Peer, Option<Outbound>), Error> {
         if message.msg_type() == crate::protocol::PING {
             let mut input = message.payload();
             let nonce = u64::decode(&mut input).map_err(Error::Ping)?;
-            Ok(Some(Outbound::Pong(nonce)))
+            Ok((self, Some(Outbound::Pong(nonce))))
         } else {
-            Ok(None)
+            Ok((self, None))
         }
     }
 }
@@ -395,7 +396,7 @@ mod tests {
         assert!(
             matches!(
                 outbound,
-                Ok(Some(super::Outbound::Pong(0x34e9_3229_8920_45d8)))
+                Ok((_, Some(super::Outbound::Pong(0x34e9_3229_8920_45d8))))
             ),
             "{outbound:?}"
         );
@@ -414,7 +415,7 @@ mod tests {
         assert!(
             matches!(
                 outbound,
-                Ok(Some(super::Outbound::Pong(0x34e9_3229_8920_45d8)))
+                Ok((_, Some(super::Outbound::Pong(0x34e9_3229_8920_45d8))))
             ),
             "{outbound:?}"
         );
@@ -436,7 +437,7 @@ mod tests {
         ] {
             let outbound = super::Peer(()).receive(&message);
             assert!(
-                matches!(outbound, Ok(None)),
+                matches!(outbound, Ok((_, None))),
                 "{:?}: {outbound:?}",
                 message.msg_type()
             );
