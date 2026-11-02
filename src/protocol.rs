@@ -19,6 +19,8 @@ pub(crate) struct MessageType([u8; MESSAGE_TYPE_SIZE]);
 // `from_name` runs at compile time here, so an invalid name does not build.
 pub(crate) const VERSION: MessageType = MessageType::from_name("version");
 pub(crate) const VERACK: MessageType = MessageType::from_name("verack");
+pub(crate) const PING: MessageType = MessageType::from_name("ping");
+pub(crate) const PONG: MessageType = MessageType::from_name("pong");
 
 impl MessageType {
     /// Pads `name` with NULs to `MESSAGE_TYPE_SIZE` bytes. Panics if the name
