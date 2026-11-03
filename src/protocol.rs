@@ -327,6 +327,18 @@ impl Headers {
         }
         Ok(Self(headers))
     }
+
+    /// True for `HEADERS_COUNT_MAX` headers. Then the peer can have more.
+    #[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
+    pub(crate) fn is_full(&self) -> bool {
+        self.0.len() == HEADERS_COUNT_MAX
+    }
+
+    /// The headers, in the order of the payload.
+    #[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
+    pub(crate) fn into_vec(self) -> Vec<crate::block::BlockHeader> {
+        self.0
+    }
 }
 
 #[cfg(test)]
@@ -401,8 +413,10 @@ mod tests {
 
         let mut input = message.payload();
         let headers = super::Headers::decode(&mut input).unwrap();
+        // Core has only blocks 1 and 2, so the batch is not full.
+        assert!(!headers.is_full());
         let hashes: Vec<_> = headers
-            .0
+            .into_vec()
             .iter()
             .map(crate::block::BlockHeader::hash)
             .collect();
@@ -428,7 +442,8 @@ mod tests {
             payload.extend_from_slice(block_1);
         }
         let headers = super::Headers::decode(&mut payload.as_slice()).unwrap();
-        assert_eq!(headers.0.len(), 2000);
+        assert!(headers.is_full());
+        assert_eq!(headers.into_vec().len(), 2000);
 
         // No header follows the count. A decode that reads a header first fails with
         // `UnexpectedEnd`.
@@ -472,7 +487,7 @@ mod tests {
         payload.push(0xaa);
         let mut input = payload.as_slice();
         let headers = super::Headers::decode(&mut input).unwrap();
-        assert_eq!(headers.0.len(), 2);
+        assert_eq!(headers.into_vec().len(), 2);
         assert_eq!(input, [0xaa]);
     }
 
