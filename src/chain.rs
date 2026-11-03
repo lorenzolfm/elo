@@ -60,6 +60,7 @@ impl Chain {
         Ok(())
     }
 
+    /// The height and the hash of the last header.
     #[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
     pub(crate) fn tip(&self) -> Tip {
         Tip {
@@ -85,7 +86,7 @@ mod tests {
     /// `count` headers, each on the header before it, the first on the regtest genesis header.
     /// elo checks no proof of work yet, so each header is the genesis header with its `prev`
     /// changed.
-    fn headers(count: usize) -> Vec<crate::block::BlockHeader> {
+    fn headers_on_genesis(count: usize) -> Vec<crate::block::BlockHeader> {
         let genesis = crate::chainparams::Network::Regtest.genesis();
         let on = |below: &crate::block::BlockHeader| crate::block::BlockHeader {
             prev: below.hash(),
@@ -98,7 +99,7 @@ mod tests {
 
     #[test]
     fn extend_puts_each_batch_on_the_tip() {
-        let headers = headers(3);
+        let headers = headers_on_genesis(3);
         let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
 
         assert_eq!(chain.extend(headers[..2].to_vec()), Ok(()));
@@ -115,7 +116,7 @@ mod tests {
 
     #[test]
     fn extend_refuses_a_batch_off_the_tip() {
-        let headers = headers(3);
+        let headers = headers_on_genesis(3);
         let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
         let before = chain.tip();
 
@@ -129,7 +130,7 @@ mod tests {
 
     #[test]
     fn extend_refuses_a_batch_with_a_break() {
-        let mut headers = headers(4);
+        let mut headers = headers_on_genesis(4);
         headers.remove(2);
         let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
         let before = chain.tip();
@@ -139,6 +140,15 @@ mod tests {
             chain.extend(headers),
             Err(super::ExtendError::NotContinuous)
         );
+        assert_eq!(chain.tip(), before);
+    }
+
+    #[test]
+    fn extend_takes_an_empty_batch() {
+        let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
+        let before = chain.tip();
+
+        assert_eq!(chain.extend(Vec::new()), Ok(()));
         assert_eq!(chain.tip(), before);
     }
 
