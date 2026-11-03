@@ -108,7 +108,7 @@ impl Decode for bool {
 /// One, three or five bytes: the shortest form that holds `value`.
 ///
 /// Panics if `value` is above `COMPACT_SIZE_MAX`, because a peer refuses it.
-fn write_compact_size(out: &mut Vec<u8>, value: u64) {
+pub(crate) fn write_compact_size(out: &mut Vec<u8>, value: u64) {
     assert!(value <= COMPACT_SIZE_MAX);
 
     match value {
@@ -132,7 +132,7 @@ fn write_compact_size(out: &mut Vec<u8>, value: u64) {
 }
 
 /// Refuses a form longer than the value needs, and a value above `COMPACT_SIZE_MAX`.
-fn read_compact_size(input: &mut &[u8]) -> Result<u64, Error> {
+pub(crate) fn read_compact_size(input: &mut &[u8]) -> Result<u64, Error> {
     let (value, value_min) = match u8::decode(input)? {
         0xfd => (u64::from(u16::decode(input)?), 0xfd),
         0xfe => (u64::from(u32::decode(input)?), 0x1_0000),

@@ -10,6 +10,11 @@
 //! The `headers` frame was captured on 2026-11-03 the same way, on a new chain. First
 //! `generatetodescriptor 2` mined blocks 1 and 2. After the handshake, the script sent its
 //! `verack` and a `getheaders` with genesis as the only locator hash.
+//!
+//! The `getheaders` frame was captured on 2026-11-03 from a new node with only genesis. The
+//! script listened, and `addnode 127.0.0.1:<port> onetry false` made Core connect to it with
+//! v1. The script claimed `NODE_NETWORK` in its `version`, then sent its `verack`. Core sent
+//! the `getheaders` after its `ping`.
 
 /// The `version`. On loopback, the IPs and ports of both addresses are zero.
 pub(crate) const VERSION_FRAME: &str = concat!(
@@ -66,6 +71,20 @@ pub(crate) const HEADERS_FRAME: &str = concat!(
 /// The hash of block 1 in `HEADERS_FRAME`, as `getblockhash 1` wrote it.
 pub(crate) const BLOCK_1_HASH: &str =
     "41650b9b585fd56a907a5286e7304582ee102c563563a9572bdf898c4f53d96f";
+
+/// The hash of block 2 in `HEADERS_FRAME`, as `getblockhash 2` wrote it.
+pub(crate) const BLOCK_2_HASH: &str =
+    "29d4ecbe35de0c35851f0ae8bb5070fbc2273c65b1538591f3deb3179883456a";
+
+/// The `getheaders` that Core sends to a new peer: version 70016, the genesis hash as the only
+/// locator hash, and a `hash_stop` of all zeros.
+pub(crate) const GETHEADERS_FRAME: &str = concat!(
+    "fabfb5da6765746865616465727300004500000070e012a4",
+    "80110100",
+    "01",
+    "06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+);
 
 /// The payload of `VERSION_FRAME`.
 pub(crate) fn version_payload() -> Vec<u8> {
