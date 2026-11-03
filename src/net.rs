@@ -241,10 +241,12 @@ impl Connection {
     /// peer for `Synced::run`, and the tip of our chain. The loop has no count bound, because
     /// only the chain of the peer bounds the sync, and elo checks no proof of work yet. It ends
     /// on the errors of `run`, and also when elo refuses a `headers` or none comes within the
-    /// headers timeout. Each wait for a message ends at the wake from `tick`. `tick` checks the
-    /// headers timeout only at the start of a turn. So a write that blocks while our
-    /// `getheaders` is outstanding can end the connection up to `SEND_TIMEOUT` after the
-    /// headers timeout, with `SendTimeout`.
+    /// headers timeout. Each wait for a message ends at the wake from `tick`, but the read takes
+    /// a message that is already there, also after the wake. `tick` checks the headers timeout
+    /// only at the start of a turn. One turn can write our `ping` and our `getheaders`, and then
+    /// a `pong`, and each write can take up to `SEND_TIMEOUT`. So the connection can end up to
+    /// three times `SEND_TIMEOUT` after the tick that sent our `getheaders`, with `SendTimeout`,
+    /// `PingTimeout` or `HeadersTimeout`.
     pub async fn sync(self) -> Result<(Synced, crate::chain::Tip), RunError> {
         let Connection {
             mut socket,
