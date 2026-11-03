@@ -420,9 +420,9 @@ mod tests {
     #[test]
     fn headers_count_is_at_most_2000() {
         let core = crate::fixtures::headers_payload();
-        let (_, headers) = core.split_first().unwrap();
-        // Block 1 and its transaction count.
-        let block_1 = &headers[..headers.len() / 2];
+        let (_, entries) = core.split_first().unwrap();
+        // The 80 bytes of block 1 and its transaction count.
+        let block_1 = &entries[..80 + 1];
         let mut payload = Vec::new();
         crate::serialize::write_compact_size(&mut payload, 2000);
         for _ in 0..2000 {
