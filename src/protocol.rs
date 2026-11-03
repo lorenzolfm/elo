@@ -2,6 +2,9 @@
 
 use crate::serialize::{Decode, Encode};
 
+/// The protocol version elo sends.
+pub(crate) const PROTOCOL_VERSION: i32 = 70016;
+
 /// The longest user agent a `version` may carry.
 const USER_AGENT_LENGTH_MAX: usize = 256;
 
