@@ -151,23 +151,28 @@
                 RUSTFLAGS="--cfg fuzzing" cargo clippy --manifest-path fuzz/Cargo.toml \
                   --locked -- --deny warnings
 
+                # The log shows only the `cargo` commands, so a `test` that fails must say
+                # why. Without this, the log ends on the last `cargo` command, which passed.
+                fail() { echo "elo-fuzz: $1" >&2; exit 1; }
+
                 # The committed corpus is at most 1 MiB, so a clone stays small.
-                test "$(du --summarize --bytes fuzz/corpus | cut --fields=1)" -le 1048576
+                corpus_size="$(du --summarize --bytes fuzz/corpus | cut --fields=1)"
+                test "$corpus_size" -le 1048576 || fail "the corpus is $corpus_size bytes, above 1 MiB"
 
                 # The targets build elo with the versions that elo ships. `--locked` checks
                 # each lockfile alone, so it does not see an update of only one. With no
                 # packages in the list, the comparison passes.
                 packages() { sed --quiet '/^name = /{N;s/\n/ /;p}' "$1" | sort; }
-                test -n "$(packages Cargo.lock)"
+                test -n "$(packages Cargo.lock)" || fail "found no packages in Cargo.lock"
                 comm -23 <(packages Cargo.lock) <(packages fuzz/Cargo.lock) | tee only-in-root
-                test ! -s only-in-root
+                test ! -s only-in-root || fail "fuzz/Cargo.lock does not have the packages above"
 
                 # With no targets, the loop runs zero times and the gate passes.
                 targets="$(cargo fuzz list)"
-                test -n "$targets"
+                test -n "$targets" || fail "found no fuzz targets"
                 for target in $targets; do
                   # `cargo fuzz run` makes a missing corpus, and an empty one passes.
-                  test -n "$(ls --almost-all "fuzz/corpus/$target")"
+                  test -n "$(ls --almost-all "fuzz/corpus/$target")" || fail "target $target has no corpus"
                   cargo fuzz run --sanitizer none "$target" -- -runs=0
                 done
               '';
