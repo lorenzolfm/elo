@@ -21,7 +21,6 @@ pub(crate) struct BlockHeader {
 
 impl BlockHeader {
     /// The double SHA-256 of the encoded header.
-    #[cfg_attr(not(test), expect(dead_code, reason = "until chain calls it"))]
     pub(crate) fn hash(&self) -> bitcoin_hashes::sha256d::Hash {
         let mut bytes = Vec::with_capacity(BLOCK_HEADER_SIZE);
         self.encode(&mut bytes);
