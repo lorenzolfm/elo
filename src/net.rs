@@ -562,8 +562,8 @@ pub mod fuzz {
         };
         let (sizes, stream) = rest.split_at(rest.len().min(usize::from(*sizes_count)));
 
-        // One read for all the bytes and one read for each byte, so an input with no size bytes
-        // still compares two splits.
+        // The largest reads and the smallest reads, so an input with no size bytes still compares
+        // two splits.
         let whole = frame_read(stream, std::iter::empty());
         assert_eq!(frame_read(stream, std::iter::repeat(1)), whole);
         let read_sizes = sizes.iter().map(|size_byte| usize::from(*size_byte) + 1);
