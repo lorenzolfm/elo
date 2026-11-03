@@ -41,9 +41,10 @@ impl Chain {
         &mut self,
         headers: Vec<crate::block::BlockHeader>,
     ) -> Result<(), ExtendError> {
-        if let Some(first) = headers.first()
-            && first.prev != self.tip.hash()
-        {
+        let Some(first) = headers.first() else {
+            return Ok(());
+        };
+        if first.prev != self.tip.hash() {
             return Err(ExtendError::NotOnTip);
         }
         if headers
