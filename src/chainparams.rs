@@ -48,7 +48,6 @@ impl Network {
     }
 
     /// The first header of the chain.
-    #[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
     pub(crate) const fn genesis(self) -> crate::block::BlockHeader {
         // No header comes before genesis.
         let prev = bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]);
