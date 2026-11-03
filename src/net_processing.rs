@@ -399,7 +399,7 @@ mod tests {
     /// A `ping` with Core's payload after `change`.
     fn ping_message(change: impl FnOnce(&mut Vec<u8>)) -> crate::transport::Message {
         let mut payload = crate::fixtures::hex(crate::fixtures::PING_FRAME)
-            .split_off(crate::transport::HEADER_SIZE);
+            .split_off(crate::transport::MESSAGE_HEADER_SIZE);
         change(&mut payload);
         message(&crate::transport::encode(
             crate::chainparams::Network::Regtest,

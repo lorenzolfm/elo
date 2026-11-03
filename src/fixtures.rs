@@ -69,12 +69,12 @@ pub(crate) const BLOCK_1_HASH: &str =
 
 /// The payload of `VERSION_FRAME`.
 pub(crate) fn version_payload() -> Vec<u8> {
-    hex(VERSION_FRAME).split_off(crate::transport::HEADER_SIZE)
+    hex(VERSION_FRAME).split_off(crate::transport::MESSAGE_HEADER_SIZE)
 }
 
 /// The payload of `HEADERS_FRAME`.
 pub(crate) fn headers_payload() -> Vec<u8> {
-    hex(HEADERS_FRAME).split_off(crate::transport::HEADER_SIZE)
+    hex(HEADERS_FRAME).split_off(crate::transport::MESSAGE_HEADER_SIZE)
 }
 
 /// A hash in hex, in the order a display shows it: the reverse of the wire order.
