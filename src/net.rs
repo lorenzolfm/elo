@@ -547,7 +547,7 @@ pub mod fuzz {
         /// The error that ended the stream, or `None` if the bytes ended first.
         error: Option<crate::transport::Error>,
         /// The count of the bytes that no read took.
-        unread: usize,
+        unread_count: usize,
     }
 
     /// Checks that each split of the same bytes gives the same `FrameRead`, that the messages
@@ -585,7 +585,7 @@ pub mod fuzz {
         let written = crate::transport::encode(NETWORK, crate::protocol::VERACK, payload);
         let read = frame_read(&written, read_sizes);
         assert_eq!(read.error, None);
-        assert_eq!(read.unread, 0);
+        assert_eq!(read.unread_count, 0);
         let [message] = read.messages.as_slice() else {
             panic!("one frame gives {} messages", read.messages.len());
         };
@@ -632,7 +632,7 @@ pub mod fuzz {
         FrameRead {
             messages,
             error,
-            unread: unread.len(),
+            unread_count: unread.len(),
         }
     }
 }
