@@ -444,7 +444,9 @@ impl Peer {
     /// its `pong` came. A `getheaders` is due at once after the handshake, and at once after a
     /// full batch. The tick fails when our outstanding `ping` is `PING_TIMEOUT` old, or our
     /// outstanding `getheaders` is `HEADERS_TIMEOUT` old. The `ping` is checked first. Each
-    /// deadline is due at its instant, not after it. The wake is the earliest deadline.
+    /// deadline is due at its instant, not after it. The wake is the earliest deadline. The
+    /// `now` of a tick is not before the `now` of an earlier tick, because each deadline counts
+    /// from an earlier `now`.
     pub(crate) fn tick(
         self,
         now: std::time::Instant,
@@ -478,6 +480,8 @@ impl PingState {
         match self {
             PingState::Unsent => Ok(PingState::send(now, nonce)),
             PingState::Outstanding { sent, .. } => {
+                // `sent` is the `now` of an earlier tick.
+                assert!(sent <= now);
                 let timeout = sent + PING_TIMEOUT;
                 if now < timeout {
                     Ok((self, None, timeout))
@@ -486,6 +490,8 @@ impl PingState {
                 }
             }
             PingState::Answered { sent } => {
+                // `sent` is the `now` of an earlier tick.
+                assert!(sent <= now);
                 let due = sent + PING_INTERVAL;
                 if now < due {
                     Ok((self, None, due))
@@ -525,6 +531,8 @@ impl SyncState {
                 Ok((sync, Some(get_headers), Some(now + HEADERS_TIMEOUT)))
             }
             SyncState::Asked { sent } => {
+                // `sent` is the `now` of an earlier tick.
+                assert!(sent <= now);
                 let timeout = sent + HEADERS_TIMEOUT;
                 if now < timeout {
                     Ok((self, None, Some(timeout)))
