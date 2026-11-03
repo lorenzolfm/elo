@@ -49,7 +49,7 @@ impl Chain {
         }
         if headers
             .array_windows()
-            .any(|[below, header]| header.prev != below.hash())
+            .any(|[below, above]| above.prev != below.hash())
         {
             return Err(ExtendError::NotContinuous);
         }
