@@ -2,6 +2,12 @@
 
 use crate::serialize::{Decode, Encode};
 
+/// The protocol version elo sends.
+pub(crate) const PROTOCOL_VERSION: i32 = 70016;
+
+/// The most headers a `headers` may carry. A peer that sends fewer has no more to send.
+const HEADERS_COUNT_MAX: usize = 2000;
+
 /// The longest user agent a `version` may carry.
 const USER_AGENT_LENGTH_MAX: usize = 256;
 
@@ -21,6 +27,10 @@ pub(crate) const VERSION: MessageType = MessageType::from_name("version");
 pub(crate) const VERACK: MessageType = MessageType::from_name("verack");
 pub(crate) const PING: MessageType = MessageType::from_name("ping");
 pub(crate) const PONG: MessageType = MessageType::from_name("pong");
+#[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
+pub(crate) const GETHEADERS: MessageType = MessageType::from_name("getheaders");
+#[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
+pub(crate) const HEADERS: MessageType = MessageType::from_name("headers");
 
 impl MessageType {
     /// Pads `name` with NULs to `MESSAGE_TYPE_SIZE` bytes. Panics if the name
@@ -259,6 +269,78 @@ impl Decode for Version {
     }
 }
 
+/// The `getheaders` payload. It asks for the headers after `tip`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
+pub(crate) struct GetHeaders {
+    /// The only hash in the locator.
+    tip: bitcoin_hashes::sha256d::Hash,
+}
+
+/// The version is `PROTOCOL_VERSION`. The locator holds only `tip`. `hash_stop` is all zeros,
+/// so the peer sends as many headers as a `headers` can carry.
+impl Encode for GetHeaders {
+    fn encode(&self, out: &mut Vec<u8>) {
+        PROTOCOL_VERSION.encode(out);
+        crate::serialize::write_compact_size(out, 1);
+        self.tip.encode(out);
+        let hash_stop = [0_u8; 32];
+        hash_stop.encode(out);
+    }
+}
+
+/// The `headers` payload: at most `HEADERS_COUNT_MAX` headers, each with a transaction count
+/// of 0.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Headers(Vec<crate::block::BlockHeader>);
+
+/// Why a `headers` payload was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeadersError {
+    /// The payload did not decode.
+    Payload(crate::serialize::Error),
+    /// The count is above `HEADERS_COUNT_MAX`.
+    TooMany(usize),
+    /// A header has a transaction count that is not 0.
+    TxCount(std::num::NonZeroUsize),
+}
+
+impl Headers {
+    /// Checks the count before it reads a header. Bytes after the last transaction count stay
+    /// in `input`.
+    #[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
+    pub(crate) fn decode(input: &mut &[u8]) -> Result<Self, HeadersError> {
+        let count = crate::serialize::read_compact_size(input).map_err(HeadersError::Payload)?;
+        if count > HEADERS_COUNT_MAX {
+            return Err(HeadersError::TooMany(count));
+        }
+
+        let mut headers = Vec::with_capacity(count);
+        for _ in 0..count {
+            let header = crate::block::BlockHeader::decode(input).map_err(HeadersError::Payload)?;
+            let tx_count =
+                crate::serialize::read_compact_size(input).map_err(HeadersError::Payload)?;
+            if let Some(tx_count) = std::num::NonZeroUsize::new(tx_count) {
+                return Err(HeadersError::TxCount(tx_count));
+            }
+            headers.push(header);
+        }
+        Ok(Self(headers))
+    }
+
+    /// True for `HEADERS_COUNT_MAX` headers. Then the peer can have more.
+    #[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
+    pub(crate) fn is_full(&self) -> bool {
+        self.0.len() == HEADERS_COUNT_MAX
+    }
+
+    /// The headers, in the order of the payload.
+    #[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
+    pub(crate) fn into_vec(self) -> Vec<crate::block::BlockHeader> {
+        self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::serialize::{Decode, Encode};
@@ -300,6 +382,113 @@ mod tests {
         crate::serialize::write_string(&mut payload, user_agent);
         payload.extend(start_height_and_relay);
         payload
+    }
+
+    #[test]
+    fn get_headers_encodes_to_core_bytes() {
+        let get_headers = super::GetHeaders {
+            tip: crate::chainparams::Network::Regtest.genesis().hash(),
+        };
+        let mut payload = Vec::new();
+        get_headers.encode(&mut payload);
+        assert_eq!(
+            crate::transport::encode(
+                crate::chainparams::Network::Regtest,
+                super::GETHEADERS,
+                &payload
+            ),
+            crate::fixtures::hex(crate::fixtures::GETHEADERS_FRAME)
+        );
+    }
+
+    #[test]
+    fn headers_decodes_core_bytes() {
+        let frame = crate::fixtures::hex(crate::fixtures::HEADERS_FRAME);
+        let (message_header, payload) = frame.split_first_chunk().unwrap();
+        let message_header =
+            crate::transport::decode_header(crate::chainparams::Network::Regtest, message_header)
+                .unwrap();
+        let message = crate::transport::check_payload(message_header, payload.to_vec()).unwrap();
+        assert_eq!(message.msg_type(), super::HEADERS);
+
+        let mut input = message.payload();
+        let headers = super::Headers::decode(&mut input).unwrap();
+        // Core has only blocks 1 and 2, so the batch is not full.
+        assert!(!headers.is_full());
+        let hashes: Vec<_> = headers
+            .into_vec()
+            .iter()
+            .map(crate::block::BlockHeader::hash)
+            .collect();
+        assert_eq!(
+            hashes,
+            [
+                crate::fixtures::hash_from_display_hex(crate::fixtures::BLOCK_1_HASH),
+                crate::fixtures::hash_from_display_hex(crate::fixtures::BLOCK_2_HASH),
+            ]
+        );
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn headers_count_is_at_most_2000() {
+        let core = crate::fixtures::headers_payload();
+        let (_, entries) = core.split_first().unwrap();
+        // The 80 bytes of block 1 and its transaction count.
+        let block_1 = &entries[..80 + 1];
+        let mut payload = Vec::new();
+        crate::serialize::write_compact_size(&mut payload, 2000);
+        for _ in 0..2000 {
+            payload.extend_from_slice(block_1);
+        }
+        let headers = super::Headers::decode(&mut payload.as_slice()).unwrap();
+        assert!(headers.is_full());
+        assert_eq!(headers.into_vec().len(), 2000);
+
+        // No header follows the count. A decode that reads a header first fails with
+        // `UnexpectedEnd`.
+        let mut payload = Vec::new();
+        crate::serialize::write_compact_size(&mut payload, 2001);
+        assert_eq!(
+            super::Headers::decode(&mut payload.as_slice()),
+            Err(super::HeadersError::TooMany(2001))
+        );
+    }
+
+    #[test]
+    fn headers_refuses_a_tx_count_that_is_not_0() {
+        let mut payload = crate::fixtures::headers_payload();
+        // The transaction count of block 1, after the count and the 80 bytes of the header.
+        let tx_count = &mut payload[1 + 80];
+        assert_eq!(*tx_count, 0);
+        *tx_count = 1;
+        assert_eq!(
+            super::Headers::decode(&mut payload.as_slice()),
+            Err(super::HeadersError::TxCount(std::num::NonZeroUsize::MIN))
+        );
+    }
+
+    #[test]
+    fn headers_requires_each_tx_count() {
+        let mut payload = crate::fixtures::headers_payload();
+        // The bytes stop where the transaction count of block 2 starts. A peer can send this.
+        payload.pop();
+        assert_eq!(
+            super::Headers::decode(&mut payload.as_slice()),
+            Err(super::HeadersError::Payload(
+                crate::serialize::Error::UnexpectedEnd
+            ))
+        );
+    }
+
+    #[test]
+    fn headers_leaves_the_bytes_after_the_last_tx_count() {
+        let mut payload = crate::fixtures::headers_payload();
+        payload.push(0xaa);
+        let mut input = payload.as_slice();
+        let headers = super::Headers::decode(&mut input).unwrap();
+        assert_eq!(headers.into_vec().len(), 2);
+        assert_eq!(input, [0xaa]);
     }
 
     #[test]

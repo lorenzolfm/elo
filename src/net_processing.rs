@@ -3,14 +3,11 @@
 
 use crate::serialize::{Decode, Encode};
 
-/// The protocol version elo sends.
-const PROTOCOL_VERSION: i32 = 70016;
-
 /// The lowest protocol version elo accepts from a peer.
 const PROTOCOL_VERSION_MIN: i32 = 70016;
 
 // elo accepts its own `version`.
-const _: () = assert!(PROTOCOL_VERSION >= PROTOCOL_VERSION_MIN);
+const _: () = assert!(crate::protocol::PROTOCOL_VERSION >= PROTOCOL_VERSION_MIN);
 
 /// The most messages a peer may send in a handshake, its `verack` included. A peer needs five
 /// at most: `version`, `wtxidrelay`, `sendaddrv2`, `sendtxrcncl` and `verack`. The rest is room
@@ -101,7 +98,7 @@ impl std::error::Error for PeerError {}
 fn our_version(peer: std::net::SocketAddr, timestamp: i64, nonce: u64) -> crate::protocol::Version {
     let unspecified = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0));
     crate::protocol::Version {
-        version: PROTOCOL_VERSION,
+        version: crate::protocol::PROTOCOL_VERSION,
         services: crate::protocol::ServiceFlags::NONE,
         timestamp,
         addr_recv: crate::protocol::Address::new(crate::protocol::ServiceFlags::NONE, peer),
