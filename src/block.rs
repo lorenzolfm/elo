@@ -31,21 +31,21 @@ impl BlockHeader {
 
 impl Encode for BlockHeader {
     fn encode(&self, out: &mut Vec<u8>) {
-        let length = out.len();
+        let length_before = out.len();
         self.version.encode(out);
         self.prev.encode(out);
         self.merkle_root.encode(out);
         self.time.encode(out);
         self.bits.encode(out);
         self.nonce.encode(out);
-        assert_eq!(out.len() - length, BLOCK_HEADER_SIZE);
+        assert_eq!(out.len() - length_before, BLOCK_HEADER_SIZE);
     }
 }
 
 /// Each field is required. Bytes after `nonce` stay in `input`.
 impl Decode for BlockHeader {
     fn decode(input: &mut &[u8]) -> Result<Self, crate::serialize::Error> {
-        let length = input.len();
+        let length_before = input.len();
         let header = Self {
             version: i32::decode(input)?,
             prev: Decode::decode(input)?,
@@ -54,7 +54,7 @@ impl Decode for BlockHeader {
             bits: u32::decode(input)?,
             nonce: u32::decode(input)?,
         };
-        assert_eq!(length - input.len(), BLOCK_HEADER_SIZE);
+        assert_eq!(length_before - input.len(), BLOCK_HEADER_SIZE);
         Ok(header)
     }
 }
