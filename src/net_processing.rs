@@ -357,7 +357,7 @@ enum SyncState {
     /// sends it.
     Due,
     /// Our `getheaders` went at `sent`. Its `headers` has not come.
-    Asked { sent: std::time::Instant },
+    Outstanding { sent: std::time::Instant },
     /// A batch that was not full came, so our tip is the tip of the peer. No `getheaders` goes
     /// again.
     Synced,
@@ -422,7 +422,7 @@ impl Peer {
 
         let mut input = message.payload();
         let headers = crate::protocol::Headers::decode(&mut input).map_err(PeerError::Headers)?;
-        let SyncState::Asked { .. } = self.sync else {
+        let SyncState::Outstanding { .. } = self.sync else {
             return Err(PeerError::UnsolicitedHeaders);
         };
         let full = headers.is_full();
@@ -527,10 +527,10 @@ impl SyncState {
         match self {
             SyncState::Due => {
                 let get_headers = crate::protocol::GetHeaders::new(chain.tip());
-                let sync = SyncState::Asked { sent: now };
+                let sync = SyncState::Outstanding { sent: now };
                 Ok((sync, Some(get_headers), Some(now + HEADERS_TIMEOUT)))
             }
-            SyncState::Asked { sent } => {
+            SyncState::Outstanding { sent } => {
                 // `sent` is the `now` of an earlier tick.
                 assert!(sent <= now);
                 let timeout = sent + HEADERS_TIMEOUT;
