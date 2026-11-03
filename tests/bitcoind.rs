@@ -13,6 +13,9 @@ const PEER_INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 /// How long elo may take to exit after `bitcoind` closes the connection.
 const EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long elo may take to sync the headers of `bitcoind` and print its tip.
+const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A directory that the drop removes.
 struct TempDir(std::path::PathBuf);
 
@@ -259,6 +262,54 @@ fn our_ping_gets_a_pong_from_bitcoind() {
     };
     assert_eq!(status.code(), Some(1));
     assert_eq!(stderr(&mut elo.0), "elo: the peer closed the connection\n");
+}
+
+#[test]
+fn sync_from_bitcoind_prints_its_tip() {
+    let bitcoind = Bitcoind::start();
+    // 2001 blocks: a full batch of 2000 headers, our next `getheaders`, and a batch of 1.
+    bitcoind.cli(&["generatetodescriptor", "2001", "raw(51)"]);
+    let best = bitcoind.cli(&["getbestblockhash"]);
+    let mut elo = Process(
+        std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
+            .arg("regtest")
+            .arg(bitcoind.peer.to_string())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+
+    // elo stays connected after the sync, so its stdout does not end. A thread reads each line,
+    // and the test waits for the `tip` line with a timeout.
+    let stdout = elo.0.stdout.take().unwrap();
+    let (lines, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufRead::lines(std::io::BufReader::new(stdout)) {
+            if lines.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + SYNC_TIMEOUT;
+    let tip = loop {
+        let timeout = deadline.saturating_duration_since(std::time::Instant::now());
+        match receiver.recv_timeout(timeout) {
+            Ok(line) => {
+                if let Some(tip) = line.strip_prefix("tip ") {
+                    break tip.to_owned();
+                }
+            }
+            // The thread ends only when stdout ends, so elo exited.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("elo exited: {}", stderr(&mut elo.0))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("elo printed no tip within {} s", SYNC_TIMEOUT.as_secs())
+            }
+        }
+    };
+    assert_eq!(tip, format!("2001 {}", best.trim_end()));
 }
 
 /// What `child` wrote to its stderr pipe. Call it only after the exit, or it blocks.

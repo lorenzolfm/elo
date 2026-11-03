@@ -27,9 +27,7 @@ pub(crate) const VERSION: MessageType = MessageType::from_name("version");
 pub(crate) const VERACK: MessageType = MessageType::from_name("verack");
 pub(crate) const PING: MessageType = MessageType::from_name("ping");
 pub(crate) const PONG: MessageType = MessageType::from_name("pong");
-#[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
 pub(crate) const GETHEADERS: MessageType = MessageType::from_name("getheaders");
-#[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
 pub(crate) const HEADERS: MessageType = MessageType::from_name("headers");
 
 impl MessageType {
@@ -271,10 +269,17 @@ impl Decode for Version {
 
 /// The `getheaders` payload. It asks for the headers after `tip`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
 pub(crate) struct GetHeaders {
     /// The only hash in the locator.
     tip: bitcoin_hashes::sha256d::Hash,
+}
+
+impl GetHeaders {
+    /// Asks for the headers after the tip of our chain. Only a chain makes a `Tip`, so the
+    /// locator cannot be another hash.
+    pub(crate) fn new(tip: crate::chain::Tip) -> GetHeaders {
+        GetHeaders { tip: tip.hash() }
+    }
 }
 
 /// The version is `PROTOCOL_VERSION`. The locator holds only `tip`. `hash_stop` is all zeros,
@@ -296,7 +301,7 @@ pub(crate) struct Headers(Vec<crate::block::BlockHeader>);
 
 /// Why a `headers` payload was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HeadersError {
+pub enum HeadersError {
     /// The payload did not decode.
     Payload(crate::serialize::Error),
     /// The count is above `HEADERS_COUNT_MAX`.
@@ -308,7 +313,6 @@ pub(crate) enum HeadersError {
 impl Headers {
     /// Checks the count before it reads a header. Bytes after the last transaction count stay
     /// in `input`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
     pub(crate) fn decode(input: &mut &[u8]) -> Result<Self, HeadersError> {
         let count = crate::serialize::read_compact_size(input).map_err(HeadersError::Payload)?;
         if count > HEADERS_COUNT_MAX {
@@ -329,17 +333,33 @@ impl Headers {
     }
 
     /// True for `HEADERS_COUNT_MAX` headers. Then the peer can have more.
-    #[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
     pub(crate) fn is_full(&self) -> bool {
         self.0.len() == HEADERS_COUNT_MAX
     }
 
     /// The headers, in the order of the payload.
-    #[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
     pub(crate) fn into_vec(self) -> Vec<crate::block::BlockHeader> {
+        // `decode` refuses a longer batch. `Chain::extend` takes its loop bound from this `Vec`.
+        assert!(self.0.len() <= HEADERS_COUNT_MAX);
         self.0
     }
 }
+
+impl std::fmt::Display for HeadersError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HeadersError::Payload(error) => write!(f, "headers payload: {error}"),
+            HeadersError::TooMany(count) => {
+                write!(f, "{count} headers, more than {HEADERS_COUNT_MAX}")
+            }
+            HeadersError::TxCount(count) => {
+                write!(f, "a header has {count} transactions, not 0")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HeadersError {}
 
 #[cfg(test)]
 mod tests {
