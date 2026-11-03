@@ -12,3 +12,7 @@ tokio = { version = "1.54.1", default-features = false, features = ["rt", "net",
 
 [dev-dependencies]
 tokio = { version = "1.54.1", default-features = false, features = ["test-util"] }
+
+# The fuzz targets in `fuzz/` build with `--cfg fuzzing`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

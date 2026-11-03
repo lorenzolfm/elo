@@ -23,9 +23,23 @@ Nix builds everything. `flake.lock` pins nixpkgs and the other inputs, and
 
 ```sh
 nix build          # the binary, at ./result/bin/elo
-nix flake check    # every CI gate: build, clippy, tests, doctests, rustfmt
+nix flake check    # every CI gate: build, clippy, tests, doctests, rustfmt, fuzz corpus
 nix develop        # a shell with the pinned toolchain (direnv: `direnv allow`)
 ```
+
+## Fuzz
+
+Each target in `fuzz/fuzz_targets/` calls a function that only a build with
+`--cfg fuzzing` has. The compiler is stable, so the targets run with no sanitizer.
+
+```sh
+nix develop -c cargo fuzz run --sanitizer none frame    # Ctrl-C stops it
+```
+
+A run writes new inputs to `fuzz/corpus/<target>/` and crashes to
+`fuzz/artifacts/<target>/`, and git ignores both. CI replays each committed input
+once and does no random run. To keep a crash fixed, copy it to the corpus and run
+`git add -f`. The committed corpus is at most 1 MiB.
 
 ## Reproducibility
 

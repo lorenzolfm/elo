@@ -59,6 +59,14 @@
           strictDeps = true;
         };
 
+        # The fuzz gate replays the corpus, and the filter above drops those files.
+        fuzzSrc = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter = path: type:
+            craneLib.filterCargoSources path type
+            || pkgs.lib.hasInfix "/fuzz/corpus/" path;
+        };
+
         # The L3 tests run elo against this bitcoind. They use bitcoin-cli from
         # the same package to see when it is ready and to read its peer info.
         # Its version is the one in their asserts.
@@ -119,6 +127,56 @@
           elo-doctest = craneLib.cargoDocTest devArgs;
 
           elo-fmt = craneLib.cargoFmt {inherit src;};
+
+          # Builds each fuzz target and replays its committed corpus once, so an input
+          # that crashed elo cannot crash it again. CI does no random run. The compiler
+          # is stable and sanitizers need nightly, so the targets have no sanitizer.
+          elo-fuzz = craneLib.mkCargoDerivation (commonArgs
+            // {
+              src = fuzzSrc;
+              pnameSuffix = "-fuzz";
+              cargoArtifacts = null;
+              doInstallCargoArtifacts = false;
+              # `fuzz/` is its own workspace, so it has its own lockfile.
+              cargoVendorDir = craneLib.vendorMultipleCargoDeps {
+                cargoLockList = [./Cargo.lock ./fuzz/Cargo.lock];
+              };
+              nativeBuildInputs = [pkgs.cargo-fuzz];
+              buildPhaseCargoCommand = ''
+                # The normal gates do not see these: `fuzz/` is outside their
+                # workspace, and they build without `--cfg fuzzing`. Clippy checks
+                # only the workspace it runs in, so it runs in both.
+                cargo fmt --manifest-path fuzz/Cargo.toml --check
+                RUSTFLAGS="--cfg fuzzing" cargo clippy --locked --all-targets -- --deny warnings
+                RUSTFLAGS="--cfg fuzzing" cargo clippy --manifest-path fuzz/Cargo.toml \
+                  --locked -- --deny warnings
+
+                # The log shows only the `cargo` commands, so a `test` that fails must say
+                # why. Without this, the log ends on the last `cargo` command, which passed.
+                fail() { echo "elo-fuzz: $1" >&2; exit 1; }
+
+                # The committed corpus is at most 1 MiB, so a clone stays small.
+                corpus_size="$(du --summarize --bytes fuzz/corpus | cut --fields=1)"
+                test "$corpus_size" -le 1048576 || fail "the corpus is $corpus_size bytes, above 1 MiB"
+
+                # The targets build elo with the versions that elo ships. `--locked` checks
+                # each lockfile alone, so it does not see an update of only one. With no
+                # packages in the list, the comparison passes.
+                packages() { sed --quiet '/^name = /{N;s/\n/ /;p}' "$1" | sort; }
+                test -n "$(packages Cargo.lock)" || fail "found no packages in Cargo.lock"
+                comm -23 <(packages Cargo.lock) <(packages fuzz/Cargo.lock) | tee only-in-root
+                test ! -s only-in-root || fail "fuzz/Cargo.lock does not have the packages above"
+
+                # With no targets, the loop runs zero times and the gate passes.
+                targets="$(cargo fuzz list)"
+                test -n "$targets" || fail "found no fuzz targets"
+                for target in $targets; do
+                  # `cargo fuzz run` makes a missing corpus, and an empty one passes.
+                  test -n "$(ls --almost-all "fuzz/corpus/$target")" || fail "target $target has no corpus"
+                  cargo fuzz run --sanitizer none "$target" -- -runs=0
+                done
+              '';
+            });
         };
       in {
         _module.args.pkgs = import nixpkgs {
@@ -143,7 +201,7 @@
         };
 
         devShells.default = craneLibDev.devShell {
-          packages = [pkgs.cargo-nextest];
+          packages = [pkgs.cargo-nextest pkgs.cargo-fuzz];
           BITCOIND = bitcoind;
           BITCOIN_CLI = bitcoinCli;
         };
