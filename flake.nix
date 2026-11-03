@@ -154,6 +154,14 @@
                 # The committed corpus is at most 1 MiB, so a clone stays small.
                 test "$(du --summarize --bytes fuzz/corpus | cut --fields=1)" -le 1048576
 
+                # The targets build elo with the versions that elo ships. `--locked` checks
+                # each lockfile alone, so it does not see an update of only one. With no
+                # packages in the list, the comparison passes.
+                packages() { sed --quiet '/^name = /{N;s/\n/ /;p}' "$1" | sort; }
+                test -n "$(packages Cargo.lock)"
+                comm -23 <(packages Cargo.lock) <(packages fuzz/Cargo.lock) | tee only-in-root
+                test ! -s only-in-root
+
                 # With no targets, the loop runs zero times and the gate passes.
                 targets="$(cargo fuzz list)"
                 test -n "$targets"
