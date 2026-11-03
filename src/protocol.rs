@@ -27,9 +27,9 @@ pub(crate) const VERSION: MessageType = MessageType::from_name("version");
 pub(crate) const VERACK: MessageType = MessageType::from_name("verack");
 pub(crate) const PING: MessageType = MessageType::from_name("ping");
 pub(crate) const PONG: MessageType = MessageType::from_name("pong");
-#[cfg_attr(not(test), expect(dead_code, reason = "until net_processing sends it"))]
+#[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
 pub(crate) const GETHEADERS: MessageType = MessageType::from_name("getheaders");
-#[cfg_attr(not(test), expect(dead_code, reason = "until net_processing reads it"))]
+#[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
 pub(crate) const HEADERS: MessageType = MessageType::from_name("headers");
 
 impl MessageType {
@@ -271,7 +271,7 @@ impl Decode for Version {
 
 /// The `getheaders` payload. It asks for the headers after `tip`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "until net_processing sends it"))]
+#[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
 pub(crate) struct GetHeaders {
     /// The only hash in the locator.
     tip: bitcoin_hashes::sha256d::Hash,
@@ -284,7 +284,8 @@ impl Encode for GetHeaders {
         PROTOCOL_VERSION.encode(out);
         crate::serialize::write_compact_size(out, 1);
         self.tip.encode(out);
-        [0_u8; 32].encode(out);
+        let hash_stop = [0_u8; 32];
+        hash_stop.encode(out);
     }
 }
 
@@ -295,7 +296,7 @@ pub(crate) struct Headers(Vec<crate::block::BlockHeader>);
 
 /// Why a `headers` payload was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HeadersError {
+pub(crate) enum HeadersError {
     /// The payload did not decode.
     Payload(crate::serialize::Error),
     /// The count is above `HEADERS_COUNT_MAX`.
@@ -418,9 +419,9 @@ mod tests {
     #[test]
     fn headers_count_is_at_most_2000() {
         let core = crate::fixtures::headers_payload();
-        let (_, both) = core.split_first().unwrap();
+        let (_, headers) = core.split_first().unwrap();
         // Block 1 and its transaction count.
-        let block_1 = &both[..both.len() / 2];
+        let block_1 = &headers[..headers.len() / 2];
         let mut payload = Vec::new();
         crate::serialize::write_compact_size(&mut payload, 2000);
         for _ in 0..2000 {
