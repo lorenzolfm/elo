@@ -302,7 +302,7 @@ pub(crate) enum HeadersError {
     /// The count is above `HEADERS_COUNT_MAX`.
     TooMany(usize),
     /// A header has a transaction count that is not 0.
-    TxCount(usize),
+    TxCount(std::num::NonZeroUsize),
 }
 
 impl Headers {
@@ -320,7 +320,7 @@ impl Headers {
             let header = crate::block::BlockHeader::decode(input).map_err(HeadersError::Payload)?;
             let tx_count =
                 crate::serialize::read_compact_size(input).map_err(HeadersError::Payload)?;
-            if tx_count != 0 {
+            if let Some(tx_count) = std::num::NonZeroUsize::new(tx_count) {
                 return Err(HeadersError::TxCount(tx_count));
             }
             headers.push(header);
@@ -449,7 +449,7 @@ mod tests {
         *tx_count = 1;
         assert_eq!(
             super::Headers::decode(&mut payload.as_slice()),
-            Err(super::HeadersError::TxCount(1))
+            Err(super::HeadersError::TxCount(std::num::NonZeroUsize::MIN))
         );
     }
 
