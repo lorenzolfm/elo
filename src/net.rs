@@ -566,7 +566,7 @@ pub mod fuzz {
         // still compares two splits.
         let whole = frame_read(stream, std::iter::empty());
         assert_eq!(frame_read(stream, std::iter::repeat(1)), whole);
-        let read_sizes = sizes.iter().map(|size| usize::from(*size) + 1);
+        let read_sizes = sizes.iter().map(|size_byte| usize::from(*size_byte) + 1);
         assert_eq!(frame_read(stream, read_sizes.clone()), whole);
 
         // All the splits can be wrong in the same way, so compare with the stream too.
