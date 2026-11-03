@@ -163,7 +163,7 @@ pub(crate) enum HandshakeOutbound {
 }
 
 /// A message that elo sends after the handshake.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum PeerOutbound {
     /// Our `ping` with a new nonce.
     Ping(u64),
@@ -860,12 +860,17 @@ mod tests {
         let Ok((_, outbound, wake)) = ticked else {
             panic!("{ticked:?}");
         };
-        assert_eq!(
-            outbound.into_outbounds().collect::<Vec<_>>(),
-            [
-                super::PeerOutbound::Ping(7),
-                super::PeerOutbound::GetHeaders(crate::protocol::GetHeaders::new(tip_after(&[]))),
-            ]
+        let outbounds: Vec<_> = outbound.into_outbounds().collect();
+        let genesis = crate::protocol::GetHeaders::new(tip_after(&[]));
+        assert!(
+            matches!(
+                outbounds[..],
+                [
+                    super::PeerOutbound::Ping(7),
+                    super::PeerOutbound::GetHeaders(get_headers),
+                ] if get_headers == genesis
+            ),
+            "{outbounds:?}"
         );
         // The headers timeout comes before the ping timeout.
         assert_eq!(wake, start + super::HEADERS_TIMEOUT);
