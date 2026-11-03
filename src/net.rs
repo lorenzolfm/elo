@@ -233,7 +233,9 @@ impl Connection {
     /// read or a write fails, a write takes longer than `SEND_TIMEOUT`, our `ping` gets no
     /// `pong` in time, or elo refuses a frame or a message. Each wait for a message ends at the
     /// wake from `tick`, each write ends within `SEND_TIMEOUT`, and the frame length limit
-    /// bounds each message.
+    /// bounds each message. `tick` checks the ping timeout only at the start of a turn. So a
+    /// `pong` write that blocks while our `ping` is outstanding can end the connection up to
+    /// `SEND_TIMEOUT` after the ping timeout, with `SendTimeout`.
     pub async fn run(self) -> RunError {
         let Connection {
             mut socket,
@@ -695,6 +697,46 @@ mod tests {
             elapsed.as_secs(),
             std::time::Duration::from_mins(2 + 20).as_secs()
         );
+    }
+
+    #[test]
+    fn peer_that_stops_reading_is_send_timeout() {
+        // The peer completes the handshake and then reads nothing. The test fills the kernel
+        // buffers before `run`, so the write of our first `ping` blocks.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+        let peer_thread = std::thread::spawn(move || accept_handshake(&listener));
+
+        let (error, elapsed) = block_on(async {
+            let (connection, _theirs) =
+                super::handshake(crate::chainparams::Network::Regtest, peer)
+                    .await
+                    .unwrap();
+            // The peer thread ends when it has sent its `verack`, so this wait blocks nothing.
+            // The stream stays open, and nothing reads it.
+            let _stream = peer_thread.join().unwrap();
+            let stream = &connection.socket.stream;
+            stream.writable().await.unwrap();
+            let filler = [0; 1 << 16];
+            let full = loop {
+                if let Err(error) = stream.try_write(&filler) {
+                    break error;
+                }
+            };
+            assert_eq!(full.kind(), std::io::ErrorKind::WouldBlock);
+            tokio::time::pause();
+            let start = tokio::time::Instant::now();
+            // A send with no timeout blocks forever. This timeout fails the test instead.
+            let run = connection.run();
+            let error = tokio::time::timeout(std::time::Duration::from_mins(30), run).await;
+            (error, start.elapsed())
+        });
+        assert!(
+            matches!(error, Ok(super::RunError::SendTimeout)),
+            "{error:?}"
+        );
+        // tokio rounds a deadline up to the next millisecond.
+        assert_eq!(elapsed.as_secs(), super::SEND_TIMEOUT.as_secs());
     }
 
     #[test]
