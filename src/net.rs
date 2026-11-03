@@ -529,6 +529,96 @@ fn nonce() -> u64 {
     std::hash::RandomState::new().build_hasher().finish()
 }
 
+/// The entry points of the fuzz targets in `fuzz/`. Only a build with `--cfg fuzzing` has this
+/// module, so a normal build has no more `pub` items, and `PartialFrame` stays private.
+#[cfg(fuzzing)]
+pub mod fuzz {
+    /// The network of the seeds.
+    const NETWORK: crate::chainparams::Network = crate::chainparams::Network::Regtest;
+
+    /// What `PartialFrame` takes from one stream.
+    #[derive(Debug, PartialEq, Eq)]
+    struct FrameRead {
+        messages: Vec<crate::transport::Message>,
+        /// The error that ended the stream, or `None` if the bytes ended first.
+        error: Option<crate::transport::Error>,
+        /// The count of the bytes that no read took.
+        unread: usize,
+    }
+
+    /// Checks that each split of the same bytes gives the same `FrameRead`, and that the
+    /// messages are the same bytes as the start of the stream.
+    ///
+    /// The first byte of `data` is the count of the size bytes after it. A size byte `s` is a
+    /// read of `s + 1` bytes. The rest of `data` is the stream.
+    pub fn frame(data: &[u8]) {
+        let Some((sizes_count, rest)) = data.split_first() else {
+            return;
+        };
+        let (sizes, stream) = rest.split_at(rest.len().min(usize::from(*sizes_count)));
+
+        // One read for all the bytes and one read for each byte, so an input with no size bytes
+        // still compares two splits.
+        let whole = frame_read(stream, std::iter::empty());
+        assert_eq!(frame_read(stream, std::iter::repeat(1)), whole);
+        let read_sizes = sizes.iter().map(|size| usize::from(*size) + 1);
+        assert_eq!(frame_read(stream, read_sizes), whole);
+
+        // All the splits can be wrong in the same way, so compare with the stream too.
+        let encoded: Vec<u8> = whole
+            .messages
+            .iter()
+            .flat_map(|message| {
+                crate::transport::encode(NETWORK, message.msg_type(), message.payload())
+            })
+            .collect();
+        assert!(stream.starts_with(&encoded));
+    }
+
+    /// Gives `stream` to a new `PartialFrame` as `Socket::receive` does, one read for each size
+    /// in `read_sizes`. A read takes all that it can when the sizes end.
+    fn frame_read(stream: &[u8], mut read_sizes: impl Iterator<Item = usize>) -> FrameRead {
+        let mut frame = super::PartialFrame::new();
+        let mut messages = Vec::new();
+        let mut unread = stream;
+        // Each turn ends the loop, takes a message, or reads at least one byte. So the length of
+        // the stream bounds the loop.
+        let error = loop {
+            match frame.cut(NETWORK) {
+                Ok(Some(message)) => {
+                    assert!(matches!(
+                        frame,
+                        super::PartialFrame::Header { filled: 0, .. }
+                    ));
+                    messages.push(message);
+                }
+                Ok(None) => {
+                    let (missing, filled) = frame.missing();
+                    assert!(!missing.is_empty());
+                    let size = read_sizes.next().unwrap_or(usize::MAX);
+                    let count = size.min(missing.len()).min(unread.len());
+                    if count == 0 {
+                        // Each read size is at least one, so only the end of the bytes stops a
+                        // read. On the socket, a read of zero bytes means the same.
+                        assert!(unread.is_empty());
+                        break None;
+                    }
+                    let (read, rest) = unread.split_at(count);
+                    missing[..count].copy_from_slice(read);
+                    *filled += count;
+                    unread = rest;
+                }
+                Err(error) => break Some(error),
+            }
+        };
+        FrameRead {
+            messages,
+            error,
+            unread: unread.len(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
