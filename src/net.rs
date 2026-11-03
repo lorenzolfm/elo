@@ -536,6 +536,10 @@ pub mod fuzz {
     /// The network of the seeds.
     const NETWORK: crate::chainparams::Network = crate::chainparams::Network::Regtest;
 
+    /// The longest payload of the frame that `frame` writes. A run can set a larger `-max_len`,
+    /// and `encode` panics above the length limit.
+    const WRITTEN_PAYLOAD_LENGTH_MAX: usize = 4096;
+
     /// What `PartialFrame` takes from one stream.
     #[derive(Debug, PartialEq, Eq)]
     struct FrameRead {
@@ -546,8 +550,9 @@ pub mod fuzz {
         unread: usize,
     }
 
-    /// Checks that each split of the same bytes gives the same `FrameRead`, and that the
-    /// messages are the same bytes as the start of the stream.
+    /// Checks that each split of the same bytes gives the same `FrameRead`, that the messages
+    /// are the same bytes as the start of the stream, and that a frame from `encode` reads back
+    /// as its message.
     ///
     /// The first byte of `data` is the count of the size bytes after it. A size byte `s` is a
     /// read of `s + 1` bytes. The rest of `data` is the stream.
@@ -562,7 +567,7 @@ pub mod fuzz {
         let whole = frame_read(stream, std::iter::empty());
         assert_eq!(frame_read(stream, std::iter::repeat(1)), whole);
         let read_sizes = sizes.iter().map(|size| usize::from(*size) + 1);
-        assert_eq!(frame_read(stream, read_sizes), whole);
+        assert_eq!(frame_read(stream, read_sizes.clone()), whole);
 
         // All the splits can be wrong in the same way, so compare with the stream too.
         let encoded: Vec<u8> = whole
@@ -573,6 +578,19 @@ pub mod fuzz {
             })
             .collect();
         assert!(stream.starts_with(&encoded));
+
+        // A reader that refuses each frame passes all the checks above, so read a frame that elo
+        // wrote.
+        let payload = &stream[..stream.len().min(WRITTEN_PAYLOAD_LENGTH_MAX)];
+        let written = crate::transport::encode(NETWORK, crate::protocol::VERACK, payload);
+        let read = frame_read(&written, read_sizes);
+        assert_eq!(read.error, None);
+        assert_eq!(read.unread, 0);
+        let [message] = read.messages.as_slice() else {
+            panic!("one frame gives {} messages", read.messages.len());
+        };
+        assert_eq!(message.msg_type(), crate::protocol::VERACK);
+        assert_eq!(message.payload(), payload);
     }
 
     /// Gives `stream` to a new `PartialFrame` as `Socket::receive` does, one read for each size
