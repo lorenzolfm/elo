@@ -84,4 +84,17 @@ mod tests {
             )
         );
     }
+
+    #[test]
+    fn header_requires_nonce() {
+        let payload = crate::fixtures::headers_payload();
+        let (_, headers) = payload.split_first().unwrap();
+        // The bytes stop where `nonce` starts. A peer can send this, so `decode` must return
+        // the error of the field and not stop at its assert.
+        let mut input = &headers[..super::BLOCK_HEADER_SIZE - size_of::<u32>()];
+        assert_eq!(
+            super::BlockHeader::decode(&mut input),
+            Err(crate::serialize::Error::UnexpectedEnd)
+        );
+    }
 }
