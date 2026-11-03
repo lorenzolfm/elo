@@ -131,8 +131,9 @@ pub(crate) fn write_compact_size(out: &mut Vec<u8>, value: u64) {
     }
 }
 
-/// Refuses a form longer than the value needs, and a value above `COMPACT_SIZE_MAX`.
-pub(crate) fn read_compact_size(input: &mut &[u8]) -> Result<u64, Error> {
+/// Refuses a form longer than the value needs, and a value above `COMPACT_SIZE_MAX`. So the
+/// value fits in a `usize`.
+pub(crate) fn read_compact_size(input: &mut &[u8]) -> Result<usize, Error> {
     let (value, value_min) = match u8::decode(input)? {
         0xfd => (u64::from(u16::decode(input)?), 0xfd),
         0xfe => (u64::from(u32::decode(input)?), 0x1_0000),
@@ -142,7 +143,7 @@ pub(crate) fn read_compact_size(input: &mut &[u8]) -> Result<u64, Error> {
     if value < value_min {
         Err(Error::NonCanonicalCompactSize)
     } else if value <= COMPACT_SIZE_MAX {
-        Ok(value)
+        usize::try_from(value).map_err(|_| Error::CompactSizeTooLarge(value))
     } else {
         Err(Error::CompactSizeTooLarge(value))
     }
@@ -157,8 +158,7 @@ pub(crate) fn write_string(out: &mut Vec<u8>, bytes: &[u8]) {
 
 /// Refuses a string longer than `length_max` bytes.
 pub(crate) fn read_limited_string(input: &mut &[u8], length_max: usize) -> Result<Vec<u8>, Error> {
-    let length =
-        usize::try_from(read_compact_size(input)?).expect("COMPACT_SIZE_MAX fits in a usize");
+    let length = read_compact_size(input)?;
     if length <= length_max {
         let (bytes, rest) = input.split_at_checked(length).ok_or(Error::UnexpectedEnd)?;
         *input = rest;
@@ -190,7 +190,7 @@ mod tests {
             let mut input = bytes;
             assert_eq!(
                 super::read_compact_size(&mut input),
-                Ok(value),
+                Ok(usize::try_from(value).unwrap()),
                 "read {value:#x}"
             );
             assert!(input.is_empty());

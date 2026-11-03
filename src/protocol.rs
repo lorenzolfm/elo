@@ -300,9 +300,9 @@ pub(crate) enum HeadersError {
     /// The payload did not decode.
     Payload(crate::serialize::Error),
     /// The count is above `HEADERS_COUNT_MAX`.
-    TooMany(u64),
+    TooMany(usize),
     /// A header has a transaction count that is not 0.
-    TxCount(u64),
+    TxCount(usize),
 }
 
 impl Headers {
@@ -311,10 +311,9 @@ impl Headers {
     #[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
     pub(crate) fn decode(input: &mut &[u8]) -> Result<Self, HeadersError> {
         let count = crate::serialize::read_compact_size(input).map_err(HeadersError::Payload)?;
-        let count = match usize::try_from(count) {
-            Ok(count) if count <= HEADERS_COUNT_MAX => count,
-            _ => return Err(HeadersError::TooMany(count)),
-        };
+        if count > HEADERS_COUNT_MAX {
+            return Err(HeadersError::TooMany(count));
+        }
 
         let mut headers = Vec::with_capacity(count);
         for _ in 0..count {
