@@ -10,14 +10,14 @@ pub(crate) struct Chain {
 
 /// The height and the hash of the last header of a chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Tip {
+pub struct Tip {
     height: usize,
     hash: bitcoin_hashes::sha256d::Hash,
 }
 
 /// Why `Chain::extend` refused a batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ExtendError {
+pub enum ExtendError {
     /// The `prev` of the first header is not the hash of the tip.
     NotOnTip,
     /// The `prev` of a header is not the hash of the header before it.
@@ -26,7 +26,6 @@ pub(crate) enum ExtendError {
 
 impl Chain {
     /// A chain with only the genesis header of `network`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
     pub(crate) fn new(network: crate::chainparams::Network) -> Chain {
         Chain {
             ancestors: Vec::new(),
@@ -36,7 +35,6 @@ impl Chain {
 
     /// Puts all of `headers` on the tip, in order, or none of them. An empty batch changes
     /// nothing.
-    #[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
     pub(crate) fn extend(
         &mut self,
         headers: Vec<crate::block::BlockHeader>,
@@ -68,12 +66,18 @@ impl Chain {
     }
 
     /// The height and the hash of the last header.
-    #[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
     pub(crate) fn tip(&self) -> Tip {
         Tip {
             height: self.ancestors.len(),
             hash: self.tip.hash(),
         }
+    }
+}
+
+impl Tip {
+    /// The hash of the last header, in wire order.
+    pub(crate) fn hash(&self) -> bitcoin_hashes::sha256d::Hash {
+        self.hash
     }
 }
 
@@ -88,25 +92,22 @@ impl std::fmt::Display for Tip {
     }
 }
 
+impl std::fmt::Display for ExtendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExtendError::NotOnTip => write!(f, "headers do not start at our tip"),
+            ExtendError::NotContinuous => write!(f, "headers do not form a chain"),
+        }
+    }
+}
+
+impl std::error::Error for ExtendError {}
+
 #[cfg(test)]
 mod tests {
-    /// `count` headers, each on the header before it, the first on the regtest genesis header.
-    /// elo checks no proof of work yet, so each header is the genesis header with its `prev`
-    /// changed.
-    fn headers_on_genesis(count: usize) -> Vec<crate::block::BlockHeader> {
-        let genesis = crate::chainparams::Network::Regtest.genesis();
-        let on = |below: &crate::block::BlockHeader| crate::block::BlockHeader {
-            prev: below.hash(),
-            ..genesis
-        };
-        std::iter::successors(Some(on(&genesis)), |below| Some(on(below)))
-            .take(count)
-            .collect()
-    }
-
     #[test]
     fn extend_puts_each_batch_on_the_tip() {
-        let headers = headers_on_genesis(3);
+        let headers = crate::fixtures::headers_on_genesis(3);
         let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
 
         assert_eq!(chain.extend(headers[..2].to_vec()), Ok(()));
@@ -123,7 +124,7 @@ mod tests {
 
     #[test]
     fn extend_refuses_a_batch_off_the_tip() {
-        let headers = headers_on_genesis(3);
+        let headers = crate::fixtures::headers_on_genesis(3);
         let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
         let before = chain.tip();
 
@@ -137,7 +138,7 @@ mod tests {
 
     #[test]
     fn extend_refuses_a_batch_with_a_break() {
-        let mut headers = headers_on_genesis(4);
+        let mut headers = crate::fixtures::headers_on_genesis(4);
         headers.remove(2);
         let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
         let before = chain.tip();

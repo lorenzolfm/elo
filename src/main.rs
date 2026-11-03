@@ -1,6 +1,6 @@
 //! `elo <network> <ip>[:port]`: dials one peer, does the handshake, and prints the peer's
-//! `version`. Then it pings the peer and answers its `ping` messages until the connection
-//! ends.
+//! `version`. Then it syncs the header chain from the peer and prints the tip. It pings the
+//! peer and answers its `ping` messages until the connection ends.
 
 use std::io::Write;
 
@@ -36,27 +36,43 @@ fn main() -> std::process::ExitCode {
         }
     };
 
-    // `println!` panics when stdout fails, for example on a full disk or a closed pipe.
-    let mut stdout = std::io::stdout().lock();
-    let printed = writeln!(
-        stdout,
+    let printed = print(format_args!(
         "version {}\nservices {:016x}\nuser_agent {}\nstart_height {}\nrelay {}",
         version.version(),
         version.services(),
         version.user_agent(),
         version.start_height(),
         version.relay(),
-    )
-    // stdout is not always line buffered, and the exit ignores a failed flush.
-    .and_then(|()| stdout.flush());
+    ));
     if let Err(error) = printed {
         eprintln!("elo: stdout: {error}");
         return std::process::ExitCode::FAILURE;
     }
 
-    let error = runtime.block_on(connection.run());
+    let (synced, tip) = match runtime.block_on(connection.sync()) {
+        Ok(sync) => sync,
+        Err(error) => {
+            eprintln!("elo: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    if let Err(error) = print(format_args!("tip {tip}")) {
+        eprintln!("elo: stdout: {error}");
+        return std::process::ExitCode::FAILURE;
+    }
+
+    let error = runtime.block_on(synced.run());
     eprintln!("elo: {error}");
     std::process::ExitCode::FAILURE
+}
+
+/// Writes `text` and a newline to stdout. `println!` panics when stdout fails, for example on
+/// a full disk or a closed pipe.
+fn print(text: std::fmt::Arguments<'_>) -> Result<(), std::io::Error> {
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{text}")?;
+    // stdout is not always line buffered, and the exit ignores a failed flush.
+    stdout.flush()
 }
 
 /// The args after the program name. `None` is bad usage.

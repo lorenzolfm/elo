@@ -1,5 +1,5 @@
 //! The handshake: the `version` and `verack` messages before a peer is ready. Then the
-//! messages after it, and our `ping`.
+//! messages after it: our `ping`, and the header sync.
 
 use crate::serialize::{Decode, Encode};
 
@@ -20,9 +20,16 @@ const PING_INTERVAL: std::time::Duration = std::time::Duration::from_mins(2);
 /// How long our `ping` may wait for its `pong`.
 const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(20);
 
-// `tick_ping` wakes `PING_TIMEOUT` after `now`. So the `wake > now` assert in `tick` holds
-// for it.
+// `PingState::send` wakes `PING_TIMEOUT` after `now`. So the `wake > now` assert in `tick`
+// holds for it.
 const _: () = assert!(!PING_TIMEOUT.is_zero());
+
+/// How long our `getheaders` may wait for its `headers`.
+const HEADERS_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
+
+// `SyncState::tick` sends a `getheaders` and wakes `HEADERS_TIMEOUT` after `now`. So the
+// `wake > now` assert in `tick` holds for it.
+const _: () = assert!(!HEADERS_TIMEOUT.is_zero());
 
 /// Why elo refuses the peer in the handshake. Each one ends the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +82,14 @@ pub enum PeerError {
     PongNonce,
     /// Our `ping` had no `pong` within `PING_TIMEOUT`.
     PingTimeout,
+    /// Their `headers` payload did not decode, or it has too many headers or a transaction.
+    Headers(crate::protocol::HeadersError),
+    /// Our chain refused their batch: it is not on our tip, or it is not a chain.
+    Extend(crate::chain::ExtendError),
+    /// Their `headers` came when no `getheaders` of ours was outstanding.
+    UnsolicitedHeaders,
+    /// Our `getheaders` had no `headers` within `HEADERS_TIMEOUT`.
+    HeadersTimeout,
 }
 
 impl std::fmt::Display for PeerError {
@@ -86,6 +101,12 @@ impl std::fmt::Display for PeerError {
             PeerError::PongNonce => write!(f, "pong nonce is not our ping's"),
             PeerError::PingTimeout => {
                 write!(f, "no pong within {} s", PING_TIMEOUT.as_secs())
+            }
+            PeerError::Headers(error) => write!(f, "{error}"),
+            PeerError::Extend(error) => write!(f, "{error}"),
+            PeerError::UnsolicitedHeaders => write!(f, "headers without our getheaders"),
+            PeerError::HeadersTimeout => {
+                write!(f, "no headers within {} s", HEADERS_TIMEOUT.as_secs())
             }
         }
     }
@@ -124,6 +145,8 @@ enum State {
 #[derive(Debug)]
 pub(crate) struct Handshake {
     state: State,
+    /// The network of the peer. Its genesis header starts our chain.
+    network: crate::chainparams::Network,
     /// The nonce in our `version`.
     nonce: u64,
     /// The messages that came, fewer than `MESSAGE_COUNT_MAX`.
@@ -140,12 +163,45 @@ pub(crate) enum HandshakeOutbound {
 }
 
 /// A message that elo sends after the handshake.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PeerOutbound {
     /// Our `ping` with a new nonce.
     Ping(u64),
     /// A `pong` with the nonce of their `ping`.
     Pong(u64),
+    /// Our `getheaders` from the tip of our chain.
+    GetHeaders(crate::protocol::GetHeaders),
+}
+
+/// What a tick sends. It has no `pong`, because only their `ping` gets one.
+#[derive(Debug)]
+pub(crate) struct TickOutbound {
+    /// The nonce of our `ping`, if one is due.
+    ping: Option<u64>,
+    /// Our `getheaders`, if one is due.
+    get_headers: Option<crate::protocol::GetHeaders>,
+}
+
+impl TickOutbound {
+    /// The messages to send, in order: our `ping` first, then our `getheaders`.
+    pub(crate) fn into_outbounds(self) -> impl Iterator<Item = PeerOutbound> {
+        let ping = self.ping.map(PeerOutbound::Ping);
+        let get_headers = self.get_headers.map(PeerOutbound::GetHeaders);
+        ping.into_iter().chain(get_headers)
+    }
+}
+
+/// What the peer does after a message. It has no `ping` and no `getheaders`, because only a
+/// tick sends them.
+#[derive(Debug)]
+pub(crate) enum Received {
+    /// Send nothing. The message was skipped, or it was a `pong` or a full batch that the peer
+    /// took.
+    NoReply,
+    /// Send a `pong` with the nonce of their `ping`.
+    Pong(u64),
+    /// Their batch was not full, so the sync ended. It holds the tip of our chain.
+    Synced(crate::chain::Tip),
 }
 
 /// What the handshake does after a message.
@@ -161,8 +217,9 @@ pub(crate) enum Step {
 }
 
 impl Handshake {
-    /// Returns our `version` to `peer`, to send first.
+    /// Returns our `version` to `peer` on `network`, to send first.
     pub(crate) fn start(
+        network: crate::chainparams::Network,
         peer: std::net::SocketAddr,
         timestamp: i64,
         nonce: u64,
@@ -178,6 +235,7 @@ impl Handshake {
         (
             Handshake {
                 state: State::AwaitingVersion,
+                network,
                 nonce,
                 message_count: 0,
             },
@@ -199,10 +257,12 @@ impl Handshake {
             State::AwaitingVersion => {
                 if message.msg_type() == crate::protocol::VERSION {
                     let theirs = receive_version(message, self.nonce)?;
-                    let handshake = next(State::AwaitingVerack(theirs), self.nonce, message_count)?;
+                    let state = State::AwaitingVerack(theirs);
+                    let handshake = next(state, self.network, self.nonce, message_count)?;
                     Ok(Step::Reply(handshake, HandshakeOutbound::Verack))
                 } else {
-                    let handshake = next(State::AwaitingVersion, self.nonce, message_count)?;
+                    let state = State::AwaitingVersion;
+                    let handshake = next(state, self.network, self.nonce, message_count)?;
                     Ok(Step::Wait(handshake))
                 }
             }
@@ -213,10 +273,13 @@ impl Handshake {
                 if message.msg_type() == crate::protocol::VERACK {
                     let peer = Peer {
                         ping: PingState::Unsent,
+                        sync: SyncState::Due,
+                        chain: crate::chain::Chain::new(self.network),
                     };
                     Ok(Step::Done(peer, theirs))
                 } else {
-                    let handshake = next(State::AwaitingVerack(theirs), self.nonce, message_count)?;
+                    let state = State::AwaitingVerack(theirs);
+                    let handshake = next(state, self.network, self.nonce, message_count)?;
                     Ok(Step::Wait(handshake))
                 }
             }
@@ -225,10 +288,16 @@ impl Handshake {
 }
 
 /// The handshake after `message_count` messages, if the peer may send one more.
-fn next(state: State, nonce: u64, message_count: u32) -> Result<Handshake, HandshakeError> {
+fn next(
+    state: State,
+    network: crate::chainparams::Network,
+    nonce: u64,
+    message_count: u32,
+) -> Result<Handshake, HandshakeError> {
     if message_count < MESSAGE_COUNT_MAX {
         Ok(Handshake {
             state,
+            network,
             nonce,
             message_count,
         })
@@ -262,6 +331,9 @@ fn receive_version(
 #[derive(Debug)]
 pub(crate) struct Peer {
     ping: PingState,
+    sync: SyncState,
+    /// The headers that the peer sent, on the genesis header of its network.
+    chain: crate::chain::Chain,
 }
 
 /// Where our `ping` is. At most one is outstanding.
@@ -278,25 +350,40 @@ enum PingState {
     Answered { sent: std::time::Instant },
 }
 
+/// Where the header sync is. At most one `getheaders` is outstanding.
+#[derive(Debug)]
+enum SyncState {
+    /// Our next `getheaders` is due: none went yet, or the last batch was full. The next tick
+    /// sends it.
+    Due,
+    /// Our `getheaders` went at `sent`. Its `headers` has not come.
+    Asked { sent: std::time::Instant },
+    /// A batch that was not full came, so our tip is the tip of the peer. No `getheaders` goes
+    /// again.
+    Synced,
+}
+
 impl Peer {
-    /// A `ping` gets a `pong` with its nonce. A `pong` must answer our outstanding `ping`. Each
-    /// other message is skipped. Each result but an error returns the peer, because an error
-    /// ends the connection.
+    /// A `ping` gets a `pong` with its nonce. A `pong` must answer our outstanding `ping`, and a
+    /// `headers` our outstanding `getheaders`. Each other message is skipped. Each result but an
+    /// error returns the peer, because an error ends the connection.
     pub(crate) fn receive(
         self,
         message: &crate::transport::Message,
-    ) -> Result<(Peer, Option<PeerOutbound>), PeerError> {
+    ) -> Result<(Peer, Received), PeerError> {
         let msg_type = message.msg_type();
         if msg_type == crate::protocol::PING {
             // The bytes after the nonce are ignored.
             let mut input = message.payload();
             let nonce = u64::decode(&mut input).map_err(PeerError::Ping)?;
-            Ok((self, Some(PeerOutbound::Pong(nonce))))
+            Ok((self, Received::Pong(nonce)))
         } else if msg_type == crate::protocol::PONG {
             let peer = self.receive_pong(message)?;
-            Ok((peer, None))
+            Ok((peer, Received::NoReply))
+        } else if msg_type == crate::protocol::HEADERS {
+            self.receive_headers(message)
         } else {
-            Ok((self, None))
+            Ok((self, Received::NoReply))
         }
     }
 
@@ -312,6 +399,7 @@ impl Peer {
                 if theirs == ours {
                     Ok(Peer {
                         ping: PingState::Answered { sent },
+                        ..self
                     })
                 } else {
                     Err(PeerError::PongNonce)
@@ -321,54 +409,137 @@ impl Peer {
         }
     }
 
-    /// Returns the peer, a `ping` with `nonce` if one is due, and when to tick next. A `ping`
-    /// is due at once after the handshake. Then it is due `PING_INTERVAL` after the last `ping`
-    /// went, if its `pong` came. When our outstanding `ping` is `PING_TIMEOUT` old, the tick
-    /// fails. Each deadline is due at its instant, not after it.
+    /// The `headers` must answer our outstanding `getheaders`, and the chain must take the
+    /// batch. Then no `getheaders` is outstanding. A full batch makes the next one due. A batch
+    /// that is not full ends the sync, an empty one too. The payload is checked first, also
+    /// when no `getheaders` is outstanding. The bytes after the last transaction count are
+    /// ignored.
+    fn receive_headers(
+        mut self,
+        message: &crate::transport::Message,
+    ) -> Result<(Peer, Received), PeerError> {
+        assert_eq!(message.msg_type(), crate::protocol::HEADERS);
+
+        let mut input = message.payload();
+        let headers = crate::protocol::Headers::decode(&mut input).map_err(PeerError::Headers)?;
+        let SyncState::Asked { .. } = self.sync else {
+            return Err(PeerError::UnsolicitedHeaders);
+        };
+        let full = headers.is_full();
+        self.chain
+            .extend(headers.into_vec())
+            .map_err(PeerError::Extend)?;
+        if full {
+            self.sync = SyncState::Due;
+            Ok((self, Received::NoReply))
+        } else {
+            self.sync = SyncState::Synced;
+            let tip = self.chain.tip();
+            Ok((self, Received::Synced(tip)))
+        }
+    }
+
+    /// Returns the peer, what to send, and when to tick next. A `ping` with `nonce` is due at
+    /// once after the handshake. Then it is due `PING_INTERVAL` after the last `ping` went, if
+    /// its `pong` came. A `getheaders` is due at once after the handshake, and at once after a
+    /// full batch. The tick fails when our outstanding `ping` is `PING_TIMEOUT` old, or our
+    /// outstanding `getheaders` is `HEADERS_TIMEOUT` old. The `ping` is checked first. Each
+    /// deadline is due at its instant, not after it. The wake is the earliest deadline.
     pub(crate) fn tick(
         self,
         now: std::time::Instant,
         nonce: u64,
-    ) -> Result<(Peer, Option<PeerOutbound>, std::time::Instant), PeerError> {
-        let (peer, outbound, wake) = match self.ping {
-            PingState::Unsent => Peer::tick_ping(now, nonce),
+    ) -> Result<(Peer, TickOutbound, std::time::Instant), PeerError> {
+        let Peer { ping, sync, chain } = self;
+        let (ping, ping_nonce, ping_wake) = ping.tick(now, nonce)?;
+        let (sync, get_headers, headers_wake) = sync.tick(now, &chain)?;
+        let wake = headers_wake.map_or(ping_wake, |headers_wake| headers_wake.min(ping_wake));
+
+        // Each `getheaders` that is due goes in this tick.
+        assert!(!matches!(sync, SyncState::Due));
+        // A wake at or before `now` would make the driver tick again with no wait.
+        assert!(wake > now);
+        let outbound = TickOutbound {
+            ping: ping_nonce,
+            get_headers,
+        };
+        Ok((Peer { ping, sync, chain }, outbound, wake))
+    }
+}
+
+impl PingState {
+    /// Returns the next state, the nonce of our `ping` if one is due, and its deadline: the
+    /// ping timeout, or the next `ping` if none is outstanding.
+    fn tick(
+        self,
+        now: std::time::Instant,
+        nonce: u64,
+    ) -> Result<(PingState, Option<u64>, std::time::Instant), PeerError> {
+        match self {
+            PingState::Unsent => Ok(PingState::send(now, nonce)),
             PingState::Outstanding { sent, .. } => {
                 let timeout = sent + PING_TIMEOUT;
                 if now < timeout {
-                    (self, None, timeout)
+                    Ok((self, None, timeout))
                 } else {
-                    return Err(PeerError::PingTimeout);
+                    Err(PeerError::PingTimeout)
                 }
             }
             PingState::Answered { sent } => {
                 let due = sent + PING_INTERVAL;
                 if now < due {
-                    (self, None, due)
+                    Ok((self, None, due))
                 } else {
-                    Peer::tick_ping(now, nonce)
+                    Ok(PingState::send(now, nonce))
                 }
             }
-        };
-        // A wake at or before `now` would make the driver tick again with no wait.
-        assert!(wake > now);
-        Ok((peer, outbound, wake))
+        }
     }
 
-    /// Our `ping` with `nonce` goes at `now`, and the next tick is at its timeout.
-    fn tick_ping(
+    /// Our `ping` with `nonce` goes at `now`. Its deadline is its timeout.
+    fn send(now: std::time::Instant, nonce: u64) -> (PingState, Option<u64>, std::time::Instant) {
+        let ping = PingState::Outstanding { nonce, sent: now };
+        (ping, Some(nonce), now + PING_TIMEOUT)
+    }
+}
+
+impl SyncState {
+    /// Returns the next state, our `getheaders` from the tip of `chain` if one is due, and the
+    /// headers timeout if a `getheaders` is outstanding.
+    fn tick(
+        self,
         now: std::time::Instant,
-        nonce: u64,
-    ) -> (Peer, Option<PeerOutbound>, std::time::Instant) {
-        let peer = Peer {
-            ping: PingState::Outstanding { nonce, sent: now },
-        };
-        (peer, Some(PeerOutbound::Ping(nonce)), now + PING_TIMEOUT)
+        chain: &crate::chain::Chain,
+    ) -> Result<
+        (
+            SyncState,
+            Option<crate::protocol::GetHeaders>,
+            Option<std::time::Instant>,
+        ),
+        PeerError,
+    > {
+        match self {
+            SyncState::Due => {
+                let get_headers = crate::protocol::GetHeaders::new(chain.tip());
+                let sync = SyncState::Asked { sent: now };
+                Ok((sync, Some(get_headers), Some(now + HEADERS_TIMEOUT)))
+            }
+            SyncState::Asked { sent } => {
+                let timeout = sent + HEADERS_TIMEOUT;
+                if now < timeout {
+                    Ok((self, None, Some(timeout)))
+                } else {
+                    Err(PeerError::HeadersTimeout)
+                }
+            }
+            SyncState::Synced => Ok((self, None, None)),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::serialize::Decode;
+    use crate::serialize::{Decode, Encode};
 
     /// The message in a regtest frame, as the driver reads it.
     fn message(frame: &[u8]) -> crate::transport::Message {
@@ -419,9 +590,36 @@ mod tests {
         pong_message(&nonce.to_le_bytes())
     }
 
+    /// A `headers` with `payload`.
+    fn headers_payload_message(payload: &[u8]) -> crate::transport::Message {
+        message(&crate::transport::encode(
+            crate::chainparams::Network::Regtest,
+            crate::protocol::HEADERS,
+            payload,
+        ))
+    }
+
+    /// A `headers` with `headers`, each with a transaction count of 0.
+    fn headers_message(headers: &[crate::block::BlockHeader]) -> crate::transport::Message {
+        let mut payload = Vec::new();
+        crate::serialize::write_compact_size(&mut payload, u64::try_from(headers.len()).unwrap());
+        for header in headers {
+            header.encode(&mut payload);
+            payload.push(0);
+        }
+        headers_payload_message(&payload)
+    }
+
+    /// The tip of a second regtest chain, after `headers`.
+    fn tip_after(headers: &[crate::block::BlockHeader]) -> crate::chain::Tip {
+        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        chain.extend(headers.to_vec()).unwrap();
+        chain.tip()
+    }
+
     fn start() -> super::Handshake {
         let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 18444));
-        super::Handshake::start(peer, 0, 0).0
+        super::Handshake::start(crate::chainparams::Network::Regtest, peer, 0, 0).0
     }
 
     fn wait(step: Result<super::Step, super::HandshakeError>) -> super::Handshake {
@@ -440,17 +638,36 @@ mod tests {
         }
     }
 
-    /// The peer as the handshake makes it.
+    /// The peer as the handshake makes it, after Core's `version` and `verack`.
     fn peer() -> super::Peer {
-        super::Peer {
-            ping: super::PingState::Unsent,
+        let (handshake, _) = reply(start().receive(&core_message(crate::fixtures::VERSION_FRAME)));
+        match handshake.receive(&core_message(crate::fixtures::VERACK_FRAME)) {
+            Ok(super::Step::Done(peer, _)) => peer,
+            other => panic!("{other:?}"),
         }
     }
 
-    /// The peer after a tick at `now` sent our `ping` with `nonce`.
-    fn pinged(now: std::time::Instant, nonce: u64) -> super::Peer {
+    /// The peer after its first tick at `now`, which sent our `ping` with `nonce` and our
+    /// `getheaders`.
+    fn asked(now: std::time::Instant, nonce: u64) -> super::Peer {
         match peer().tick(now, nonce) {
-            Ok((peer, Some(super::PeerOutbound::Ping(sent)), _)) if sent == nonce => peer,
+            Ok((
+                peer,
+                super::TickOutbound {
+                    ping: Some(sent),
+                    get_headers: Some(_),
+                },
+                _,
+            )) if sent == nonce => peer,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The peer after `asked`, and after an empty `headers` that ended the sync. So only our
+    /// `ping` with `nonce` is outstanding.
+    fn pinged(now: std::time::Instant, nonce: u64) -> super::Peer {
+        match asked(now, nonce).receive(&headers_message(&[])) {
+            Ok((peer, super::Received::Synced(_))) => peer,
             other => panic!("{other:?}"),
         }
     }
@@ -458,7 +675,14 @@ mod tests {
     /// A tick at `now` that sends nothing. Returns the peer and when to tick next.
     fn idle(peer: super::Peer, now: std::time::Instant) -> (super::Peer, std::time::Instant) {
         match peer.tick(now, 0) {
-            Ok((peer, None, wake)) => (peer, wake),
+            Ok((
+                peer,
+                super::TickOutbound {
+                    ping: None,
+                    get_headers: None,
+                },
+                wake,
+            )) => (peer, wake),
             other => panic!("{other:?}"),
         }
     }
@@ -466,7 +690,7 @@ mod tests {
     /// A message that the peer accepts with no reply.
     fn accept(peer: super::Peer, message: &crate::transport::Message) -> super::Peer {
         match peer.receive(message) {
-            Ok((peer, None)) => peer,
+            Ok((peer, super::Received::NoReply)) => peer,
             other => panic!("{other:?}"),
         }
     }
@@ -548,7 +772,12 @@ mod tests {
     fn their_version_with_our_nonce_is_self_connection() {
         // A socket that is connected to itself reads our `version` back.
         let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 18444));
-        let (handshake, outbound) = super::Handshake::start(peer, 0, 0x0123_4567_89ab_cdef);
+        let (handshake, outbound) = super::Handshake::start(
+            crate::chainparams::Network::Regtest,
+            peer,
+            0,
+            0x0123_4567_89ab_cdef,
+        );
         let super::HandshakeOutbound::Version(payload) = outbound else {
             panic!("{outbound:?}");
         };
@@ -585,7 +814,7 @@ mod tests {
         assert!(
             matches!(
                 outbound,
-                Ok((_, Some(super::PeerOutbound::Pong(0x34e9_3229_8920_45d8))))
+                Ok((_, super::Received::Pong(0x34e9_3229_8920_45d8)))
             ),
             "{outbound:?}"
         );
@@ -606,7 +835,7 @@ mod tests {
         assert!(
             matches!(
                 outbound,
-                Ok((_, Some(super::PeerOutbound::Pong(0x34e9_3229_8920_45d8))))
+                Ok((_, super::Received::Pong(0x34e9_3229_8920_45d8)))
             ),
             "{outbound:?}"
         );
@@ -617,7 +846,7 @@ mod tests {
         // Their `ping` does not touch ours: it still times out at `PING_TIMEOUT`.
         let start = std::time::Instant::now();
         let outbound = pinged(start, 7).receive(&core_message(crate::fixtures::PING_FRAME));
-        let Ok((peer, Some(super::PeerOutbound::Pong(0x34e9_3229_8920_45d8)))) = outbound else {
+        let Ok((peer, super::Received::Pong(0x34e9_3229_8920_45d8))) = outbound else {
             panic!("{outbound:?}");
         };
         let ticked = peer.tick(start + super::PING_TIMEOUT, 8).err();
@@ -625,13 +854,21 @@ mod tests {
     }
 
     #[test]
-    fn first_tick_sends_a_ping() {
+    fn first_tick_sends_a_ping_then_getheaders_from_genesis() {
         let start = std::time::Instant::now();
         let ticked = peer().tick(start, 7);
-        let Ok((_, Some(super::PeerOutbound::Ping(7)), wake)) = ticked else {
+        let Ok((_, outbound, wake)) = ticked else {
             panic!("{ticked:?}");
         };
-        assert_eq!(wake, start + super::PING_TIMEOUT);
+        assert_eq!(
+            outbound.into_outbounds().collect::<Vec<_>>(),
+            [
+                super::PeerOutbound::Ping(7),
+                super::PeerOutbound::GetHeaders(crate::protocol::GetHeaders::new(tip_after(&[]))),
+            ]
+        );
+        // The headers timeout comes before the ping timeout.
+        assert_eq!(wake, start + super::HEADERS_TIMEOUT);
     }
 
     #[test]
@@ -651,7 +888,15 @@ mod tests {
         let (peer, wake) = idle(peer, due - NANOSECOND);
         assert_eq!(wake, due);
         let ticked = peer.tick(due, 8);
-        let Ok((_, Some(super::PeerOutbound::Ping(8)), wake)) = ticked else {
+        let Ok((
+            _,
+            super::TickOutbound {
+                ping: Some(8),
+                get_headers: None,
+            },
+            wake,
+        )) = ticked
+        else {
             panic!("{ticked:?}");
         };
         assert_eq!(wake, due + super::PING_TIMEOUT);
@@ -661,7 +906,17 @@ mod tests {
         let (peer, _) = idle(pinged(start, 7), late);
         let ticked = accept(peer, &pong(7)).tick(late, 8);
         assert!(
-            matches!(ticked, Ok((_, Some(super::PeerOutbound::Ping(8)), _))),
+            matches!(
+                ticked,
+                Ok((
+                    _,
+                    super::TickOutbound {
+                        ping: Some(8),
+                        get_headers: None
+                    },
+                    _
+                ))
+            ),
             "{ticked:?}"
         );
     }
@@ -720,14 +975,15 @@ mod tests {
     }
 
     #[test]
-    fn peer_skips_every_message_but_ping_and_pong() {
+    fn peer_skips_every_message_but_ping_pong_and_headers() {
         // Core sends `sendcmpct` and `feefilter` after the handshake, and a block `inv` for each
-        // new tip. The messages of the handshake are skipped too. A `version` is skipped without
-        // a decode, so an empty payload passes.
+        // new tip. elo answers no `getheaders`. The messages of the handshake are skipped too. A
+        // `version` is skipped without a decode, so an empty payload passes.
         for message in [
             core_message(crate::fixtures::SENDCMPCT_FRAME),
             core_message(crate::fixtures::FEEFILTER_FRAME),
             core_message(crate::fixtures::BLOCK_INV_FRAME),
+            core_message(crate::fixtures::GETHEADERS_FRAME),
             version_message(Vec::clear),
             core_message(crate::fixtures::VERACK_FRAME),
             core_message(crate::fixtures::WTXIDRELAY_FRAME),
@@ -735,10 +991,128 @@ mod tests {
         ] {
             let outbound = peer().receive(&message);
             assert!(
-                matches!(outbound, Ok((_, None))),
+                matches!(outbound, Ok((_, super::Received::NoReply))),
                 "{:?}: {outbound:?}",
                 message.msg_type()
             );
         }
+    }
+
+    #[test]
+    fn full_batch_makes_the_next_tick_send_getheaders_from_the_new_tip() {
+        let start = std::time::Instant::now();
+        let headers = crate::fixtures::headers_on_genesis(2000);
+        let peer = accept(asked(start, 7), &headers_message(&headers));
+
+        // The headers timeout starts again with the new `getheaders`.
+        let later = start + std::time::Duration::from_mins(1);
+        let ticked = peer.tick(later, 8);
+        let Ok((
+            _,
+            super::TickOutbound {
+                ping: None,
+                get_headers: Some(get_headers),
+            },
+            wake,
+        )) = ticked
+        else {
+            panic!("{ticked:?}");
+        };
+        assert_eq!(
+            get_headers,
+            crate::protocol::GetHeaders::new(tip_after(&headers))
+        );
+        assert_eq!(wake, later + super::HEADERS_TIMEOUT);
+    }
+
+    #[test]
+    fn short_batch_ends_the_sync_at_its_last_header() {
+        let start = std::time::Instant::now();
+        let headers = crate::fixtures::headers_on_genesis(2);
+        let received = asked(start, 7).receive(&headers_message(&headers));
+        let Ok((_, super::Received::Synced(tip))) = received else {
+            panic!("{received:?}");
+        };
+        assert_eq!(tip, tip_after(&headers));
+    }
+
+    #[test]
+    fn empty_batch_ends_the_sync_at_our_tip() {
+        // The empty batch comes after a full batch, so our tip is not genesis.
+        let start = std::time::Instant::now();
+        let headers = crate::fixtures::headers_on_genesis(2000);
+        let peer = accept(asked(start, 7), &headers_message(&headers));
+        let ticked = peer.tick(start, 8);
+        let Ok((peer, _, _)) = ticked else {
+            panic!("{ticked:?}");
+        };
+
+        let received = peer.receive(&headers_message(&[]));
+        let Ok((_, super::Received::Synced(tip))) = received else {
+            panic!("{received:?}");
+        };
+        assert_eq!(tip, tip_after(&headers));
+    }
+
+    #[test]
+    fn no_getheaders_after_the_sync() {
+        // After the sync, only our `ping` sets the wake, and no headers timeout is left.
+        let start = std::time::Instant::now();
+        let later = start + std::time::Duration::from_mins(10);
+        let (_, wake) = idle(pinged(start, 7), later);
+        assert_eq!(wake, start + super::PING_TIMEOUT);
+    }
+
+    #[test]
+    fn headers_without_our_getheaders_is_unsolicited_headers() {
+        // Before our first `getheaders`, and after the sync.
+        let start = std::time::Instant::now();
+        for peer in [peer(), pinged(start, 7)] {
+            assert_eq!(
+                peer.receive(&headers_message(&[])).err(),
+                Some(super::PeerError::UnsolicitedHeaders)
+            );
+        }
+    }
+
+    #[test]
+    fn their_headers_payload_is_checked_first() {
+        // The payload has no count. It fails also when no `getheaders` is outstanding.
+        let start = std::time::Instant::now();
+        for peer in [peer(), asked(start, 7)] {
+            assert_eq!(
+                peer.receive(&headers_payload_message(&[])).err(),
+                Some(super::PeerError::Headers(
+                    crate::protocol::HeadersError::Payload(crate::serialize::Error::UnexpectedEnd)
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn headers_off_our_tip_end_the_connection() {
+        // The first header is on block 1, which our chain does not have.
+        let start = std::time::Instant::now();
+        let headers = crate::fixtures::headers_on_genesis(2);
+        assert_eq!(
+            asked(start, 7)
+                .receive(&headers_message(&headers[1..]))
+                .err(),
+            Some(super::PeerError::Extend(
+                crate::chain::ExtendError::NotOnTip
+            ))
+        );
+    }
+
+    #[test]
+    fn getheaders_without_headers_for_headers_timeout_is_headers_timeout() {
+        let start = std::time::Instant::now();
+        let timeout = start + super::HEADERS_TIMEOUT;
+        let (peer, wake) = idle(asked(start, 7), timeout - NANOSECOND);
+        assert_eq!(wake, timeout);
+        assert_eq!(
+            peer.tick(timeout, 8).err(),
+            Some(super::PeerError::HeadersTimeout)
+        );
     }
 }

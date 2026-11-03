@@ -96,6 +96,20 @@ pub(crate) fn headers_payload() -> Vec<u8> {
     hex(HEADERS_FRAME).split_off(crate::transport::MESSAGE_HEADER_SIZE)
 }
 
+/// `count` headers, each on the header before it, the first on the regtest genesis header.
+/// elo checks no proof of work yet, so each header is the genesis header with its `prev`
+/// changed.
+pub(crate) fn headers_on_genesis(count: usize) -> Vec<crate::block::BlockHeader> {
+    let genesis = crate::chainparams::Network::Regtest.genesis();
+    let on = |below: &crate::block::BlockHeader| crate::block::BlockHeader {
+        prev: below.hash(),
+        ..genesis
+    };
+    std::iter::successors(Some(on(&genesis)), |below| Some(on(below)))
+        .take(count)
+        .collect()
+}
+
 /// A hash in hex, in the order a display shows it: the reverse of the wire order.
 pub(crate) fn hash_from_display_hex(s: &str) -> bitcoin_hashes::sha256d::Hash {
     let mut bytes: [u8; 32] = hex(s).try_into().unwrap();
