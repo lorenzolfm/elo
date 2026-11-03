@@ -544,10 +544,19 @@ pub mod fuzz {
     #[derive(Debug, PartialEq, Eq)]
     struct FrameRead {
         messages: Vec<crate::transport::Message>,
-        /// The error that ended the stream, or `None` if the bytes ended first.
-        error: Option<crate::transport::Error>,
-        /// The count of the bytes that no read took.
-        unread_count: usize,
+        end: FrameEnd,
+    }
+
+    /// Why the reads of one stream stopped.
+    #[derive(Debug, PartialEq, Eq)]
+    enum FrameEnd {
+        /// The reads took each byte, and `PartialFrame` needs more.
+        BytesEnded,
+        /// `PartialFrame` refused a frame, and no read took the last `unread_count` bytes.
+        Refused {
+            error: crate::transport::Error,
+            unread_count: usize,
+        },
     }
 
     /// Checks that each split of the same bytes gives the same `FrameRead`, that the messages
@@ -565,8 +574,13 @@ pub mod fuzz {
         // The largest reads and the smallest reads, so an input with no size bytes still compares
         // two splits.
         let whole = frame_read(stream, std::iter::empty());
-        assert_eq!(frame_read(stream, std::iter::repeat(1)), whole);
-        let read_sizes = sizes.iter().map(|size_byte| usize::from(*size_byte) + 1);
+        assert_eq!(
+            frame_read(stream, std::iter::repeat(std::num::NonZeroUsize::MIN)),
+            whole
+        );
+        let read_sizes = sizes
+            .iter()
+            .map(|size_byte| std::num::NonZeroUsize::MIN.saturating_add(usize::from(*size_byte)));
         assert_eq!(frame_read(stream, read_sizes.clone()), whole);
 
         // All the splits can be wrong in the same way, so compare with the stream too.
@@ -584,8 +598,7 @@ pub mod fuzz {
         let payload = &stream[..stream.len().min(WRITTEN_PAYLOAD_LENGTH_MAX)];
         let written = crate::transport::encode(NETWORK, crate::protocol::VERACK, payload);
         let read = frame_read(&written, read_sizes);
-        assert_eq!(read.error, None);
-        assert_eq!(read.unread_count, 0);
+        assert_eq!(read.end, FrameEnd::BytesEnded);
         let [message] = read.messages.as_slice() else {
             panic!("one frame gives {} messages", read.messages.len());
         };
@@ -595,13 +608,16 @@ pub mod fuzz {
 
     /// Gives `stream` to a new `PartialFrame` as `Socket::receive` does, one read for each size
     /// in `read_sizes`. A read takes all that it can when the sizes end.
-    fn frame_read(stream: &[u8], mut read_sizes: impl Iterator<Item = usize>) -> FrameRead {
+    fn frame_read(
+        stream: &[u8],
+        mut read_sizes: impl Iterator<Item = std::num::NonZeroUsize>,
+    ) -> FrameRead {
         let mut frame = super::PartialFrame::new();
         let mut messages = Vec::new();
         let mut unread = stream;
         // Each turn ends the loop, takes a message, or reads at least one byte. So the length of
         // the stream bounds the loop.
-        let error = loop {
+        let end = loop {
             match frame.cut(NETWORK) {
                 Ok(Some(message)) => {
                     assert!(matches!(
@@ -610,30 +626,27 @@ pub mod fuzz {
                     ));
                     messages.push(message);
                 }
+                // On the socket, a read of zero bytes means the same.
+                Ok(None) if unread.is_empty() => break FrameEnd::BytesEnded,
                 Ok(None) => {
                     let (missing, filled) = frame.missing();
                     assert!(!missing.is_empty());
-                    let size = read_sizes.next().unwrap_or(usize::MAX);
-                    let count = size.min(missing.len()).min(unread.len());
-                    if count == 0 {
-                        // Each read size is at least one, so only the end of the bytes stops a
-                        // read. On the socket, a read of zero bytes means the same.
-                        assert!(unread.is_empty());
-                        break None;
-                    }
+                    let size = read_sizes.next().unwrap_or(std::num::NonZeroUsize::MAX);
+                    let count = size.get().min(missing.len()).min(unread.len());
                     let (read, rest) = unread.split_at(count);
                     missing[..count].copy_from_slice(read);
                     *filled += count;
                     unread = rest;
                 }
-                Err(error) => break Some(error),
+                Err(error) => {
+                    break FrameEnd::Refused {
+                        error,
+                        unread_count: unread.len(),
+                    };
+                }
             }
         };
-        FrameRead {
-            messages,
-            error,
-            unread_count: unread.len(),
-        }
+        FrameRead { messages, end }
     }
 }
 
