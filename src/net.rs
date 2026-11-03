@@ -149,7 +149,7 @@ struct Socket {
 enum PartialFrame {
     /// The header has not passed its checks. The bytes so far are `bytes[..filled]`.
     Header {
-        bytes: [u8; crate::transport::HEADER_SIZE],
+        bytes: [u8; crate::transport::MESSAGE_HEADER_SIZE],
         filled: usize,
     },
     /// The header passed its checks. The payload so far is `payload[..filled]`.
@@ -373,7 +373,7 @@ impl Socket {
     /// for example at a timeout, loses no bytes: the next call continues the same frame.
     async fn receive(&mut self) -> Result<crate::transport::Message, ReceiveError> {
         // Each turn returns or reads at least one byte, and a frame has at most
-        // `HEADER_SIZE` + `PAYLOAD_LENGTH_MAX` bytes. So the loop ends.
+        // `MESSAGE_HEADER_SIZE` + `PAYLOAD_LENGTH_MAX` bytes. So the loop ends.
         loop {
             if let Some(message) = self
                 .frame
@@ -409,7 +409,7 @@ impl Socket {
 impl PartialFrame {
     fn new() -> PartialFrame {
         PartialFrame::Header {
-            bytes: [0; crate::transport::HEADER_SIZE],
+            bytes: [0; crate::transport::MESSAGE_HEADER_SIZE],
             filled: 0,
         }
     }
@@ -433,7 +433,7 @@ impl PartialFrame {
     ) -> Result<Option<crate::transport::Message>, crate::transport::Error> {
         if let PartialFrame::Header {
             bytes,
-            filled: crate::transport::HEADER_SIZE,
+            filled: crate::transport::MESSAGE_HEADER_SIZE,
         } = self
         {
             let header = crate::transport::decode_header(network, bytes)?;
@@ -491,7 +491,7 @@ mod tests {
 
     /// Reads one frame on the peer's side of the socket.
     fn read_frame(stream: &mut std::net::TcpStream) -> Vec<u8> {
-        let mut frame = vec![0; crate::transport::HEADER_SIZE];
+        let mut frame = vec![0; crate::transport::MESSAGE_HEADER_SIZE];
         stream.read_exact(&mut frame).unwrap();
         let header = frame.first_chunk().unwrap();
         let header =

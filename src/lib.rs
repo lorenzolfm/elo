@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod block;
 pub mod chainparams;
 pub mod net;
 mod net_processing;

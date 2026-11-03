@@ -2,11 +2,11 @@
 
 use crate::serialize::{Decode, Encode};
 
-/// The size of the checksum in a header.
+/// The size of the checksum in a message header.
 const CHECKSUM_SIZE: usize = 4;
 
 /// Magic, message type, length and checksum.
-pub(crate) const HEADER_SIZE: usize = crate::chainparams::MAGIC_SIZE
+pub(crate) const MESSAGE_HEADER_SIZE: usize = crate::chainparams::MAGIC_SIZE
     + crate::protocol::MESSAGE_TYPE_SIZE
     + size_of::<u32>()
     + CHECKSUM_SIZE;
@@ -85,7 +85,7 @@ impl Message {
 /// Checks the magic, the message type and the length.
 pub(crate) fn decode_header(
     network: crate::chainparams::Network,
-    bytes: &[u8; HEADER_SIZE],
+    bytes: &[u8; MESSAGE_HEADER_SIZE],
 ) -> Result<MessageHeader, Error> {
     let mut input = bytes.as_slice();
     let magic = <[u8; crate::chainparams::MAGIC_SIZE]>::decode(&mut input)
@@ -146,7 +146,7 @@ pub(crate) fn encode(
         checksum: checksum(payload),
     };
 
-    let mut frame = Vec::with_capacity(HEADER_SIZE + payload.len());
+    let mut frame = Vec::with_capacity(MESSAGE_HEADER_SIZE + payload.len());
     network.magic().encode(&mut frame);
     header.msg_type.as_bytes().encode(&mut frame);
     header.length.encode(&mut frame);
@@ -167,7 +167,7 @@ fn checksum(payload: &[u8]) -> [u8; CHECKSUM_SIZE] {
 
 #[cfg(test)]
 mod tests {
-    fn split(frame: &[u8]) -> (&[u8; super::HEADER_SIZE], &[u8]) {
+    fn split(frame: &[u8]) -> (&[u8; super::MESSAGE_HEADER_SIZE], &[u8]) {
         frame.split_first_chunk().unwrap()
     }
 

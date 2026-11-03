@@ -79,6 +79,19 @@ macro_rules! little_endian {
 
 little_endian!(u8, u16, u32, u64, i32, i64);
 
+/// The bytes in the order that SHA-256 writes them. A hash shows as hex in the reverse order.
+impl Encode for bitcoin_hashes::sha256d::Hash {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.as_byte_array().encode(out);
+    }
+}
+
+impl Decode for bitcoin_hashes::sha256d::Hash {
+    fn decode(input: &mut &[u8]) -> Result<Self, Error> {
+        Decode::decode(input).map(Self::from_byte_array)
+    }
+}
+
 impl Encode for bool {
     fn encode(&self, out: &mut Vec<u8>) {
         u8::from(*self).encode(out);

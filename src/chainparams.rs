@@ -13,6 +13,19 @@ pub enum Network {
 /// The size of the magic that starts every message.
 pub(crate) const MAGIC_SIZE: usize = 4;
 
+/// The merkle root of the genesis block of mainnet, signet and regtest. The three have the
+/// same coinbase transaction.
+const GENESIS_MERKLE_ROOT: [u8; 32] = [
+    0x3b, 0xa3, 0xed, 0xfd, 0x7a, 0x7b, 0x12, 0xb2, 0x7a, 0xc7, 0x2c, 0x3e, 0x67, 0x76, 0x8f, 0x61,
+    0x7f, 0xc8, 0x1b, 0xc3, 0x88, 0x8a, 0x51, 0x32, 0x3a, 0x9f, 0xb8, 0xaa, 0x4b, 0x1e, 0x5e, 0x4a,
+];
+
+/// The merkle root of the genesis block of testnet4, which has its own coinbase transaction.
+const GENESIS_MERKLE_ROOT_TESTNET4: [u8; 32] = [
+    0x4e, 0x7b, 0x2b, 0x91, 0x28, 0xfe, 0x02, 0x91, 0xdb, 0x06, 0x93, 0xaf, 0x2a, 0xe4, 0x18, 0xb7,
+    0x67, 0xe6, 0x57, 0xcd, 0x40, 0x7e, 0x80, 0xcb, 0x14, 0x34, 0x22, 0x1e, 0xae, 0xa7, 0xa0, 0x7a,
+];
+
 impl Network {
     /// The bytes that start every message.
     pub(crate) const fn magic(self) -> [u8; MAGIC_SIZE] {
@@ -33,6 +46,47 @@ impl Network {
             Network::Regtest => 18444,
         }
     }
+
+    /// The first header of the chain.
+    #[cfg_attr(not(test), expect(dead_code, reason = "until net_processing calls it"))]
+    pub(crate) const fn genesis(self) -> crate::block::BlockHeader {
+        // No header comes before genesis.
+        let prev = bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]);
+        match self {
+            Network::Mainnet => crate::block::BlockHeader {
+                version: 1,
+                prev,
+                merkle_root: GENESIS_MERKLE_ROOT,
+                time: 1231006505,
+                bits: 0x1d00ffff,
+                nonce: 2083236893,
+            },
+            Network::Testnet4 => crate::block::BlockHeader {
+                version: 1,
+                prev,
+                merkle_root: GENESIS_MERKLE_ROOT_TESTNET4,
+                time: 1714777860,
+                bits: 0x1d00ffff,
+                nonce: 393743547,
+            },
+            Network::Signet => crate::block::BlockHeader {
+                version: 1,
+                prev,
+                merkle_root: GENESIS_MERKLE_ROOT,
+                time: 1598918400,
+                bits: 0x1e0377ae,
+                nonce: 52613770,
+            },
+            Network::Regtest => crate::block::BlockHeader {
+                version: 1,
+                prev,
+                merkle_root: GENESIS_MERKLE_ROOT,
+                time: 1296688602,
+                bits: 0x207fffff,
+                nonce: 2,
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -49,5 +103,34 @@ mod tests {
         let hash = bitcoin_hashes::sha256d::Hash::hash(&serialized).to_byte_array();
 
         assert_eq!(super::Network::Signet.magic(), *hash.first_chunk().unwrap());
+    }
+
+    #[test]
+    fn genesis_hashes_to_the_genesis_block_hash() {
+        let cases = [
+            (
+                super::Network::Mainnet,
+                "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+            ),
+            (
+                super::Network::Testnet4,
+                "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043",
+            ),
+            (
+                super::Network::Signet,
+                "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6",
+            ),
+            (
+                super::Network::Regtest,
+                "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206",
+            ),
+        ];
+        for (network, hash) in cases {
+            assert_eq!(
+                network.genesis().hash(),
+                crate::fixtures::hash_from_display_hex(hash),
+                "{network:?}"
+            );
+        }
     }
 }
