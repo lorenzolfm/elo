@@ -393,10 +393,11 @@ mod tests {
     #[test]
     fn headers_decodes_core_bytes() {
         let frame = crate::fixtures::hex(crate::fixtures::HEADERS_FRAME);
-        let (header, payload) = frame.split_first_chunk().unwrap();
-        let header =
-            crate::transport::decode_header(crate::chainparams::Network::Regtest, header).unwrap();
-        let message = crate::transport::check_payload(header, payload.to_vec()).unwrap();
+        let (message_header, payload) = frame.split_first_chunk().unwrap();
+        let message_header =
+            crate::transport::decode_header(crate::chainparams::Network::Regtest, message_header)
+                .unwrap();
+        let message = crate::transport::check_payload(message_header, payload.to_vec()).unwrap();
         assert_eq!(message.msg_type(), super::HEADERS);
 
         let mut input = message.payload();
