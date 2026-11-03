@@ -37,9 +37,9 @@ nix develop -c cargo fuzz run --sanitizer none frame    # Ctrl-C stops it
 ```
 
 A run writes new inputs to `fuzz/corpus/<target>/` and crashes to
-`fuzz/artifacts/<target>/`. CI replays each committed input once and does no
-random run. Commit an input only to keep a crash fixed. The committed corpus is
-at most 1 MiB.
+`fuzz/artifacts/<target>/`, and git ignores both. CI replays each committed input
+once and does no random run. To keep a crash fixed, copy it to the corpus and run
+`git add -f`. The committed corpus is at most 1 MiB.
 
 ## Reproducibility
 

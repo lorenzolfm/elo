@@ -4,3 +4,5 @@
 /result-*
 /fuzz/target
 /fuzz/artifacts
+# The new inputs of a random run. Git still tracks each committed input.
+/fuzz/corpus/*/*
