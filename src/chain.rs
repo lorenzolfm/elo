@@ -58,6 +58,12 @@ impl Chain {
             self.ancestors
                 .push(std::mem::replace(&mut self.tip, header));
         }
+        // The checks above read the batch. This reads the chain: the tip is on the header below
+        // it.
+        assert_eq!(
+            Some(self.tip.prev),
+            self.ancestors.last().map(crate::block::BlockHeader::hash)
+        );
         Ok(())
     }
 
