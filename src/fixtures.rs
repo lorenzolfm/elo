@@ -6,6 +6,10 @@
 //!
 //! The frames after the handshake were captured on 2026-10-26 the same way. The script also
 //! sent its `verack` and answered the `ping`. Then `generatetodescriptor 1` mined block 1.
+//!
+//! The `headers` frame was captured on 2026-11-03 the same way, on a new chain. First
+//! `generatetodescriptor 2` mined blocks 1 and 2. After the handshake, the script sent its
+//! `verack` and a `getheaders` with genesis as the only locator hash.
 
 /// The `version`. On loopback, the IPs and ports of both addresses are zero.
 pub(crate) const VERSION_FRAME: &str = concat!(
@@ -44,9 +48,40 @@ pub(crate) const BLOCK_INV_FRAME: &str = concat!(
     "0102000000faf4d233a8d1e92d0b03cd5dcc530307fdca5133639c54520be1a98d48ff6939",
 );
 
+/// The `headers` reply to a `getheaders` from genesis: blocks 1 and 2, each with a
+/// transaction count of 0.
+pub(crate) const HEADERS_FRAME: &str = concat!(
+    "fabfb5da686561646572730000000000a30000006ba96776",
+    "02",
+    "0000002006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f",
+    "f90344ddd9a16af4f07ed7af45a2e9aec7b443ae92f7bf6560bbaea78cb122b9",
+    "ede8e96affff7f2000000000",
+    "00",
+    "000000206fd9534f8c89df2b57a96335562c10ee824530e786527a906ad55f589b0b6541",
+    "22ea6542f9b592e9cc0b8d6e02eeac9212efd6eda177ed157d9321680975d678",
+    "eee8e96affff7f2000000000",
+    "00",
+);
+
+/// The hash of block 1 in `HEADERS_FRAME`, as `getblockhash 1` wrote it.
+pub(crate) const BLOCK_1_HASH: &str =
+    "41650b9b585fd56a907a5286e7304582ee102c563563a9572bdf898c4f53d96f";
+
 /// The payload of `VERSION_FRAME`.
 pub(crate) fn version_payload() -> Vec<u8> {
     hex(VERSION_FRAME).split_off(crate::transport::HEADER_SIZE)
+}
+
+/// The payload of `HEADERS_FRAME`.
+pub(crate) fn headers_payload() -> Vec<u8> {
+    hex(HEADERS_FRAME).split_off(crate::transport::HEADER_SIZE)
+}
+
+/// A hash in hex, in the order a display shows it: the reverse of the wire order.
+pub(crate) fn hash_from_display_hex(s: &str) -> bitcoin_hashes::sha256d::Hash {
+    let mut bytes: [u8; 32] = hex(s).try_into().unwrap();
+    bytes.reverse();
+    bitcoin_hashes::sha256d::Hash::from_byte_array(bytes)
 }
 
 pub(crate) fn hex(s: &str) -> Vec<u8> {
