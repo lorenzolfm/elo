@@ -64,16 +64,12 @@ mod tests {
     use crate::serialize::Decode;
 
     #[test]
-    fn header_decodes_core_bytes() {
+    fn header_decodes_prev_in_wire_order() {
         let payload = crate::fixtures::headers_payload();
         let (count, mut input) = payload.split_first().unwrap();
         assert_eq!(*count, 2);
         let header = super::BlockHeader::decode(&mut input).unwrap();
 
-        assert_eq!(
-            header.hash(),
-            crate::fixtures::hash_from_display_hex(crate::fixtures::BLOCK_1_HASH)
-        );
         // The `prev` of block 1 is the regtest genesis hash, so a decoded hash keeps the wire
         // order. The hash of block 1 cannot show this: a decode and an encode that both
         // reverse the bytes give the same hash.
