@@ -564,7 +564,8 @@ pub mod fuzz {
     /// as its message.
     ///
     /// The first byte of `data` is the count of the size bytes after it. A size byte `s` is a
-    /// read of `s + 1` bytes. The rest of `data` is the stream.
+    /// read of `s + 1` bytes. The rest of `data` is the stream. The committed corpus uses this
+    /// layout, so a change to the layout must rewrite the corpus.
     pub fn frame(data: &[u8]) {
         let Some((sizes_count, rest)) = data.split_first() else {
             return;
