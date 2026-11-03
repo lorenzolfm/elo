@@ -303,8 +303,8 @@ async fn run_turn(
     // The wake goes to a tokio timer, so `now` comes from the same clock. Then a paused clock
     // in a test also moves the time of the peer.
     let now = tokio::time::Instant::now().into_std();
-    let (peer, outbound, wake) = peer.tick(now, nonce()).map_err(RunError::NetProcessing)?;
-    for outbound in outbound.into_outbounds() {
+    let (peer, tick_outbound, wake) = peer.tick(now, nonce()).map_err(RunError::NetProcessing)?;
+    for outbound in tick_outbound.into_outbounds() {
         run_send(socket, &outbound).await?;
     }
     // The wait covers only the read, which is cancel safe, so the turn keeps the peer when the
