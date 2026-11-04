@@ -499,10 +499,7 @@ pub(crate) mod fuzz {
         assert!(count <= HEADERS_WRITTEN_COUNT_MAX);
         let mut bytes = bytes.iter().copied().chain(std::iter::repeat(0));
         let mut written = Vec::new();
-        crate::serialize::write_compact_size(
-            &mut written,
-            u64::try_from(count).unwrap_or(u64::MAX),
-        );
+        crate::serialize::write_compact_size(&mut written, count);
         for _ in 0..count {
             written.extend(bytes.by_ref().take(crate::block::BLOCK_HEADER_SIZE));
             crate::serialize::write_compact_size(&mut written, 0);
@@ -515,10 +512,7 @@ pub(crate) mod fuzz {
     fn headers_check(headers: super::Headers, taken: &[u8]) {
         let headers = headers.into_vec();
         let mut encoded = Vec::new();
-        crate::serialize::write_compact_size(
-            &mut encoded,
-            u64::try_from(headers.len()).unwrap_or(u64::MAX),
-        );
+        crate::serialize::write_compact_size(&mut encoded, headers.len());
         for header in &headers {
             header.encode(&mut encoded);
             crate::serialize::write_compact_size(&mut encoded, 0);
