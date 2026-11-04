@@ -361,6 +361,172 @@ impl std::fmt::Display for HeadersError {
 
 impl std::error::Error for HeadersError {}
 
+/// The entry points of the `version` and `headers` fuzz targets.
+#[cfg(fuzzing)]
+pub(crate) mod fuzz {
+    use crate::serialize::{Decode, Encode};
+
+    // The seeds hold these limits as bytes, and each check takes its limit from the same constant.
+    // So a new limit moves the checks and not the seeds, and the replay still passes. A new limit
+    // must rewrite the seeds at the limit.
+    const _: () = assert!(super::HEADERS_COUNT_MAX == 2000);
+    const _: () = assert!(super::USER_AGENT_LENGTH_MAX == 256);
+
+    /// The size of the `version` fields before the user agent.
+    const VERSION_BEFORE_USER_AGENT_SIZE: usize = 80;
+
+    /// The size of the `version` fields after the user agent: `start_height` and `relay`.
+    const VERSION_AFTER_USER_AGENT_SIZE: usize = size_of::<i32>() + size_of::<bool>();
+
+    /// The size of the `version` fields other than the user agent.
+    const VERSION_FIXED_SIZE: usize =
+        VERSION_BEFORE_USER_AGENT_SIZE + VERSION_AFTER_USER_AGENT_SIZE;
+
+    /// The largest batch that `headers` writes: the first count above the limit.
+    const HEADERS_WRITTEN_COUNT_MAX: usize = super::HEADERS_COUNT_MAX + 1;
+
+    /// Checks that a `version` from `data` encodes to the bytes that its decode took, and that a
+    /// payload from `data` reads back: with `relay`, without it, and with bytes after it.
+    ///
+    /// The first bytes of `data` fill the fields other than the user agent, with zeros after their
+    /// end. The rest of `data` is the user agent, up to its limit. The committed corpus uses this
+    /// layout, so a change to the layout must rewrite the corpus.
+    pub fn version(data: &[u8]) {
+        let mut input = data;
+        if let Ok(version) = super::Version::decode(&mut input) {
+            version_check(&version, &data[..data.len() - input.len()], input);
+        }
+
+        // A decoder that refuses each payload passes the check above, so read a payload that is
+        // valid by its layout.
+        let written = version_write(data);
+        version_read_all(&written, &[]);
+        version_read_all(&written[..written.len() - size_of::<bool>()], &[]);
+        // The bytes after `relay` stay in `input`. A later protocol version can add fields there.
+        version_read_all(&written, data);
+    }
+
+    /// The fields from `data`, in the order of the payload.
+    fn version_write(data: &[u8]) -> Vec<u8> {
+        let mut fixed = [0; VERSION_FIXED_SIZE];
+        for (fixed_byte, byte) in fixed.iter_mut().zip(data) {
+            *fixed_byte = *byte;
+        }
+        let (before, after) = fixed.split_at(VERSION_BEFORE_USER_AGENT_SIZE);
+        let user_agent = data.get(VERSION_FIXED_SIZE..).unwrap_or_default();
+        let user_agent = &user_agent[..user_agent.len().min(super::USER_AGENT_LENGTH_MAX)];
+
+        let mut written = before.to_vec();
+        crate::serialize::write_string(&mut written, user_agent);
+        written.extend_from_slice(after);
+        written
+    }
+
+    /// Checks that `payload` and then `after` decodes, and that the decode takes each byte of
+    /// `payload` and no byte of `after`.
+    fn version_read_all(payload: &[u8], after: &[u8]) {
+        let stream = [payload, after].concat();
+        let mut input = stream.as_slice();
+        match super::Version::decode(&mut input) {
+            Ok(version) => version_check(&version, payload, after),
+            Err(error) => panic!("the decode refuses a valid `version`: {error}"),
+        }
+        assert_eq!(input, after);
+    }
+
+    /// Checks that `taken`, the bytes that a decode took, are what `version` encodes to. Only
+    /// `relay` can differ: a decode takes any byte as a bool, or no byte as true. Only the end of
+    /// the input can mean that `relay` is missing, so `rest` must then be empty.
+    fn version_check(version: &super::Version, taken: &[u8], rest: &[u8]) {
+        let mut encoded = Vec::new();
+        version.encode(&mut encoded);
+        let (fields, encoded_relay) = encoded.split_at(encoded.len() - size_of::<bool>());
+        assert_eq!(encoded_relay, [u8::from(version.relay)]);
+        match taken.strip_prefix(fields) {
+            Some([]) => {
+                assert!(rest.is_empty());
+                assert!(version.relay);
+            }
+            Some([relay]) => assert_eq!(version.relay, *relay != 0),
+            _ => panic!("the decode took {taken:02x?}, and the encode wrote {encoded:02x?}"),
+        }
+    }
+
+    /// Checks that the headers from `data` encode to the bytes that their decode took, and that a
+    /// batch from `data` reads back, or is refused only if it has too many headers.
+    ///
+    /// The first two bytes of `data`, little-endian, give the count of the batch. So a short input
+    /// reaches the limit and the first count above it. The bytes after them fill the headers, with
+    /// zeros after their end. Bytes that the headers do not use come after the batch. The committed
+    /// corpus uses this layout, so a change to the layout must rewrite the corpus.
+    pub fn headers(data: &[u8]) {
+        let mut input = data;
+        if let Ok(headers) = super::Headers::decode(&mut input) {
+            headers_check(headers, &data[..data.len() - input.len()]);
+        }
+
+        // A decoder that refuses each payload passes the check above, so read a batch that is
+        // valid by its layout.
+        let [count_low, count_high, bytes @ ..] = data else {
+            return;
+        };
+        let count = usize::from(u16::from_le_bytes([*count_low, *count_high]))
+            % (HEADERS_WRITTEN_COUNT_MAX + 1);
+        // The bytes that the headers do not use come after the batch, and stay in `input`.
+        let header_bytes_size = bytes.len().min(count * crate::block::BLOCK_HEADER_SIZE);
+        let (header_bytes, after) = bytes.split_at(header_bytes_size);
+        let mut written = headers_write(count, header_bytes);
+        let batch_size = written.len();
+        written.extend_from_slice(after);
+        let mut input = written.as_slice();
+        match super::Headers::decode(&mut input) {
+            Ok(headers) => {
+                assert!(count <= super::HEADERS_COUNT_MAX);
+                assert_eq!(input, after);
+                assert_eq!(headers.is_full(), count == super::HEADERS_COUNT_MAX);
+                headers_check(headers, &written[..batch_size]);
+            }
+            Err(error) => {
+                assert!(count > super::HEADERS_COUNT_MAX);
+                assert_eq!(error, super::HeadersError::TooMany(count));
+            }
+        }
+    }
+
+    /// `count` headers from `bytes`, with zeros after their end, each with a transaction count of
+    /// 0.
+    fn headers_write(count: usize, bytes: &[u8]) -> Vec<u8> {
+        assert!(count <= HEADERS_WRITTEN_COUNT_MAX);
+        let mut bytes = bytes.iter().copied().chain(std::iter::repeat(0));
+        let mut written = Vec::new();
+        crate::serialize::write_compact_size(
+            &mut written,
+            u64::try_from(count).unwrap_or(u64::MAX),
+        );
+        for _ in 0..count {
+            written.extend(bytes.by_ref().take(crate::block::BLOCK_HEADER_SIZE));
+            crate::serialize::write_compact_size(&mut written, 0);
+        }
+        written
+    }
+
+    /// Checks that `taken`, the bytes that a decode took, are what the headers encode to, each
+    /// with a transaction count of 0.
+    fn headers_check(headers: super::Headers, taken: &[u8]) {
+        let headers = headers.into_vec();
+        let mut encoded = Vec::new();
+        crate::serialize::write_compact_size(
+            &mut encoded,
+            u64::try_from(headers.len()).unwrap_or(u64::MAX),
+        );
+        for header in &headers {
+            header.encode(&mut encoded);
+            crate::serialize::write_compact_size(&mut encoded, 0);
+        }
+        assert_eq!(encoded, taken);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::serialize::{Decode, Encode};

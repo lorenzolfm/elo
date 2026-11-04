@@ -170,6 +170,24 @@
                 # With no targets, the loop runs zero times and the gate passes.
                 targets="$(cargo fuzz list)"
                 test -n "$targets" || fail "found no fuzz targets"
+
+                # A target has one name in its manifest entry, file, entry point and corpus.
+                # A copy that keeps an old name replays a corpus through another entry point,
+                # and the replay passes.
+                test "$(ls fuzz/corpus | sort)" = "$(sort <<< "$targets")" \
+                  || fail "the corpus directories are not the targets"
+                test "$(ls fuzz/fuzz_targets | sed 's/\.rs$//' | sort)" = "$(sort <<< "$targets")" \
+                  || fail "the files in fuzz_targets are not the targets"
+                # `packages` also prints each `[[bin]]`: its name and its path, on one line.
+                manifest="$(packages fuzz/Cargo.toml)"
+                for target in $targets; do
+                  grep --fixed-strings --line-regexp --quiet \
+                    "name = \"$target\" path = \"fuzz_targets/$target.rs\"" <<< "$manifest" \
+                    || fail "target $target does not build fuzz_targets/$target.rs"
+                  grep --fixed-strings --quiet "elo::fuzz::$target(data)" "fuzz/fuzz_targets/$target.rs" \
+                    || fail "fuzz_targets/$target.rs does not call elo::fuzz::$target"
+                done
+
                 for target in $targets; do
                   # `cargo fuzz run` makes a missing corpus, and an empty one passes.
                   test -n "$(ls --almost-all "fuzz/corpus/$target")" || fail "target $target has no corpus"

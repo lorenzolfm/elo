@@ -529,10 +529,9 @@ fn nonce() -> u64 {
     std::hash::RandomState::new().build_hasher().finish()
 }
 
-/// The entry points of the fuzz targets in `fuzz/`. Only a build with `--cfg fuzzing` has this
-/// module, so a normal build has no more `pub` items, and `PartialFrame` stays private.
+/// The entry point of the `frame` fuzz target.
 #[cfg(fuzzing)]
-pub mod fuzz {
+pub(crate) mod fuzz {
     /// The network of the seeds.
     const NETWORK: crate::chainparams::Network = crate::chainparams::Network::Regtest;
 

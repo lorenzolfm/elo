@@ -3,7 +3,7 @@
 use crate::serialize::{Decode, Encode};
 
 /// The size of an encoded header.
-const BLOCK_HEADER_SIZE: usize = 80;
+pub(crate) const BLOCK_HEADER_SIZE: usize = 80;
 
 /// A block header. Its hash names the block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
