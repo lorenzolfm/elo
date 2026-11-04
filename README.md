@@ -62,8 +62,10 @@ the target with the limits of the session:
 
 ```sh
 cargo fuzz build --sanitizer none <target>
-(ulimit -v 1048576; fuzz/target/*/release/<target> -timeout=30 <file>)
+(ulimit -v 1048576; fuzz/target/*/release/<target> -timeout=30 -runs=10000 <file>)
 ```
+
+The input runs many times, so a leak reaches the limit.
 
 A session does not start when its files take more than 1 GiB. Then remove files from
 `/tmp/elo-fuzz/corpus` by hand.
