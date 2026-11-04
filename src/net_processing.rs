@@ -545,6 +545,658 @@ impl SyncState {
     }
 }
 
+/// The entry point of the `machines` fuzz target.
+#[cfg(fuzzing)]
+pub(crate) mod fuzz {
+    use crate::serialize::{Decode, Encode};
+
+    /// The network of each frame. The machines do not read the magic, so one is enough. The network
+    /// of the machines comes from the script.
+    const FRAME_NETWORK: crate::chainparams::Network = crate::chainparams::Network::Regtest;
+
+    /// The address of the peer in each `version` of a script.
+    const PEER: std::net::SocketAddr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 18444);
+
+    // The models take each limit from the constant that the machines use, and the seeds hold each
+    // limit as a count of bytes and turns. So a new limit moves the models and not the seeds, and
+    // the replay still passes. A new limit must rewrite the seeds at the limit.
+    const _: () = assert!(super::PROTOCOL_VERSION_MIN == 70016);
+    const _: () = assert!(super::MESSAGE_COUNT_MAX == 16);
+    const _: () = assert!(super::PING_INTERVAL.as_secs() == 120);
+    const _: () = assert!(super::PING_TIMEOUT.as_secs() == 1200);
+    const _: () = assert!(super::HEADERS_TIMEOUT.as_secs() == 120);
+
+    /// The count of a full batch. It is a second copy of the limit in `protocol`, so a wrong value
+    /// of that limit makes the model and the machine disagree.
+    const HEADERS_FULL_COUNT: usize = 2000;
+
+    /// The most headers that one script writes. A full batch costs about 3 ms and 160 KB of chain,
+    /// and a few bytes of a script ask for one. So this bounds the cost of a run.
+    const HEADERS_WRITTEN_COUNT_MAX: usize = 3 * HEADERS_FULL_COUNT;
+
+    /// A good peer, with a full batch. A machine that refuses each message fails on each seed. But
+    /// a new layout can leave the seeds with nothing to check, and the replay still passes. This
+    /// script must end the sync, so a new layout fails here until it also rewrites this script.
+    #[rustfmt::skip]
+    const GOOD_SCRIPT: &[u8] = &[
+        0,                // Regtest.
+        1,                // Our nonce.
+        1, 1, 0, 0,       // Their `version`.
+        2, 0,             // Their `verack`.
+        7, 5, 255, 0, 0,  // A tick with our `ping` and `getheaders`, and a full batch.
+        0,                // No time passes.
+        8, 4, 0, 0,       // A tick with our next `getheaders`, and the `pong` to our `ping`.
+        0,                // No time passes.
+        9, 5, 2, 0, 0,    // A tick with nothing to send, and a batch that ends the sync.
+        0,                // No time passes.
+    ];
+
+    /// Runs `Handshake` and `Peer` on the script in `data`, in the order of the driver: a tick
+    /// before each receive, and `now` never goes back. `HandshakeModel` and `PeerModel` write the
+    /// doc of each function a second time, and each result must be what they expect. Each error
+    /// ends the run, as it ends the connection.
+    ///
+    /// A script holds a network byte (`script_network`), a nonce byte for our `version`, messages
+    /// until the handshake ends, and then turns. A turn holds a nonce byte for the tick, a message,
+    /// and a byte for `now_next`. A read after the end of `data` gives 0. A message is a kind byte,
+    /// modulo 7, then:
+    ///
+    /// - 0: no message.
+    /// - 1: `version`. A byte to add to our nonce in the handshake, so 0 is our nonce, and an `i8`
+    ///   to add to `PROTOCOL_VERSION_MIN`.
+    /// - 2: `verack`.
+    /// - 3: `ping`. A nonce byte.
+    /// - 4: `pong` with the nonce of our outstanding `ping`. A byte: 0 keeps the nonce, and each
+    ///   other byte `b` flips bit `b % 64`.
+    /// - 5: `headers`, each on the header below it, from our tip. A count byte: 253 is one above a
+    ///   full batch, 254 is one below it, 255 is a full batch, and each other byte is the count.
+    ///   Then a byte `b`: header `b - 1` has a wrong `prev`, and 0 changes none.
+    /// - 6: another message type, which each machine skips.
+    ///
+    /// Then an `i8` to add to the length of the payload, so bytes come off its end or go after it.
+    /// The committed corpus uses this layout, so a change to the layout must rewrite the corpus.
+    pub fn machines(data: &[u8]) {
+        // One run is enough, because a script does the same in each run.
+        static GOOD_SCRIPT_RUN: std::sync::Once = std::sync::Once::new();
+        GOOD_SCRIPT_RUN.call_once(|| assert!(machines_run(GOOD_SCRIPT)));
+
+        machines_run(data);
+    }
+
+    /// Returns true if the script ended the sync, and no message or tick ended the run.
+    fn machines_run(data: &[u8]) -> bool {
+        let mut script = Script {
+            unread: data,
+            headers_written_count: 0,
+        };
+        let network = script_network(script.byte());
+        let nonce = script.nonce();
+        let timestamp = nonce.cast_signed();
+        let (handshake, outbound) = super::Handshake::start(network, PEER, timestamp, nonce);
+        machines_start_check(&outbound, timestamp, nonce);
+        let tip = network.genesis().hash();
+        match handshake_run(&mut script, handshake, nonce, tip) {
+            Some(peer) => peer_run(&mut script, peer, tip),
+            None => false,
+        }
+    }
+
+    /// The network of a script. Its genesis header starts the chain of the peer.
+    fn script_network(byte: u8) -> crate::chainparams::Network {
+        match byte % 3 {
+            0 => crate::chainparams::Network::Regtest,
+            1 => crate::chainparams::Network::Mainnet,
+            _ => crate::chainparams::Network::Testnet4,
+        }
+    }
+
+    /// Checks that `outbound` is our `version`, with no services and no transactions. The handshake
+    /// compares their nonce with the nonce that it keeps, so `nonce` must also be on the wire.
+    fn machines_start_check(outbound: &super::HandshakeOutbound, timestamp: i64, nonce: u64) {
+        let super::HandshakeOutbound::Version(payload) = outbound else {
+            panic!("the handshake starts with {outbound:?}");
+        };
+        let ours = match crate::protocol::Version::decode(&mut payload.as_slice()) {
+            Ok(ours) => ours,
+            Err(error) => panic!("the decode refuses our `version`: {error}"),
+        };
+        let none = crate::protocol::ServiceFlags::NONE;
+        assert_eq!(ours.version, crate::protocol::PROTOCOL_VERSION);
+        assert_eq!(ours.services, none);
+        assert_eq!(ours.timestamp, timestamp);
+        assert_eq!(ours.addr_recv, crate::protocol::Address::new(none, PEER));
+        assert_eq!(ours.nonce, nonce);
+        assert!(!ours.relay);
+    }
+
+    /// Gives each message of `script` to `handshake`. Returns the peer if the handshake ended
+    /// with one. A message takes at least its kind byte, so the length of the script bounds the
+    /// loop. `tip` is only for the `headers` in the script, which the handshake skips.
+    fn handshake_run(
+        script: &mut Script,
+        mut handshake: super::Handshake,
+        nonce: u64,
+        tip: bitcoin_hashes::sha256d::Hash,
+    ) -> Option<super::Peer> {
+        let mut model = HandshakeModel {
+            nonce,
+            theirs: None,
+            message_count: 0,
+        };
+        while !script.unread.is_empty() {
+            let unread_count = script.unread.len();
+            let message = script.message(nonce, tip);
+            assert!(script.unread.len() < unread_count);
+            let Some(message) = message else {
+                continue;
+            };
+            match (handshake.receive(&message), model.receive(&message)) {
+                (Ok(super::Step::Wait(next)), Ok(HandshakeExpected::Wait)) => handshake = next,
+                (
+                    Ok(super::Step::Reply(next, super::HandshakeOutbound::Verack)),
+                    Ok(HandshakeExpected::Reply),
+                ) => handshake = next,
+                (Ok(super::Step::Done(peer, theirs)), Ok(HandshakeExpected::Done(expected))) => {
+                    assert_eq!(theirs, expected);
+                    return Some(peer);
+                }
+                (Err(error), Err(expected)) => {
+                    assert_eq!(error, expected);
+                    return None;
+                }
+                (step, expected) => panic!("the handshake gave {step:?}, not {expected:?}"),
+            }
+        }
+        None
+    }
+
+    /// Runs one turn after the other, as the driver does. Returns true if the sync ended and no
+    /// error ended the run. Each turn takes at least one byte of the script, so the length of the
+    /// script bounds the loop.
+    fn peer_run(
+        script: &mut Script,
+        mut peer: super::Peer,
+        tip: bitcoin_hashes::sha256d::Hash,
+    ) -> bool {
+        let mut now = std::time::Instant::now();
+        let mut model = PeerModel::new(now, tip);
+        while !script.unread.is_empty() {
+            let unread_count = script.unread.len();
+            let nonce = script.nonce();
+            assert!(script.unread.len() < unread_count);
+            let Some((ticked, wake)) = peer_tick(peer, &mut model, now, nonce) else {
+                return false;
+            };
+            peer = ticked;
+            // The wait of the driver can end with no message.
+            if let Some(message) = script.message(model.ping_nonce(), model.tip) {
+                let Some(received) = peer_receive(peer, &mut model, &message) else {
+                    return false;
+                };
+                peer = received;
+            }
+            now = now_next(script.byte(), now, wake);
+        }
+        model.is_synced()
+    }
+
+    /// Ticks `peer`, and checks the result against `model`. Returns the peer and its wake, or
+    /// nothing if the tick failed.
+    fn peer_tick(
+        peer: super::Peer,
+        model: &mut PeerModel,
+        now: std::time::Instant,
+        nonce: u64,
+    ) -> Option<(super::Peer, std::time::Instant)> {
+        match (peer.tick(now, nonce), model.tick(now, nonce)) {
+            (Ok((peer, outbound, wake)), Ok(expected)) => {
+                assert_eq!(wake, expected.wake);
+                // The driver sends these, in this order.
+                let mut outbounds = outbound.into_outbounds();
+                if let Some(nonce) = expected.ping {
+                    let ping = outbounds.next();
+                    assert!(
+                        matches!(ping, Some(super::PeerOutbound::Ping(sent)) if sent == nonce),
+                        "{ping:?}, not a ping with {nonce}"
+                    );
+                }
+                if expected.get_headers {
+                    let Some(super::PeerOutbound::GetHeaders(get_headers)) = outbounds.next()
+                    else {
+                        panic!("the tick has no getheaders");
+                    };
+                    peer_get_headers_check(get_headers, model.tip);
+                }
+                let extra = outbounds.next();
+                assert!(extra.is_none(), "{extra:?}");
+                Some((peer, wake))
+            }
+            (Err(error), Err(expected)) => {
+                assert_eq!(error, expected);
+                None
+            }
+            (ticked, expected) => panic!("the tick gave {ticked:?}, not {expected:?}"),
+        }
+    }
+
+    /// Checks that `get_headers` asks for the headers after `tip`, and for as many as a `headers`
+    /// can carry.
+    fn peer_get_headers_check(
+        get_headers: crate::protocol::GetHeaders,
+        tip: bitcoin_hashes::sha256d::Hash,
+    ) {
+        let mut encoded = Vec::new();
+        get_headers.encode(&mut encoded);
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&crate::protocol::PROTOCOL_VERSION.to_le_bytes());
+        expected.push(1);
+        expected.extend_from_slice(tip.as_byte_array());
+        expected.extend_from_slice(&[0; 32]);
+        assert_eq!(encoded, expected);
+    }
+
+    /// Gives `message` to `peer`, and checks the result against `model`. Returns the peer, or
+    /// nothing if it refused the message.
+    fn peer_receive(
+        peer: super::Peer,
+        model: &mut PeerModel,
+        message: &crate::transport::Message,
+    ) -> Option<super::Peer> {
+        match (peer.receive(message), model.receive(message)) {
+            (Ok((peer, super::Received::NoReply)), Ok(ReceivedExpected::NoReply)) => Some(peer),
+            (Ok((peer, super::Received::Pong(nonce))), Ok(ReceivedExpected::Pong(expected))) => {
+                assert_eq!(nonce, expected);
+                Some(peer)
+            }
+            (Ok((peer, super::Received::Synced(tip))), Ok(ReceivedExpected::Synced)) => {
+                assert_eq!(tip.hash(), model.tip);
+                let height = format!("{} ", model.height);
+                assert!(tip.to_string().starts_with(&height), "{tip}, not {height}");
+                Some(peer)
+            }
+            (Err(error), Err(expected)) => {
+                assert_eq!(error, expected);
+                None
+            }
+            (received, expected) => panic!("the peer gave {received:?}, not {expected:?}"),
+        }
+    }
+
+    /// The `now` of the next tick. A deadline is due at its instant, so a random time would almost
+    /// never test it. So each kind but the first steps relative to `wake`, the earliest deadline
+    /// from the last tick. `byte % 4` picks the kind, and `byte / 4` is the amount:
+    ///
+    /// - 0: the amount in seconds after `now`, so a message that came before `wake`, or no time.
+    /// - 1: just before `wake`.
+    /// - 2: at `wake`.
+    /// - 3: the amount in minutes after `wake`, so a tick that came late.
+    fn now_next(byte: u8, now: std::time::Instant, wake: std::time::Instant) -> std::time::Instant {
+        // `tick` asserts this. The next assert needs it for the second kind.
+        assert!(now < wake);
+        let amount = u64::from(byte / 4);
+        let next = match byte % 4 {
+            0 => now + std::time::Duration::from_secs(amount),
+            1 => wake - std::time::Duration::from_nanos(1),
+            2 => wake,
+            _ => wake + std::time::Duration::from_mins(amount),
+        };
+        // `tick` needs this for its deadlines.
+        assert!(now <= next);
+        next
+    }
+
+    /// The bytes of a script that no read took yet.
+    struct Script<'a> {
+        unread: &'a [u8],
+        /// The headers that the script wrote, at most `HEADERS_WRITTEN_COUNT_MAX`.
+        headers_written_count: usize,
+    }
+
+    impl Script<'_> {
+        fn byte(&mut self) -> u8 {
+            let (byte, rest) = self.unread.split_first().unwrap_or((&0, &[]));
+            self.unread = rest;
+            *byte
+        }
+
+        fn signed_byte(&mut self) -> i8 {
+            i8::from_le_bytes([self.byte()])
+        }
+
+        /// One byte in each place of the nonce, so one byte of a script changes each place.
+        fn nonce(&mut self) -> u64 {
+            u64::from_le_bytes([self.byte(); size_of::<u64>()])
+        }
+
+        /// The next message, as the driver reads it. `nonce` is the one that our `version` and
+        /// `pong` start from, and `tip` the one that a batch starts from.
+        fn message(
+            &mut self,
+            nonce: u64,
+            tip: bitcoin_hashes::sha256d::Hash,
+        ) -> Option<crate::transport::Message> {
+            /// A type that no machine reads.
+            const OTHER: crate::protocol::MessageType =
+                crate::protocol::MessageType::new(*b"wtxidrelay\0\0").expect("a printable name");
+
+            let (msg_type, mut payload) = match self.byte() % 7 {
+                0 => return None,
+                1 => (crate::protocol::VERSION, self.version_payload(nonce)),
+                2 => (crate::protocol::VERACK, Vec::new()),
+                3 => (crate::protocol::PING, self.nonce().to_le_bytes().to_vec()),
+                4 => (crate::protocol::PONG, self.pong_payload(nonce)),
+                5 => (crate::protocol::HEADERS, self.headers_payload(tip)),
+                _ => (OTHER, Vec::new()),
+            };
+            let length = payload
+                .len()
+                .saturating_add_signed(isize::from(self.signed_byte()));
+            payload.resize(length, 0xaa);
+            Some(message_read(msg_type, &payload))
+        }
+
+        fn version_payload(&mut self, nonce: u64) -> Vec<u8> {
+            let nonce = nonce.wrapping_add(u64::from(self.byte()));
+            let mut theirs = super::our_version(PEER, 0, nonce);
+            theirs.version = super::PROTOCOL_VERSION_MIN + i32::from(self.signed_byte());
+            let mut payload = Vec::new();
+            theirs.encode(&mut payload);
+            payload
+        }
+
+        fn pong_payload(&mut self, nonce: u64) -> Vec<u8> {
+            let byte = self.byte();
+            let theirs = match byte {
+                0 => nonce,
+                _ => nonce ^ (1 << (byte % 64)),
+            };
+            assert_eq!(theirs == nonce, byte == 0);
+            theirs.to_le_bytes().to_vec()
+        }
+
+        /// A batch from `tip`. Random bytes never match the hash of the tip, so this builds each
+        /// `prev`. Without this, each batch stops at `NotOnTip`.
+        fn headers_payload(&mut self, tip: bitcoin_hashes::sha256d::Hash) -> Vec<u8> {
+            let count = match self.byte() {
+                253 => HEADERS_FULL_COUNT + 1,
+                254 => HEADERS_FULL_COUNT - 1,
+                255 => HEADERS_FULL_COUNT,
+                count => usize::from(count),
+            };
+            let count = count.min(HEADERS_WRITTEN_COUNT_MAX - self.headers_written_count);
+            self.headers_written_count += count;
+            assert!(self.headers_written_count <= HEADERS_WRITTEN_COUNT_MAX);
+            let wrong_prev_byte = usize::from(self.byte());
+
+            let mut payload = Vec::new();
+            crate::serialize::write_compact_size(&mut payload, count);
+            let mut prev = tip;
+            for index in 0..count {
+                let header = crate::block::BlockHeader {
+                    version: 0,
+                    prev: if index + 1 == wrong_prev_byte {
+                        hash_wrong(prev)
+                    } else {
+                        prev
+                    },
+                    merkle_root: [0; 32],
+                    time: 0,
+                    bits: 0,
+                    nonce: 0,
+                };
+                header.encode(&mut payload);
+                crate::serialize::write_compact_size(&mut payload, 0);
+                prev = header.hash();
+            }
+            payload
+        }
+    }
+
+    /// `hash` with one bit flipped, so a compare of part of a hash does not see it.
+    fn hash_wrong(hash: bitcoin_hashes::sha256d::Hash) -> bitcoin_hashes::sha256d::Hash {
+        let mut bytes = hash.to_byte_array();
+        bytes[31] ^= 1;
+        let wrong = bitcoin_hashes::sha256d::Hash::from_byte_array(bytes);
+        assert_ne!(wrong, hash);
+        wrong
+    }
+
+    /// `check_payload` is the only constructor of a `Message`, so this reads a frame as the driver
+    /// does.
+    fn message_read(
+        msg_type: crate::protocol::MessageType,
+        payload: &[u8],
+    ) -> crate::transport::Message {
+        let frame = crate::transport::encode(FRAME_NETWORK, msg_type, payload);
+        let Some((header, read_payload)) = frame.split_first_chunk() else {
+            panic!("a frame of {} bytes has no header", frame.len());
+        };
+        let message = crate::transport::decode_header(FRAME_NETWORK, header)
+            .and_then(|header| crate::transport::check_payload(header, read_payload.to_vec()));
+        match message {
+            Ok(message) => {
+                assert_eq!(message.msg_type(), msg_type);
+                assert_eq!(message.payload(), payload);
+                message
+            }
+            Err(error) => panic!("elo refuses a frame that it wrote: {error}"),
+        }
+    }
+
+    /// What `Handshake::receive` returns, by its doc.
+    struct HandshakeModel {
+        nonce: u64,
+        /// Their first `version`, once it came.
+        theirs: Option<crate::protocol::Version>,
+        message_count: u32,
+    }
+
+    #[derive(Debug)]
+    enum HandshakeExpected {
+        Wait,
+        Reply,
+        Done(crate::protocol::Version),
+    }
+
+    impl HandshakeModel {
+        fn receive(
+            &mut self,
+            message: &crate::transport::Message,
+        ) -> Result<HandshakeExpected, super::HandshakeError> {
+            assert!(self.message_count < super::MESSAGE_COUNT_MAX);
+            self.message_count += 1;
+
+            let msg_type = message.msg_type();
+            let expected = match &self.theirs {
+                None if msg_type == crate::protocol::VERSION => {
+                    let theirs = crate::protocol::Version::decode(&mut message.payload())
+                        .map_err(super::HandshakeError::Version)?;
+                    if theirs.version < super::PROTOCOL_VERSION_MIN {
+                        return Err(super::HandshakeError::Obsolete(theirs.version));
+                    }
+                    if theirs.nonce == self.nonce {
+                        return Err(super::HandshakeError::SelfConnection);
+                    }
+                    self.theirs = Some(theirs);
+                    HandshakeExpected::Reply
+                }
+                Some(theirs) if msg_type == crate::protocol::VERACK => {
+                    return Ok(HandshakeExpected::Done(theirs.clone()));
+                }
+                _ => HandshakeExpected::Wait,
+            };
+            if self.message_count < super::MESSAGE_COUNT_MAX {
+                Ok(expected)
+            } else {
+                Err(super::HandshakeError::TooManyMessages)
+            }
+        }
+    }
+
+    /// What `Peer::tick` and `Peer::receive` return, by their docs. It holds deadlines, not the
+    /// states of the peer, so a change to those states needs no change here.
+    struct PeerModel {
+        /// When our next `ping` is due, or when our outstanding one times out.
+        ping_deadline: std::time::Instant,
+        /// The nonce of our outstanding `ping`, and when it went.
+        ping_outstanding: Option<(u64, std::time::Instant)>,
+        /// True when the next tick must send a `getheaders`.
+        get_headers_due: bool,
+        /// When our outstanding `getheaders` times out.
+        get_headers_deadline: Option<std::time::Instant>,
+        /// The hash and the height of the last header of the chain.
+        tip: bitcoin_hashes::sha256d::Hash,
+        height: usize,
+    }
+
+    #[derive(Debug)]
+    struct TickExpected {
+        ping: Option<u64>,
+        get_headers: bool,
+        wake: std::time::Instant,
+    }
+
+    #[derive(Debug)]
+    enum ReceivedExpected {
+        NoReply,
+        Pong(u64),
+        Synced,
+    }
+
+    impl PeerModel {
+        /// The model of a new peer on the genesis hash `tip`. Its first tick is at `now`.
+        fn new(now: std::time::Instant, tip: bitcoin_hashes::sha256d::Hash) -> PeerModel {
+            PeerModel {
+                ping_deadline: now,
+                ping_outstanding: None,
+                get_headers_due: true,
+                get_headers_deadline: None,
+                tip,
+                height: 0,
+            }
+        }
+
+        /// A batch that was not full came, so no `getheaders` goes again.
+        fn is_synced(&self) -> bool {
+            !self.get_headers_due && self.get_headers_deadline.is_none()
+        }
+
+        /// The nonce of a `pong` that answers our `ping`, or any nonce if none is outstanding.
+        fn ping_nonce(&self) -> u64 {
+            self.ping_outstanding.map_or(0, |(nonce, _)| nonce)
+        }
+
+        fn tick(
+            &mut self,
+            now: std::time::Instant,
+            nonce: u64,
+        ) -> Result<TickExpected, super::PeerError> {
+            let ping_is_due = self.ping_deadline <= now;
+            if ping_is_due && self.ping_outstanding.is_some() {
+                return Err(super::PeerError::PingTimeout);
+            }
+            if self
+                .get_headers_deadline
+                .is_some_and(|deadline| deadline <= now)
+            {
+                return Err(super::PeerError::HeadersTimeout);
+            }
+
+            let ping = ping_is_due.then_some(nonce);
+            if ping_is_due {
+                self.ping_outstanding = Some((nonce, now));
+                self.ping_deadline = now + super::PING_TIMEOUT;
+            }
+            let get_headers = self.get_headers_due;
+            if get_headers {
+                self.get_headers_due = false;
+                self.get_headers_deadline = Some(now + super::HEADERS_TIMEOUT);
+            }
+            let wake = self
+                .get_headers_deadline
+                .map_or(self.ping_deadline, |deadline| {
+                    deadline.min(self.ping_deadline)
+                });
+            assert!(now < wake);
+            Ok(TickExpected {
+                ping,
+                get_headers,
+                wake,
+            })
+        }
+
+        fn receive(
+            &mut self,
+            message: &crate::transport::Message,
+        ) -> Result<ReceivedExpected, super::PeerError> {
+            let msg_type = message.msg_type();
+            if msg_type == crate::protocol::PING {
+                let nonce = message_nonce(message).map_err(super::PeerError::Ping)?;
+                Ok(ReceivedExpected::Pong(nonce))
+            } else if msg_type == crate::protocol::PONG {
+                let theirs = message_nonce(message).map_err(super::PeerError::Pong)?;
+                let Some((ours, sent)) = self.ping_outstanding else {
+                    return Err(super::PeerError::UnsolicitedPong);
+                };
+                if theirs != ours {
+                    return Err(super::PeerError::PongNonce);
+                }
+                self.ping_outstanding = None;
+                self.ping_deadline = sent + super::PING_INTERVAL;
+                Ok(ReceivedExpected::NoReply)
+            } else if msg_type == crate::protocol::HEADERS {
+                self.receive_headers(message)
+            } else {
+                Ok(ReceivedExpected::NoReply)
+            }
+        }
+
+        fn receive_headers(
+            &mut self,
+            message: &crate::transport::Message,
+        ) -> Result<ReceivedExpected, super::PeerError> {
+            let headers = crate::protocol::Headers::decode(&mut message.payload())
+                .map_err(super::PeerError::Headers)?
+                .into_vec();
+            assert!(headers.len() <= HEADERS_FULL_COUNT);
+            if self.get_headers_deadline.is_none() {
+                return Err(super::PeerError::UnsolicitedHeaders);
+            }
+
+            let mut tip = self.tip;
+            for (index, header) in headers.iter().enumerate() {
+                if header.prev != tip {
+                    return Err(super::PeerError::Extend(if index == 0 {
+                        crate::chain::ExtendError::NotOnTip
+                    } else {
+                        crate::chain::ExtendError::NotContinuous
+                    }));
+                }
+                tip = header.hash();
+            }
+            self.tip = tip;
+            self.height += headers.len();
+            self.get_headers_deadline = None;
+            if headers.len() == HEADERS_FULL_COUNT {
+                self.get_headers_due = true;
+                Ok(ReceivedExpected::NoReply)
+            } else {
+                Ok(ReceivedExpected::Synced)
+            }
+        }
+    }
+
+    /// The first 8 bytes of the payload, little-endian. Each byte after them is ignored.
+    fn message_nonce(message: &crate::transport::Message) -> Result<u64, crate::serialize::Error> {
+        match message.payload().first_chunk() {
+            Some(nonce) => Ok(u64::from_le_bytes(*nonce)),
+            None => Err(crate::serialize::Error::UnexpectedEnd),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::serialize::{Decode, Encode};
