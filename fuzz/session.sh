@@ -22,9 +22,11 @@ fail() {
 
 # The shell and libFuzzer must read the window as one number. libFuzzer stops at the first character
 # that is not a digit and keeps an `int`, and 0 is no limit. So 0x20 and 2^32 each remove the limit.
-window_seconds="${1:-}"
+usage="usage: session <seconds>, a decimal number above 0"
+test "$#" -eq 1 || fail "$usage"
+window_seconds="$1"
 case "$window_seconds" in
-  '' | 0* | *[!0-9]*) fail "usage: session <seconds>, a decimal number above 0" ;;
+  '' | 0* | *[!0-9]*) fail "$usage" ;;
 esac
 test "$window_seconds" -le 86400 || fail "the window is more than one day"
 
