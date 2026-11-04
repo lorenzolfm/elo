@@ -617,6 +617,7 @@ pub(crate) mod fuzz {
     /// A new layout that keeps the end of each seed does not fail here. For example, with another
     /// bit for each `pong` byte, `pong-high-bit` still ends on `PongNonce`, and no seed then
     /// changes bit 63.
+    // The `elo-fuzz` gate reads the names line by line, so each row stays on one line.
     #[rustfmt::skip]
     const SEED_ENDS: &[(&str, &[u8], &str)] = &[
         seed!("handshake-15th-is-version", "PeerOpen { height: 0, synced: false }"),
