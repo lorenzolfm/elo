@@ -761,6 +761,8 @@ pub(crate) mod fuzz {
                 peer = received;
             }
             now = now_next(script.byte(), now, wake);
+            // The chain holds only headers that the script wrote.
+            assert!(model.height <= script.headers_written_count);
         }
         model.is_synced()
     }
@@ -955,6 +957,8 @@ pub(crate) mod fuzz {
             let count = count.min(HEADERS_WRITTEN_COUNT_MAX - self.headers_written_count);
             self.headers_written_count += count;
             assert!(self.headers_written_count <= HEADERS_WRITTEN_COUNT_MAX);
+            // The loop below takes its bound from this.
+            assert!(count <= HEADERS_FULL_COUNT + 1);
             // A count is one more than the index of the last header.
             let wrong_prev_position = match self.byte() {
                 255 => count,
@@ -1038,6 +1042,11 @@ pub(crate) mod fuzz {
         ) -> Result<HandshakeExpected, super::HandshakeError> {
             assert!(self.message_count < super::MESSAGE_COUNT_MAX);
             self.message_count += 1;
+            // The handshake keeps only a `version` that it accepts.
+            if let Some(theirs) = &self.theirs {
+                assert!(theirs.version >= super::PROTOCOL_VERSION_MIN);
+                assert_ne!(theirs.nonce, self.nonce);
+            }
 
             let msg_type = message.msg_type();
             let expected = match &self.theirs {
@@ -1150,6 +1159,8 @@ pub(crate) mod fuzz {
             if get_headers {
                 self.get_headers = GetHeadersModel::Outstanding(now + super::HEADERS_TIMEOUT);
             }
+            // Each `getheaders` that is due goes in this tick.
+            assert!(!matches!(self.get_headers, GetHeadersModel::Due));
             let wake = match self.get_headers {
                 GetHeadersModel::Outstanding(deadline) => deadline.min(self.ping_deadline),
                 GetHeadersModel::Due | GetHeadersModel::Ended => self.ping_deadline,
@@ -1215,6 +1226,8 @@ pub(crate) mod fuzz {
                     ));
                 }
             }
+            // Only an empty batch keeps the tip.
+            assert_eq!(tip == self.tip, headers.is_empty());
             self.tip = tip;
             self.height += headers.len();
             if headers.len() == HEADERS_FULL_COUNT {
