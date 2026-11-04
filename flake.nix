@@ -226,6 +226,7 @@
         in
           pkgs.runCommand "elo-fuzz-targets" {
             nativeBuildInputs = [pkgs.removeReferencesTo];
+            # This sees only a path that the loop below cannot find. The load check holds the rest.
             allowedReferences = kept;
           } ''
             cp --recursive --no-preserve=mode ${gates.elo-fuzz} "$out"
@@ -237,6 +238,15 @@
                 *) remove-references-to -t "$path" "$out"/targets/* ;;
               esac
             done
+
+            # The loop removes each path outside `kept`, and a target can need one at run time. Then
+            # no reference is left to stop the build, so load each target. The last line of a target
+            # that does not load is the error of the loader.
+            for target in "$out"/targets/*; do
+              "$target" -help=1 2>&1 | tail --lines=1
+            done
+            # `session.sh` names this target.
+            test -x "$out/targets/machines"
           '';
 
         # A long run on a home machine. The session holds no secret and needs no network.
