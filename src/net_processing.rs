@@ -560,7 +560,7 @@ pub(crate) mod fuzz {
 
     // The models take each limit from the constant that the machines use, and the seeds hold each
     // limit as a count of bytes and turns. So a new limit moves the models and not the seeds, and
-    // the gate can still pass: `SEED_ENDS` does not see a `PING_INTERVAL` of 119 or 121 seconds.
+    // each row can still pass: `SEED_ENDS` does not see a `PING_INTERVAL` of 119 or 121 seconds.
     // A new limit must rewrite the seeds at the limit.
     const _: () = assert!(super::PROTOCOL_VERSION_MIN == 70016);
     const _: () = assert!(super::MESSAGE_COUNT_MAX == 16);
