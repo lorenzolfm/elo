@@ -644,6 +644,7 @@ pub(crate) mod fuzz {
         };
         let network = script_network(script.byte());
         let nonce = script.nonce();
+        // The layout has no byte for it. A value from the script still shows a fixed timestamp.
         let timestamp = nonce.cast_signed();
         let (handshake, outbound) =
             super::Handshake::start(network, PEER_ADDRESS, timestamp, nonce);
@@ -664,8 +665,8 @@ pub(crate) mod fuzz {
     }
 
     /// Checks each field of `outbound`, our `version`. It claims no services and asks for no
-    /// transactions. The handshake compares their nonce with the nonce that it keeps, so `nonce` must
-    /// also be on the wire.
+    /// transactions. The handshake compares their nonce with the nonce that it keeps, so `nonce`
+    /// must also be on the wire.
     fn machines_start_check(outbound: &super::HandshakeOutbound, timestamp: i64, nonce: u64) {
         let super::HandshakeOutbound::Version(payload) = outbound else {
             panic!("the handshake starts with {outbound:?}");
@@ -894,6 +895,7 @@ pub(crate) mod fuzz {
     }
 
     impl Script<'_> {
+        /// The next byte, or 0 after the end of the script.
         fn byte(&mut self) -> u8 {
             let (byte, rest) = self.unread.split_first().unwrap_or((&0, &[]));
             self.unread = rest;
@@ -931,6 +933,7 @@ pub(crate) mod fuzz {
             let length = payload
                 .len()
                 .saturating_add_signed(isize::from(self.signed_byte()));
+            // Not zero, so a read of these bytes as a field gives a value that shows.
             payload.resize(length, 0xaa);
             Some(message_read(msg_type, &payload))
         }
@@ -1008,7 +1011,7 @@ pub(crate) mod fuzz {
         tip: bitcoin_hashes::sha256d::Hash,
     }
 
-    /// `hash` with one bit flipped, so a compare of part of a hash does not see it.
+    /// `hash` with one bit of its last byte flipped, so a compare of only its start does not see it.
     fn hash_wrong(hash: bitcoin_hashes::sha256d::Hash) -> bitcoin_hashes::sha256d::Hash {
         let mut bytes = hash.to_byte_array();
         bytes[31] ^= 1;
@@ -1047,6 +1050,7 @@ pub(crate) mod fuzz {
         message_count: u32,
     }
 
+    /// What `Handshake::receive` returns, without the machine.
     #[derive(Debug)]
     enum HandshakeExpected {
         Wait,
@@ -1117,6 +1121,8 @@ pub(crate) mod fuzz {
         Ended,
     }
 
+    /// What `Peer::tick` returns, without the peer. The tick nonce and `PeerModel::tip` give the
+    /// contents of what it sends.
     #[derive(Debug)]
     struct TickExpected {
         ping: bool,
@@ -1124,6 +1130,7 @@ pub(crate) mod fuzz {
         wake: std::time::Instant,
     }
 
+    /// What `Peer::receive` returns, without the peer. `PeerModel` holds the tip for `Synced`.
     #[derive(Debug)]
     enum ReceivedExpected {
         NoReply,
@@ -1157,6 +1164,7 @@ pub(crate) mod fuzz {
             now: std::time::Instant,
             nonce: u64,
         ) -> Result<TickExpected, super::PeerError> {
+            // The `ping` is checked first, as the doc of `Peer::tick` says.
             let ping = if now < self.ping_deadline {
                 false
             } else if self.ping_outstanding.is_some() {
