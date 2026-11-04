@@ -245,7 +245,8 @@
             for target in "$out"/targets/*; do
               "$target" -help=1 2>&1 | tail --lines=1
             done
-            # `session.sh` names this target.
+            # `session.sh` names these two targets.
+            test -x "$out/targets/compact_size"
             test -x "$out/targets/machines"
           '';
 

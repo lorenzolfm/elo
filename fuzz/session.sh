@@ -1,8 +1,9 @@
 # One fuzz session, in the image of `elo-fuzz-image`. Usage: session <seconds>
 #
-# Two processes run at all times, so a session holds two cores. One runs `machines` for the whole
-# window, because it has the most states. The other runs each other target in turn, and the window
-# is split between them. No fork mode: a fork job deletes its panic text, and needs a writable /tmp.
+# At most two processes run, so a session holds at most two cores. One runs `machines` for the whole
+# window, because it has the most states. The other runs each other target in turn. `compact_size`
+# gets at most 60 s, because 84M runs in 30 s found a new input only at run 23. The other targets
+# split the rest. No fork mode: a fork job deletes its panic text, and needs a writable /tmp.
 #
 # A crash ends its target for this session, so a session keeps at most one crash for each target.
 # Then the session fails, so its Job fails and the alert on the last good session can fire.
@@ -26,19 +27,23 @@ esac
 test "$window_seconds" -le 86400 || fail "the window is more than one day"
 
 test -x /targets/machines || fail "need /targets/machines"
+test -x /targets/compact_size || fail "need /targets/compact_size"
 
 others=()
 for path in /targets/*; do
   other="${path##*/}"
-  if test "$other" != machines; then
-    others+=("$other")
-  fi
+  case "$other" in
+    compact_size | machines) ;;
+    *) others+=("$other") ;;
+  esac
 done
-test "${#others[@]}" -gt 0 || fail "need a target other than machines"
+test "${#others[@]}" -gt 0 || fail "need a target other than machines and compact_size"
 
-# A floor division, so the second process ends inside the window. A share of 0 s would be no limit.
-other_seconds=$((window_seconds / ${#others[@]}))
-test "$other_seconds" -gt 0 || fail "need at least ${#others[@]} seconds"
+# Floor divisions, so the second process ends inside the window. A share of 0 s would be no limit.
+share_seconds=$((window_seconds / (${#others[@]} + 1)))
+test "$share_seconds" -gt 0 || fail "need at least $((${#others[@]} + 1)) seconds"
+compact_size_seconds=$((share_seconds < 60 ? share_seconds : 60))
+other_seconds=$(((window_seconds - compact_size_seconds) / ${#others[@]}))
 
 mkdir -p /data/corpus /data/crashes /data/logs
 
@@ -68,6 +73,7 @@ fuzz() {
 
 fuzz_others() {
   local failed=0
+  fuzz compact_size "$compact_size_seconds" || failed=1
   for target in "${others[@]}"; do
     fuzz "$target" "$other_seconds" || failed=1
   done
