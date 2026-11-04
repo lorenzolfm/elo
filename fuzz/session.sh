@@ -12,20 +12,33 @@
 #   /data/crashes/<target>-<commit>-*   each crash, with the name that libFuzzer gives it
 #   /data/logs/<target>.log             the libFuzzer log of the last session
 
-seconds="$1"
+fail() {
+  echo "session: $1" >&2
+  exit 2
+}
+
+# The shell and libFuzzer must read the window as one number. libFuzzer stops at the first character
+# that is not a digit and keeps an `int`, and 0 is no limit. So 0x20 and 2^32 each remove the limit.
+window_seconds="${1:-}"
+case "$window_seconds" in
+  '' | 0* | *[!0-9]*) fail "usage: session <seconds>, a decimal number above 0" ;;
+esac
+test "$window_seconds" -le 86400 || fail "the window is more than one day"
+
+test -x /targets/machines || fail "need /targets/machines"
 
 others=()
 for path in /targets/*; do
-  target="${path##*/}"
-  if test "$target" != machines; then
-    others+=("$target")
+  other="${path##*/}"
+  if test "$other" != machines; then
+    others+=("$other")
   fi
 done
-other_seconds=$((seconds / ${#others[@]}))
-if test ! -x /targets/machines || test "$other_seconds" -le 0; then
-  echo "session: need /targets/machines, and at least ${#others[@]} seconds" >&2
-  exit 2
-fi
+test "${#others[@]}" -gt 0 || fail "need a target other than machines"
+
+# A floor division, so the second process ends inside the window. A share of 0 s would be no limit.
+other_seconds=$((window_seconds / ${#others[@]}))
+test "$other_seconds" -gt 0 || fail "need at least ${#others[@]} seconds"
 
 mkdir -p /data/crashes /data/logs
 
@@ -54,7 +67,7 @@ fuzz_others() {
   return "$failed"
 }
 
-fuzz machines "$seconds" &
+fuzz machines "$window_seconds" &
 machines_pid=$!
 fuzz_others &
 others_pid=$!
