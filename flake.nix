@@ -142,6 +142,9 @@
                 cargoLockList = [./Cargo.lock ./fuzz/Cargo.lock];
               };
               nativeBuildInputs = [pkgs.cargo-fuzz];
+              # The last step runs the tests, which listen and connect on loopback. The macOS
+              # sandbox blocks that without this flag.
+              __darwinAllowLocalNetworking = true;
               buildPhaseCargoCommand = ''
                 # The normal gates do not see these: `fuzz/` is outside their
                 # workspace, and they build without `--cfg fuzzing`. Clippy checks
