@@ -142,6 +142,9 @@
                 cargoLockList = [./Cargo.lock ./fuzz/Cargo.lock];
               };
               nativeBuildInputs = [pkgs.cargo-fuzz];
+              # The last step runs the tests, which listen and connect on loopback. The macOS
+              # sandbox blocks that without this flag.
+              __darwinAllowLocalNetworking = true;
               buildPhaseCargoCommand = ''
                 # The normal gates do not see these: `fuzz/` is outside their
                 # workspace, and they build without `--cfg fuzzing`. Clippy checks
@@ -193,6 +196,11 @@
                   test -n "$(ls --almost-all "fuzz/corpus/$target")" || fail "target $target has no corpus"
                   cargo fuzz run --sanitizer none "$target" -- -runs=0
                 done
+
+                # The tests of `SEED_ENDS` have `cfg(fuzzing)`, so only this gate runs them. After
+                # the replay, so a machine bug has its seed as the failing input. No filter, because
+                # a filter that matches no test exits 0.
+                RUSTFLAGS="--cfg fuzzing" cargo test --locked --lib
               '';
             });
         };

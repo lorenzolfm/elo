@@ -560,7 +560,8 @@ pub(crate) mod fuzz {
 
     // The models take each limit from the constant that the machines use, and the seeds hold each
     // limit as a count of bytes and turns. So a new limit moves the models and not the seeds, and
-    // the replay still passes. A new limit must rewrite the seeds at the limit.
+    // each row can still pass: `SEED_ENDS` does not see a `PING_INTERVAL` of 119 or 121 seconds.
+    // A new limit must rewrite the seeds at the limit.
     const _: () = assert!(super::PROTOCOL_VERSION_MIN == 70016);
     const _: () = assert!(super::MESSAGE_COUNT_MAX == 16);
     const _: () = assert!(super::PING_INTERVAL.as_secs() == 120);
@@ -576,8 +577,7 @@ pub(crate) mod fuzz {
     const SCRIPT_HEADERS_COUNT_MAX: usize = 3 * HEADERS_FULL_COUNT;
 
     // The seeds need two full batches and then a batch that is not empty. Below this, those batches
-    // get shorter, and the replay still passes. A batch off the tip after a full batch then has no
-    // check.
+    // get shorter. A row fails, but a new end in that row hides the lost case.
     const _: () = assert!(SCRIPT_HEADERS_COUNT_MAX >= 2 * HEADERS_FULL_COUNT + 2);
 
     /// Spreads a byte over the places of a nonce. It is odd, so each byte gives another nonce.
@@ -585,23 +585,130 @@ pub(crate) mod fuzz {
     const _: () = assert!(NONCE_SPREAD % 2 == 1);
     const _: () = assert!(NONCE_SPREAD != NONCE_SPREAD.swap_bytes());
 
-    /// A good peer, with a full batch. A machine that refuses each message fails on each seed. But
-    /// a new layout can leave the seeds with nothing to check, and the replay still passes. This
-    /// script must end the sync, so a new layout that changes the meaning of these bytes fails here
-    /// until it also rewrites this script. A new layout that changes only other values does not
-    /// fail here. For example, each time, length change and wrong `prev` in this script is 0.
+    /// The bit of a nonce that a `pong` byte other than 0 flips.
+    const fn pong_flip_bit(byte: u8) -> u8 {
+        byte % 64
+    }
+
+    // Only `pong-high-bit` flips bit 63 and only `pong-low-bit` flips bit 0, and their rows do not
+    // hold the bit. A new layout that moves a bit keeps the end of the seed, so it must fail here
+    // until it rewrites the seed.
+    const _: () = assert!(pong_flip_bit(63) == 63);
+    const _: () = assert!(pong_flip_bit(64) == 0);
+
+    /// How a script ended. Only the tests read it, through its `Debug`.
+    #[derive(Debug)]
+    #[expect(dead_code)]
+    enum ScriptEnd {
+        /// The bytes ended in the handshake.
+        HandshakeOpen,
+        HandshakeRefused(super::HandshakeError),
+        /// The bytes ended after the handshake.
+        PeerOpen {
+            height: usize,
+            synced: bool,
+        },
+        PeerRefused(super::PeerError),
+    }
+
+    /// A seed, its bytes, and the `Debug` of its `ScriptEnd`.
+    #[cfg(test)]
+    macro_rules! seed {
+        ($name:literal, $end:literal) => {
+            (
+                $name,
+                include_bytes!(concat!("../fuzz/corpus/machines/", $name)).as_slice(),
+                $end,
+            )
+        };
+    }
+
+    /// Each committed seed. Each byte string is a legal script, so a seed in an old layout runs,
+    /// and the model and the machine agree. A new layout that moves the end of a seed fails here
+    /// until it also rewrites that seed and its row.
+    /// A new layout that keeps the end of each seed does not fail here. For example, with another
+    /// network order, each seed only runs another network and keeps its end.
+    // Without this, rustfmt stacks each row and the table is 223 lines.
     #[rustfmt::skip]
-    const GOOD_SCRIPT: &[u8] = &[
-        0,                // Regtest.
-        1,                // Our nonce.
-        1, 1, 0, 0,       // Their `version`.
-        2, 0,             // Their `verack`.
-        7, 5, 255, 0, 0,  // A tick with our `ping` and `getheaders`, and a full batch.
-        0,                // No time passes.
-        8, 4, 0, 0,       // A tick with our next `getheaders`, and the `pong` to our `ping`.
-        0,                // No time passes.
-        9, 5, 2, 0, 0,    // A tick with nothing to send, and a batch that ends the sync.
-        0,                // No time passes.
+    #[cfg(test)]
+    const SEED_ENDS: &[(&str, &[u8], &str)] = &[
+        seed!("handshake-15th-is-version", "PeerOpen { height: 0, synced: false }"),
+        seed!("handshake-16th-is-other", "HandshakeRefused(TooManyMessages)"),
+        seed!("handshake-16th-is-other-no-version", "HandshakeRefused(TooManyMessages)"),
+        seed!("handshake-16th-is-verack", "PeerOpen { height: 0, synced: false }"),
+        seed!("handshake-16th-is-version", "HandshakeRefused(TooManyMessages)"),
+        seed!("handshake-bytes-after-relay", "PeerOpen { height: 0, synced: false }"),
+        seed!("handshake-empty-version", "HandshakeRefused(Version(UnexpectedEnd))"),
+        seed!("handshake-no-message-kinds", "PeerOpen { height: 0, synced: false }"),
+        seed!("handshake-no-messages", "HandshakeOpen"),
+        seed!("handshake-no-relay", "PeerOpen { height: 0, synced: false }"),
+        seed!("handshake-no-start-height", "HandshakeRefused(Version(UnexpectedEnd))"),
+        seed!("handshake-obsolete-and-self-connection", "HandshakeRefused(Obsolete(70015))"),
+        seed!("handshake-peer-messages-skipped", "PeerOpen { height: 0, synced: false }"),
+        seed!("handshake-protocol-above-min", "PeerOpen { height: 0, synced: false }"),
+        seed!("handshake-protocol-below-min", "HandshakeRefused(Obsolete(70015))"),
+        seed!("handshake-second-version-is-skipped", "PeerOpen { height: 0, synced: false }"),
+        seed!("handshake-self-connection", "HandshakeRefused(SelfConnection)"),
+        seed!("handshake-skips-before-and-after-version", "PeerOpen { height: 0, synced: false }"),
+        seed!("handshake-version-verack", "PeerOpen { height: 0, synced: false }"),
+        seed!("headers-above-full", "PeerRefused(Headers(TooMany(2001)))"),
+        seed!("headers-after-sync", "PeerRefused(UnsolicitedHeaders)"),
+        seed!("headers-break-last", "PeerRefused(Extend(NotContinuous))"),
+        seed!("headers-break-last-of-full", "PeerRefused(Extend(NotContinuous))"),
+        seed!("headers-break-second", "PeerRefused(Extend(NotContinuous))"),
+        seed!("headers-budget-ends", "PeerOpen { height: 6000, synced: true }"),
+        seed!("headers-bytes-after", "PeerOpen { height: 2, synced: true }"),
+        seed!("headers-cut", "PeerRefused(Headers(Payload(UnexpectedEnd)))"),
+        seed!("headers-cut-after-sync", "PeerRefused(Headers(Payload(UnexpectedEnd)))"),
+        seed!("headers-empty-payload", "PeerRefused(Headers(Payload(UnexpectedEnd)))"),
+        seed!("headers-off-tip", "PeerRefused(Extend(NotOnTip))"),
+        seed!("headers-off-tip-after-full", "PeerRefused(Extend(NotOnTip))"),
+        seed!("headers-off-tip-after-sync", "PeerRefused(UnsolicitedHeaders)"),
+        seed!("headers-wrong-index-past-end", "PeerOpen { height: 2, synced: true }"),
+        seed!("mix-long", "PeerRefused(PingTimeout)"),
+        seed!("network-mainnet", "PeerOpen { height: 2, synced: true }"),
+        seed!("network-signet", "PeerOpen { height: 2, synced: true }"),
+        seed!("network-testnet4", "PeerOpen { height: 2, synced: true }"),
+        seed!("peer-skips-version-and-verack", "PeerOpen { height: 0, synced: false }"),
+        seed!("ping-bytes-after", "PeerOpen { height: 0, synced: false }"),
+        seed!("ping-cut", "PeerRefused(Ping(UnexpectedEnd))"),
+        seed!("ping-empty", "PeerRefused(Ping(UnexpectedEnd))"),
+        seed!("ping-gets-pong", "PeerOpen { height: 0, synced: false }"),
+        seed!("pong-answers", "PeerOpen { height: 0, synced: false }"),
+        seed!("pong-bytes-after", "PeerOpen { height: 0, synced: false }"),
+        seed!("pong-cut", "PeerRefused(Pong(UnexpectedEnd))"),
+        seed!("pong-cut-after-answer", "PeerRefused(Pong(UnexpectedEnd))"),
+        seed!("pong-high-bit", "PeerRefused(PongNonce)"),
+        seed!("pong-low-bit", "PeerRefused(PongNonce)"),
+        seed!("pong-other-nonce-after-answer", "PeerRefused(UnsolicitedPong)"),
+        seed!("pong-twice", "PeerRefused(UnsolicitedPong)"),
+        seed!("sync-below-full", "PeerOpen { height: 1999, synced: true }"),
+        seed!("sync-empty-batch", "PeerOpen { height: 0, synced: true }"),
+        seed!("sync-full-full-empty", "PeerOpen { height: 4000, synced: true }"),
+        seed!("sync-full-late-tick-then-empty", "PeerOpen { height: 2000, synced: true }"),
+        seed!("sync-full-then-short", "PeerOpen { height: 2002, synced: true }"),
+        seed!("sync-longest-short-byte", "PeerOpen { height: 252, synced: true }"),
+        seed!("sync-one-header", "PeerOpen { height: 1, synced: true }"),
+        seed!("sync-short-batch", "PeerOpen { height: 2, synced: true }"),
+        seed!("sync-then-idle-turns", "PeerOpen { height: 2, synced: true }"),
+        seed!("time-after-sync-only-ping-sets-wake", "PeerOpen { height: 2, synced: true }"),
+        seed!("time-answered-ping-and-headers-timeout", "PeerRefused(HeadersTimeout)"),
+        seed!("time-both-timeouts-ping-first", "PeerRefused(PingTimeout)"),
+        seed!("time-headers-timeout-at-wake", "PeerRefused(HeadersTimeout)"),
+        seed!("time-headers-timeout-late", "PeerRefused(HeadersTimeout)"),
+        seed!("time-headers-timeout-ping-not-due", "PeerRefused(HeadersTimeout)"),
+        seed!("time-late-pong-next-ping-at-once", "PeerOpen { height: 0, synced: true }"),
+        seed!("time-next-getheaders-before-timeout", "PeerOpen { height: 2000, synced: false }"),
+        seed!("time-next-getheaders-restarts-timeout", "PeerRefused(HeadersTimeout)"),
+        seed!("time-next-ping-at-interval", "PeerOpen { height: 0, synced: true }"),
+        seed!("time-next-ping-before-interval", "PeerOpen { height: 0, synced: true }"),
+        seed!("time-no-message-before-headers-timeout", "PeerOpen { height: 0, synced: false }"),
+        seed!("time-no-second-ping-while-outstanding", "PeerOpen { height: 0, synced: true }"),
+        seed!("time-ping-timeout-at-wake", "PeerRefused(PingTimeout)"),
+        seed!("time-ping-timeout-late", "PeerRefused(PingTimeout)"),
+        seed!("time-ping-wake-before-headers-wake", "PeerOpen { height: 2000, synced: false }"),
+        seed!("time-skipped-message-moves-nothing", "PeerRefused(HeadersTimeout)"),
+        seed!("time-their-ping-does-not-move-ours", "PeerRefused(PingTimeout)"),
     ];
 
     /// Runs `Handshake` and `Peer` on the script in `data`, in the order of the driver: a tick
@@ -631,15 +738,11 @@ pub(crate) mod fuzz {
     /// Then an `i8` to add to the length of the payload, so bytes come off its end or go after it.
     /// The committed corpus uses this layout, so a change to the layout must rewrite the corpus.
     pub fn machines(data: &[u8]) {
-        // One run is enough, because a script does the same in each run.
-        static GOOD_SCRIPT_RUN: std::sync::Once = std::sync::Once::new();
-        GOOD_SCRIPT_RUN.call_once(|| assert!(machines_run(GOOD_SCRIPT)));
-
         machines_run(data);
     }
 
-    /// Returns true if the script ended the sync, and no message or tick ended the run.
-    fn machines_run(data: &[u8]) -> bool {
+    /// Runs the script in `data`, and returns how it ended.
+    fn machines_run(data: &[u8]) -> ScriptEnd {
         let mut script = Script {
             unread: data,
             headers_written_count: 0,
@@ -652,8 +755,8 @@ pub(crate) mod fuzz {
             super::Handshake::start(network, PEER_ADDRESS, timestamp, nonce);
         machines_start_check(&outbound, timestamp, nonce);
         match handshake_run(&mut script, handshake, nonce) {
-            Some(peer) => peer_run(&mut script, peer, network.genesis().hash()),
-            None => false,
+            Ok(peer) => peer_run(&mut script, peer, network.genesis().hash()),
+            Err(end) => end,
         }
     }
 
@@ -699,13 +802,13 @@ pub(crate) mod fuzz {
     }
 
     /// Gives each message of `script` to `handshake`. Returns the peer if the handshake ended
-    /// with one. A message takes at least its kind byte, so the length of the script bounds the
-    /// loop.
+    /// with one, or how the script ended. A message takes at least its kind byte, so the length
+    /// of the script bounds the loop.
     fn handshake_run(
         script: &mut Script,
         mut handshake: super::Handshake,
         nonce: u64,
-    ) -> Option<super::Peer> {
+    ) -> Result<super::Peer, ScriptEnd> {
         // The handshake skips each `pong` and `headers`, so their base does not matter.
         let base = MessageBase {
             our_nonce: nonce,
@@ -732,34 +835,34 @@ pub(crate) mod fuzz {
                 ) => handshake = next,
                 (Ok(super::Step::Done(peer, theirs)), Ok(HandshakeExpected::Done(expected))) => {
                     assert_eq!(theirs, expected);
-                    return Some(peer);
+                    return Ok(peer);
                 }
                 (Err(error), Err(expected)) => {
                     assert_eq!(error, expected);
-                    return None;
+                    return Err(ScriptEnd::HandshakeRefused(error));
                 }
                 (step, expected) => panic!("the handshake gave {step:?}, not {expected:?}"),
             }
         }
-        None
+        Err(ScriptEnd::HandshakeOpen)
     }
 
-    /// Runs one turn after the other, as the driver does. Returns true if the sync ended and no
-    /// error ended the run. Each turn takes at least one byte of the script, so the length of the
-    /// script bounds the loop.
+    /// Runs one turn after the other, as the driver does. Each turn takes at least one byte of
+    /// the script, so the length of the script bounds the loop.
     fn peer_run(
         script: &mut Script,
         mut peer: super::Peer,
         tip: bitcoin_hashes::sha256d::Hash,
-    ) -> bool {
+    ) -> ScriptEnd {
         let mut now = std::time::Instant::now();
         let mut model = PeerModel::new(now, tip);
         while !script.unread.is_empty() {
             let unread_count = script.unread.len();
             let nonce = script.nonce();
             assert!(script.unread.len() < unread_count);
-            let Some((ticked, wake)) = peer_tick(peer, &mut model, now, nonce) else {
-                return false;
+            let (ticked, wake) = match peer_tick(peer, &mut model, now, nonce) {
+                Ok(ticked) => ticked,
+                Err(error) => return ScriptEnd::PeerRefused(error),
             };
             peer = ticked;
             // The peer skips each `version`, so its base does not matter.
@@ -770,26 +873,29 @@ pub(crate) mod fuzz {
             };
             // The wait of the driver can end with no message.
             if let Some(message) = script.message(&base) {
-                let Some(received) = peer_receive(peer, &mut model, &message) else {
-                    return false;
+                peer = match peer_receive(peer, &mut model, &message) {
+                    Ok(received) => received,
+                    Err(error) => return ScriptEnd::PeerRefused(error),
                 };
-                peer = received;
             }
             now = now_next(script.byte(), now, wake);
             // The chain holds only headers that the script wrote.
             assert!(model.height <= script.headers_written_count);
         }
-        model.is_synced()
+        ScriptEnd::PeerOpen {
+            height: model.height,
+            synced: model.is_synced(),
+        }
     }
 
-    /// Ticks `peer`, and checks the result against `model`. Returns the peer and its wake, or
-    /// nothing if the tick failed.
+    /// Ticks `peer`, and checks the result against `model`. Returns the peer and its wake, or the
+    /// error if the tick failed.
     fn peer_tick(
         peer: super::Peer,
         model: &mut PeerModel,
         now: std::time::Instant,
         nonce: u64,
-    ) -> Option<(super::Peer, std::time::Instant)> {
+    ) -> Result<(super::Peer, std::time::Instant), super::PeerError> {
         match (peer.tick(now, nonce), model.tick(now, nonce)) {
             (Ok((peer, outbound, wake)), Ok(expected)) => {
                 assert_eq!(wake, expected.wake);
@@ -813,11 +919,11 @@ pub(crate) mod fuzz {
                 }
                 let extra = outbounds.next();
                 assert!(extra.is_none(), "{extra:?}");
-                Some((peer, wake))
+                Ok((peer, wake))
             }
             (Err(error), Err(expected)) => {
                 assert_eq!(error, expected);
-                None
+                Err(error)
             }
             (ticked, expected) => panic!("the tick gave {ticked:?}, not {expected:?}"),
         }
@@ -840,28 +946,28 @@ pub(crate) mod fuzz {
         assert_eq!(encoded, expected);
     }
 
-    /// Gives `message` to `peer`, and checks the result against `model`. Returns the peer, or
-    /// nothing if it refused the message.
+    /// Gives `message` to `peer`, and checks the result against `model`. Returns the peer, or the
+    /// error if it refused the message.
     fn peer_receive(
         peer: super::Peer,
         model: &mut PeerModel,
         message: &crate::transport::Message,
-    ) -> Option<super::Peer> {
+    ) -> Result<super::Peer, super::PeerError> {
         match (peer.receive(message), model.receive(message)) {
-            (Ok((peer, super::Received::NoReply)), Ok(ReceivedExpected::NoReply)) => Some(peer),
+            (Ok((peer, super::Received::NoReply)), Ok(ReceivedExpected::NoReply)) => Ok(peer),
             (Ok((peer, super::Received::Pong(nonce))), Ok(ReceivedExpected::Pong(expected))) => {
                 assert_eq!(nonce, expected);
-                Some(peer)
+                Ok(peer)
             }
             (Ok((peer, super::Received::Synced(tip))), Ok(ReceivedExpected::Synced)) => {
                 assert_eq!(tip.hash(), model.tip);
                 let height = format!("{} ", model.height);
                 assert!(tip.to_string().starts_with(&height), "{tip}, not {height}");
-                Some(peer)
+                Ok(peer)
             }
             (Err(error), Err(expected)) => {
                 assert_eq!(error, expected);
-                None
+                Err(error)
             }
             (received, expected) => panic!("the peer gave {received:?}, not {expected:?}"),
         }
@@ -954,7 +1060,7 @@ pub(crate) mod fuzz {
             let byte = self.byte();
             let theirs = match byte {
                 0 => ping_nonce,
-                _ => ping_nonce ^ (1 << (byte % 64)),
+                _ => ping_nonce ^ (1 << pong_flip_bit(byte)),
             };
             assert_eq!(theirs == ping_nonce, byte == 0);
             theirs.to_le_bytes().to_vec()
@@ -1271,6 +1377,36 @@ pub(crate) mod fuzz {
         match message.payload().first_chunk() {
             Some(nonce) => Ok(u64::from_le_bytes(*nonce)),
             None => Err(crate::serialize::Error::UnexpectedEnd),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        /// A row with no seed stops the build, so only this sees a new seed. It reads the
+        /// directory, so it also fails on the new inputs of a random run. Only tracked files
+        /// reach the `elo-fuzz` gate.
+        #[test]
+        fn each_seed_has_a_row() {
+            let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/fuzz/corpus/machines");
+            let no_row: Vec<_> = std::fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .filter(|seed| !super::SEED_ENDS.iter().any(|row| row.0 == seed))
+                .collect();
+            assert!(no_row.is_empty(), "seeds with no row: {no_row:?}");
+        }
+
+        /// This prints each wrong row, because a new layout moves the ends of many seeds.
+        #[test]
+        fn each_seed_ends_as_its_row_says() {
+            let wrong: Vec<_> = super::SEED_ENDS
+                .iter()
+                .filter_map(|(name, bytes, expected)| {
+                    let end = format!("{:?}", super::machines_run(bytes));
+                    (end != *expected).then(|| format!("{name}: {end}, not {expected}"))
+                })
+                .collect();
+            assert!(wrong.is_empty(), "{}", wrong.join("\n"));
         }
     }
 }
