@@ -20,6 +20,7 @@ mod fixtures;
 #[cfg(fuzzing)]
 pub mod fuzz {
     pub use crate::net::fuzz::frame;
+    pub use crate::net_processing::fuzz::machines;
     pub use crate::protocol::fuzz::{headers, version};
     pub use crate::serialize::fuzz::compact_size;
 }
