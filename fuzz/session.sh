@@ -54,16 +54,23 @@ data_size_kib="$(du --summarize --total --block-size=1K /data/corpus /data/crash
   tail --lines=1 | cut --fields=1)"
 test "$data_size_kib" -le $((1024 * 1024)) || fail "its files take $data_size_kib KiB, above 1 GiB"
 
-# A script takes milliseconds, so 30 s is a hang. Each target has a small chain and, by the check
-# above, a small corpus, so 1 GiB is a leak. Each one is a crash, with its own file. Each target
-# reaches its limits from a short input, and with no `-max_len` the largest seed sets the length.
+# Each target has a small chain and, by the check above, a small corpus, so 1 GiB is a leak. Above
+# this limit an allocation fails at once, so it is a crash with a file that holds its input, also
+# when the target does not touch the memory. `-rss_limit_mb` does not do this. It reads the RSS once
+# each second, so a fast allocation reaches the limit of a container first and no file holds the
+# input, and its `oom-` file can hold a later input. Two processes at this limit fit in 3 GiB.
+ulimit -v $((1024 * 1024)) || fail "cannot limit the address space"
+
+# A script takes milliseconds, so 30 s is a hang, and that is a crash, with its own file. Each
+# target reaches its limits from a short input, and with no `-max_len` the largest seed sets the
+# length.
 # A caller with `||` turns `errexit` off here, so each step that can fail says how `fuzz` ends.
 fuzz() {
   local target="$1" limit_seconds="$2"
   local log="/data/logs/$target.log"
   mkdir --parents "/data/corpus/$target" || return 1
   echo "$target: start, $limit_seconds s, commit $ELO_COMMIT"
-  if "/targets/$target" -max_total_time="$limit_seconds" -timeout=30 -rss_limit_mb=1024 \
+  if "/targets/$target" -max_total_time="$limit_seconds" -timeout=30 \
     -max_len=4096 -artifact_prefix="/data/crashes/$target-$ELO_COMMIT-" \
     "/data/corpus/$target" "/corpus/$target" >"$log" 2>&1; then
     echo "$target: $(grep --extended-regexp '^#[0-9]+\s+DONE' "$log" | tail --lines=1)"
