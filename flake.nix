@@ -162,6 +162,11 @@
                 corpus_size="$(du --summarize --bytes fuzz/corpus | cut --fields=1)"
                 test "$corpus_size" -le 1048576 || fail "the corpus is $corpus_size bytes, above 1 MiB"
 
+                # A session reads at most 4096 bytes of an input: the `-max_len` of `session.sh`.
+                # The replay below reads all of a seed, so a longer seed is not what passed here.
+                long_seeds="$(find fuzz/corpus -type f -size +4096c)"
+                test -z "$long_seeds" || fail "these seeds are above 4096 bytes: $long_seeds"
+
                 # The targets build elo with the versions that elo ships. `--locked` checks
                 # each lockfile alone, so it does not see an update of only one. With no
                 # packages in the list, the comparison passes.
@@ -202,7 +207,68 @@
                 # a filter that matches no test exits 0.
                 RUSTFLAGS="--cfg fuzzing" cargo test --locked --lib
               '';
+              # The bytes that the replay ran, so the image holds what passed this gate.
+              installPhaseCommand = ''
+                mkdir --parents "$out/targets"
+                cp --recursive fuzz/corpus "$out/corpus"
+                for target in $(cargo fuzz list); do
+                  cp fuzz/target/*/release/"$target" "$out/targets/"
+                done
+              '';
             });
+        };
+
+        fuzzSession = pkgs.writeShellApplication {
+          name = "session";
+          runtimeInputs = [pkgs.coreutils pkgs.gnugrep];
+          text = builtins.readFile ./fuzz/session.sh;
+        };
+
+        # The targets and the corpus of the gate. Panic locations and line tables name each store
+        # path that the build read, so without this the image holds a compiler: 150 MB, not 42 MB.
+        fuzzTargets = let
+          kept = [pkgs.stdenv.cc.libc.out pkgs.stdenv.cc.cc.lib];
+        in
+          pkgs.runCommand "elo-fuzz-targets" {
+            nativeBuildInputs = [pkgs.removeReferencesTo];
+            # This sees only a path that the loop below cannot find. The load check holds the rest.
+            allowedReferences = kept;
+          } ''
+            cp --recursive --no-preserve=mode ${gates.elo-fuzz} "$out"
+            chmod +x "$out"/targets/*
+            for path in $(grep --binary-files=text --only-matching --no-filename --extended-regexp \
+              "$NIX_STORE/[0-9a-z]{32}-[^/[:cntrl:]]*" "$out"/targets/* | sort --unique); do
+              case " ${toString kept} " in
+                *" $path "*) ;;
+                *) remove-references-to -t "$path" "$out"/targets/* ;;
+              esac
+            done
+
+            # The loop removes each path outside `kept`, and a target can need one at run time. Then
+            # no reference is left to stop the build, so load each target. The last line of a target
+            # that does not load is the error of the loader.
+            for target in "$out"/targets/*; do
+              "$target" -help=1 2>&1 | tail --lines=1
+            done
+            # `session.sh` names these two targets.
+            test -x "$out/targets/compact_size"
+            test -x "$out/targets/machines"
+          '';
+
+        # A long run on a home machine. The session holds no secret and needs no network.
+        elo-fuzz-image = pkgs.dockerTools.buildLayeredImage {
+          name = "elo-fuzz";
+          tag = "local";
+          contents = [fuzzTargets fuzzSession];
+          config = {
+            Entrypoint = ["${pkgs.lib.getExe fuzzSession}"];
+            User = "65534:65534";
+            Env = [
+              "ELO_COMMIT=${inputs.self.rev or "dirty"}"
+              "RUST_BACKTRACE=1"
+            ];
+            Labels."org.opencontainers.image.source" = "https://github.com/lorenzolfm/elo";
+          };
         };
       in {
         _module.args.pkgs = import nixpkgs {
@@ -218,6 +284,9 @@
           gates
           // {
             default = elo;
+          }
+          // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            inherit elo-fuzz-image;
           };
 
         apps.default = {

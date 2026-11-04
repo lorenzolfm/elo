@@ -44,6 +44,32 @@ a row in `SEED_ENDS`, which holds how the seed ends. To check the rows, run
 `RUSTFLAGS="--cfg fuzzing" cargo test --lib`. It also fails on the new inputs of a
 random run, because they have no row. `nix build .#elo-fuzz` sees only tracked files.
 
+Each commit on `main` also pushes the targets of the gate to GHCR, as
+`ghcr.io/lorenzolfm/elo-fuzz:main` and `:sha-<commit>`. The image runs one session of
+`fuzz/session.sh`, on at most two cores, for the seconds that you give it, up to one day. It
+needs no network and writes only to `/data`:
+
+```sh
+nix build .#elo-fuzz-image && docker load --input result
+mkdir --parents /tmp/elo-fuzz
+docker run --rm --read-only --network none --user "$(id -u):$(id -g)" \
+  --volume /tmp/elo-fuzz:/data elo-fuzz:local 3600
+```
+
+A session fails if a target crashes, and each later session fails until you remove the file. The
+crash is at `/tmp/elo-fuzz/crashes/<target>-<commit>-*`. To read it, check out that commit and run
+the target with the limits of the session:
+
+```sh
+cargo fuzz build --sanitizer none <target>
+(ulimit -v 1048576; fuzz/target/*/release/<target> -timeout=30 -runs=10000 <file>)
+```
+
+The input runs many times, so a leak reaches the limit.
+
+A session does not start when its files take more than 1 GiB. Then remove files from
+`/tmp/elo-fuzz/corpus` by hand.
+
 ## Reproducibility
 
 ```sh

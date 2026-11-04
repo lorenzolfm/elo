@@ -25,7 +25,7 @@ jobs:
       # One job for each derivation, so the runners work in parallel. A single
       # `nix flake check` puts every gate behind one log and one runner.
       matrix:
-        gate: [elo, elo-clippy, elo-test, elo-doctest, elo-fmt, elo-fuzz]
+        gate: [elo, elo-clippy, elo-test, elo-doctest, elo-fmt, elo-fuzz, elo-fuzz-image]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -42,3 +42,42 @@ jobs:
       # inputs, so the dependencies are named on their own.
       - if: matrix.gate == 'elo'
         run: nix build --print-build-logs --rebuild .#elo .#elo.cargoArtifacts
+
+  # A long fuzz run takes this image. Only a push to main reaches this job, so a pull request
+  # cannot push an image.
+  fuzz-image:
+    name: fuzz image
+    if: github.event_name == 'push'
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+
+      - run: nix build --print-build-logs .#elo-fuzz-image
+
+      # No build runs the entry point, so run a short session. A crash in it also stops the push,
+      # so `main` stays on the last image that ran. Each target takes at least 1 s, so 8 s leaves
+      # room for new targets. Not in a gate, because a gate must not depend on a random run.
+      - run: |
+          docker load --input result
+          data="$(mktemp --directory)"
+          docker run --rm --read-only --network none --user "$(id -u):$(id -g)" \
+            --volume "$data:/data" elo-fuzz:local 8
+
+      # `sha-` first, so `main` never names an image that has no commit tag.
+      - env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          for tag in "sha-$GITHUB_SHA" main; do
+            docker tag elo-fuzz:local "ghcr.io/lorenzolfm/elo-fuzz:$tag"
+            docker push "ghcr.io/lorenzolfm/elo-fuzz:$tag"
+          done
