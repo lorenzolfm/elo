@@ -575,6 +575,11 @@ pub(crate) mod fuzz {
     /// and a few bytes of a script ask for one. So this bounds the cost of a run.
     const HEADERS_WRITTEN_COUNT_MAX: usize = 3 * HEADERS_FULL_COUNT;
 
+    /// Spreads a byte over the places of a nonce. It is odd, so each byte gives another nonce.
+    const NONCE_SPREAD: u64 = 0x0123_4567_89ab_cdef;
+    const _: () = assert!(NONCE_SPREAD % 2 == 1);
+    const _: () = assert!(NONCE_SPREAD != NONCE_SPREAD.swap_bytes());
+
     /// A good peer, with a full batch. A machine that refuses each message fails on each seed. But
     /// a new layout can leave the seeds with nothing to check, and the replay still passes. This
     /// script must end the sync, so a new layout fails here until it also rewrites this script.
@@ -865,9 +870,10 @@ pub(crate) mod fuzz {
             i8::from_le_bytes([self.byte()])
         }
 
-        /// One byte in each place of the nonce, so one byte of a script changes each place.
+        /// One byte, spread over the places of the nonce. The same byte in each place reads the
+        /// same in both byte orders, and that hides a byte-order bug.
         fn nonce(&mut self) -> u64 {
-            u64::from_le_bytes([self.byte(); size_of::<u64>()])
+            u64::from(self.byte()).wrapping_mul(NONCE_SPREAD)
         }
 
         /// The next message, as the driver reads it. `nonce` is the one that our `version` and
