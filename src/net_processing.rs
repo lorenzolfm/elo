@@ -657,10 +657,11 @@ pub(crate) mod fuzz {
 
     /// The network of a script. Its genesis header starts the chain of the peer.
     fn script_network(byte: u8) -> crate::chainparams::Network {
-        match byte % 3 {
+        match byte % 4 {
             0 => crate::chainparams::Network::Regtest,
             1 => crate::chainparams::Network::Mainnet,
-            _ => crate::chainparams::Network::Testnet4,
+            2 => crate::chainparams::Network::Testnet4,
+            _ => crate::chainparams::Network::Signet,
         }
     }
 
