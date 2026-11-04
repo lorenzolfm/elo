@@ -972,10 +972,10 @@ pub(crate) mod fuzz {
             assert!(self.headers_written_count <= SCRIPT_HEADERS_COUNT_MAX);
             // The loop below takes its bound from this.
             assert!(count <= HEADERS_FULL_COUNT + 1);
-            // A count is one more than the index of the last header.
-            let wrong_prev_position = match self.byte() {
-                255 => count,
-                position => usize::from(position),
+            let wrong_prev_index = match self.byte() {
+                0 => None,
+                255 => count.checked_sub(1),
+                byte => Some(usize::from(byte) - 1),
             };
 
             let mut payload = Vec::new();
@@ -984,7 +984,7 @@ pub(crate) mod fuzz {
             for index in 0..count {
                 let header = crate::block::BlockHeader {
                     version: 0,
-                    prev: if index + 1 == wrong_prev_position {
+                    prev: if Some(index) == wrong_prev_index {
                         hash_wrong(prev)
                     } else {
                         prev
