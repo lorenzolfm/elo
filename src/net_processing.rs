@@ -610,7 +610,7 @@ mod tests {
     /// A `headers` with `headers`, each with a transaction count of 0.
     fn headers_message(headers: &[crate::block::BlockHeader]) -> crate::transport::Message {
         let mut payload = Vec::new();
-        crate::serialize::write_compact_size(&mut payload, u64::try_from(headers.len()).unwrap());
+        crate::serialize::write_compact_size(&mut payload, headers.len());
         for header in headers {
             header.encode(&mut payload);
             payload.push(0);

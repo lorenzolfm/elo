@@ -1,10 +1,9 @@
 //! The wire encoding.
 
 /// The largest value a CompactSize may hold.
-const COMPACT_SIZE_MAX: u64 = 0x0200_0000;
+const COMPACT_SIZE_MAX: u32 = 0x0200_0000;
 
-// A CompactSize elo accepts fits in four bytes, and so in a `usize`.
-const _: () = assert!(COMPACT_SIZE_MAX < 1 << 32);
+// A CompactSize elo accepts fits in a `usize`.
 const _: () = assert!(usize::BITS >= u32::BITS);
 
 /// Why a decode failed.
@@ -108,8 +107,8 @@ impl Decode for bool {
 /// One, three or five bytes: the shortest form that holds `value`.
 ///
 /// Panics if `value` is above `COMPACT_SIZE_MAX`, because a peer refuses it.
-pub(crate) fn write_compact_size(out: &mut Vec<u8>, value: u64) {
-    assert!(value <= COMPACT_SIZE_MAX);
+pub(crate) fn write_compact_size(out: &mut Vec<u8>, value: usize) {
+    assert!(value <= COMPACT_SIZE_MAX as usize);
 
     match value {
         0..0xfd => {
@@ -142,7 +141,7 @@ pub(crate) fn read_compact_size(input: &mut &[u8]) -> Result<usize, Error> {
     };
     if value < value_min {
         Err(Error::NonCanonicalCompactSize)
-    } else if value <= COMPACT_SIZE_MAX {
+    } else if value <= u64::from(COMPACT_SIZE_MAX) {
         usize::try_from(value).map_err(|_| Error::CompactSizeTooLarge(value))
     } else {
         Err(Error::CompactSizeTooLarge(value))
@@ -151,8 +150,7 @@ pub(crate) fn read_compact_size(input: &mut &[u8]) -> Result<usize, Error> {
 
 /// A CompactSize length, then the bytes.
 pub(crate) fn write_string(out: &mut Vec<u8>, bytes: &[u8]) {
-    let length = u64::try_from(bytes.len()).expect("a usize fits in a u64");
-    write_compact_size(out, length);
+    write_compact_size(out, bytes.len());
     out.extend_from_slice(bytes);
 }
 
@@ -186,7 +184,7 @@ pub(crate) mod fuzz {
         if let Ok(value) = super::read_compact_size(&mut input) {
             let mut written = Vec::new();
             // A write panics above `COMPACT_SIZE_MAX`, so a read cannot let such a value through.
-            super::write_compact_size(&mut written, u64::try_from(value).unwrap_or(u64::MAX));
+            super::write_compact_size(&mut written, value);
             assert_eq!(written, data[..data.len() - input.len()]);
         }
 
@@ -195,12 +193,11 @@ pub(crate) mod fuzz {
         for (value_byte, byte) in value_bytes.iter_mut().zip(data) {
             *value_byte = *byte;
         }
-        let value = u64::from(u32::from_le_bytes(value_bytes)) % (super::COMPACT_SIZE_MAX + 1);
+        let value = (u32::from_le_bytes(value_bytes) % (super::COMPACT_SIZE_MAX + 1)) as usize;
         let mut written = Vec::new();
         super::write_compact_size(&mut written, value);
         let mut input = written.as_slice();
-        let read = super::read_compact_size(&mut input).map(u64::try_from);
-        assert_eq!(read, Ok(Ok(value)));
+        assert_eq!(super::read_compact_size(&mut input), Ok(value));
         assert!(input.is_empty());
     }
 }
@@ -211,13 +208,16 @@ mod tests {
 
     #[test]
     fn compact_size_uses_the_shortest_form() {
-        let cases: [(u64, &[u8]); 6] = [
+        let cases: [(usize, &[u8]); 6] = [
             (0, &[0x00]),
             (0xfc, &[0xfc]),
             (0xfd, &[0xfd, 0xfd, 0x00]),
             (0xffff, &[0xfd, 0xff, 0xff]),
             (0x1_0000, &[0xfe, 0x00, 0x00, 0x01, 0x00]),
-            (super::COMPACT_SIZE_MAX, &[0xfe, 0x00, 0x00, 0x00, 0x02]),
+            (
+                super::COMPACT_SIZE_MAX as usize,
+                &[0xfe, 0x00, 0x00, 0x00, 0x02],
+            ),
         ];
         for (value, bytes) in cases {
             let mut out = Vec::new();
@@ -227,7 +227,7 @@ mod tests {
             let mut input = bytes;
             assert_eq!(
                 super::read_compact_size(&mut input),
-                Ok(usize::try_from(value).unwrap()),
+                Ok(value),
                 "read {value:#x}"
             );
             assert!(input.is_empty());
@@ -255,7 +255,7 @@ mod tests {
         assert_eq!(
             super::read_compact_size(&mut input),
             Err(super::Error::CompactSizeTooLarge(
-                super::COMPACT_SIZE_MAX + 1
+                u64::from(super::COMPACT_SIZE_MAX) + 1
             ))
         );
     }
