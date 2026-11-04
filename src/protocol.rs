@@ -376,6 +376,9 @@ pub(crate) mod fuzz {
     const VERSION_FIXED_SIZE: usize =
         VERSION_BEFORE_USER_AGENT_SIZE + VERSION_AFTER_USER_AGENT_SIZE;
 
+    /// The largest batch that `headers` writes: the first count above the limit.
+    const HEADERS_WRITTEN_COUNT_MAX: usize = super::HEADERS_COUNT_MAX + 1;
+
     /// Checks that a `version` from `data` encodes to the bytes that its decode took, and that a
     /// payload from `data` reads back, with `relay` and without it.
     ///
@@ -453,7 +456,7 @@ pub(crate) mod fuzz {
             return;
         };
         let count = usize::from(u16::from_le_bytes([*count_low, *count_high]))
-            % (super::HEADERS_COUNT_MAX + 2);
+            % (HEADERS_WRITTEN_COUNT_MAX + 1);
         let written = headers_write(count, bytes);
         let mut input = written.as_slice();
         match super::Headers::decode(&mut input) {
@@ -473,6 +476,7 @@ pub(crate) mod fuzz {
     /// `count` headers from `bytes`, with zeros after their end, each with a transaction count of
     /// 0.
     fn headers_write(count: usize, bytes: &[u8]) -> Vec<u8> {
+        assert!(count <= HEADERS_WRITTEN_COUNT_MAX);
         let mut bytes = bytes.iter().copied().chain(std::iter::repeat(0));
         let mut written = Vec::new();
         crate::serialize::write_compact_size(
