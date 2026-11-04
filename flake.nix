@@ -162,6 +162,11 @@
                 corpus_size="$(du --summarize --bytes fuzz/corpus | cut --fields=1)"
                 test "$corpus_size" -le 1048576 || fail "the corpus is $corpus_size bytes, above 1 MiB"
 
+                # A session reads at most 4096 bytes of an input: the `-max_len` of `session.sh`.
+                # The replay below reads all of a seed, so a longer seed is not what passed here.
+                long_seeds="$(find fuzz/corpus -type f -size +4096c)"
+                test -z "$long_seeds" || fail "these seeds are above 4096 bytes: $long_seeds"
+
                 # The targets build elo with the versions that elo ships. `--locked` checks
                 # each lockfile alone, so it does not see an update of only one. With no
                 # packages in the list, the comparison passes.
