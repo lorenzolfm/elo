@@ -141,10 +141,11 @@ pub(crate) fn read_compact_size(input: &mut &[u8]) -> Result<usize, Error> {
     };
     if value < value_min {
         Err(Error::NonCanonicalCompactSize)
-    } else if value <= u64::from(COMPACT_SIZE_MAX) {
-        usize::try_from(value).map_err(|_| Error::CompactSizeTooLarge(value))
     } else {
-        Err(Error::CompactSizeTooLarge(value))
+        match u32::try_from(value) {
+            Ok(narrow) if narrow <= COMPACT_SIZE_MAX => Ok(narrow as usize),
+            _ => Err(Error::CompactSizeTooLarge(value)),
+        }
     }
 }
 
