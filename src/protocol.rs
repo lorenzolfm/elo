@@ -440,7 +440,8 @@ pub(crate) mod fuzz {
     fn version_check(version: &super::Version, taken: &[u8], rest: &[u8]) {
         let mut encoded = Vec::new();
         version.encode(&mut encoded);
-        let fields = &encoded[..encoded.len() - size_of::<bool>()];
+        let (fields, encoded_relay) = encoded.split_at(encoded.len() - size_of::<bool>());
+        assert_eq!(encoded_relay, [u8::from(version.relay)]);
         match taken.strip_prefix(fields) {
             Some([]) => {
                 assert!(rest.is_empty());
