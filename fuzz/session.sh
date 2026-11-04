@@ -6,7 +6,9 @@
 # split the rest. No fork mode: a fork job deletes its panic text, and needs a writable /tmp.
 #
 # A crash ends its target for this session, so a session keeps at most one crash for each target.
-# Then the session fails, so its Job fails and the alert on the last good session can fire.
+# Then the session fails, so its Job fails and the alert on the last good session can fire. A crash
+# file also fails each later session until a person removes it: a crash input does not join the
+# corpus, so the next session can miss the bug and pass.
 #
 # /targets and /corpus are in the image. /data holds all that the session writes:
 #   /data/corpus/<target>/              the new inputs of each session
@@ -101,4 +103,11 @@ others_pid=$!
 failed=0
 wait "$machines_pid" || failed=1
 wait "$others_pid" || failed=1
+
+crash_files="$(ls --almost-all /data/crashes)" || failed=1
+if test -n "$crash_files"; then
+  echo "session: a person must read and remove these files in /data/crashes:"
+  echo "$crash_files"
+  failed=1
+fi
 exit "$failed"
