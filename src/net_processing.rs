@@ -1172,11 +1172,11 @@ pub(crate) mod fuzz {
             } else {
                 true
             };
-            let get_headers = match self.get_headers {
-                GetHeadersModel::Due => true,
-                GetHeadersModel::Outstanding(deadline) if now < deadline => false,
+            let (get_headers, headers_deadline) = match self.get_headers {
+                GetHeadersModel::Due => (true, Some(now + super::HEADERS_TIMEOUT)),
+                GetHeadersModel::Outstanding(deadline) if now < deadline => (false, Some(deadline)),
                 GetHeadersModel::Outstanding(_) => return Err(super::PeerError::HeadersTimeout),
-                GetHeadersModel::Ended => false,
+                GetHeadersModel::Ended => (false, None),
             };
 
             if ping {
@@ -1184,15 +1184,11 @@ pub(crate) mod fuzz {
                 self.ping_outstanding = true;
                 self.ping_deadline = now + super::PING_TIMEOUT;
             }
-            if get_headers {
-                self.get_headers = GetHeadersModel::Outstanding(now + super::HEADERS_TIMEOUT);
-            }
-            // Each `getheaders` that is due goes in this tick.
-            assert!(!matches!(self.get_headers, GetHeadersModel::Due));
-            let wake = match self.get_headers {
-                GetHeadersModel::Outstanding(deadline) => deadline.min(self.ping_deadline),
-                GetHeadersModel::Due | GetHeadersModel::Ended => self.ping_deadline,
-            };
+            self.get_headers =
+                headers_deadline.map_or(GetHeadersModel::Ended, GetHeadersModel::Outstanding);
+            let wake = headers_deadline.map_or(self.ping_deadline, |deadline| {
+                deadline.min(self.ping_deadline)
+            });
             assert!(now < wake);
             Ok(TickExpected {
                 ping,
