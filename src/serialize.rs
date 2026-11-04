@@ -168,6 +168,38 @@ pub(crate) fn read_limited_string(input: &mut &[u8], length_max: usize) -> Resul
     }
 }
 
+/// The entry point of the `compact_size` fuzz target.
+#[cfg(fuzzing)]
+pub(crate) mod fuzz {
+    /// Checks that a value from a read writes back as the bytes that the read took, and that a
+    /// value from `data` reads back after a write.
+    ///
+    /// The value is the first four bytes of `data`, little-endian, with zeros after their end. The
+    /// committed corpus uses this layout, so a change to the layout must rewrite the corpus.
+    pub fn compact_size(data: &[u8]) {
+        let mut input = data;
+        if let Ok(value) = super::read_compact_size(&mut input) {
+            let mut written = Vec::new();
+            // A write panics above `COMPACT_SIZE_MAX`, so a read cannot let such a value through.
+            super::write_compact_size(&mut written, u64::try_from(value).unwrap_or(u64::MAX));
+            assert_eq!(written, data[..data.len() - input.len()]);
+        }
+
+        // A reader that refuses each value passes the check above, so read a value that elo wrote.
+        let mut value_bytes = [0; size_of::<u32>()];
+        for (value_byte, byte) in value_bytes.iter_mut().zip(data) {
+            *value_byte = *byte;
+        }
+        let value = u64::from(u32::from_le_bytes(value_bytes)) % (super::COMPACT_SIZE_MAX + 1);
+        let mut written = Vec::new();
+        super::write_compact_size(&mut written, value);
+        let mut input = written.as_slice();
+        let read = super::read_compact_size(&mut input).map(u64::try_from);
+        assert_eq!(read, Ok(Ok(value)));
+        assert!(input.is_empty());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::serialize::Decode;

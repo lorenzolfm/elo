@@ -18,5 +18,26 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "compact_size"
+path = "fuzz_targets/compact_size.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "headers"
+path = "fuzz_targets/headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "version"
+path = "fuzz_targets/version.rs"
+test = false
+doc = false
+bench = false
+
 # Its own workspace, so its dependencies stay out of the lockfile of elo.
 [workspace]
