@@ -575,6 +575,11 @@ pub(crate) mod fuzz {
     /// and a few bytes of a script ask for one. So this bounds the cost of a run.
     const HEADERS_WRITTEN_COUNT_MAX: usize = 3 * HEADERS_FULL_COUNT;
 
+    // The seeds need two full batches and then a batch that is not empty. Below this, those batches
+    // get shorter, and the replay still passes. A batch off the tip after a full batch then has no
+    // check.
+    const _: () = assert!(HEADERS_WRITTEN_COUNT_MAX >= 2 * HEADERS_FULL_COUNT + 2);
+
     /// Spreads a byte over the places of a nonce. It is odd, so each byte gives another nonce.
     const NONCE_SPREAD: u64 = 0x0123_4567_89ab_cdef;
     const _: () = assert!(NONCE_SPREAD % 2 == 1);
@@ -616,6 +621,7 @@ pub(crate) mod fuzz {
     ///   other byte `b` flips bit `b % 64`.
     /// - 5: `headers`, each on the header below it, from our tip. A count byte: 253 is one above a
     ///   full batch, 254 is one below it, 255 is a full batch, and each other byte is the count.
+    ///   The script stops at `HEADERS_WRITTEN_COUNT_MAX` headers, so a later batch can be shorter.
     ///   Then a byte `b`: header `b - 1` has a wrong `prev`, and 0 changes none.
     /// - 6: another message type, which each machine skips.
     ///
