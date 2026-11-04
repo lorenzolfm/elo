@@ -617,8 +617,8 @@ pub(crate) mod fuzz {
     ///   to add to `PROTOCOL_VERSION_MIN`.
     /// - 2: `verack`.
     /// - 3: `ping`. A nonce byte.
-    /// - 4: `pong` with the nonce of our outstanding `ping`. A byte: 0 keeps the nonce, and each
-    ///   other byte `b` flips bit `b % 64`.
+    /// - 4: `pong` with the nonce of our last `ping`. A byte: 0 keeps the nonce, and each other
+    ///   byte `b` flips bit `b % 64`.
     /// - 5: `headers`, each on the header below it, from our tip. A count byte: 253 is one above a
     ///   full batch, 254 is one below it, 255 is a full batch, and each other byte is the count.
     ///   The script stops at `SCRIPT_HEADERS_COUNT_MAX` headers, so a later batch can be shorter.
@@ -762,7 +762,7 @@ pub(crate) mod fuzz {
             // The peer skips each `version`, so its base does not matter.
             let base = MessageBase {
                 our_nonce: 0,
-                ping_nonce: model.ping_nonce(),
+                ping_nonce: model.ping_nonce,
                 tip: model.tip,
             };
             // The wait of the driver can end with no message.
@@ -1005,7 +1005,7 @@ pub(crate) mod fuzz {
     struct MessageBase {
         /// The nonce in our `version`. A `version` starts from it.
         our_nonce: u64,
-        /// The nonce of our outstanding `ping`. A `pong` starts from it.
+        /// The nonce of our last `ping`. A `pong` starts from it, so a `pong` can repeat.
         ping_nonce: u64,
         /// The hash of the tip of our chain. A batch starts from it.
         tip: bitcoin_hashes::sha256d::Hash,
@@ -1104,8 +1104,10 @@ pub(crate) mod fuzz {
     struct PeerModel {
         /// When our next `ping` is due, or when our outstanding one times out.
         ping_deadline: std::time::Instant,
-        /// The nonce of our outstanding `ping`.
-        ping_outstanding: Option<u64>,
+        /// The nonce of our last `ping`. No message comes before the first tick, which sends one.
+        ping_nonce: u64,
+        /// The `pong` to our last `ping` has not come.
+        ping_outstanding: bool,
         get_headers: GetHeadersModel,
         /// The hash and the height of the last header of the chain.
         tip: bitcoin_hashes::sha256d::Hash,
@@ -1144,7 +1146,8 @@ pub(crate) mod fuzz {
         fn new(now: std::time::Instant, tip: bitcoin_hashes::sha256d::Hash) -> PeerModel {
             PeerModel {
                 ping_deadline: now,
-                ping_outstanding: None,
+                ping_nonce: 0,
+                ping_outstanding: false,
                 get_headers: GetHeadersModel::Due,
                 tip,
                 height: 0,
@@ -1155,11 +1158,6 @@ pub(crate) mod fuzz {
             matches!(self.get_headers, GetHeadersModel::Ended)
         }
 
-        /// The nonce of a `pong` that answers our `ping`, or any nonce if none is outstanding.
-        fn ping_nonce(&self) -> u64 {
-            self.ping_outstanding.unwrap_or(0)
-        }
-
         fn tick(
             &mut self,
             now: std::time::Instant,
@@ -1168,7 +1166,7 @@ pub(crate) mod fuzz {
             // The `ping` is checked first, as the doc of `Peer::tick` says.
             let ping = if now < self.ping_deadline {
                 false
-            } else if self.ping_outstanding.is_some() {
+            } else if self.ping_outstanding {
                 return Err(super::PeerError::PingTimeout);
             } else {
                 true
@@ -1181,7 +1179,8 @@ pub(crate) mod fuzz {
             };
 
             if ping {
-                self.ping_outstanding = Some(nonce);
+                self.ping_nonce = nonce;
+                self.ping_outstanding = true;
                 self.ping_deadline = now + super::PING_TIMEOUT;
             }
             if get_headers {
@@ -1211,15 +1210,15 @@ pub(crate) mod fuzz {
                 Ok(ReceivedExpected::Pong(nonce))
             } else if msg_type == crate::protocol::PONG {
                 let theirs = message_nonce(message).map_err(super::PeerError::Pong)?;
-                match self.ping_outstanding {
-                    Some(ours) if theirs == ours => {
-                        self.ping_outstanding = None;
-                        // The deadline was `sent + PING_TIMEOUT`. It is now `sent + PING_INTERVAL`.
-                        self.ping_deadline -= super::PING_TIMEOUT - super::PING_INTERVAL;
-                        Ok(ReceivedExpected::NoReply)
-                    }
-                    Some(_) => Err(super::PeerError::PongNonce),
-                    None => Err(super::PeerError::UnsolicitedPong),
+                if !self.ping_outstanding {
+                    Err(super::PeerError::UnsolicitedPong)
+                } else if theirs != self.ping_nonce {
+                    Err(super::PeerError::PongNonce)
+                } else {
+                    self.ping_outstanding = false;
+                    // The deadline was `sent + PING_TIMEOUT`. It is now `sent + PING_INTERVAL`.
+                    self.ping_deadline -= super::PING_TIMEOUT - super::PING_INTERVAL;
+                    Ok(ReceivedExpected::NoReply)
                 }
             } else if msg_type == crate::protocol::HEADERS {
                 self.receive_headers(message)
