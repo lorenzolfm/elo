@@ -590,9 +590,11 @@ pub(crate) mod fuzz {
         byte % 64
     }
 
-    // Only `pong-high-bit` flips bit 63, and its row does not hold the bit. A new layout that moves
-    // that bit keeps the end of the seed, so it must fail here until it rewrites the seed.
+    // Only `pong-high-bit` flips bit 63 and only `pong-low-bit` flips bit 0, and their rows do not
+    // hold the bit. A new layout that moves a bit keeps the end of the seed, so it must fail here
+    // until it rewrites the seed.
     const _: () = assert!(pong_flip_bit(63) == 63);
+    const _: () = assert!(pong_flip_bit(64) == 0);
 
     /// How a script ended. Only the tests read it, through its `Debug`.
     #[derive(Debug)]
