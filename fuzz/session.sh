@@ -40,10 +40,17 @@ test "${#others[@]}" -gt 0 || fail "need a target other than machines"
 other_seconds=$((window_seconds / ${#others[@]}))
 test "$other_seconds" -gt 0 || fail "need at least ${#others[@]} seconds"
 
-mkdir -p /data/crashes /data/logs
+mkdir -p /data/corpus /data/crashes /data/logs
 
-# A script takes milliseconds, so 30 s is a hang. Each target has a small chain and a small corpus,
-# so 1 GiB is a leak. Each one is a crash, with its own file.
+# libFuzzer keeps a corpus in memory, so a large one looks like a leak. A mounted directory can also
+# have no quota. So a session does not start with more than 1 GiB of these files. A person prunes
+# them. Only these three directories count, because the session does not write the rest of /data.
+data_size_kib="$(du --summarize --total --block-size=1K /data/corpus /data/crashes /data/logs |
+  tail --lines=1 | cut --fields=1)"
+test "$data_size_kib" -le $((1024 * 1024)) || fail "its files take $data_size_kib KiB, above 1 GiB"
+
+# A script takes milliseconds, so 30 s is a hang. Each target has a small chain and, by the check
+# above, a small corpus, so 1 GiB is a leak. Each one is a crash, with its own file.
 fuzz() {
   local target="$1" limit="$2" log="/data/logs/$1.log"
   mkdir -p "/data/corpus/$target"
