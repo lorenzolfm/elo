@@ -202,7 +202,57 @@
                 # a filter that matches no test exits 0.
                 RUSTFLAGS="--cfg fuzzing" cargo test --locked --lib
               '';
+              # The bytes that the replay ran, so the image holds what passed this gate.
+              installPhaseCommand = ''
+                mkdir --parents "$out/targets"
+                cp --recursive fuzz/corpus "$out/corpus"
+                for target in $(cargo fuzz list); do
+                  cp fuzz/target/*/release/"$target" "$out/targets/"
+                done
+              '';
             });
+        };
+
+        fuzzSession = pkgs.writeShellApplication {
+          name = "session";
+          runtimeInputs = [pkgs.coreutils pkgs.gnugrep];
+          text = builtins.readFile ./fuzz/session.sh;
+        };
+
+        # The targets and the corpus of the gate. Panic locations and line tables name each store
+        # path that the build read, so without this the image holds a compiler: 150 MB, not 42 MB.
+        fuzzTargets = let
+          kept = [pkgs.stdenv.cc.libc.out pkgs.stdenv.cc.cc.lib];
+        in
+          pkgs.runCommand "elo-fuzz-targets" {
+            nativeBuildInputs = [pkgs.removeReferencesTo];
+            allowedReferences = kept;
+          } ''
+            cp --recursive --no-preserve=mode ${gates.elo-fuzz} "$out"
+            chmod +x "$out"/targets/*
+            for path in $(grep --binary-files=text --only-matching --no-filename --extended-regexp \
+              "$NIX_STORE/[0-9a-z]{32}-[^/[:cntrl:]]*" "$out"/targets/* | sort --unique); do
+              case " ${toString kept} " in
+                *" $path "*) ;;
+                *) remove-references-to -t "$path" "$out"/targets/* ;;
+              esac
+            done
+          '';
+
+        # A long run on a home machine. The session holds no secret and needs no network.
+        elo-fuzz-image = pkgs.dockerTools.buildLayeredImage {
+          name = "elo-fuzz";
+          tag = "local";
+          contents = [fuzzTargets fuzzSession];
+          config = {
+            Entrypoint = ["${pkgs.lib.getExe fuzzSession}"];
+            User = "65534:65534";
+            Env = [
+              "ELO_COMMIT=${inputs.self.rev or "dirty"}"
+              "RUST_BACKTRACE=1"
+            ];
+            Labels."org.opencontainers.image.source" = "https://github.com/lorenzolfm/elo";
+          };
         };
       in {
         _module.args.pkgs = import nixpkgs {
@@ -218,6 +268,9 @@
           gates
           // {
             default = elo;
+          }
+          // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+            inherit elo-fuzz-image;
           };
 
         apps.default = {
