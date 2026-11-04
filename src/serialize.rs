@@ -265,6 +265,12 @@ mod tests {
                 u64::from(super::COMPACT_SIZE_MAX) + 1
             ))
         );
+
+        let mut input: &[u8] = &[0xff, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00];
+        assert_eq!(
+            super::read_compact_size(&mut input),
+            Err(super::Error::CompactSizeTooLarge(0x1_0000_0000))
+        );
     }
 
     #[test]
