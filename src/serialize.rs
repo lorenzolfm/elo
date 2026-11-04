@@ -171,6 +171,11 @@ pub(crate) fn read_limited_string(input: &mut &[u8], length_max: usize) -> Resul
 /// The entry point of the `compact_size` fuzz target.
 #[cfg(fuzzing)]
 pub(crate) mod fuzz {
+    // The seeds hold this limit as bytes, and the check takes its limit from the same constant. So
+    // a new limit moves the check and not the seeds, and the replay still passes. A new limit must
+    // rewrite the seeds at the limit.
+    const _: () = assert!(super::COMPACT_SIZE_MAX == 0x0200_0000);
+
     /// Checks that a value from a read writes back as the bytes that the read took, and that a
     /// value from `data` reads back after a write.
     ///

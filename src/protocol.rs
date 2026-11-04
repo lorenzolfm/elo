@@ -366,6 +366,12 @@ impl std::error::Error for HeadersError {}
 pub(crate) mod fuzz {
     use crate::serialize::{Decode, Encode};
 
+    // The seeds hold these limits as bytes, and each check takes its limit from the same constant.
+    // So a new limit moves the checks and not the seeds, and the replay still passes. A new limit
+    // must rewrite the seeds at the limit.
+    const _: () = assert!(super::HEADERS_COUNT_MAX == 2000);
+    const _: () = assert!(super::USER_AGENT_LENGTH_MAX == 256);
+
     /// The size of the `version` fields before the user agent.
     const VERSION_BEFORE_USER_AGENT_SIZE: usize = 80;
 
