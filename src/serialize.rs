@@ -236,6 +236,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
+    fn compact_size_write_panics_above_compact_size_max() {
+        super::write_compact_size(&mut Vec::new(), super::COMPACT_SIZE_MAX as usize + 1);
+    }
+
+    #[test]
     fn compact_size_refuses_a_longer_form() {
         let cases: [&[u8]; 3] = [
             &[0xfd, 0xfc, 0x00],
