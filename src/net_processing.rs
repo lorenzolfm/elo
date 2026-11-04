@@ -778,19 +778,21 @@ pub(crate) mod fuzz {
                 assert_eq!(wake, expected.wake);
                 // The driver sends these, in this order.
                 let mut outbounds = outbound.into_outbounds();
-                if let Some(nonce) = expected.ping {
-                    let ping = outbounds.next();
-                    assert!(
-                        matches!(ping, Some(super::PeerOutbound::Ping(sent)) if sent == nonce),
-                        "{ping:?}, not a ping with {nonce}"
-                    );
+                if expected.ping {
+                    match outbounds.next() {
+                        Some(super::PeerOutbound::Ping(ping_nonce)) => {
+                            assert_eq!(ping_nonce, nonce)
+                        }
+                        other => panic!("{other:?}, not a ping"),
+                    }
                 }
                 if expected.get_headers {
-                    let Some(super::PeerOutbound::GetHeaders(get_headers)) = outbounds.next()
-                    else {
-                        panic!("the tick has no getheaders");
-                    };
-                    peer_get_headers_check(get_headers, model.tip);
+                    match outbounds.next() {
+                        Some(super::PeerOutbound::GetHeaders(get_headers)) => {
+                            peer_get_headers_check(get_headers, model.tip);
+                        }
+                        other => panic!("{other:?}, not a getheaders"),
+                    }
                 }
                 let extra = outbounds.next();
                 assert!(extra.is_none(), "{extra:?}");
@@ -1069,20 +1071,27 @@ pub(crate) mod fuzz {
     struct PeerModel {
         /// When our next `ping` is due, or when our outstanding one times out.
         ping_deadline: std::time::Instant,
-        /// The nonce of our outstanding `ping`, and when it went.
-        ping_outstanding: Option<(u64, std::time::Instant)>,
-        /// True when the next tick must send a `getheaders`.
-        get_headers_due: bool,
-        /// When our outstanding `getheaders` times out.
-        get_headers_deadline: Option<std::time::Instant>,
+        /// The nonce of our outstanding `ping`.
+        ping_outstanding: Option<u64>,
+        get_headers: GetHeadersModel,
         /// The hash and the height of the last header of the chain.
         tip: bitcoin_hashes::sha256d::Hash,
         height: usize,
     }
 
+    /// Where our `getheaders` is.
+    enum GetHeadersModel {
+        /// The next tick sends one.
+        Due,
+        /// One is outstanding, and it times out at this instant.
+        Outstanding(std::time::Instant),
+        /// A batch that was not full came, so none goes again.
+        Ended,
+    }
+
     #[derive(Debug)]
     struct TickExpected {
-        ping: Option<u64>,
+        ping: bool,
         get_headers: bool,
         wake: std::time::Instant,
     }
@@ -1100,21 +1109,19 @@ pub(crate) mod fuzz {
             PeerModel {
                 ping_deadline: now,
                 ping_outstanding: None,
-                get_headers_due: true,
-                get_headers_deadline: None,
+                get_headers: GetHeadersModel::Due,
                 tip,
                 height: 0,
             }
         }
 
-        /// A batch that was not full came, so no `getheaders` goes again.
         fn is_synced(&self) -> bool {
-            !self.get_headers_due && self.get_headers_deadline.is_none()
+            matches!(self.get_headers, GetHeadersModel::Ended)
         }
 
         /// The nonce of a `pong` that answers our `ping`, or any nonce if none is outstanding.
         fn ping_nonce(&self) -> u64 {
-            self.ping_outstanding.map_or(0, |(nonce, _)| nonce)
+            self.ping_outstanding.unwrap_or(0)
         }
 
         fn tick(
@@ -1122,32 +1129,31 @@ pub(crate) mod fuzz {
             now: std::time::Instant,
             nonce: u64,
         ) -> Result<TickExpected, super::PeerError> {
-            let ping_is_due = self.ping_deadline <= now;
-            if ping_is_due && self.ping_outstanding.is_some() {
+            let ping = if now < self.ping_deadline {
+                false
+            } else if self.ping_outstanding.is_some() {
                 return Err(super::PeerError::PingTimeout);
-            }
-            if self
-                .get_headers_deadline
-                .is_some_and(|deadline| deadline <= now)
-            {
-                return Err(super::PeerError::HeadersTimeout);
-            }
+            } else {
+                true
+            };
+            let get_headers = match self.get_headers {
+                GetHeadersModel::Due => true,
+                GetHeadersModel::Outstanding(deadline) if now < deadline => false,
+                GetHeadersModel::Outstanding(_) => return Err(super::PeerError::HeadersTimeout),
+                GetHeadersModel::Ended => false,
+            };
 
-            let ping = ping_is_due.then_some(nonce);
-            if ping_is_due {
-                self.ping_outstanding = Some((nonce, now));
+            if ping {
+                self.ping_outstanding = Some(nonce);
                 self.ping_deadline = now + super::PING_TIMEOUT;
             }
-            let get_headers = self.get_headers_due;
             if get_headers {
-                self.get_headers_due = false;
-                self.get_headers_deadline = Some(now + super::HEADERS_TIMEOUT);
+                self.get_headers = GetHeadersModel::Outstanding(now + super::HEADERS_TIMEOUT);
             }
-            let wake = self
-                .get_headers_deadline
-                .map_or(self.ping_deadline, |deadline| {
-                    deadline.min(self.ping_deadline)
-                });
+            let wake = match self.get_headers {
+                GetHeadersModel::Outstanding(deadline) => deadline.min(self.ping_deadline),
+                GetHeadersModel::Due | GetHeadersModel::Ended => self.ping_deadline,
+            };
             assert!(now < wake);
             Ok(TickExpected {
                 ping,
@@ -1166,15 +1172,16 @@ pub(crate) mod fuzz {
                 Ok(ReceivedExpected::Pong(nonce))
             } else if msg_type == crate::protocol::PONG {
                 let theirs = message_nonce(message).map_err(super::PeerError::Pong)?;
-                let Some((ours, sent)) = self.ping_outstanding else {
-                    return Err(super::PeerError::UnsolicitedPong);
-                };
-                if theirs != ours {
-                    return Err(super::PeerError::PongNonce);
+                match self.ping_outstanding {
+                    Some(ours) if theirs == ours => {
+                        self.ping_outstanding = None;
+                        // The deadline was `sent + PING_TIMEOUT`. It is now `sent + PING_INTERVAL`.
+                        self.ping_deadline -= super::PING_TIMEOUT - super::PING_INTERVAL;
+                        Ok(ReceivedExpected::NoReply)
+                    }
+                    Some(_) => Err(super::PeerError::PongNonce),
+                    None => Err(super::PeerError::UnsolicitedPong),
                 }
-                self.ping_outstanding = None;
-                self.ping_deadline = sent + super::PING_INTERVAL;
-                Ok(ReceivedExpected::NoReply)
             } else if msg_type == crate::protocol::HEADERS {
                 self.receive_headers(message)
             } else {
@@ -1190,28 +1197,31 @@ pub(crate) mod fuzz {
                 .map_err(super::PeerError::Headers)?
                 .into_vec();
             assert!(headers.len() <= HEADERS_FULL_COUNT);
-            if self.get_headers_deadline.is_none() {
+            let GetHeadersModel::Outstanding(_) = self.get_headers else {
                 return Err(super::PeerError::UnsolicitedHeaders);
-            }
+            };
 
             let mut tip = self.tip;
             for (index, header) in headers.iter().enumerate() {
-                if header.prev != tip {
-                    return Err(super::PeerError::Extend(if index == 0 {
-                        crate::chain::ExtendError::NotOnTip
-                    } else {
-                        crate::chain::ExtendError::NotContinuous
-                    }));
+                if header.prev == tip {
+                    tip = header.hash();
+                } else if index == 0 {
+                    return Err(super::PeerError::Extend(
+                        crate::chain::ExtendError::NotOnTip,
+                    ));
+                } else {
+                    return Err(super::PeerError::Extend(
+                        crate::chain::ExtendError::NotContinuous,
+                    ));
                 }
-                tip = header.hash();
             }
             self.tip = tip;
             self.height += headers.len();
-            self.get_headers_deadline = None;
             if headers.len() == HEADERS_FULL_COUNT {
-                self.get_headers_due = true;
+                self.get_headers = GetHeadersModel::Due;
                 Ok(ReceivedExpected::NoReply)
             } else {
+                self.get_headers = GetHeadersModel::Ended;
                 Ok(ReceivedExpected::Synced)
             }
         }
