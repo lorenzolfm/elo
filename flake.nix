@@ -192,10 +192,11 @@
 
                 # A `machines` seed with no row in `SEED_ENDS` has no check of its end. A row with
                 # no seed stops the build. Names and not counts, so a copied row does not hide a
-                # new seed. With no rows found, the names differ and this fails.
-                rows="$(sed --quiet 's/^ *seed!("\([^"]*\)".*/\1/p' src/net_processing.rs | sort)"
-                test "$(ls fuzz/corpus/machines | sort)" = "$rows" \
-                  || fail "the seeds in fuzz/corpus/machines are not the rows of SEED_ENDS"
+                # new seed. With no rows found, the names differ and this fails. `diff` prints the
+                # names, because a list of this size is slow to compare by hand.
+                diff <(ls fuzz/corpus/machines | sort) \
+                  <(sed --quiet 's/^ *seed!("\([^"]*\)".*/\1/p' src/net_processing.rs | sort) \
+                  || fail "the seeds in fuzz/corpus/machines (<) are not the rows of SEED_ENDS (>)"
 
                 for target in $targets; do
                   # `cargo fuzz run` makes a missing corpus, and an empty one passes.
