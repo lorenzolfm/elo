@@ -47,13 +47,13 @@ test "$share_seconds" -gt 0 || fail "need at least $((${#others[@]} + 1)) second
 compact_size_seconds=$((share_seconds < 60 ? share_seconds : 60))
 other_seconds=$(((window_seconds - compact_size_seconds) / ${#others[@]}))
 
-mkdir --parents /data/corpus /data/crashes /data/logs
+mkdir --parents /data/corpus /data/crashes /data/logs || fail "cannot write to /data"
 
 # libFuzzer keeps a corpus in memory, so a large one looks like a leak. A mounted directory can also
 # have no quota. So a session does not start with more than 1 GiB of these files. A person prunes
 # them. Only these three directories count, because the session does not write the rest of /data.
 data_size_kib="$(du --summarize --total --block-size=1K /data/corpus /data/crashes /data/logs |
-  tail --lines=1 | cut --fields=1)"
+  tail --lines=1 | cut --fields=1)" || fail "cannot read the size of /data"
 test "$data_size_kib" -le $((1024 * 1024)) || fail "its files take $data_size_kib KiB, above 1 GiB"
 
 # Each target has a small chain and, by the check above, a small corpus, so 1 GiB is a leak. Above
