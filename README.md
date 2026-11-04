@@ -58,8 +58,15 @@ docker run --rm --read-only --network none --user "$(id -u):$(id -g)" \
 
 A session fails if a target crashes, and each later session fails until you remove the file. The
 crash is at `/tmp/elo-fuzz/crashes/<target>-<commit>-*`. To read it, check out that commit and run
-`cargo fuzz run --sanitizer none <target> <file>`. A session does not start when its files take
-more than 1 GiB. Then remove files from `/tmp/elo-fuzz/corpus` by hand.
+the target with the limits of the session:
+
+```sh
+cargo fuzz build --sanitizer none <target>
+(ulimit -v 1048576; fuzz/target/*/release/<target> -timeout=30 <file>)
+```
+
+A session does not start when its files take more than 1 GiB. Then remove files from
+`/tmp/elo-fuzz/corpus` by hand.
 
 ## Reproducibility
 
