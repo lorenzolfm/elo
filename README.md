@@ -42,7 +42,7 @@ once and does no random run. To keep a crash fixed, copy it to the corpus and ru
 `git add -f`. The committed corpus is at most 1 MiB. A seed of `machines` also needs
 a row in `SEED_ENDS`, which holds how the seed ends. To check the rows, run
 `RUSTFLAGS="--cfg fuzzing" cargo test --lib`. It also fails on the new inputs of a
-random run, because they have no row. `nix build .#elo-fuzz` sees only committed files.
+random run, because they have no row. `nix build .#elo-fuzz` sees only tracked files.
 
 ## Reproducibility
 

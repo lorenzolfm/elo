@@ -1383,7 +1383,7 @@ pub(crate) mod fuzz {
     #[cfg(test)]
     mod tests {
         /// A row with no seed stops the build, so only this sees a new seed. It reads the
-        /// directory, so it also fails on the new inputs of a random run. Only committed files
+        /// directory, so it also fails on the new inputs of a random run. Only tracked files
         /// reach the `elo-fuzz` gate.
         #[test]
         fn each_seed_has_a_row() {
