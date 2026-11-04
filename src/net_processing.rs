@@ -560,7 +560,7 @@ pub(crate) mod fuzz {
 
     // The models take each limit from the constant that the machines use, and the seeds hold each
     // limit as a count of bytes and turns. So a new limit moves the models and not the seeds, and
-    // the replay can still pass: `SEED_ENDS` does not see a `PING_INTERVAL` of 119 or 121 seconds.
+    // the gate can still pass: `SEED_ENDS` does not see a `PING_INTERVAL` of 119 or 121 seconds.
     // A new limit must rewrite the seeds at the limit.
     const _: () = assert!(super::PROTOCOL_VERSION_MIN == 70016);
     const _: () = assert!(super::MESSAGE_COUNT_MAX == 16);
@@ -594,7 +594,7 @@ pub(crate) mod fuzz {
     // that bit keeps the end of the seed, so it must fail here until it rewrites the seed.
     const _: () = assert!(pong_flip_bit(63) == 63);
 
-    /// How a script ended. Only `SEED_ENDS` reads it, through its `Debug`.
+    /// How a script ended. Only the tests read it, through its `Debug`.
     #[derive(Debug)]
     #[expect(dead_code)]
     enum ScriptEnd {
@@ -610,6 +610,7 @@ pub(crate) mod fuzz {
     }
 
     /// A seed, its bytes, and the `Debug` of its `ScriptEnd`.
+    #[cfg(test)]
     macro_rules! seed {
         ($name:literal, $end:literal) => {
             (
@@ -620,13 +621,14 @@ pub(crate) mod fuzz {
         };
     }
 
-    /// Each committed seed. The `elo-fuzz` gate fails on a seed with no row. Each byte string is a
-    /// legal script, so a seed in an old layout runs, and the model and the machine agree. A new
-    /// layout that moves the end of a seed fails here until it also rewrites that seed and its row.
+    /// Each committed seed. Each byte string is a legal script, so a seed in an old layout runs,
+    /// and the model and the machine agree. A new layout that moves the end of a seed fails here
+    /// until it also rewrites that seed and its row.
     /// A new layout that keeps the end of each seed does not fail here. For example, with another
     /// network order, each seed only runs another network and keeps its end.
-    // The `elo-fuzz` gate reads the names line by line, so each row stays on one line.
+    // Without this, rustfmt stacks each row and the table is 223 lines.
     #[rustfmt::skip]
+    #[cfg(test)]
     const SEED_ENDS: &[(&str, &[u8], &str)] = &[
         seed!("handshake-15th-is-version", "PeerOpen { height: 0, synced: false }"),
         seed!("handshake-16th-is-other", "HandshakeRefused(TooManyMessages)"),
@@ -734,14 +736,7 @@ pub(crate) mod fuzz {
     /// Then an `i8` to add to the length of the payload, so bytes come off its end or go after it.
     /// The committed corpus uses this layout, so a change to the layout must rewrite the corpus.
     pub fn machines(data: &[u8]) {
-        let end = machines_run(data);
-        // A check of the rows here, and not of all rows at the first call, keeps a failing seed as
-        // the failing input. The fuzzer runs the empty input first.
-        for (name, bytes, expected) in SEED_ENDS {
-            if *bytes == data {
-                assert_eq!(format!("{end:?}"), *expected, "seed {name}");
-            }
-        }
+        machines_run(data);
     }
 
     /// Runs the script in `data`, and returns how it ended.
@@ -1380,6 +1375,36 @@ pub(crate) mod fuzz {
         match message.payload().first_chunk() {
             Some(nonce) => Ok(u64::from_le_bytes(*nonce)),
             None => Err(crate::serialize::Error::UnexpectedEnd),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        /// A row with no seed stops the build, so only this sees a new seed. It reads the
+        /// directory, so it also fails on the new inputs of a random run. Only committed files
+        /// reach the `elo-fuzz` gate.
+        #[test]
+        fn each_seed_has_a_row() {
+            let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/fuzz/corpus/machines");
+            let no_row: Vec<_> = std::fs::read_dir(directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .filter(|seed| !super::SEED_ENDS.iter().any(|row| row.0 == seed))
+                .collect();
+            assert!(no_row.is_empty(), "seeds with no row: {no_row:?}");
+        }
+
+        /// This prints each wrong row, because a new layout moves the ends of many seeds.
+        #[test]
+        fn each_seed_ends_as_its_row_says() {
+            let wrong: Vec<_> = super::SEED_ENDS
+                .iter()
+                .filter_map(|(name, bytes, expected)| {
+                    let end = format!("{:?}", super::machines_run(bytes));
+                    (end != *expected).then(|| format!("{name}: {end}, not {expected}"))
+                })
+                .collect();
+            assert!(wrong.is_empty(), "{}", wrong.join("\n"));
         }
     }
 }

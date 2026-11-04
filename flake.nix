@@ -156,10 +156,8 @@
                 fail() { echo "elo-fuzz: $1" >&2; exit 1; }
 
                 # The committed corpus is at most 1 MiB, so a clone stays small.
-                corpus_size_max=1048576
                 corpus_size="$(du --summarize --bytes fuzz/corpus | cut --fields=1)"
-                test "$corpus_size" -le "$corpus_size_max" \
-                  || fail "the corpus is $corpus_size bytes, above 1 MiB"
+                test "$corpus_size" -le 1048576 || fail "the corpus is $corpus_size bytes, above 1 MiB"
 
                 # The targets build elo with the versions that elo ships. `--locked` checks
                 # each lockfile alone, so it does not see an update of only one. With no
@@ -190,22 +188,16 @@
                     || fail "fuzz_targets/$target.rs does not call elo::fuzz::$target"
                 done
 
-                # A `machines` seed with no row in `SEED_ENDS` has no check of its end. A row with
-                # no seed stops the build. Names and not counts, so a copied row does not hide a
-                # new seed. With no rows found, the names differ and this fails. `diff` prints the
-                # names, because a list of this size is slow to compare by hand.
-                diff <(ls fuzz/corpus/machines | sort) \
-                  <(sed --quiet 's/^ *seed!("\([^"]*\)".*/\1/p' src/net_processing.rs | sort) \
-                  || fail "the seeds in fuzz/corpus/machines (<) are not the rows of SEED_ENDS (>)"
-
                 for target in $targets; do
                   # `cargo fuzz run` makes a missing corpus, and an empty one passes.
                   test -n "$(ls --almost-all "fuzz/corpus/$target")" || fail "target $target has no corpus"
-                  # A row of `SEED_ENDS` sees only the exact bytes of its seed, so a seed that is
-                  # cut passes with no check. No seed is larger than the corpus, so this limit cuts
-                  # none.
-                  cargo fuzz run --sanitizer none "$target" -- -runs=0 -max_len="$corpus_size_max"
+                  cargo fuzz run --sanitizer none "$target" -- -runs=0
                 done
+
+                # The tests of `SEED_ENDS` have `cfg(fuzzing)`, so only this gate runs them. After
+                # the replay, so a machine bug has its seed as the failing input. No filter, because
+                # a filter that matches no test exits 0.
+                RUSTFLAGS="--cfg fuzzing" cargo test --locked --lib
               '';
             });
         };
