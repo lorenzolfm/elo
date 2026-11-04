@@ -46,8 +46,8 @@ random run, because they have no row. `nix build .#elo-fuzz` sees only tracked f
 
 Each commit on `main` also pushes the targets of the gate to GHCR, as
 `ghcr.io/lorenzolfm/elo-fuzz:main` and `:sha-<commit>`. The image runs one session of
-`fuzz/session.sh`, on two cores, for the seconds that you give it. It needs no network and
-writes only to `/data`:
+`fuzz/session.sh`, on at most two cores, for the seconds that you give it, up to one day. It
+needs no network and writes only to `/data`:
 
 ```sh
 nix build .#elo-fuzz-image && docker load --input result
@@ -56,8 +56,10 @@ docker run --rm --read-only --network none --user "$(id -u):$(id -g)" \
   --volume /tmp/elo-fuzz:/data elo-fuzz:local 3600
 ```
 
-A session fails if a target crashes. The crash is at `/data/crashes/<target>-<commit>-*`. To
-read it, check out that commit and run `cargo fuzz run --sanitizer none <target> <file>`.
+A session fails if a target crashes. The crash is at
+`/tmp/elo-fuzz/crashes/<target>-<commit>-*`. To read it, check out that commit and run
+`cargo fuzz run --sanitizer none <target> <file>`. A session does not start when its files take
+more than 1 GiB. Then remove files from `/tmp/elo-fuzz/corpus` by hand.
 
 ## Reproducibility
 

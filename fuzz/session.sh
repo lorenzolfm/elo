@@ -45,7 +45,7 @@ test "$share_seconds" -gt 0 || fail "need at least $((${#others[@]} + 1)) second
 compact_size_seconds=$((share_seconds < 60 ? share_seconds : 60))
 other_seconds=$(((window_seconds - compact_size_seconds) / ${#others[@]}))
 
-mkdir -p /data/corpus /data/crashes /data/logs
+mkdir --parents /data/corpus /data/crashes /data/logs
 
 # libFuzzer keeps a corpus in memory, so a large one looks like a leak. A mounted directory can also
 # have no quota. So a session does not start with more than 1 GiB of these files. A person prunes
@@ -57,23 +57,26 @@ test "$data_size_kib" -le $((1024 * 1024)) || fail "its files take $data_size_ki
 # A script takes milliseconds, so 30 s is a hang. Each target has a small chain and, by the check
 # above, a small corpus, so 1 GiB is a leak. Each one is a crash, with its own file. Each target
 # reaches its limits from a short input, and with no `-max_len` the largest seed sets the length.
+# A caller with `||` turns `errexit` off here, so each step that can fail says how `fuzz` ends.
 fuzz() {
-  local target="$1" limit="$2" log="/data/logs/$1.log"
-  mkdir -p "/data/corpus/$target"
-  echo "$target: start, $limit s, commit $ELO_COMMIT"
-  if "/targets/$target" -max_total_time="$limit" -timeout=30 -rss_limit_mb=1024 \
+  local target="$1" limit_seconds="$2"
+  local log="/data/logs/$target.log"
+  mkdir --parents "/data/corpus/$target" || return 1
+  echo "$target: start, $limit_seconds s, commit $ELO_COMMIT"
+  if "/targets/$target" -max_total_time="$limit_seconds" -timeout=30 -rss_limit_mb=1024 \
     -max_len=4096 -artifact_prefix="/data/crashes/$target-$ELO_COMMIT-" \
     "/data/corpus/$target" "/corpus/$target" >"$log" 2>&1; then
     echo "$target: $(grep --extended-regexp '^#[0-9]+\s+DONE' "$log" | tail --lines=1)"
   else
     echo "$target: FAILED with status $?, log in $log"
-    grep --after-context=1 --extended-regexp 'panicked at|^==[0-9]+== ERROR' "$log" | head --lines=8
+    grep --after-context=1 --extended-regexp 'panicked at|^==[0-9]+== ERROR' "$log" |
+      head --lines=8 || true
     return 1
   fi
 }
 
 fuzz_others() {
-  local failed=0
+  local failed=0 target
   fuzz compact_size "$compact_size_seconds" || failed=1
   for target in "${others[@]}"; do
     fuzz "$target" "$other_seconds" || failed=1
