@@ -380,7 +380,7 @@ pub(crate) mod fuzz {
     const HEADERS_WRITTEN_COUNT_MAX: usize = super::HEADERS_COUNT_MAX + 1;
 
     /// Checks that a `version` from `data` encodes to the bytes that its decode took, and that a
-    /// payload from `data` reads back, with `relay` and without it.
+    /// payload from `data` reads back: with `relay`, without it, and with bytes after it.
     ///
     /// The first bytes of `data` fill the fields other than the user agent, with zeros after their
     /// end. The rest of `data` is the user agent, up to its limit. The committed corpus uses this
@@ -388,14 +388,16 @@ pub(crate) mod fuzz {
     pub fn version(data: &[u8]) {
         let mut input = data;
         if let Ok(version) = super::Version::decode(&mut input) {
-            version_check(&version, &data[..data.len() - input.len()]);
+            version_check(&version, &data[..data.len() - input.len()], input);
         }
 
         // A decoder that refuses each payload passes the check above, so read a payload that is
         // valid by its layout.
         let written = version_write(data);
-        version_read_all(&written);
-        version_read_all(&written[..written.len() - size_of::<bool>()]);
+        version_read_all(&written, &[]);
+        version_read_all(&written[..written.len() - size_of::<bool>()], &[]);
+        // The bytes after `relay` stay in `input`. A later protocol version can add fields there.
+        version_read_all(&written, data);
     }
 
     /// The fields from `data`, in the order of the payload.
@@ -414,24 +416,30 @@ pub(crate) mod fuzz {
         written
     }
 
-    /// Checks that `payload` decodes, and that the decode takes each byte.
-    fn version_read_all(payload: &[u8]) {
-        let mut input = payload;
+    /// Checks that `payload` and then `after` decodes, and that the decode takes each byte of
+    /// `payload` and no byte of `after`.
+    fn version_read_all(payload: &[u8], after: &[u8]) {
+        let stream = [payload, after].concat();
+        let mut input = stream.as_slice();
         match super::Version::decode(&mut input) {
-            Ok(version) => version_check(&version, payload),
+            Ok(version) => version_check(&version, payload, after),
             Err(error) => panic!("the decode refuses a valid `version`: {error}"),
         }
-        assert!(input.is_empty());
+        assert_eq!(input, after);
     }
 
     /// Checks that `taken`, the bytes that a decode took, are what `version` encodes to. Only
-    /// `relay` can differ: a decode takes any byte as a bool, or no byte as true.
-    fn version_check(version: &super::Version, taken: &[u8]) {
+    /// `relay` can differ: a decode takes any byte as a bool, or no byte as true. Only the end of
+    /// the input can mean that `relay` is missing, so `rest` must then be empty.
+    fn version_check(version: &super::Version, taken: &[u8], rest: &[u8]) {
         let mut encoded = Vec::new();
         version.encode(&mut encoded);
         let fields = &encoded[..encoded.len() - size_of::<bool>()];
         match taken.strip_prefix(fields) {
-            Some([]) => assert!(version.relay),
+            Some([]) => {
+                assert!(rest.is_empty());
+                assert!(version.relay);
+            }
             Some([relay]) => assert_eq!(version.relay, *relay != 0),
             _ => panic!("the decode took {taken:02x?}, and the encode wrote {encoded:02x?}"),
         }
@@ -442,8 +450,8 @@ pub(crate) mod fuzz {
     ///
     /// The first two bytes of `data`, little-endian, give the count of the batch. So a short input
     /// reaches the limit and the first count above it. The bytes after them fill the headers, with
-    /// zeros after their end. The committed corpus uses this layout, so a change to the layout must
-    /// rewrite the corpus.
+    /// zeros after their end. Bytes that the headers do not use come after the batch. The committed
+    /// corpus uses this layout, so a change to the layout must rewrite the corpus.
     pub fn headers(data: &[u8]) {
         let mut input = data;
         if let Ok(headers) = super::Headers::decode(&mut input) {
@@ -457,14 +465,19 @@ pub(crate) mod fuzz {
         };
         let count = usize::from(u16::from_le_bytes([*count_low, *count_high]))
             % (HEADERS_WRITTEN_COUNT_MAX + 1);
-        let written = headers_write(count, bytes);
+        // The bytes that the headers do not use come after the batch, and stay in `input`.
+        let header_bytes_size = bytes.len().min(count * crate::block::BLOCK_HEADER_SIZE);
+        let (header_bytes, after) = bytes.split_at(header_bytes_size);
+        let mut written = headers_write(count, header_bytes);
+        let batch_size = written.len();
+        written.extend_from_slice(after);
         let mut input = written.as_slice();
         match super::Headers::decode(&mut input) {
             Ok(headers) => {
                 assert!(count <= super::HEADERS_COUNT_MAX);
-                assert!(input.is_empty());
+                assert_eq!(input, after);
                 assert_eq!(headers.is_full(), count == super::HEADERS_COUNT_MAX);
-                headers_check(headers, &written);
+                headers_check(headers, &written[..batch_size]);
             }
             Err(error) => {
                 assert!(count > super::HEADERS_COUNT_MAX);
