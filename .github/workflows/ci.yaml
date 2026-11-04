@@ -63,11 +63,19 @@ jobs:
 
       - run: nix build --print-build-logs .#elo-fuzz-image
 
+      # No build runs the entry point, so run a short session. A crash in it also stops the push,
+      # so `main` stays on the last image that ran. Each target takes at least 1 s, so 8 s leaves
+      # room for new targets. Not in a gate, because a gate must not depend on a random run.
+      - run: |
+          docker load --input result
+          data="$(mktemp --directory)"
+          docker run --rm --read-only --network none --user "$(id -u):$(id -g)" \
+            --volume "$data:/data" elo-fuzz:local 8
+
       # `sha-` first, so `main` never names an image that has no commit tag.
       - env:
           GHCR_TOKEN: ${{ github.token }}
         run: |
-          docker load --input result
           echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           for tag in "sha-$GITHUB_SHA" main; do
             docker tag elo-fuzz:local "ghcr.io/lorenzolfm/elo-fuzz:$tag"
