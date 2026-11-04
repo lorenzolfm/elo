@@ -64,6 +64,8 @@ ulimit -v $((1024 * 1024)) || fail "cannot limit the address space"
 # A script takes milliseconds, so 30 s is a hang, and that is a crash, with its own file. Each
 # target reaches its limits from a short input, and with no `-max_len` the largest seed sets the
 # length.
+# A unit below the timeout is not a crash. By default libFuzzer writes a file for a unit of 10 s,
+# and the session passes. So the limit for a slow unit is above the timeout, and it writes no file.
 # A caller with `||` turns `errexit` off here, so each step that can fail says how `fuzz` ends.
 fuzz() {
   local target="$1" limit_seconds="$2"
@@ -71,7 +73,7 @@ fuzz() {
   mkdir --parents "/data/corpus/$target" || return 1
   echo "$target: start, $limit_seconds s, commit $ELO_COMMIT"
   if "/targets/$target" -max_total_time="$limit_seconds" -timeout=30 \
-    -max_len=4096 -artifact_prefix="/data/crashes/$target-$ELO_COMMIT-" \
+    -max_len=4096 -report_slow_units=3600 -artifact_prefix="/data/crashes/$target-$ELO_COMMIT-" \
     "/data/corpus/$target" "/corpus/$target" >"$log" 2>&1; then
     echo "$target: $(grep --extended-regexp '^#[0-9]+\s+DONE' "$log" | tail --lines=1)"
   else
