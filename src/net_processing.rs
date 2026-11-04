@@ -1011,7 +1011,8 @@ pub(crate) mod fuzz {
         tip: bitcoin_hashes::sha256d::Hash,
     }
 
-    /// `hash` with one bit of its last byte flipped, so a compare of only its start does not see it.
+    /// `hash` with one bit of its last byte flipped, so a compare of only its start does not see
+    /// it.
     fn hash_wrong(hash: bitcoin_hashes::sha256d::Hash) -> bitcoin_hashes::sha256d::Hash {
         let mut bytes = hash.to_byte_array();
         bytes[31] ^= 1;
