@@ -585,6 +585,15 @@ pub(crate) mod fuzz {
     const _: () = assert!(NONCE_SPREAD % 2 == 1);
     const _: () = assert!(NONCE_SPREAD != NONCE_SPREAD.swap_bytes());
 
+    /// The bit of a nonce that a `pong` byte other than 0 flips.
+    const fn pong_flip_bit(byte: u8) -> u8 {
+        byte % 64
+    }
+
+    // Only `pong-high-bit` flips bit 63, and its row does not hold the bit. A new layout that moves
+    // that bit keeps the end of the seed, so it must fail here until it rewrites the seed.
+    const _: () = assert!(pong_flip_bit(63) == 63);
+
     /// How a script ended. Only `SEED_ENDS` reads it, through its `Debug`.
     #[derive(Debug)]
     #[expect(dead_code)]
@@ -615,8 +624,7 @@ pub(crate) mod fuzz {
     /// legal script, so a seed in an old layout runs, and the model and the machine agree. A new
     /// layout that moves the end of a seed fails here until it also rewrites that seed and its row.
     /// A new layout that keeps the end of each seed does not fail here. For example, with another
-    /// bit for each `pong` byte, `pong-high-bit` still ends on `PongNonce`, and no seed then
-    /// changes bit 63.
+    /// network order, each seed only runs another network and keeps its end.
     // The `elo-fuzz` gate reads the names line by line, so each row stays on one line.
     #[rustfmt::skip]
     const SEED_ENDS: &[(&str, &[u8], &str)] = &[
@@ -1055,7 +1063,7 @@ pub(crate) mod fuzz {
             let byte = self.byte();
             let theirs = match byte {
                 0 => ping_nonce,
-                _ => ping_nonce ^ (1 << (byte % 64)),
+                _ => ping_nonce ^ (1 << pong_flip_bit(byte)),
             };
             assert_eq!(theirs == ping_nonce, byte == 0);
             theirs.to_le_bytes().to_vec()
