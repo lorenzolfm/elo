@@ -622,7 +622,8 @@ pub(crate) mod fuzz {
     /// - 5: `headers`, each on the header below it, from our tip. A count byte: 253 is one above a
     ///   full batch, 254 is one below it, 255 is a full batch, and each other byte is the count.
     ///   The script stops at `HEADERS_WRITTEN_COUNT_MAX` headers, so a later batch can be shorter.
-    ///   Then a byte `b`: header `b - 1` has a wrong `prev`, and 0 changes none.
+    ///   Then a byte `b`: header `b - 1` has a wrong `prev`, 255 is the last header, and 0 changes
+    ///   none.
     /// - 6: another message type, which each machine skips.
     ///
     /// Then an `i8` to add to the length of the payload, so bytes come off its end or go after it.
@@ -952,7 +953,11 @@ pub(crate) mod fuzz {
             let count = count.min(HEADERS_WRITTEN_COUNT_MAX - self.headers_written_count);
             self.headers_written_count += count;
             assert!(self.headers_written_count <= HEADERS_WRITTEN_COUNT_MAX);
-            let wrong_prev_byte = usize::from(self.byte());
+            // A count is one more than the index of the last header.
+            let wrong_prev_position = match self.byte() {
+                255 => count,
+                position => usize::from(position),
+            };
 
             let mut payload = Vec::new();
             crate::serialize::write_compact_size(&mut payload, count);
@@ -960,7 +965,7 @@ pub(crate) mod fuzz {
             for index in 0..count {
                 let header = crate::block::BlockHeader {
                     version: 0,
-                    prev: if index + 1 == wrong_prev_byte {
+                    prev: if index + 1 == wrong_prev_position {
                         hash_wrong(prev)
                     } else {
                         prev
