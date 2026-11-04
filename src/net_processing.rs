@@ -587,7 +587,9 @@ pub(crate) mod fuzz {
 
     /// A good peer, with a full batch. A machine that refuses each message fails on each seed. But
     /// a new layout can leave the seeds with nothing to check, and the replay still passes. This
-    /// script must end the sync, so a new layout fails here until it also rewrites this script.
+    /// script must end the sync, so a new layout that changes the meaning of these bytes fails here
+    /// until it also rewrites this script. A new layout that changes only other values does not
+    /// fail here. For example, each time, length change and wrong `prev` in this script is 0.
     #[rustfmt::skip]
     const GOOD_SCRIPT: &[u8] = &[
         0,                // Regtest.
