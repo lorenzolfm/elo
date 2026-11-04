@@ -555,7 +555,7 @@ pub(crate) mod fuzz {
     const FRAME_NETWORK: crate::chainparams::Network = crate::chainparams::Network::Regtest;
 
     /// The address of the peer in each `version` of a script.
-    const PEER: std::net::SocketAddr =
+    const PEER_ADDRESS: std::net::SocketAddr =
         std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 18444);
 
     // The models take each limit from the constant that the machines use, and the seeds hold each
@@ -573,12 +573,12 @@ pub(crate) mod fuzz {
 
     /// The most headers that one script writes. A full batch costs about 3 ms and 160 KB of chain,
     /// and a few bytes of a script ask for one. So this bounds the cost of a run.
-    const HEADERS_WRITTEN_COUNT_MAX: usize = 3 * HEADERS_FULL_COUNT;
+    const SCRIPT_HEADERS_COUNT_MAX: usize = 3 * HEADERS_FULL_COUNT;
 
     // The seeds need two full batches and then a batch that is not empty. Below this, those batches
     // get shorter, and the replay still passes. A batch off the tip after a full batch then has no
     // check.
-    const _: () = assert!(HEADERS_WRITTEN_COUNT_MAX >= 2 * HEADERS_FULL_COUNT + 2);
+    const _: () = assert!(SCRIPT_HEADERS_COUNT_MAX >= 2 * HEADERS_FULL_COUNT + 2);
 
     /// Spreads a byte over the places of a nonce. It is odd, so each byte gives another nonce.
     const NONCE_SPREAD: u64 = 0x0123_4567_89ab_cdef;
@@ -621,7 +621,7 @@ pub(crate) mod fuzz {
     ///   other byte `b` flips bit `b % 64`.
     /// - 5: `headers`, each on the header below it, from our tip. A count byte: 253 is one above a
     ///   full batch, 254 is one below it, 255 is a full batch, and each other byte is the count.
-    ///   The script stops at `HEADERS_WRITTEN_COUNT_MAX` headers, so a later batch can be shorter.
+    ///   The script stops at `SCRIPT_HEADERS_COUNT_MAX` headers, so a later batch can be shorter.
     ///   Then a byte `b`: header `b - 1` has a wrong `prev`, 255 is the last header, and 0 changes
     ///   none.
     /// - 6: another message type, which each machine skips.
@@ -645,11 +645,11 @@ pub(crate) mod fuzz {
         let network = script_network(script.byte());
         let nonce = script.nonce();
         let timestamp = nonce.cast_signed();
-        let (handshake, outbound) = super::Handshake::start(network, PEER, timestamp, nonce);
+        let (handshake, outbound) =
+            super::Handshake::start(network, PEER_ADDRESS, timestamp, nonce);
         machines_start_check(&outbound, timestamp, nonce);
-        let tip = network.genesis().hash();
-        match handshake_run(&mut script, handshake, nonce, tip) {
-            Some(peer) => peer_run(&mut script, peer, tip),
+        match handshake_run(&mut script, handshake, nonce) {
+            Some(peer) => peer_run(&mut script, peer, network.genesis().hash()),
             None => false,
         }
     }
@@ -682,7 +682,7 @@ pub(crate) mod fuzz {
         assert_eq!(ours.timestamp, timestamp);
         assert_eq!(
             ours.addr_recv,
-            crate::protocol::Address::new(no_services, PEER)
+            crate::protocol::Address::new(no_services, PEER_ADDRESS)
         );
         assert_eq!(
             ours.addr_from,
@@ -696,13 +696,18 @@ pub(crate) mod fuzz {
 
     /// Gives each message of `script` to `handshake`. Returns the peer if the handshake ended
     /// with one. A message takes at least its kind byte, so the length of the script bounds the
-    /// loop. `tip` is only for the `headers` in the script, which the handshake skips.
+    /// loop.
     fn handshake_run(
         script: &mut Script,
         mut handshake: super::Handshake,
         nonce: u64,
-        tip: bitcoin_hashes::sha256d::Hash,
     ) -> Option<super::Peer> {
+        // The handshake skips each `pong` and `headers`, so their base does not matter.
+        let base = MessageBase {
+            our_nonce: nonce,
+            ping_nonce: 0,
+            tip: bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]),
+        };
         let mut model = HandshakeModel {
             nonce,
             theirs: None,
@@ -710,9 +715,9 @@ pub(crate) mod fuzz {
         };
         while !script.unread.is_empty() {
             let unread_count = script.unread.len();
-            let message = script.message(nonce, tip);
+            let message_next = script.message(&base);
             assert!(script.unread.len() < unread_count);
-            let Some(message) = message else {
+            let Some(message) = message_next else {
                 continue;
             };
             match (handshake.receive(&message), model.receive(&message)) {
@@ -753,8 +758,14 @@ pub(crate) mod fuzz {
                 return false;
             };
             peer = ticked;
+            // The peer skips each `version`, so its base does not matter.
+            let base = MessageBase {
+                our_nonce: 0,
+                ping_nonce: model.ping_nonce(),
+                tip: model.tip,
+            };
             // The wait of the driver can end with no message.
-            if let Some(message) = script.message(model.ping_nonce(), model.tip) {
+            if let Some(message) = script.message(&base) {
                 let Some(received) = peer_receive(peer, &mut model, &message) else {
                     return false;
                 };
@@ -854,21 +865,21 @@ pub(crate) mod fuzz {
 
     /// The `now` of the next tick. A deadline is due at its instant, so a random time would almost
     /// never test it. So each kind but the first steps relative to `wake`, the earliest deadline
-    /// from the last tick. `byte % 4` picks the kind, and `byte / 4` is the amount:
+    /// from the last tick. `byte % 4` picks the kind, and `byte / 4` is a count of units:
     ///
-    /// - 0: the amount in seconds after `now`, so a message that came before `wake`, or no time.
+    /// - 0: that many seconds after `now`, so a message that came before `wake`, or no time.
     /// - 1: just before `wake`.
     /// - 2: at `wake`.
-    /// - 3: the amount in minutes after `wake`, so a tick that came late.
+    /// - 3: that many minutes after `wake`, so a tick that came late.
     fn now_next(byte: u8, now: std::time::Instant, wake: std::time::Instant) -> std::time::Instant {
         // `tick` asserts this. The next assert needs it for the second kind.
         assert!(now < wake);
-        let amount = u64::from(byte / 4);
+        let unit_count = u64::from(byte / 4);
         let next = match byte % 4 {
-            0 => now + std::time::Duration::from_secs(amount),
+            0 => now + std::time::Duration::from_secs(unit_count),
             1 => wake - std::time::Duration::from_nanos(1),
             2 => wake,
-            _ => wake + std::time::Duration::from_mins(amount),
+            _ => wake + std::time::Duration::from_mins(unit_count),
         };
         // `tick` needs this for its deadlines.
         assert!(now <= next);
@@ -878,7 +889,7 @@ pub(crate) mod fuzz {
     /// The bytes of a script that no read took yet.
     struct Script<'a> {
         unread: &'a [u8],
-        /// The headers that the script wrote, at most `HEADERS_WRITTEN_COUNT_MAX`.
+        /// The headers that the script wrote, at most `SCRIPT_HEADERS_COUNT_MAX`.
         headers_written_count: usize,
     }
 
@@ -899,24 +910,22 @@ pub(crate) mod fuzz {
             u64::from(self.byte()).wrapping_mul(NONCE_SPREAD)
         }
 
-        /// The next message, as the driver reads it. `nonce` is the one that our `version` and
-        /// `pong` start from, and `tip` the one that a batch starts from.
-        fn message(
-            &mut self,
-            nonce: u64,
-            tip: bitcoin_hashes::sha256d::Hash,
-        ) -> Option<crate::transport::Message> {
+        /// The next message, as the driver reads it.
+        fn message(&mut self, base: &MessageBase) -> Option<crate::transport::Message> {
             /// A type that no machine reads.
             const OTHER: crate::protocol::MessageType =
                 crate::protocol::MessageType::new(*b"wtxidrelay\0\0").expect("a printable name");
 
             let (msg_type, mut payload) = match self.byte() % 7 {
                 0 => return None,
-                1 => (crate::protocol::VERSION, self.version_payload(nonce)),
+                1 => (
+                    crate::protocol::VERSION,
+                    self.version_payload(base.our_nonce),
+                ),
                 2 => (crate::protocol::VERACK, Vec::new()),
                 3 => (crate::protocol::PING, self.nonce().to_le_bytes().to_vec()),
-                4 => (crate::protocol::PONG, self.pong_payload(nonce)),
-                5 => (crate::protocol::HEADERS, self.headers_payload(tip)),
+                4 => (crate::protocol::PONG, self.pong_payload(base.ping_nonce)),
+                5 => (crate::protocol::HEADERS, self.headers_payload(base.tip)),
                 _ => (OTHER, Vec::new()),
             };
             let length = payload
@@ -926,37 +935,37 @@ pub(crate) mod fuzz {
             Some(message_read(msg_type, &payload))
         }
 
-        fn version_payload(&mut self, nonce: u64) -> Vec<u8> {
-            let nonce = nonce.wrapping_add(u64::from(self.byte()));
-            let mut theirs = super::our_version(PEER, 0, nonce);
+        fn version_payload(&mut self, our_nonce: u64) -> Vec<u8> {
+            let their_nonce = our_nonce.wrapping_add(u64::from(self.byte()));
+            let mut theirs = super::our_version(PEER_ADDRESS, 0, their_nonce);
             theirs.version = super::PROTOCOL_VERSION_MIN + i32::from(self.signed_byte());
             let mut payload = Vec::new();
             theirs.encode(&mut payload);
             payload
         }
 
-        fn pong_payload(&mut self, nonce: u64) -> Vec<u8> {
+        fn pong_payload(&mut self, ping_nonce: u64) -> Vec<u8> {
             let byte = self.byte();
             let theirs = match byte {
-                0 => nonce,
-                _ => nonce ^ (1 << (byte % 64)),
+                0 => ping_nonce,
+                _ => ping_nonce ^ (1 << (byte % 64)),
             };
-            assert_eq!(theirs == nonce, byte == 0);
+            assert_eq!(theirs == ping_nonce, byte == 0);
             theirs.to_le_bytes().to_vec()
         }
 
         /// A batch from `tip`. Random bytes never match the hash of the tip, so this builds each
         /// `prev`. Without this, each batch stops at `NotOnTip`.
         fn headers_payload(&mut self, tip: bitcoin_hashes::sha256d::Hash) -> Vec<u8> {
-            let count = match self.byte() {
+            let count_asked = match self.byte() {
                 253 => HEADERS_FULL_COUNT + 1,
                 254 => HEADERS_FULL_COUNT - 1,
                 255 => HEADERS_FULL_COUNT,
-                count => usize::from(count),
+                byte => usize::from(byte),
             };
-            let count = count.min(HEADERS_WRITTEN_COUNT_MAX - self.headers_written_count);
+            let count = count_asked.min(SCRIPT_HEADERS_COUNT_MAX - self.headers_written_count);
             self.headers_written_count += count;
-            assert!(self.headers_written_count <= HEADERS_WRITTEN_COUNT_MAX);
+            assert!(self.headers_written_count <= SCRIPT_HEADERS_COUNT_MAX);
             // The loop below takes its bound from this.
             assert!(count <= HEADERS_FULL_COUNT + 1);
             // A count is one more than the index of the last header.
@@ -987,6 +996,16 @@ pub(crate) mod fuzz {
             }
             payload
         }
+    }
+
+    /// What the messages of a script build on.
+    struct MessageBase {
+        /// The nonce in our `version`. A `version` starts from it.
+        our_nonce: u64,
+        /// The nonce of our outstanding `ping`. A `pong` starts from it.
+        ping_nonce: u64,
+        /// The hash of the tip of our chain. A batch starts from it.
+        tip: bitcoin_hashes::sha256d::Hash,
     }
 
     /// `hash` with one bit flipped, so a compare of part of a hash does not see it.
