@@ -656,8 +656,9 @@ pub(crate) mod fuzz {
         }
     }
 
-    /// Checks that `outbound` is our `version`, with no services and no transactions. The handshake
-    /// compares their nonce with the nonce that it keeps, so `nonce` must also be on the wire.
+    /// Checks each field of `outbound`, our `version`. It claims no services and asks for no
+    /// transactions. The handshake compares their nonce with the nonce that it keeps, so `nonce` must
+    /// also be on the wire.
     fn machines_start_check(outbound: &super::HandshakeOutbound, timestamp: i64, nonce: u64) {
         let super::HandshakeOutbound::Version(payload) = outbound else {
             panic!("the handshake starts with {outbound:?}");
@@ -666,12 +667,23 @@ pub(crate) mod fuzz {
             Ok(ours) => ours,
             Err(error) => panic!("the decode refuses our `version`: {error}"),
         };
-        let none = crate::protocol::ServiceFlags::NONE;
+        let no_services = crate::protocol::ServiceFlags::NONE;
+        let unspecified = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0));
+        let user_agent = format!("/elo:{}/", env!("CARGO_PKG_VERSION"));
         assert_eq!(ours.version, crate::protocol::PROTOCOL_VERSION);
-        assert_eq!(ours.services, none);
+        assert_eq!(ours.services, no_services);
         assert_eq!(ours.timestamp, timestamp);
-        assert_eq!(ours.addr_recv, crate::protocol::Address::new(none, PEER));
+        assert_eq!(
+            ours.addr_recv,
+            crate::protocol::Address::new(no_services, PEER)
+        );
+        assert_eq!(
+            ours.addr_from,
+            crate::protocol::Address::new(no_services, unspecified)
+        );
         assert_eq!(ours.nonce, nonce);
+        assert_eq!(ours.user_agent.as_bytes(), user_agent.as_bytes());
+        assert_eq!(ours.start_height, 0);
         assert!(!ours.relay);
     }
 
