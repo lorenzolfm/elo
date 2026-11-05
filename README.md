@@ -73,8 +73,8 @@ A session does not start when its files take more than 1 GiB. Then remove files 
 ## Mutants
 
 CI runs `cargo mutants` on the lines that each pull request changes. A missed mutant fails the job.
-Then add a test, or add a class to `exclude_re` in `.cargo/mutants.toml`, with its reason. A timeout
-counts as caught, because the mutant hangs a test. To run the same check here:
+Then add a test, or add a class to `exclude_re` in `.cargo/mutants.toml`, with its reason. A test
+fails after 35 s, so a mutant that hangs a test reads as caught. To run the same check here:
 
 ```sh
 git diff origin/main... > /tmp/elo.diff

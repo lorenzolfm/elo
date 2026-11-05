@@ -59,17 +59,9 @@ jobs:
 
       - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
 
-      # A timeout counts as caught, because the mutant hangs a test. cargo-mutants exits 3 for a
-      # timeout, also when it missed another mutant, so a timeout passes only with no missed mutant.
       - run: |
           git diff HEAD^1 HEAD > "$RUNNER_TEMP/pull-request.diff"
-          status=0
-          nix develop --command cargo mutants --in-diff "$RUNNER_TEMP/pull-request.diff" --jobs 2 ||
-            status="$?"
-          if test "$status" -eq 3 && test -f mutants.out/missed.txt && test ! -s mutants.out/missed.txt; then
-            exit 0
-          fi
-          exit "$status"
+          nix develop --command cargo mutants --in-diff "$RUNNER_TEMP/pull-request.diff" --jobs 2
 
   # A long fuzz run takes this image. Only a push to main reaches this job, so a pull request
   # cannot push an image.
