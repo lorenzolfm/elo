@@ -5,6 +5,6 @@ test_tool = "nextest"
 # another test fails. So nextest ends each run first.
 minimum_test_timeout = 80
 
-# The text of an error is for a person, and no program reads it. A test of that text only repeats
-# the literal, so this class has no test.
+# The text of an error is for a person. A test of that text only repeats the literal, so this class
+# needs no test. L3 reads the text of `RunError`. That test still runs, but this mutant does not.
 exclude_re = ['<impl std::fmt::Display for \w*Error>::fmt']
