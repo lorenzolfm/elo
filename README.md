@@ -70,6 +70,20 @@ The input runs many times, so a leak reaches the limit.
 A session does not start when its files take more than 1 GiB. Then remove files from
 `/tmp/elo-fuzz/corpus` by hand.
 
+## Mutants
+
+CI runs `cargo mutants` on the lines that each pull request changes. A missed mutant fails the job.
+Then add a test, or add a class to `exclude_re` in `.cargo/mutants.toml`, with its reason. A timeout
+counts as caught, because the mutant hangs a test. To run the same check here:
+
+```sh
+git diff origin/main... > /tmp/elo.diff
+nix develop -c cargo mutants --in-diff /tmp/elo.diff
+```
+
+`nix develop -c cargo mutants` runs each mutant in the crate. `mutants.out/missed.txt` lists what the
+tests missed. cargo-mutants does not mutate inside an `assert!`, so check those by hand.
+
 ## Reproducibility
 
 ```sh

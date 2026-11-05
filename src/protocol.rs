@@ -363,6 +363,8 @@ impl std::error::Error for HeadersError {}
 
 /// The entry points of the `version` and `headers` fuzz targets.
 #[cfg(fuzzing)]
+// Only cargo-mutants reads this attribute. Its test runs do not build this module.
+#[cfg_attr(false, mutants::skip)]
 pub(crate) mod fuzz {
     use crate::serialize::{Decode, Encode};
 

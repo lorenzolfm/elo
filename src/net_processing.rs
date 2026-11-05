@@ -547,6 +547,8 @@ impl SyncState {
 
 /// The entry point of the `machines` fuzz target.
 #[cfg(fuzzing)]
+// Only cargo-mutants reads this attribute. Its test runs do not build this module.
+#[cfg_attr(false, mutants::skip)]
 pub(crate) mod fuzz {
     use crate::serialize::{Decode, Encode};
 

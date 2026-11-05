@@ -1,0 +1,6 @@
+# The same runner as the `elo-test` gate.
+test_tool = "nextest"
+
+# The text of an error is for a person, and no program reads it. A test of that text only repeats
+# the literal, so this class has no test.
+exclude_re = ['<impl std::fmt::Display for \w*Error>::fmt']

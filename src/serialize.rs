@@ -169,6 +169,8 @@ pub(crate) fn read_limited_string(input: &mut &[u8], length_max: usize) -> Resul
 
 /// The entry point of the `compact_size` fuzz target.
 #[cfg(fuzzing)]
+// Only cargo-mutants reads this attribute. Its test runs do not build this module.
+#[cfg_attr(false, mutants::skip)]
 pub(crate) mod fuzz {
     // The seeds hold this limit as bytes, and the check takes its limit from the same constant. So
     // a new limit moves the check and not the seeds, and the replay still passes. A new limit must
