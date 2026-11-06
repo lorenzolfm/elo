@@ -7,6 +7,7 @@ mod chain;
 pub mod chainparams;
 pub mod net;
 mod net_processing;
+mod pow;
 mod protocol;
 mod serialize;
 mod transport;

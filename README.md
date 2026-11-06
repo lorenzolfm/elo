@@ -4,9 +4,10 @@ A Bitcoin node daemon. Work in progress: the binary dials one peer, does the
 v1 `version`/`verack` handshake and prints the peer's `version`. Then it syncs
 the header chain from genesis to the peer's tip and prints `tip <height> <hash>`.
 The chain is in memory, and elo checks only that each header is on the one
-before it. After the sync, elo stays connected and answers each `ping` with a
-`pong`. From the handshake on, it pings the peer every 2 min. It drops a peer
-that does not answer a `ping` within 20 min, or a `getheaders` within 2 min.
+before it and has proof of work. After the sync, elo stays connected and answers
+each `ping` with a `pong`. From the handshake on, it pings the peer every 2 min.
+It drops a peer that does not answer a `ping` within 20 min, or a `getheaders`
+within 2 min.
 
 ```sh
 elo <mainnet|testnet4|signet|regtest> <ip>[:port]    # IPv6 as [::1]:8333

@@ -16,6 +16,8 @@
 //! v1. The script claimed `NODE_NETWORK` in its `version`, then sent its `verack`. Core sent
 //! the `getheaders` after its `ping`.
 
+use crate::serialize::Encode;
+
 /// The `version`. On loopback, the IPs and ports of both addresses are zero.
 pub(crate) const VERSION_FRAME: &str = concat!(
     "fabfb5da76657273696f6e000000000066000000b34372e3",
@@ -96,18 +98,36 @@ pub(crate) fn headers_payload() -> Vec<u8> {
     hex(HEADERS_FRAME).split_off(crate::transport::MESSAGE_HEADER_SIZE)
 }
 
-/// `count` headers, each on the header before it, the first on the regtest genesis header.
-/// elo checks no proof of work yet, so each header is the genesis header with its `prev`
-/// changed.
+/// `count` headers, each on the header before it, the first on the regtest genesis header. Each
+/// is the genesis header with its `prev` and its `nonce` changed.
 pub(crate) fn headers_on_genesis(count: usize) -> Vec<crate::block::BlockHeader> {
     let genesis = crate::chainparams::Network::Regtest.genesis();
-    let on = |below: &crate::block::BlockHeader| crate::block::BlockHeader {
-        prev: below.hash(),
-        ..genesis
+    let on = |below: &crate::block::BlockHeader| {
+        crate::pow::mined_for_regtest(crate::block::BlockHeader {
+            prev: below.hash(),
+            ..genesis
+        })
     };
     std::iter::successors(Some(on(&genesis)), |below| Some(on(below)))
         .take(count)
         .collect()
+}
+
+/// A `headers` payload with `headers`, each with a transaction count of 0.
+pub(crate) fn headers_payload_with(headers: &[crate::block::BlockHeader]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    crate::serialize::write_compact_size(&mut payload, headers.len());
+    for header in headers {
+        header.encode(&mut payload);
+        payload.push(0);
+    }
+    payload
+}
+
+/// `headers` as a batch for the chain. It goes through `decode`, so `Headers` has no constructor
+/// for the tests.
+pub(crate) fn headers_batch(headers: &[crate::block::BlockHeader]) -> crate::protocol::Headers {
+    crate::protocol::Headers::decode(&mut headers_payload_with(headers).as_slice()).unwrap()
 }
 
 /// A hash in hex, in the order a display shows it: the reverse of the wire order.

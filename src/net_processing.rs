@@ -84,7 +84,8 @@ pub enum PeerError {
     PingTimeout,
     /// Their `headers` payload did not decode, or it has too many headers or a transaction.
     Headers(crate::protocol::HeadersError),
-    /// Our chain refused their batch: it is not on our tip, or it is not a chain.
+    /// Our chain refused their batch: it is not on our tip, it is not a chain, or a header fails
+    /// proof of work.
     Extend(crate::chain::ExtendError),
     /// Their `headers` came when no `getheaders` of ours was outstanding.
     UnsolicitedHeaders,
@@ -426,9 +427,7 @@ impl Peer {
             return Err(PeerError::UnsolicitedHeaders);
         };
         let full = headers.is_full();
-        self.chain
-            .extend(headers.into_vec())
-            .map_err(PeerError::Extend)?;
+        self.chain.extend(headers).map_err(PeerError::Extend)?;
         if full {
             self.sync = SyncState::Due;
             Ok((self, Received::NoReply))
@@ -574,13 +573,17 @@ pub(crate) mod fuzz {
     /// of that limit makes the model and the machine disagree.
     const HEADERS_FULL_COUNT: usize = 2000;
 
-    /// The most headers that one script writes. A full batch costs about 3 ms and 160 KB of chain,
+    /// The most headers that one script writes. A full batch costs about 7 ms and 160 KB of chain,
     /// and a few bytes of a script ask for one. So this bounds the cost of a run.
     const SCRIPT_HEADERS_COUNT_MAX: usize = 3 * HEADERS_FULL_COUNT;
 
     // The seeds need two full batches and then a batch that is not empty. Below this, those batches
     // get shorter. A row fails, but a new end in that row hides the lost case.
     const _: () = assert!(SCRIPT_HEADERS_COUNT_MAX >= 2 * HEADERS_FULL_COUNT + 2);
+
+    /// The `bits` of each header that a script writes. They are above the limit of each other
+    /// network, so a script goes past its first header only on regtest.
+    const SCRIPT_HEADER_BITS: u32 = crate::chainparams::Network::Regtest.genesis().bits;
 
     /// Spreads a byte over the places of a nonce. It is odd, so each byte gives another nonce.
     const NONCE_SPREAD: u64 = 0x0123_4567_89ab_cdef;
@@ -668,9 +671,9 @@ pub(crate) mod fuzz {
         seed!("headers-off-tip-after-sync", "PeerRefused(UnsolicitedHeaders)"),
         seed!("headers-wrong-index-past-end", "PeerOpen { height: 2, synced: true }"),
         seed!("mix-long", "PeerRefused(PingTimeout)"),
-        seed!("network-mainnet", "PeerOpen { height: 2, synced: true }"),
-        seed!("network-signet", "PeerOpen { height: 2, synced: true }"),
-        seed!("network-testnet4", "PeerOpen { height: 2, synced: true }"),
+        seed!("network-mainnet", "PeerRefused(Extend(ProofOfWork))"),
+        seed!("network-signet", "PeerRefused(Extend(ProofOfWork))"),
+        seed!("network-testnet4", "PeerRefused(Extend(ProofOfWork))"),
         seed!("peer-skips-version-and-verack", "PeerOpen { height: 0, synced: false }"),
         seed!("ping-bytes-after", "PeerOpen { height: 0, synced: false }"),
         seed!("ping-cut", "PeerRefused(Ping(UnexpectedEnd))"),
@@ -734,7 +737,8 @@ pub(crate) mod fuzz {
     ///   full batch, 254 is one below it, 255 is a full batch, and each other byte is the count.
     ///   The script stops at `SCRIPT_HEADERS_COUNT_MAX` headers, so a later batch can be shorter.
     ///   Then a byte `b`: header `b - 1` has a wrong `prev`, 255 is the last header, and 0 changes
-    ///   none.
+    ///   none. The script mines each header after it picks the `prev`, so proof of work never
+    ///   decides between two ends on regtest.
     /// - 6: another message type, which each machine skips.
     ///
     /// Then an `i8` to add to the length of the payload, so bytes come off its end or go after it.
@@ -757,7 +761,7 @@ pub(crate) mod fuzz {
             super::Handshake::start(network, PEER_ADDRESS, timestamp, nonce);
         machines_start_check(&outbound, timestamp, nonce);
         match handshake_run(&mut script, handshake, nonce) {
-            Ok(peer) => peer_run(&mut script, peer, network.genesis().hash()),
+            Ok(peer) => peer_run(&mut script, peer, network),
             Err(end) => end,
         }
     }
@@ -854,10 +858,10 @@ pub(crate) mod fuzz {
     fn peer_run(
         script: &mut Script,
         mut peer: super::Peer,
-        tip: bitcoin_hashes::sha256d::Hash,
+        network: crate::chainparams::Network,
     ) -> ScriptEnd {
         let mut now = std::time::Instant::now();
-        let mut model = PeerModel::new(now, tip);
+        let mut model = PeerModel::new(now, network);
         while !script.unread.is_empty() {
             let unread_count = script.unread.len();
             let nonce = script.nonce();
@@ -1092,7 +1096,7 @@ pub(crate) mod fuzz {
             crate::serialize::write_compact_size(&mut payload, count);
             let mut prev = tip;
             for index in 0..count {
-                let header = crate::block::BlockHeader {
+                let header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
                     version: 0,
                     prev: if Some(index) == wrong_prev_index {
                         hash_wrong(prev)
@@ -1101,9 +1105,9 @@ pub(crate) mod fuzz {
                     },
                     merkle_root: [0; 32],
                     time: 0,
-                    bits: 0,
+                    bits: SCRIPT_HEADER_BITS,
                     nonce: 0,
-                };
+                });
                 header.encode(&mut payload);
                 crate::serialize::write_compact_size(&mut payload, 0);
                 prev = header.hash();
@@ -1223,6 +1227,7 @@ pub(crate) mod fuzz {
         /// The hash and the height of the last header of the chain.
         tip: bitcoin_hashes::sha256d::Hash,
         height: usize,
+        network: crate::chainparams::Network,
     }
 
     /// Where our `getheaders` is.
@@ -1253,15 +1258,16 @@ pub(crate) mod fuzz {
     }
 
     impl PeerModel {
-        /// The model of a new peer on the genesis hash `tip`. Its first tick is at `now`.
-        fn new(now: std::time::Instant, tip: bitcoin_hashes::sha256d::Hash) -> PeerModel {
+        /// The model of a new peer on the genesis header of `network`. Its first tick is at `now`.
+        fn new(now: std::time::Instant, network: crate::chainparams::Network) -> PeerModel {
             PeerModel {
                 ping_deadline: now,
                 ping_nonce: 0,
                 ping_outstanding: false,
                 get_headers: GetHeadersModel::Due,
-                tip,
+                tip: network.genesis().hash(),
                 height: 0,
+                network,
             }
         }
 
@@ -1349,6 +1355,16 @@ pub(crate) mod fuzz {
             let mut tip = self.tip;
             for (index, header) in headers.iter().enumerate() {
                 if header.prev == tip {
+                    // A script mines each header for regtest, and `SCRIPT_HEADER_BITS` are above
+                    // each other limit. So only regtest takes what a script writes. A new script
+                    // byte that writes other headers fails here, and must change this model.
+                    assert_eq!(header.bits, SCRIPT_HEADER_BITS);
+                    assert!(header.hash().as_byte_array()[31] < 0x7f);
+                    if self.network != crate::chainparams::Network::Regtest {
+                        return Err(super::PeerError::Extend(
+                            crate::chain::ExtendError::ProofOfWork,
+                        ));
+                    }
                     tip = header.hash();
                 } else if index == 0 {
                     return Err(super::PeerError::Extend(
@@ -1415,7 +1431,7 @@ pub(crate) mod fuzz {
 
 #[cfg(test)]
 mod tests {
-    use crate::serialize::{Decode, Encode};
+    use crate::serialize::Decode;
 
     /// The message in a regtest frame, as the driver reads it.
     fn message(frame: &[u8]) -> crate::transport::Message {
@@ -1477,19 +1493,15 @@ mod tests {
 
     /// A `headers` with `headers`, each with a transaction count of 0.
     fn headers_message(headers: &[crate::block::BlockHeader]) -> crate::transport::Message {
-        let mut payload = Vec::new();
-        crate::serialize::write_compact_size(&mut payload, headers.len());
-        for header in headers {
-            header.encode(&mut payload);
-            payload.push(0);
-        }
-        headers_payload_message(&payload)
+        headers_payload_message(&crate::fixtures::headers_payload_with(headers))
     }
 
     /// The tip of a second regtest chain, after `headers`.
     fn tip_after(headers: &[crate::block::BlockHeader]) -> crate::chain::Tip {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
-        chain.extend(headers.to_vec()).unwrap();
+        chain
+            .extend(crate::fixtures::headers_batch(headers))
+            .unwrap();
         chain.tip()
     }
 
