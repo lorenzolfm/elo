@@ -1,8 +1,8 @@
 //! Proof of work.
 
 /// The highest hash that a header may have. The bytes are big-endian, so the order of two arrays is
-/// the order of their numbers. Only `from_bits` makes one, so it is above zero and at most the limit
-/// that `from_bits` got.
+/// the order of their numbers. Only `from_bits` makes one, so it is above zero and at most the
+/// limit that `from_bits` got.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Target([u8; 32]);
 
@@ -10,20 +10,20 @@ impl Target {
     /// Reads the compact form `bits`. Its first byte is the size of the number in bytes. Its other
     /// three bytes are the first bytes of the number, so a number of fewer than three bytes uses
     /// only the first of them. The first bit after the size byte is a sign. Returns nothing for a
-    /// number that is negative, is zero, does not fit in 32 bytes, or is above `limit`. A peer picks
-    /// `bits`, so no value may panic.
+    /// number that is negative, is zero, does not fit in 32 bytes, or is above `limit`. A peer
+    /// picks `bits`, so no value may panic.
     fn from_bits(bits: u32, limit: [u8; 32]) -> Option<Target> {
         let [size, high, middle, low] = bits.to_be_bytes();
         if high & 0x80 != 0 {
             return None;
         }
         let mut target = [0; 32];
-        for (offset, byte) in [high, middle, low].into_iter().enumerate() {
-            match (target.len() + offset).checked_sub(usize::from(size)) {
+        for (word_index, byte) in [high, middle, low].into_iter().enumerate() {
+            match (target.len() + word_index).checked_sub(usize::from(size)) {
                 // An index past the end is after the last byte of the number, so the number does
                 // not use this byte.
-                Some(index) => {
-                    if let Some(place) = target.get_mut(index) {
+                Some(target_index) => {
+                    if let Some(place) = target.get_mut(target_index) {
                         *place = byte;
                     }
                 }
@@ -64,9 +64,9 @@ pub(crate) fn has_proof_of_work(
 }
 
 /// `header` with the first `nonce` that gives a hash below the regtest target, whatever its `bits`
-/// are. A top byte below 0x7f is below that target, so about every second nonce passes. The top byte
-/// of a hash is its last byte in wire order. This does not call the check above, so a check that
-/// reads the wrong byte refuses these headers. Only the tests and the fuzz script call this.
+/// are. A top byte below 0x7f is below that target, so about every second nonce passes. The top
+/// byte of a hash is its last byte in wire order. This does not call the check above, so a check
+/// that reads the wrong byte refuses these headers. Only the tests and the fuzz script call this.
 #[cfg(any(test, fuzzing))]
 // Only cargo-mutants reads this attribute.
 #[cfg_attr(false, mutants::skip)]
