@@ -70,11 +70,17 @@ impl Bitcoind {
         drop(peer_listener);
         drop(rpc_listener);
 
-        let datadir = TempDir(std::env::temp_dir().join(format!(
-            "elo-bitcoind-{}-{}",
-            std::process::id(),
-            peer.port()
-        )));
+        // In the target directory, because nextest stops a test with a signal, and then no drop
+        // runs. A mutant run removes each target directory, and nothing removes the temp directory
+        // of `nix develop`. The lock stays in that temp directory: the two jobs of a mutant run
+        // have different target directories, and their tests also take ports.
+        let datadir = TempDir(
+            std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+                "elo-bitcoind-{}-{}",
+                std::process::id(),
+                peer.port()
+            )),
+        );
         std::fs::create_dir(&datadir.0).unwrap();
 
         let child = std::process::Command::new(path)
