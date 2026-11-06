@@ -77,7 +77,7 @@ Then add a test, or add a class to `exclude_re` in `.cargo/mutants.toml`, with i
 fails after 35 s, so a mutant that hangs a test reads as caught. To run the same check here:
 
 ```sh
-git diff origin/main... > /tmp/elo.diff
+git -c core.quotePath=false diff origin/main... > /tmp/elo.diff
 nix develop -c cargo mutants --in-diff /tmp/elo.diff
 ```
 
