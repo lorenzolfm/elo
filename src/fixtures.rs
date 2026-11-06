@@ -96,14 +96,15 @@ pub(crate) fn headers_payload() -> Vec<u8> {
     hex(HEADERS_FRAME).split_off(crate::transport::MESSAGE_HEADER_SIZE)
 }
 
-/// `count` headers, each on the header before it, the first on the regtest genesis header.
-/// elo checks no proof of work yet, so each header is the genesis header with its `prev`
-/// changed.
+/// `count` headers, each on the header before it, the first on the regtest genesis header. Each
+/// is the genesis header with its `prev` and its `nonce` changed.
 pub(crate) fn headers_on_genesis(count: usize) -> Vec<crate::block::BlockHeader> {
     let genesis = crate::chainparams::Network::Regtest.genesis();
-    let on = |below: &crate::block::BlockHeader| crate::block::BlockHeader {
-        prev: below.hash(),
-        ..genesis
+    let on = |below: &crate::block::BlockHeader| {
+        crate::pow::mined_for_regtest(crate::block::BlockHeader {
+            prev: below.hash(),
+            ..genesis
+        })
     };
     std::iter::successors(Some(on(&genesis)), |below| Some(on(below)))
         .take(count)

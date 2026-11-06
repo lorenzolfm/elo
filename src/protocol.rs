@@ -510,7 +510,9 @@ pub(crate) mod fuzz {
     }
 
     /// Checks that `taken`, the bytes that a decode took, are what the headers encode to, each
-    /// with a transaction count of 0.
+    /// with a transaction count of 0. A peer picks each `bits`, so each one also goes through the
+    /// proof-of-work check, which must return for any value. Regtest has the highest limit, so the
+    /// most values reach the compare with the hash.
     fn headers_check(headers: super::Headers, taken: &[u8]) {
         let headers = headers.into_vec();
         let mut encoded = Vec::new();
@@ -518,6 +520,11 @@ pub(crate) mod fuzz {
         for header in &headers {
             header.encode(&mut encoded);
             crate::serialize::write_compact_size(&mut encoded, 0);
+            crate::pow::has_proof_of_work(
+                header.hash(),
+                header.bits,
+                crate::chainparams::Network::Regtest,
+            );
         }
         assert_eq!(encoded, taken);
     }

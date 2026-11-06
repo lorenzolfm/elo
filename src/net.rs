@@ -239,7 +239,7 @@ async fn handshake_stream_exchange(
 impl Connection {
     /// Runs one turn after the other until a batch that is not full ends the sync. Returns the
     /// peer for `Synced::run`, and the tip of our chain. The loop has no count bound, because
-    /// only the chain of the peer bounds the sync, and elo checks no proof of work yet. It ends
+    /// only the chain of the peer bounds the sync, and elo has no minimum chain work yet. It ends
     /// on the errors of `run`, and also when elo refuses a `headers` or none comes within the
     /// headers timeout. Each wait for a message ends at the wake from `tick`, but the read takes
     /// a message that is already there, also after the wake. `tick` checks the headers timeout

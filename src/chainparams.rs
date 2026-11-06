@@ -26,6 +26,24 @@ const GENESIS_MERKLE_ROOT_TESTNET4: [u8; 32] = [
     0x67, 0xe6, 0x57, 0xcd, 0x40, 0x7e, 0x80, 0xcb, 0x14, 0x34, 0x22, 0x1e, 0xae, 0xa7, 0xa0, 0x7a,
 ];
 
+/// The highest target of mainnet and testnet4, big-endian.
+const POW_LIMIT: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+];
+
+/// The highest target of signet, big-endian.
+const POW_LIMIT_SIGNET: [u8; 32] = [
+    0x00, 0x00, 0x03, 0x77, 0xae, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// The highest target of regtest, big-endian.
+const POW_LIMIT_REGTEST: [u8; 32] = [
+    0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+];
+
 impl Network {
     /// The bytes that start every message.
     pub(crate) const fn magic(self) -> [u8; MAGIC_SIZE] {
@@ -44,6 +62,15 @@ impl Network {
             Network::Testnet4 => 48333,
             Network::Signet => 38333,
             Network::Regtest => 18444,
+        }
+    }
+
+    /// The highest target that a header of the network may have, big-endian.
+    pub(crate) const fn pow_limit(self) -> [u8; 32] {
+        match self {
+            Network::Mainnet | Network::Testnet4 => POW_LIMIT,
+            Network::Signet => POW_LIMIT_SIGNET,
+            Network::Regtest => POW_LIMIT_REGTEST,
         }
     }
 
@@ -102,6 +129,28 @@ mod tests {
         let hash = bitcoin_hashes::sha256d::Hash::hash(&serialized).to_byte_array();
 
         assert_eq!(super::Network::Signet.magic(), *hash.first_chunk().unwrap());
+    }
+
+    #[test]
+    fn pow_limit_is_between_the_highest_bits_in_range_and_the_next_bits() {
+        // The lowest hash meets each target, so only the range of the network can refuse.
+        let hash = bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]);
+        for (network, bits_in_range, bits_above) in [
+            (super::Network::Mainnet, 0x1d00_ffff, 0x1d01_0000),
+            (super::Network::Testnet4, 0x1d00_ffff, 0x1d01_0000),
+            // These `bits` are exactly the limit.
+            (super::Network::Signet, 0x1e03_77ae, 0x1e03_77af),
+            (super::Network::Regtest, 0x207f_ffff, 0x2100_8000),
+        ] {
+            assert!(
+                crate::pow::has_proof_of_work(hash, bits_in_range, network),
+                "{network:?}"
+            );
+            assert!(
+                !crate::pow::has_proof_of_work(hash, bits_above, network),
+                "{network:?}"
+            );
+        }
     }
 
     #[test]
