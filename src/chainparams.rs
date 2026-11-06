@@ -132,28 +132,6 @@ mod tests {
     }
 
     #[test]
-    fn pow_limit_is_between_the_highest_bits_in_range_and_the_next_bits() {
-        // The lowest hash meets each target, so only the range of the network can refuse.
-        let hash = bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]);
-        for (network, bits_in_range, bits_above) in [
-            (super::Network::Mainnet, 0x1d00_ffff, 0x1d01_0000),
-            (super::Network::Testnet4, 0x1d00_ffff, 0x1d01_0000),
-            // These `bits` are exactly the limit.
-            (super::Network::Signet, 0x1e03_77ae, 0x1e03_77af),
-            (super::Network::Regtest, 0x207f_ffff, 0x2100_8000),
-        ] {
-            assert!(
-                crate::pow::has_proof_of_work(hash, bits_in_range, network),
-                "{network:?}"
-            );
-            assert!(
-                !crate::pow::has_proof_of_work(hash, bits_above, network),
-                "{network:?}"
-            );
-        }
-    }
-
-    #[test]
     fn genesis_hashes_to_the_genesis_block_hash() {
         let cases = [
             (

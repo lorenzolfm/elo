@@ -53,14 +53,16 @@ impl Target {
     }
 }
 
-/// The target in `bits` is in the range of `network`, and `hash` is at most that target.
+/// The hash of `header`, if its `bits` are a target in the range of `network` and the hash is at
+/// most that target.
 #[must_use = "a dropped answer lets each header pass"]
-pub(crate) fn has_proof_of_work(
-    hash: bitcoin_hashes::sha256d::Hash,
-    bits: u32,
+pub(crate) fn proven_hash(
+    header: &crate::block::BlockHeader,
     network: crate::chainparams::Network,
-) -> bool {
-    Target::from_bits(bits, network.pow_limit()).is_some_and(|target| target.is_met_by(hash))
+) -> Option<bitcoin_hashes::sha256d::Hash> {
+    let target = Target::from_bits(header.bits, network.pow_limit())?;
+    let hash = header.hash();
+    target.is_met_by(hash).then_some(hash)
 }
 
 /// `header` with the first `nonce` that gives a hash below the regtest target, whatever its `bits`
@@ -202,6 +204,44 @@ mod tests {
     }
 
     #[test]
+    fn pow_limit_is_between_the_highest_bits_in_range_and_the_next_bits() {
+        for (network, bits_in_range, bits_above) in [
+            (
+                crate::chainparams::Network::Mainnet,
+                0x1d00_ffff,
+                0x1d01_0000,
+            ),
+            (
+                crate::chainparams::Network::Testnet4,
+                0x1d00_ffff,
+                0x1d01_0000,
+            ),
+            // These `bits` are exactly the limit.
+            (
+                crate::chainparams::Network::Signet,
+                0x1e03_77ae,
+                0x1e03_77af,
+            ),
+            (
+                crate::chainparams::Network::Regtest,
+                0x207f_ffff,
+                0x2100_8000,
+            ),
+        ] {
+            let limit = network.pow_limit();
+            assert!(
+                super::Target::from_bits(bits_in_range, limit).is_some(),
+                "{network:?}"
+            );
+            assert_eq!(
+                super::Target::from_bits(bits_above, limit),
+                None,
+                "{network:?}"
+            );
+        }
+    }
+
+    #[test]
     fn each_genesis_has_proof_of_work() {
         // Real headers, so this also shows the byte order of the hash: in wire order, each hash
         // but the regtest one starts with bytes above its target.
@@ -212,8 +252,9 @@ mod tests {
             crate::chainparams::Network::Regtest,
         ] {
             let genesis = network.genesis();
-            assert!(
-                super::has_proof_of_work(genesis.hash(), genesis.bits, network),
+            assert_eq!(
+                super::proven_hash(&genesis, network),
+                Some(genesis.hash()),
                 "{network:?}"
             );
         }

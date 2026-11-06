@@ -63,11 +63,7 @@ impl Chain {
             if header.prev != prev {
                 return Err(ExtendError::NotContinuous);
             }
-            let hash = header.hash();
-            if !crate::pow::has_proof_of_work(hash, header.bits, self.network) {
-                return Err(ExtendError::ProofOfWork);
-            }
-            prev = hash;
+            prev = crate::pow::proven_hash(header, self.network).ok_or(ExtendError::ProofOfWork)?;
         }
 
         for header in headers {
@@ -80,11 +76,7 @@ impl Chain {
             Some(self.tip.prev),
             self.ancestors.last().map(crate::block::BlockHeader::hash)
         );
-        assert!(crate::pow::has_proof_of_work(
-            self.tip.hash(),
-            self.tip.bits,
-            self.network
-        ));
+        assert!(crate::pow::proven_hash(&self.tip, self.network).is_some());
         Ok(())
     }
 
