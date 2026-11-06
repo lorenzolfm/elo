@@ -47,6 +47,9 @@ impl Chain {
         &mut self,
         headers: Vec<crate::block::BlockHeader>,
     ) -> Result<(), ExtendError> {
+        // `Headers` holds this bound for a batch from a peer, and the loops below take their bound
+        // from it.
+        assert!(headers.len() <= crate::protocol::HEADERS_COUNT_MAX);
         let Some(first) = headers.first() else {
             return Ok(());
         };
