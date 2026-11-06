@@ -82,7 +82,10 @@ nix develop -c cargo mutants --in-diff /tmp/elo.diff
 ```
 
 `nix develop -c cargo mutants` runs each mutant in the crate. `mutants.out/missed.txt` lists what the
-tests missed. cargo-mutants does not mutate inside an `assert!`, so check those by hand.
+tests missed.
+
+cargo-mutants does not mutate inside a macro call, such as `assert!` or `matches!`, or inside an
+`impl` function named `new`. A change there passes the job with no mutant, so check those by hand.
 
 ## Reproducibility
 
