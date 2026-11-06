@@ -1,5 +1,8 @@
 //! Proof of work.
 
+/// The headers of one period. The first header of a period has a height that is a multiple of this.
+const PERIOD_HEADERS: usize = 2016;
+
 /// The seconds that a period of headers should take: two weeks.
 const PERIOD_TIMESPAN_SECONDS: u32 = 14 * 24 * 60 * 60;
 
@@ -11,6 +14,35 @@ const TIMESPAN_SECONDS_MAX: u32 = PERIOD_TIMESPAN_SECONDS * 4;
 
 // The divide in the smallest time is exact, so the two factors are the same.
 const _: () = assert!(PERIOD_TIMESPAN_SECONDS.is_multiple_of(4));
+
+/// On testnet4, a header more than this many seconds after the header below it has the limit.
+const MIN_DIFFICULTY_GAP: u32 = 20 * 60;
+
+/// The headers below one header of a batch, by height: the chain, then the part of the batch that
+/// comes before that header. A batch is not on the chain until each of its headers passes, so the
+/// rule reads it through this.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Ancestors<'a> {
+    pub(crate) below_tip: &'a [crate::block::BlockHeader],
+    pub(crate) tip: &'a crate::block::BlockHeader,
+    pub(crate) batch: &'a [crate::block::BlockHeader],
+}
+
+impl<'a> Ancestors<'a> {
+    /// The height of the header above these headers. It is at least 1, because a chain has genesis.
+    fn height_above(self) -> usize {
+        self.below_tip.len() + 1 + self.batch.len()
+    }
+
+    /// The header at `height`, which must be below `height_above`.
+    fn at(self, height: usize) -> &'a crate::block::BlockHeader {
+        match height.checked_sub(self.below_tip.len()) {
+            None => &self.below_tip[height],
+            Some(0) => self.tip,
+            Some(above_tip) => &self.batch[above_tip - 1],
+        }
+    }
+}
 
 /// The highest hash that a header may have. The bytes are big-endian, so the order of two arrays is
 /// the order of their numbers. Only `from_bits` makes one, so it is above zero and at most the
@@ -128,10 +160,6 @@ fn scaled_up_to(mut number: [u8; 32], timespan_seconds: u32, limit: [u8; 32]) ->
 ///
 /// This takes `bits`, not a `Target`, and reads them with `limit`. So the limit that bounds the
 /// target and the limit that caps the answer cannot differ.
-#[cfg_attr(
-    not(any(test, fuzzing)),
-    expect(dead_code, reason = "until the exact `bits` check calls it")
-)]
 fn retargeted_bits(bits: u32, first_time: u32, last_time: u32, limit: [u8; 32]) -> Option<u32> {
     let target = Target::from_bits(bits, limit)?;
     // A time before `first_time` counts as zero, so it takes the smallest time, as any short time
@@ -146,6 +174,62 @@ fn retargeted_bits(bits: u32, first_time: u32, last_time: u32, limit: [u8; 32]) 
     // This reads the answer with `from_bits`, not with the code that wrote it.
     assert!(Target::from_bits(next, limit).is_some());
     Some(next)
+}
+
+/// The `bits` of the last header of this period that does not have the limit. If each one has the
+/// limit, these are the limit. The header above `ancestors` must not start a period. The first
+/// header of a period comes from the change of the target, so this does not read below it. So this
+/// reads fewer than `PERIOD_HEADERS` headers.
+fn last_real_bits(ancestors: Ancestors<'_>, limit_bits: u32) -> u32 {
+    let height_above = ancestors.height_above();
+    assert!(!height_above.is_multiple_of(PERIOD_HEADERS));
+    let period_first = height_above / PERIOD_HEADERS * PERIOD_HEADERS;
+    (period_first..height_above)
+        .rev()
+        .map(|height| ancestors.at(height).bits)
+        .find(|bits| *bits != limit_bits)
+        .unwrap_or(limit_bits)
+}
+
+/// The `bits` that a header with `time` must have on `ancestors`. Returns nothing if no header can
+/// pass: a target below 4 fell to zero, or a header that this reads has no target up to the limit,
+/// and a chain does not hold such a header.
+///
+/// Regtest has one target. Each header of its chain has the `bits` of the limit, because its genesis
+/// has them and no rule gives other `bits`. So it needs no period and no time.
+#[must_use = "a dropped answer lets each `bits` pass"]
+pub(crate) fn required_bits(
+    network: crate::chainparams::Network,
+    ancestors: Ancestors<'_>,
+    time: u32,
+) -> Option<u32> {
+    let limit = network.pow_limit();
+    let height = ancestors.height_above();
+    let last = ancestors.at(height - 1);
+    let period_ends = height.is_multiple_of(PERIOD_HEADERS);
+    match network {
+        crate::chainparams::Network::Regtest => Some(to_bits(limit)),
+        crate::chainparams::Network::Mainnet | crate::chainparams::Network::Signet => {
+            if period_ends {
+                let first = ancestors.at(height - PERIOD_HEADERS);
+                retargeted_bits(last.bits, first.time, last.time, limit)
+            } else {
+                Some(last.bits)
+            }
+        }
+        // The first header of a period cannot have the limit by a late time, so its `bits` are the
+        // real ones. The last header of a period can.
+        crate::chainparams::Network::Testnet4 => {
+            if period_ends {
+                let first = ancestors.at(height - PERIOD_HEADERS);
+                retargeted_bits(first.bits, first.time, last.time, limit)
+            } else if time.saturating_sub(last.time) > MIN_DIFFICULTY_GAP {
+                Some(to_bits(limit))
+            } else {
+                Some(last_real_bits(ancestors, to_bits(limit)))
+            }
+        }
+    }
 }
 
 /// The hash of `header`, if its `bits` are a target in the range of `network` and the hash is at
@@ -198,6 +282,46 @@ pub(crate) mod fuzz {
                 // Only a target below 4 can have no answer.
                 Some(super::Target([high @ .., low])) => {
                     assert!(next.is_some() || (high == [0; 31] && low < 4));
+                }
+            }
+        }
+    }
+
+    /// A peer picks each `bits` and each `time` of `headers`, so each header goes through the rule
+    /// of each network, as the header above the ones before it. The rule must return for any value.
+    /// A batch has fewer headers than a period, so no period ends here, and a period that ends would
+    /// fail the assert on mainnet. These checks do not repeat the walk of testnet4: its answer must
+    /// only be the limit or `bits` from below the header.
+    pub(crate) fn required_bits_check(headers: &[crate::block::BlockHeader]) {
+        for network in [
+            crate::chainparams::Network::Mainnet,
+            crate::chainparams::Network::Testnet4,
+            crate::chainparams::Network::Signet,
+            crate::chainparams::Network::Regtest,
+        ] {
+            let genesis = network.genesis();
+            for (index, header) in headers.iter().enumerate() {
+                let batch = &headers[..index];
+                let ancestors = super::Ancestors {
+                    below_tip: &[],
+                    tip: &genesis,
+                    batch,
+                };
+                let required = super::required_bits(network, ancestors, header.time);
+                let last_bits = batch.last().unwrap_or(&genesis).bits;
+                match network {
+                    crate::chainparams::Network::Regtest => {
+                        assert_eq!(required, Some(genesis.bits));
+                    }
+                    crate::chainparams::Network::Mainnet | crate::chainparams::Network::Signet => {
+                        assert_eq!(required, Some(last_bits));
+                    }
+                    crate::chainparams::Network::Testnet4 => {
+                        assert!(required.is_some_and(|required| {
+                            required == genesis.bits
+                                || batch.iter().any(|below| below.bits == required)
+                        }));
+                    }
                 }
             }
         }
@@ -584,6 +708,141 @@ mod tests {
                 super::retargeted_bits(bits, 1_000_000, last_time, limit),
                 Some(expected),
                 "{bits:#010x} {last_time}"
+            );
+        }
+    }
+
+    /// `count` headers with `bits`, each 600 seconds after the header before it.
+    fn headers(count: u32, bits: u32) -> Vec<crate::block::BlockHeader> {
+        (0..count)
+            .map(|index| crate::block::BlockHeader {
+                time: 600 * index,
+                bits,
+                ..crate::chainparams::Network::Regtest.genesis()
+            })
+            .collect()
+    }
+
+    /// `headers` as the headers below one header. The rule reads each part the same way.
+    fn ancestors(headers: &[crate::block::BlockHeader]) -> super::Ancestors<'_> {
+        let (tip, batch) = headers.split_first().unwrap();
+        super::Ancestors {
+            below_tip: &[],
+            tip,
+            batch,
+        }
+    }
+
+    const REAL_BITS: u32 = 0x1c7f_ffff;
+    const LOW_BITS: u32 = 0x1b1f_ffff;
+
+    #[test]
+    fn required_bits_keep_the_last_bits_inside_a_period() {
+        for network in [
+            crate::chainparams::Network::Mainnet,
+            crate::chainparams::Network::Signet,
+        ] {
+            for count in [1, 2015, 2017] {
+                let mut headers = headers(count, REAL_BITS);
+                headers.last_mut().unwrap().bits = LOW_BITS;
+                // A late time changes nothing on these networks.
+                assert_eq!(
+                    super::required_bits(network, ancestors(&headers), u32::MAX),
+                    Some(LOW_BITS),
+                    "{network:?} {count}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn required_bits_on_testnet4_take_the_limit_after_a_late_time() {
+        let network = crate::chainparams::Network::Testnet4;
+        let limit_bits = network.genesis().bits;
+        let headers = headers(2, REAL_BITS);
+        let last_time = headers[1].time;
+        for (time, expected) in [
+            (last_time + 1201, limit_bits),
+            (last_time + 1200, REAL_BITS),
+            // A time that goes back is not late.
+            (last_time - 1, REAL_BITS),
+        ] {
+            assert_eq!(
+                super::required_bits(network, ancestors(&headers), time),
+                Some(expected),
+                "{time}"
+            );
+        }
+    }
+
+    #[test]
+    fn required_bits_on_testnet4_go_back_to_the_last_real_bits() {
+        let network = crate::chainparams::Network::Testnet4;
+        let limit_bits = network.genesis().bits;
+        // Each case gives the `bits` from height 0. The time is not late, so the rule goes back.
+        let last_of_period = {
+            let mut bits = vec![limit_bits; 2015];
+            bits[2014] = REAL_BITS;
+            bits
+        };
+        let start_of_period_real = {
+            let mut bits = vec![limit_bits; 2100];
+            bits[2016] = REAL_BITS;
+            bits
+        };
+        let start_of_period_at_limit = {
+            let mut bits = vec![REAL_BITS; 2100];
+            bits[2016..].fill(limit_bits);
+            bits
+        };
+        for (name, bits, expected) in [
+            ("the last", vec![limit_bits, REAL_BITS], REAL_BITS),
+            (
+                "below two",
+                vec![limit_bits, REAL_BITS, limit_bits, limit_bits],
+                REAL_BITS,
+            ),
+            (
+                "the nearest",
+                vec![limit_bits, LOW_BITS, REAL_BITS, limit_bits],
+                REAL_BITS,
+            ),
+            ("only the limit", vec![limit_bits, limit_bits], limit_bits),
+            ("end of the period", last_of_period, REAL_BITS),
+            (
+                "to the first of the period",
+                start_of_period_real,
+                REAL_BITS,
+            ),
+            // The real `bits` below the period do not count.
+            ("not below the period", start_of_period_at_limit, limit_bits),
+        ] {
+            let chain: Vec<_> = bits
+                .into_iter()
+                .map(|bits| crate::block::BlockHeader {
+                    bits,
+                    ..network.genesis()
+                })
+                .collect();
+            let last_time = chain.last().unwrap().time;
+            assert_eq!(
+                super::required_bits(network, ancestors(&chain), last_time),
+                Some(expected),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn required_bits_on_regtest_are_the_limit_at_each_height() {
+        let network = crate::chainparams::Network::Regtest;
+        let limit_bits = network.genesis().bits;
+        // A period ends at 2016, and the math that changes a target gives other `bits` there.
+        for count in [1, 2015, 2016] {
+            assert_eq!(
+                super::required_bits(network, ancestors(&headers(count, limit_bits)), u32::MAX),
+                Some(limit_bits),
+                "{count}"
             );
         }
     }
