@@ -531,6 +531,8 @@ fn nonce() -> u64 {
 
 /// The entry point of the `frame` fuzz target.
 #[cfg(fuzzing)]
+// Only cargo-mutants reads this attribute. Its test runs do not build this module.
+#[cfg_attr(false, mutants::skip)]
 pub(crate) mod fuzz {
     /// The network of the seeds.
     const NETWORK: crate::chainparams::Network = crate::chainparams::Network::Regtest;

@@ -296,7 +296,7 @@
         };
 
         devShells.default = craneLibDev.devShell {
-          packages = [pkgs.cargo-nextest pkgs.cargo-fuzz];
+          packages = [pkgs.cargo-nextest pkgs.cargo-fuzz pkgs.cargo-mutants];
           BITCOIND = bitcoind;
           BITCOIN_CLI = bitcoinCli;
         };
