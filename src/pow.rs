@@ -1,5 +1,8 @@
 //! Proof of work.
 
+/// The seconds that a period of headers should take: two weeks.
+const PERIOD_TIMESPAN: u32 = 14 * 24 * 60 * 60;
+
 /// The highest hash that a header may have. The bytes are big-endian, so the order of two arrays is
 /// the order of their numbers. Only `from_bits` makes one, so it is above zero and at most the
 /// limit that `from_bits` got.
@@ -53,6 +56,75 @@ impl Target {
     }
 }
 
+/// The compact form of `number`, as `Target::from_bits` reads it. Only the first three bytes of the
+/// number stay. A first byte with its top bit set would read as the sign, so it moves one byte
+/// down and the size goes up by one. A number of zero gives zero.
+fn to_bits(number: [u8; 32]) -> u32 {
+    let mut size = 32_u8;
+    let mut rest = number.as_slice();
+    while let [0, after_zero @ ..] = rest {
+        size -= 1;
+        rest = after_zero;
+    }
+    assert_eq!(usize::from(size), rest.len());
+    let (high, middle, low) = match *rest {
+        [high, middle, low, ..] => (high, middle, low),
+        [high, middle] => (high, middle, 0),
+        [high] => (high, 0, 0),
+        [] => (0, 0, 0),
+    };
+    if high & 0x80 != 0 {
+        u32::from_be_bytes([size + 1, 0, high, middle])
+    } else {
+        u32::from_be_bytes([size, high, middle, low])
+    }
+}
+
+/// `number` times `factor`, over `divisor`. The multiply is first, so the divide sees all of the
+/// product. The product must fit in 32 bytes.
+fn scaled(mut number: [u8; 32], factor: u32, divisor: u32) -> [u8; 32] {
+    // A byte times a `u32`, plus a carry of at most that `u32`, fits in a `u64`.
+    let mut carry = 0_u64;
+    for byte in number.iter_mut().rev() {
+        let value = u64::from(*byte) * u64::from(factor) + carry;
+        [.., *byte] = value.to_be_bytes();
+        carry = value >> 8;
+    }
+    assert_eq!(carry, 0);
+    // A remainder is below a `u32`, so with one more byte it fits in a `u64`.
+    let divisor = u64::from(divisor);
+    let mut remainder = 0_u64;
+    for byte in &mut number {
+        let value = (remainder << 8) + u64::from(*byte);
+        [.., *byte] = (value / divisor).to_be_bytes();
+        remainder = value % divisor;
+    }
+    number
+}
+
+/// The `bits` of the next period. `bits` give the target to change, and `first_time` and
+/// `last_time` are the times of the first and the last header of the period that ends. The target
+/// changes by the time between them over `PERIOD_TIMESPAN`, by at most a factor of 4 in each
+/// direction, and it stays at most `limit`. A target below 4 can become zero, and that gives
+/// `bits` of zero. Returns nothing if `bits` are no target up to `limit`.
+///
+/// At the largest change, `limit` times the time must fit in 32 bytes. Regtest does not fit.
+#[cfg_attr(
+    not(any(test, fuzzing)),
+    expect(dead_code, reason = "until the exact `bits` check calls it")
+)]
+fn retargeted_bits(bits: u32, first_time: u32, last_time: u32, limit: [u8; 32]) -> Option<u32> {
+    let target = Target::from_bits(bits, limit)?;
+    // A time before `first_time` counts as zero, so it takes the smallest time, as any short time
+    // does.
+    let timespan = last_time
+        .saturating_sub(first_time)
+        .clamp(PERIOD_TIMESPAN / 4, PERIOD_TIMESPAN * 4);
+    Some(to_bits(
+        scaled(target.0, timespan, PERIOD_TIMESPAN).min(limit),
+    ))
+}
+
 /// The hash of `header`, if its `bits` are a target in the range of `network` and the hash is at
 /// most that target.
 #[must_use = "a dropped answer lets each header pass"]
@@ -80,6 +152,31 @@ pub(crate) fn mined_for_regtest(header: crate::block::BlockHeader) -> crate::blo
         panic!("no nonce mines {header:?}");
     };
     mined
+}
+
+#[cfg(fuzzing)]
+// Only cargo-mutants reads this attribute. Its test runs do not build this module.
+#[cfg_attr(false, mutants::skip)]
+pub(crate) mod fuzz {
+    /// A peer picks each field of `header`, so its `bits` and two of its fields go through the
+    /// change of a target, which must return for any value. Signet has the highest limit of a
+    /// network that changes its target, so it is the nearest to an overflow. The answer must be a
+    /// target up to the limit, or zero. This rule reads the answer with `from_bits`, not with the
+    /// code that wrote it.
+    pub(crate) fn retarget_check(header: &crate::block::BlockHeader) {
+        for network in [
+            crate::chainparams::Network::Mainnet,
+            crate::chainparams::Network::Signet,
+        ] {
+            let limit = network.pow_limit();
+            let Some(next) = super::retargeted_bits(header.bits, header.nonce, header.time, limit)
+            else {
+                assert_eq!(super::Target::from_bits(header.bits, limit), None);
+                continue;
+            };
+            assert!(next == 0 || super::Target::from_bits(next, limit).is_some());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -239,6 +336,202 @@ mod tests {
                 "{network:?}"
             );
         }
+    }
+
+    /// 32 bytes from hex.
+    fn number(s: &str) -> [u8; 32] {
+        crate::fixtures::hex(s).try_into().unwrap()
+    }
+
+    #[test]
+    fn to_bits_writes_the_compact_form() {
+        let cases = [
+            (
+                "0000000000000000000000000000000000000000000000000000000000000000",
+                0x0000_0000,
+            ),
+            // One or two bytes: the bytes after the number are zero.
+            (
+                "0000000000000000000000000000000000000000000000000000000000000012",
+                0x0112_0000,
+            ),
+            (
+                "0000000000000000000000000000000000000000000000000000000000001234",
+                0x0212_3400,
+            ),
+            (
+                "0000000000000000000000000000000000000000000000000000000000123456",
+                0x0312_3456,
+            ),
+            // Only the first three bytes stay.
+            (
+                "0000000000000000000000000000000000000000000000000000000012345678",
+                0x0412_3456,
+            ),
+            // A first byte with its top bit set moves one byte down.
+            (
+                "0000000000000000000000000000000000000000000000000000000000000080",
+                0x0200_8000,
+            ),
+            (
+                "0000000000000000000000000000000000000000000000000000000000008012",
+                0x0300_8012,
+            ),
+            (
+                "0000000000000000000000000000000000000000000000000000000092345678",
+                0x0500_9234,
+            ),
+            // The whole width.
+            (
+                "1234560000000000000000000000000000000000000000000000000000000000",
+                0x2012_3456,
+            ),
+            (
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                0x2100_ffff,
+            ),
+        ];
+        for (number, expected) in cases {
+            assert_eq!(super::to_bits(self::number(number)), expected, "{number}");
+        }
+    }
+
+    #[test]
+    fn to_bits_of_each_limit_is_the_bits_of_its_genesis() {
+        for network in [
+            crate::chainparams::Network::Mainnet,
+            crate::chainparams::Network::Testnet4,
+            crate::chainparams::Network::Signet,
+            crate::chainparams::Network::Regtest,
+        ] {
+            assert_eq!(
+                super::to_bits(network.pow_limit()),
+                network.genesis().bits,
+                "{network:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn retargeted_bits_change_with_the_time_of_the_period() {
+        let limit = crate::chainparams::Network::Mainnet.pow_limit();
+        // The first four come from `pow_tests.cpp` of Bitcoin Core: real mainnet retargets, but the
+        // first time of the fourth is not a real block time.
+        let cases = [
+            ("no bound", 0x1d00_ffff, 1261130161, 1262152739, 0x1d00_d86a),
+            (
+                "the limit",
+                0x1d00_ffff,
+                1231006505,
+                1233061996,
+                0x1d00_ffff,
+            ),
+            (
+                "the smallest time",
+                0x1c05_a3f4,
+                1279008237,
+                1279297671,
+                0x1c01_68fd,
+            ),
+            (
+                "the largest time",
+                0x1c38_7f6f,
+                1263163443,
+                1269211443,
+                0x1d00_e1fd,
+            ),
+            // At a bound, a second inside it changes the answer and a second outside it does not.
+            (
+                "below a quarter",
+                0x1c7f_ffff,
+                1_000_000,
+                1_302_399,
+                0x1c1f_ffff,
+            ),
+            ("a quarter", 0x1c7f_ffff, 1_000_000, 1_302_400, 0x1c1f_ffff),
+            (
+                "above a quarter",
+                0x1c7f_ffff,
+                1_000_000,
+                1_302_401,
+                0x1c20_0006,
+            ),
+            (
+                "below four times",
+                0x1b1f_ffff,
+                1_000_000,
+                5_838_399,
+                0x1b7f_fffa,
+            ),
+            ("four times", 0x1b1f_ffff, 1_000_000, 5_838_400, 0x1b7f_fffc),
+            (
+                "above four times",
+                0x1b1f_ffff,
+                1_000_000,
+                5_838_401,
+                0x1b7f_fffc,
+            ),
+            ("the same", 0x1c04_0000, 1_000_000, 2_209_600, 0x1c04_0000),
+            // A time that goes back counts as a short time.
+            ("back", 0x1c7f_ffff, 1_302_401, 1_000_000, 0x1c1f_ffff),
+            // The multiply is first: a divide first gives zero.
+            ("one", 0x0101_0000, 1_000_000, 2_209_600, 0x0101_0000),
+            // The answer can be zero.
+            ("zero", 0x0101_0000, 1_000_000, 1_000_000, 0),
+        ];
+        for (name, bits, first_time, last_time, expected) in cases {
+            assert_eq!(
+                super::retargeted_bits(bits, first_time, last_time, limit),
+                Some(expected),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn retargeted_bits_refuse_what_is_no_target_up_to_the_limit() {
+        let limit = crate::chainparams::Network::Mainnet.pow_limit();
+        for bits in [0, 0x1d01_0000] {
+            assert_eq!(
+                super::retargeted_bits(bits, 1_000_000, 2_209_600, limit),
+                None,
+                "{bits:#010x}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_largest_change_of_each_limit_that_changes_fits() {
+        // These products are from big integers, not from this code.
+        let mainnet = "00000003fffffffffffffffffffffffffffffffffffffffffffffffffffffffc";
+        for (network, expected) in [
+            (crate::chainparams::Network::Mainnet, mainnet),
+            (crate::chainparams::Network::Testnet4, mainnet),
+            (
+                crate::chainparams::Network::Signet,
+                "00000ddeb8000000000000000000000000000000000000000000000000000000",
+            ),
+        ] {
+            assert_eq!(
+                super::scaled(
+                    network.pow_limit(),
+                    super::PERIOD_TIMESPAN * 4,
+                    super::PERIOD_TIMESPAN
+                ),
+                number(expected),
+                "{network:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion")]
+    fn the_largest_change_of_the_regtest_limit_does_not_fit() {
+        super::scaled(
+            crate::chainparams::Network::Regtest.pow_limit(),
+            super::PERIOD_TIMESPAN * 4,
+            super::PERIOD_TIMESPAN,
+        );
     }
 
     #[test]

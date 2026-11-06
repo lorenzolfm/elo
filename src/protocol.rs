@@ -521,6 +521,7 @@ pub(crate) mod fuzz {
         for header in &headers {
             header.encode(&mut encoded);
             crate::serialize::write_compact_size(&mut encoded, 0);
+            crate::pow::fuzz::retarget_check(header);
             let network = crate::chainparams::Network::Regtest;
             if let Some(hash) = crate::pow::proven_hash(header, network) {
                 // The regtest limit starts with 0x7f, so no hash that passes has a higher top byte.
