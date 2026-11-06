@@ -427,9 +427,7 @@ impl Peer {
             return Err(PeerError::UnsolicitedHeaders);
         };
         let full = headers.is_full();
-        self.chain
-            .extend(headers.into_vec())
-            .map_err(PeerError::Extend)?;
+        self.chain.extend(headers).map_err(PeerError::Extend)?;
         if full {
             self.sync = SyncState::Due;
             Ok((self, Received::NoReply))
@@ -1433,7 +1431,7 @@ pub(crate) mod fuzz {
 
 #[cfg(test)]
 mod tests {
-    use crate::serialize::{Decode, Encode};
+    use crate::serialize::Decode;
 
     /// The message in a regtest frame, as the driver reads it.
     fn message(frame: &[u8]) -> crate::transport::Message {
@@ -1495,19 +1493,15 @@ mod tests {
 
     /// A `headers` with `headers`, each with a transaction count of 0.
     fn headers_message(headers: &[crate::block::BlockHeader]) -> crate::transport::Message {
-        let mut payload = Vec::new();
-        crate::serialize::write_compact_size(&mut payload, headers.len());
-        for header in headers {
-            header.encode(&mut payload);
-            payload.push(0);
-        }
-        headers_payload_message(&payload)
+        headers_payload_message(&crate::fixtures::headers_payload_with(headers))
     }
 
     /// The tip of a second regtest chain, after `headers`.
     fn tip_after(headers: &[crate::block::BlockHeader]) -> crate::chain::Tip {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
-        chain.extend(headers.to_vec()).unwrap();
+        chain
+            .extend(crate::fixtures::headers_batch(headers))
+            .unwrap();
         chain.tip()
     }
 

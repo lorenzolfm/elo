@@ -43,13 +43,8 @@ impl Chain {
     /// Puts all of `headers` on the tip, in order, or none of them. An empty batch changes
     /// nothing. The first header that fails gives the error, and the `prev` of a header is checked
     /// before its proof of work.
-    pub(crate) fn extend(
-        &mut self,
-        headers: Vec<crate::block::BlockHeader>,
-    ) -> Result<(), ExtendError> {
-        // `Headers` holds this bound for a batch from a peer, and the loops below take their bound
-        // from it.
-        assert!(headers.len() <= crate::protocol::HEADERS_COUNT_MAX);
+    pub(crate) fn extend(&mut self, headers: crate::protocol::Headers) -> Result<(), ExtendError> {
+        let headers = headers.into_vec();
         let Some(first) = headers.first() else {
             return Ok(());
         };
@@ -126,8 +121,14 @@ mod tests {
         let headers = crate::fixtures::headers_on_genesis(3);
         let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
 
-        assert_eq!(chain.extend(headers[..2].to_vec()), Ok(()));
-        assert_eq!(chain.extend(headers[2..].to_vec()), Ok(()));
+        assert_eq!(
+            chain.extend(crate::fixtures::headers_batch(&headers[..2])),
+            Ok(())
+        );
+        assert_eq!(
+            chain.extend(crate::fixtures::headers_batch(&headers[2..])),
+            Ok(())
+        );
 
         assert_eq!(
             chain.tip(),
@@ -146,7 +147,7 @@ mod tests {
 
         // The first header is on block 1, which the chain does not have.
         assert_eq!(
-            chain.extend(headers[1..].to_vec()),
+            chain.extend(crate::fixtures::headers_batch(&headers[1..])),
             Err(super::ExtendError::NotOnTip)
         );
         assert_eq!(chain.tip(), before);
@@ -161,7 +162,7 @@ mod tests {
 
         // Blocks 1 and 2 connect, but block 4 is not on block 2, so the chain takes none.
         assert_eq!(
-            chain.extend(headers),
+            chain.extend(crate::fixtures::headers_batch(&headers)),
             Err(super::ExtendError::NotContinuous)
         );
         assert_eq!(chain.tip(), before);
@@ -185,7 +186,10 @@ mod tests {
         let before = chain.tip();
 
         // The bad header is the last, and block 1 is good, so the chain takes none.
-        assert_eq!(chain.extend(headers), Err(super::ExtendError::ProofOfWork));
+        assert_eq!(
+            chain.extend(crate::fixtures::headers_batch(&headers)),
+            Err(super::ExtendError::ProofOfWork)
+        );
         assert_eq!(chain.tip(), before);
     }
 
@@ -201,7 +205,7 @@ mod tests {
         let mut chain = super::Chain::new(network);
 
         assert_eq!(
-            chain.extend(vec![header]),
+            chain.extend(crate::fixtures::headers_batch(&[header])),
             Err(super::ExtendError::ProofOfWork)
         );
     }
@@ -220,7 +224,10 @@ mod tests {
             (vec![good, bad], super::ExtendError::NotContinuous),
         ] {
             let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
-            assert_eq!(chain.extend(headers), Err(expected));
+            assert_eq!(
+                chain.extend(crate::fixtures::headers_batch(&headers)),
+                Err(expected)
+            );
         }
     }
 
@@ -229,7 +236,7 @@ mod tests {
         let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
         let before = chain.tip();
 
-        assert_eq!(chain.extend(Vec::new()), Ok(()));
+        assert_eq!(chain.extend(crate::fixtures::headers_batch(&[])), Ok(()));
         assert_eq!(chain.tip(), before);
     }
 
