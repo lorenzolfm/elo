@@ -512,7 +512,8 @@ pub(crate) mod fuzz {
     /// Checks that `taken`, the bytes that a decode took, are what the headers encode to, each
     /// with a transaction count of 0. A peer picks each `bits`, so each one also goes through the
     /// proof-of-work check, which must return for any value. Regtest has the highest limit, so the
-    /// most values reach the compare with the hash.
+    /// most values reach the compare with the hash. The `machines` script mines each header, so
+    /// only this fuzz target reaches a hash above its proof-of-work target.
     fn headers_check(headers: super::Headers, taken: &[u8]) {
         let headers = headers.into_vec();
         let mut encoded = Vec::new();
@@ -520,11 +521,14 @@ pub(crate) mod fuzz {
         for header in &headers {
             header.encode(&mut encoded);
             crate::serialize::write_compact_size(&mut encoded, 0);
-            crate::pow::has_proof_of_work(
-                header.hash(),
-                header.bits,
-                crate::chainparams::Network::Regtest,
-            );
+            let hash = header.hash();
+            let network = crate::chainparams::Network::Regtest;
+            if crate::pow::has_proof_of_work(hash, header.bits, network) {
+                // The regtest limit starts with 0x7f, so no hash that passes has a higher top byte.
+                // The top byte of a hash is its last byte in wire order. This rule does not call
+                // the check, so a check that takes too many hashes fails here.
+                assert!(hash.as_byte_array()[31] <= 0x7f);
+            }
         }
         assert_eq!(encoded, taken);
     }

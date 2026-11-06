@@ -35,6 +35,9 @@ impl Target {
         if target == [0; 32] {
             return None;
         }
+        // A size of 0 or above 34 keeps no byte of the word, so it gives a target of zero.
+        assert!(size >= 1);
+        assert!(usize::from(size) <= target.len() + 2);
         if target > limit {
             return None;
         }
@@ -51,6 +54,7 @@ impl Target {
 }
 
 /// The target in `bits` is in the range of `network`, and `hash` is at most that target.
+#[must_use = "a dropped answer lets each header pass"]
 pub(crate) fn has_proof_of_work(
     hash: bitcoin_hashes::sha256d::Hash,
     bits: u32,
