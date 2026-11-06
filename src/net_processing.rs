@@ -1357,8 +1357,11 @@ pub(crate) mod fuzz {
             let mut tip = self.tip;
             for (index, header) in headers.iter().enumerate() {
                 if header.prev == tip {
-                    // This holds only for what a script writes: each header is mined for regtest,
-                    // and `SCRIPT_HEADER_BITS` are above each other limit.
+                    // A script mines each header for regtest, and `SCRIPT_HEADER_BITS` are above
+                    // each other limit. So only regtest takes what a script writes. A new script
+                    // byte that writes other headers fails here, and must change this model.
+                    assert_eq!(header.bits, SCRIPT_HEADER_BITS);
+                    assert!(header.hash().as_byte_array()[31] < 0x7f);
                     if self.network != crate::chainparams::Network::Regtest {
                         return Err(super::PeerError::Extend(
                             crate::chain::ExtendError::ProofOfWork,
