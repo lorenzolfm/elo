@@ -92,73 +92,86 @@ mod tests {
         // The limit is above each target, so only the compact form can refuse.
         let limit = [0xff; 32];
         let cases = [
-            // Zero: the word is zero, or it has no byte that the size keeps.
-            (0x0000_0000, None),
-            (0x0012_3456, None),
-            (0x0100_3456, None),
-            (0x0200_0056, None),
-            (0x0300_0000, None),
-            (0x0400_0000, None),
-            // Zero with the sign bit.
-            (0x0092_3456, None),
-            (0x0180_3456, None),
-            (0x0280_0056, None),
-            (0x0380_0000, None),
-            (0x0480_0000, None),
             // A size of three bytes or fewer. The sign bit is not a bit of the number.
             (
                 0x0112_3456,
-                Some("0000000000000000000000000000000000000000000000000000000000000012"),
+                "0000000000000000000000000000000000000000000000000000000000000012",
             ),
-            (0x01fe_dcba, None),
             (
                 0x0200_8000,
-                Some("0000000000000000000000000000000000000000000000000000000000000080"),
+                "0000000000000000000000000000000000000000000000000000000000000080",
             ),
             (
                 0x0212_3456,
-                Some("0000000000000000000000000000000000000000000000000000000000001234"),
+                "0000000000000000000000000000000000000000000000000000000000001234",
             ),
             (
                 0x0312_3456,
-                Some("0000000000000000000000000000000000000000000000000000000000123456"),
+                "0000000000000000000000000000000000000000000000000000000000123456",
             ),
             // A size above three bytes.
             (
                 0x0412_3456,
-                Some("0000000000000000000000000000000000000000000000000000000012345600"),
+                "0000000000000000000000000000000000000000000000000000000012345600",
             ),
-            (0x0492_3456, None),
             (
                 0x0500_9234,
-                Some("0000000000000000000000000000000000000000000000000000000092340000"),
+                "0000000000000000000000000000000000000000000000000000000092340000",
             ),
             (
                 0x2012_3456,
-                Some("1234560000000000000000000000000000000000000000000000000000000000"),
+                "1234560000000000000000000000000000000000000000000000000000000000",
             ),
             // At the top of the target: the size may pass 32 only by the zeros at the word's start.
-            // In each `None`, another byte of the word is not zero, so only the fit refuses it.
             (
                 0x2100_ffff,
-                Some("ffff000000000000000000000000000000000000000000000000000000000000"),
+                "ffff000000000000000000000000000000000000000000000000000000000000",
             ),
-            (0x2101_0001, None),
             (
                 0x2200_00ff,
-                Some("ff00000000000000000000000000000000000000000000000000000000000000"),
+                "ff00000000000000000000000000000000000000000000000000000000000000",
             ),
-            (0x2200_0101, None),
-            // No byte of the word fits.
-            (0x2300_0001, None),
-            (0xff12_3456, None),
         ];
         for (bits, expected) in cases {
             assert_eq!(
                 super::Target::from_bits(bits, limit),
-                expected.map(target),
+                Some(target(expected)),
                 "{bits:#010x}"
             );
+        }
+    }
+
+    #[test]
+    fn from_bits_refuses_zero_and_negative_and_what_does_not_fit() {
+        // The limit is above each target, so only the compact form can refuse.
+        let limit = [0xff; 32];
+        let cases = [
+            // Zero: the word is zero, or it has no byte that the size keeps.
+            0x0000_0000,
+            0x0012_3456,
+            0x0100_3456,
+            0x0200_0056,
+            0x0300_0000,
+            0x0400_0000,
+            // Zero with the sign bit.
+            0x0092_3456,
+            0x0180_3456,
+            0x0280_0056,
+            0x0380_0000,
+            0x0480_0000,
+            // Negative, with a number that is not zero.
+            0x01fe_dcba,
+            0x0492_3456,
+            // At the top of the target: another byte of the word is not zero, so only the fit
+            // refuses it.
+            0x2101_0001,
+            0x2200_0101,
+            // No byte of the word fits.
+            0x2300_0001,
+            0xff12_3456,
+        ];
+        for bits in cases {
+            assert_eq!(super::Target::from_bits(bits, limit), None, "{bits:#010x}");
         }
     }
 
