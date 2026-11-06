@@ -12,4 +12,6 @@ gitignore = true
 
 # The text of an error is for a person. A test of that text only repeats the literal, so this class
 # needs no test. L3 reads the text of `RunError`. That test still runs, but this mutant does not.
+#
+# cargo-mutants does not apply this list to a `delete field` mutant, so that mutant needs a test.
 exclude_re = ['<impl std::fmt::Display for \w*Error>::fmt']
