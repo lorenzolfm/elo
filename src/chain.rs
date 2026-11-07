@@ -686,8 +686,9 @@ mod tests {
         }
     }
 
-    /// The header at height 0 of the chains of the timewarp tests. It is two weeks below `last`, so
-    /// a change of the target keeps the `bits`, on each network that changes them.
+    /// The first header of the period of `last`, in the chains of the timewarp tests. It is two
+    /// weeks below `last`, so a change of the target keeps the `bits`, on each network that changes
+    /// them.
     fn timewarp_first(last: crate::block::BlockHeader) -> crate::block::BlockHeader {
         crate::block::BlockHeader {
             time: last.time - 14 * 24 * 60 * 60,
