@@ -189,7 +189,7 @@ pub(crate) fn required_bits(
 ) -> Option<u32> {
     let limit = network.pow_limit();
     let height_above = ancestors.height_above();
-    let last = ancestors.at(height_above - 1);
+    let last = ancestors.last();
     let period_ends = height_above.is_multiple_of(PERIOD_HEADERS_COUNT);
     match network {
         // `extend` checks the `bits` of a header before the rule reads that header, so peer bytes
@@ -242,11 +242,11 @@ pub(crate) fn timewarp_time_min(
         | crate::chainparams::Network::Signet
         | crate::chainparams::Network::Regtest => 0,
         crate::chainparams::Network::Testnet4 => {
-            let height_above = ancestors.height_above();
-            if height_above.is_multiple_of(PERIOD_HEADERS_COUNT) {
-                // Height 0 is a multiple too, and genesis has no header below it.
-                assert!(height_above >= PERIOD_HEADERS_COUNT);
-                let last_time = ancestors.at(height_above - 1).time;
+            if ancestors
+                .height_above()
+                .is_multiple_of(PERIOD_HEADERS_COUNT)
+            {
+                let last_time = ancestors.last().time;
                 let time_min = last_time.saturating_sub(TIMEWARP_SECONDS_MAX);
                 // A bound above the last time refuses a header that is not back at all.
                 assert!(time_min <= last_time);

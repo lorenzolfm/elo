@@ -174,6 +174,14 @@ impl<'a> Ancestors<'a> {
         self.below_tip.len() + 1 + self.batch.len()
     }
 
+    /// The highest of these headers. There is always one, because `tip` is a header.
+    pub(crate) fn last(self) -> &'a crate::block::BlockHeader {
+        match self.batch {
+            [.., last] => last,
+            [] => self.tip,
+        }
+    }
+
     /// The header at `height`, which must be below `height_above`.
     pub(crate) fn at(self, height: usize) -> &'a crate::block::BlockHeader {
         match height.checked_sub(self.below_tip.len()) {
