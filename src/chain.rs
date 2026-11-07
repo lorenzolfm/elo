@@ -382,21 +382,23 @@ mod tests {
 
     /// A regtest header for each of `times`, each on the header before it, the first on `below`.
     fn mined_on(below: crate::block::BlockHeader, times: &[u32]) -> Vec<crate::block::BlockHeader> {
+        let mut headers = Vec::with_capacity(times.len());
         let mut prev = below.hash();
-        times
-            .iter()
-            .map(|time| {
-                let header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
-                    prev,
-                    time: *time,
-                    ..below
-                });
-                prev = header.hash();
-                header
-            })
-            .collect()
+        for time in times {
+            let header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
+                prev,
+                time: *time,
+                ..below
+            });
+            prev = header.hash();
+            headers.push(header);
+        }
+        headers
     }
 
+    /// Each row mines the headers below, and splits them between the chain and the batch. On each
+    /// split, a batch with a time at the median must leave the chain as it was, and a batch with a
+    /// time one second above the median must pass.
     #[test]
     fn extend_takes_a_time_only_above_the_median_time_of_the_headers_below() {
         let genesis = crate::chainparams::Network::Regtest.genesis();
