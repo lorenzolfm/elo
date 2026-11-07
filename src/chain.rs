@@ -28,7 +28,8 @@ pub enum ExtendError {
     /// The `bits` of a header are not a target in the range of the network, or the hash of the
     /// header is above that target.
     ProofOfWork,
-    /// The `bits` of a header are not the `bits` that the headers below it require.
+    /// The `bits` of a header are not the `bits` that the headers below it require. On testnet4 the
+    /// answer also reads the time of the header.
     WrongBits,
 }
 
