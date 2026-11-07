@@ -12,7 +12,8 @@ const _: () = assert!(!MEDIAN_TIME_HEADERS_COUNT_MAX.is_multiple_of(2));
 /// a time at most 10 minutes below the header below it.
 #[derive(Debug)]
 pub(crate) struct Chain {
-    /// The network of the chain. Its rules bound the target of each header.
+    /// The network of the chain. Its rules bound the target of each header and, on testnet4, the
+    /// time of each first header of a period.
     network: crate::chainparams::Network,
     /// The headers below the tip, from genesis. The index of a header is its height.
     below_tip: Vec<crate::block::BlockHeader>,
