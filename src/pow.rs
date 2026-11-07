@@ -429,12 +429,24 @@ mod tests {
         }
     }
 
-    #[test]
-    fn retargeted_bits_change_with_the_time_of_the_period() {
+    /// Each row has a name, `bits`, the first time, the last time and the answer on the mainnet
+    /// limit.
+    fn assert_retargets(cases: &[(&str, u32, u32, u32, u32)]) {
         let limit = crate::chainparams::Network::Mainnet.pow_limit();
-        // The first four come from `pow_tests.cpp` of Bitcoin Core: real mainnet retargets, but the
-        // first time of the fourth is not a real block time.
-        let cases = [
+        for &(name, bits, first_time, last_time, expected) in cases {
+            assert_eq!(
+                super::retargeted_bits(bits, first_time, last_time, limit),
+                Some(expected),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn retargeted_bits_match_real_retargets() {
+        // These come from `pow_tests.cpp` of Bitcoin Core: real mainnet retargets, but the first
+        // time of the last row is not a real block time.
+        assert_retargets(&[
             ("no bound", 0x1d00_ffff, 1261130161, 1262152739, 0x1d00_d86a),
             (
                 "the limit",
@@ -457,6 +469,12 @@ mod tests {
                 1269211443,
                 0x1d00_e1fd,
             ),
+        ]);
+    }
+
+    #[test]
+    fn retargeted_bits_change_with_the_time_of_the_period() {
+        assert_retargets(&[
             // At a bound, a second inside it changes the answer and a second outside it does not.
             (
                 "below a quarter",
@@ -495,14 +513,7 @@ mod tests {
             ("one", 0x0101_0000, 1_000_000, 2_209_600, 0x0101_0000),
             // The answer can be zero.
             ("zero", 0x0101_0000, 1_000_000, 1_000_000, 0),
-        ];
-        for (name, bits, first_time, last_time, expected) in cases {
-            assert_eq!(
-                super::retargeted_bits(bits, first_time, last_time, limit),
-                Some(expected),
-                "{name}"
-            );
-        }
+        ]);
     }
 
     #[test]
