@@ -240,10 +240,13 @@ pub(crate) fn timewarp_time_min(
         crate::chainparams::Network::Testnet4 => {
             let height_above = ancestors.height_above();
             if height_above.is_multiple_of(PERIOD_HEADERS_COUNT) {
-                ancestors
-                    .at(height_above - 1)
-                    .time
-                    .saturating_sub(TIMEWARP_SECONDS_MAX)
+                // Height 0 is a multiple too, and genesis has no header below it.
+                assert!(height_above >= PERIOD_HEADERS_COUNT);
+                let last_time = ancestors.at(height_above - 1).time;
+                let time_min = last_time.saturating_sub(TIMEWARP_SECONDS_MAX);
+                // A bound above the last time refuses a header that is not back at all.
+                assert!(time_min <= last_time);
+                time_min
             } else {
                 0
             }
