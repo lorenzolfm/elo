@@ -129,6 +129,8 @@ impl Chain {
         }
 
         self.extend_store(headers, time_max);
+        // The loop proved the last header of the batch, so this holds that the store took each one.
+        assert_eq!(self.tip.hash(), prev);
         Ok(())
     }
 
