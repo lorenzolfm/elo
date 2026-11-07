@@ -102,10 +102,12 @@ fn scaled_up_to(mut number: [u8; 32], timespan_seconds: u32, limit: [u8; 32]) ->
         high = value >> 8;
     }
     let divisor = u64::from(PERIOD_TIMESPAN_SECONDS);
-    // The part of the answer above the 32 bytes. If it is not zero, the answer is above each limit.
-    let above = high / divisor;
+    // The answer passes 32 bytes, so it is above each limit.
+    if high >= divisor {
+        return limit;
+    }
     // A remainder is below a `u32`, so with one more byte it fits in a `u64`.
-    let mut remainder = high % divisor;
+    let mut remainder = high;
     for byte in &mut number {
         let value = (remainder << 8) + u64::from(*byte);
         let quotient = value / divisor;
@@ -114,7 +116,7 @@ fn scaled_up_to(mut number: [u8; 32], timespan_seconds: u32, limit: [u8; 32]) ->
         [.., *byte] = quotient.to_be_bytes();
         remainder = value % divisor;
     }
-    if above == 0 { number.min(limit) } else { limit }
+    number.min(limit)
 }
 
 /// The `bits` of the next period. `bits` give the target to change, and `first_time` and
@@ -570,16 +572,18 @@ mod tests {
     fn retargeted_bits_keep_a_product_above_32_bytes() {
         // These answers are from big integers, not from this code.
         let limit = crate::chainparams::Network::Regtest.pow_limit();
-        for (last_time, expected) in [
+        for (bits, last_time, expected) in [
             // The product passes 32 bytes, but the answer does not.
-            (1_302_400, 0x201f_ffff),
+            (0x207f_ffff, 1_302_400, 0x201f_ffff),
             // The answer also passes 32 bytes, so it takes the limit.
-            (5_838_400, 0x207f_ffff),
+            (0x207f_ffff, 5_838_400, 0x207f_ffff),
+            // The answer is exactly 2^256: the smallest number above 32 bytes.
+            (0x2040_0000, 5_838_400, 0x207f_ffff),
         ] {
             assert_eq!(
-                super::retargeted_bits(0x207f_ffff, 1_000_000, last_time, limit),
+                super::retargeted_bits(bits, 1_000_000, last_time, limit),
                 Some(expected),
-                "{last_time}"
+                "{bits:#010x} {last_time}"
             );
         }
     }
