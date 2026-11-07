@@ -47,9 +47,9 @@ pub enum ExtendError {
 /// rules read it through this.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Ancestors<'a> {
-    pub(crate) below_tip: &'a [crate::block::BlockHeader],
-    pub(crate) tip: &'a crate::block::BlockHeader,
-    pub(crate) batch: &'a [crate::block::BlockHeader],
+    below_tip: &'a [crate::block::BlockHeader],
+    tip: &'a crate::block::BlockHeader,
+    batch: &'a [crate::block::BlockHeader],
 }
 
 impl Chain {
@@ -130,6 +130,22 @@ impl Chain {
 }
 
 impl<'a> Ancestors<'a> {
+    /// `tip` as the only header of a chain, and `batch` above it. Only the tests and the fuzz
+    /// script call this, so the rules of another module read these headers and cannot write them.
+    #[cfg(any(test, fuzzing))]
+    // Only cargo-mutants reads this attribute.
+    #[cfg_attr(false, mutants::skip)]
+    pub(crate) fn on_tip(
+        tip: &'a crate::block::BlockHeader,
+        batch: &'a [crate::block::BlockHeader],
+    ) -> Ancestors<'a> {
+        Ancestors {
+            below_tip: &[],
+            tip,
+            batch,
+        }
+    }
+
     /// The height of the header above these headers. It is at least 1, because a chain has genesis.
     pub(crate) fn height_above(self) -> usize {
         self.below_tip.len() + 1 + self.batch.len()
@@ -222,12 +238,7 @@ pub(crate) mod fuzz {
         let genesis = crate::chainparams::Network::Regtest.genesis();
         for index in 0..headers.len().min(MEDIAN_CHECK_HEADERS_COUNT_MAX) {
             let batch = &headers[..index];
-            let ancestors = super::Ancestors {
-                below_tip: &[],
-                tip: &genesis,
-                batch,
-            };
-            let median = ancestors.median_time_past();
+            let median = super::Ancestors::on_tip(&genesis, batch).median_time_past();
             let times = || {
                 std::iter::once(&genesis)
                     .chain(batch)

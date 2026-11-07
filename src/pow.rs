@@ -285,11 +285,7 @@ pub(crate) mod fuzz {
             let genesis = network.genesis();
             for (index, header) in headers.iter().enumerate() {
                 let batch = &headers[..index];
-                let ancestors = crate::chain::Ancestors {
-                    below_tip: &[],
-                    tip: &genesis,
-                    batch,
-                };
+                let ancestors = crate::chain::Ancestors::on_tip(&genesis, batch);
                 let required = super::required_bits(network, ancestors, header.time);
                 let last_bits = batch.last().unwrap_or(&genesis).bits;
                 match network {
@@ -712,11 +708,7 @@ mod tests {
     /// `chain` as the headers below one header. The rule reads each part the same way.
     fn ancestors(chain: &[crate::block::BlockHeader]) -> crate::chain::Ancestors<'_> {
         let (tip, batch) = chain.split_first().unwrap();
-        crate::chain::Ancestors {
-            below_tip: &[],
-            tip,
-            batch,
-        }
+        crate::chain::Ancestors::on_tip(tip, batch)
     }
 
     const REAL_BITS: u32 = 0x1c7f_ffff;
