@@ -114,6 +114,12 @@ fn scaled(mut number: [u8; 32], factor: u32, divisor: u32) -> [u8; 32] {
     expect(dead_code, reason = "until the exact `bits` check calls it")
 )]
 fn retargeted_bits(bits: u32, first_time: u32, last_time: u32, limit: [u8; 32]) -> Option<u32> {
+    // A test holds that the largest change of the signet limit fits, and a lower limit has a lower
+    // product. Without this, a limit that does not fit passes until a peer picks a high target.
+    assert!(
+        limit <= crate::chainparams::Network::Signet.pow_limit(),
+        "the limit is above the highest limit that fits"
+    );
     let target = Target::from_bits(bits, limit)?;
     // A time before `first_time` counts as zero, so it takes the smallest time, as any short time
     // does.
@@ -530,6 +536,18 @@ mod tests {
             crate::chainparams::Network::Regtest.pow_limit(),
             super::PERIOD_TIMESPAN * 4,
             super::PERIOD_TIMESPAN,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "the limit is above the highest limit that fits")]
+    fn a_limit_that_does_not_fit_panics_with_a_low_target() {
+        // The product of this target fits, so only the check of the limit can panic.
+        super::retargeted_bits(
+            0x1d00_ffff,
+            1_000_000,
+            2_209_600,
+            crate::chainparams::Network::Regtest.pow_limit(),
         );
     }
 
