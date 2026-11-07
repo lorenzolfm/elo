@@ -942,9 +942,10 @@ mod tests {
             genesis,
             &[genesis.time + 1, genesis.time + 2, genesis.time + 3],
         );
+        let clock_after_genesis = 100;
+        let clock = i64::from(genesis.time + clock_after_genesis);
         // A person wrote the two hours.
-        let clock = i64::from(genesis.time) + 100;
-        let at_bound = genesis.time + 100 + 2 * 60 * 60;
+        let at_bound = genesis.time + clock_after_genesis + 2 * 60 * 60;
         let cases: [(&str, i64, u32, Result<(), super::ExtendError>); 4] = [
             ("at the bound", clock, at_bound, Ok(())),
             (
