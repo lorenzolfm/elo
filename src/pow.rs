@@ -1,7 +1,7 @@
 //! Proof of work.
 
 /// The headers of one period. The first header of a period has a height that is a multiple of this.
-const PERIOD_HEADERS: usize = 2016;
+const PERIOD_HEADERS_COUNT: usize = 2016;
 
 /// The seconds that a period of headers should take: two weeks.
 const PERIOD_TIMESPAN_SECONDS: u32 = 14 * 24 * 60 * 60;
@@ -16,7 +16,7 @@ const TIMESPAN_SECONDS_MAX: u32 = PERIOD_TIMESPAN_SECONDS * 4;
 const _: () = assert!(PERIOD_TIMESPAN_SECONDS.is_multiple_of(4));
 
 /// On testnet4, a header more than this many seconds after the header below it has the limit.
-const MIN_DIFFICULTY_GAP: u32 = 20 * 60;
+const MIN_DIFFICULTY_GAP_SECONDS: u32 = 20 * 60;
 
 /// The headers below one header of a batch, by height: the chain, then the part of the batch that
 /// comes before that header. A batch is not on the chain until each of its headers passes, so the
@@ -179,11 +179,11 @@ fn retargeted_bits(bits: u32, first_time: u32, last_time: u32, limit: [u8; 32]) 
 /// The `bits` of the last header of this period that does not have the limit. If each one has the
 /// limit, these are the limit. The header above `ancestors` must not start a period. The first
 /// header of a period comes from the change of the target, so this does not read below it. So this
-/// reads fewer than `PERIOD_HEADERS` headers.
+/// reads fewer than `PERIOD_HEADERS_COUNT` headers.
 fn last_real_bits(ancestors: Ancestors<'_>, limit_bits: u32) -> u32 {
     let height_above = ancestors.height_above();
-    assert!(!height_above.is_multiple_of(PERIOD_HEADERS));
-    let period_first = height_above - height_above % PERIOD_HEADERS;
+    assert!(!height_above.is_multiple_of(PERIOD_HEADERS_COUNT));
+    let period_first = height_above - height_above % PERIOD_HEADERS_COUNT;
     (period_first..height_above)
         .rev()
         .map(|height| ancestors.at(height).bits)
@@ -206,9 +206,9 @@ pub(crate) fn required_bits(
     time: u32,
 ) -> Option<u32> {
     let limit = network.pow_limit();
-    let height = ancestors.height_above();
-    let last = ancestors.at(height - 1);
-    let period_ends = height.is_multiple_of(PERIOD_HEADERS);
+    let height_above = ancestors.height_above();
+    let last = ancestors.at(height_above - 1);
+    let period_ends = height_above.is_multiple_of(PERIOD_HEADERS_COUNT);
     match network {
         // `extend` checks the `bits` of a header before the rule reads that header, so peer bytes
         // cannot reach this assert.
@@ -218,7 +218,7 @@ pub(crate) fn required_bits(
         }
         crate::chainparams::Network::Mainnet | crate::chainparams::Network::Signet => {
             if period_ends {
-                let first = ancestors.at(height - PERIOD_HEADERS);
+                let first = ancestors.at(height_above - PERIOD_HEADERS_COUNT);
                 retargeted_bits(last.bits, first.time, last.time, limit)
             } else {
                 Some(last.bits)
@@ -228,9 +228,9 @@ pub(crate) fn required_bits(
         // real ones. The last header of a period can.
         crate::chainparams::Network::Testnet4 => {
             if period_ends {
-                let first = ancestors.at(height - PERIOD_HEADERS);
+                let first = ancestors.at(height_above - PERIOD_HEADERS_COUNT);
                 retargeted_bits(first.bits, first.time, last.time, limit)
-            } else if time.saturating_sub(last.time) > MIN_DIFFICULTY_GAP {
+            } else if time.saturating_sub(last.time) > MIN_DIFFICULTY_GAP_SECONDS {
                 Some(to_bits(limit))
             } else {
                 Some(last_real_bits(ancestors, to_bits(limit)))
@@ -735,9 +735,9 @@ mod tests {
             .collect()
     }
 
-    /// `headers` as the headers below one header. The rule reads each part the same way.
-    fn ancestors(headers: &[crate::block::BlockHeader]) -> super::Ancestors<'_> {
-        let (tip, batch) = headers.split_first().unwrap();
+    /// `chain` as the headers below one header. The rule reads each part the same way.
+    fn ancestors(chain: &[crate::block::BlockHeader]) -> super::Ancestors<'_> {
+        let (tip, batch) = chain.split_first().unwrap();
         super::Ancestors {
             below_tip: &[],
             tip,
