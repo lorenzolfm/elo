@@ -84,8 +84,7 @@ pub enum PeerError {
     PingTimeout,
     /// Their `headers` payload did not decode, or it has too many headers or a transaction.
     Headers(crate::protocol::HeadersError),
-    /// Our chain refused their batch: it is not on our tip, it is not a chain, or a header fails
-    /// proof of work, has the wrong `bits` or has a time at or below the median time below it.
+    /// Our chain refused their batch. The error says why.
     Extend(crate::chain::ExtendError),
     /// Their `headers` came when no `getheaders` of ours was outstanding.
     UnsolicitedHeaders,
