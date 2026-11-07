@@ -126,6 +126,52 @@ pub(crate) const TESTNET4_RUN: [&str; 5] = [
     ),
 ];
 
+/// Made-up headers of testnet4 at the end of a period, which no real chain has. A real chain cannot
+/// hold a first header that the rule on its time refuses, and a test cannot mine at this limit. So
+/// a script mined these once, on 2026-11-07, in about 60 s on 32 threads. Each has the `bits` of
+/// the limit, a merkle root that is made up, and a version and a time that are legal on a real
+/// chain.
+pub(crate) const TESTNET4_TIMEWARP: [&str; 6] = [
+    // The header below the last header of the period. It has no proof of work, and its time is one
+    // second above the genesis time.
+    concat!(
+        "000000200000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "056f3566ffff001d00000000",
+    ),
+    // The last header of the period, on the header above. Its time is two weeks above the genesis
+    // time.
+    concat!(
+        "00000020d63865c0c977eb51da864c86dd3ddf2b907a23e55cc8fd6246d1e118a0603a7b",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "04e44766ffff001d59bec392",
+    ),
+    // A first header of the next period, 600 seconds below the last header.
+    concat!(
+        "0000002002ef6c700351a00f5afa2a1cf4c333bed29d117217d764cbb5b13bc700000000",
+        "0200000000000000000000000000000000000000000000000000000000000000",
+        "ace14766ffff001d540ba5d9",
+    ),
+    // A first header of the next period, 601 seconds below the last header.
+    concat!(
+        "0000002002ef6c700351a00f5afa2a1cf4c333bed29d117217d764cbb5b13bc700000000",
+        "0100000000000000000000000000000000000000000000000000000000000000",
+        "abe14766ffff001d7ccbb794",
+    ),
+    // A first header of the next period, one second above the genesis time.
+    concat!(
+        "0000002002ef6c700351a00f5afa2a1cf4c333bed29d117217d764cbb5b13bc700000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "056f3566ffff001dd9769580",
+    ),
+    // A header on the 601 seconds one, with the time of the last header.
+    concat!(
+        "00000020efab162c3e3a395a6dd031370d87d1b31ba9120c8d99bc5078d5d87500000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "04e44766ffff001d0af8cc47",
+    ),
+];
+
 /// The `version`. On loopback, the IPs and ports of both addresses are zero.
 pub(crate) const VERSION_FRAME: &str = concat!(
     "fabfb5da76657273696f6e000000000066000000b34372e3",

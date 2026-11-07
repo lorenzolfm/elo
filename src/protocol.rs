@@ -514,8 +514,8 @@ pub(crate) mod fuzz {
     /// proof-of-work check, which must return for any value. Regtest has the highest limit, so the
     /// most values reach the compare with the hash. The `machines` script mines each header, so
     /// only this fuzz target reaches a hash above its proof-of-work target. A peer picks each
-    /// `time`, so each one also goes through the rule of `bits`, and the first ones go through the
-    /// median time.
+    /// `time`, so each one also goes through the rule of `bits` and the bound of the timewarp rule,
+    /// and the first ones go through the median time.
     fn headers_check(headers: super::Headers, taken: &[u8]) {
         let headers = headers.into_vec();
         let mut encoded = Vec::new();
@@ -524,6 +524,7 @@ pub(crate) mod fuzz {
             header.encode(&mut encoded);
             crate::serialize::write_compact_size(&mut encoded, 0);
             crate::pow::fuzz::retarget_check(header);
+            crate::pow::fuzz::timewarp_check(header);
             let network = crate::chainparams::Network::Regtest;
             if let Some(hash) = crate::pow::proven_hash(header, network) {
                 // The regtest limit starts with 0x7f, so no hash that passes has a higher top byte.
