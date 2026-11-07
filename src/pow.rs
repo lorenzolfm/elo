@@ -89,21 +89,23 @@ fn to_bits(number: [u8; 32]) -> u32 {
     }
 }
 
-/// `number` times `factor`, over `divisor`, rounded down. The multiply is first, so the divide sees
-/// all of the product. The product must fit in 32 bytes. The answer can be zero or above a limit,
-/// so it is no `Target`.
-fn scaled(mut number: [u8; 32], factor: u32, divisor: u32) -> [u8; 32] {
-    // A byte times a `u32`, plus a carry of at most that `u32`, fits in a `u64`.
-    let mut carry = 0_u64;
+/// `number` times `timespan_seconds`, over `PERIOD_TIMESPAN_SECONDS`, rounded down, and at most
+/// `limit`. The multiply is first, so the divide sees all of the product. The answer can be zero, so
+/// it is no `Target`.
+fn scaled_up_to(mut number: [u8; 32], timespan_seconds: u32, limit: [u8; 32]) -> [u8; 32] {
+    // `high` holds the bytes of the product above the 32. A byte times a `u32`, plus a `high` of at
+    // most that `u32`, fits in a `u64`. So no number and no time can overflow.
+    let mut high = 0_u64;
     for byte in number.iter_mut().rev() {
-        let value = u64::from(*byte) * u64::from(factor) + carry;
+        let value = u64::from(*byte) * u64::from(timespan_seconds) + high;
         [.., *byte] = value.to_be_bytes();
-        carry = value >> 8;
+        high = value >> 8;
     }
-    assert_eq!(carry, 0, "the product must fit in 32 bytes");
+    let divisor = u64::from(PERIOD_TIMESPAN_SECONDS);
+    // The part of the answer above the 32 bytes. If it is not zero, the answer is above each limit.
+    let above = high / divisor;
     // A remainder is below a `u32`, so with one more byte it fits in a `u64`.
-    let divisor = u64::from(divisor);
-    let mut remainder = 0_u64;
+    let mut remainder = high % divisor;
     for byte in &mut number {
         let value = (remainder << 8) + u64::from(*byte);
         let quotient = value / divisor;
@@ -112,7 +114,7 @@ fn scaled(mut number: [u8; 32], factor: u32, divisor: u32) -> [u8; 32] {
         [.., *byte] = quotient.to_be_bytes();
         remainder = value % divisor;
     }
-    number
+    if above == 0 { number.min(limit) } else { limit }
 }
 
 /// The `bits` of the next period. `bits` give the target to change, and `first_time` and
@@ -121,8 +123,6 @@ fn scaled(mut number: [u8; 32], factor: u32, divisor: u32) -> [u8; 32] {
 /// each direction, and it stays at most `limit`. A target below 4 can become zero, and that gives
 /// `bits` of zero. Returns nothing if `bits` are no target up to `limit`.
 ///
-/// At the largest change, `limit` times the time must fit in 32 bytes. Regtest does not fit.
-///
 /// This takes `bits`, not a `Target`, and reads them with `limit`. So the limit that bounds the
 /// target and the limit that caps the answer cannot differ.
 #[cfg_attr(
@@ -130,19 +130,13 @@ fn scaled(mut number: [u8; 32], factor: u32, divisor: u32) -> [u8; 32] {
     expect(dead_code, reason = "until the exact `bits` check calls it")
 )]
 fn retargeted_bits(bits: u32, first_time: u32, last_time: u32, limit: [u8; 32]) -> Option<u32> {
-    // A test holds that the largest change of the signet limit fits, and a lower limit has a lower
-    // product. Without this, a limit that does not fit passes until a peer picks a high target.
-    assert!(
-        limit <= crate::chainparams::Network::Signet.pow_limit(),
-        "the limit is above the highest limit that fits"
-    );
     let target = Target::from_bits(bits, limit)?;
     // A time before `first_time` counts as zero, so it takes the smallest time, as any short time
     // does.
     let timespan_seconds = last_time
         .saturating_sub(first_time)
         .clamp(TIMESPAN_SECONDS_MIN, TIMESPAN_SECONDS_MAX);
-    let next = to_bits(scaled(target.0, timespan_seconds, PERIOD_TIMESPAN_SECONDS).min(limit));
+    let next = to_bits(scaled_up_to(target.0, timespan_seconds, limit));
     // This reads the answer with `from_bits`, not with the code that wrote it. Zero is the one
     // answer that is no target.
     if next != 0 {
@@ -186,12 +180,13 @@ pub(crate) fn mined_for_regtest(header: crate::block::BlockHeader) -> crate::blo
 pub(crate) mod fuzz {
     /// A peer picks each field of `header`, so its `bits` and its times go through the change of a
     /// target, whose asserts must hold for any value. A header has one time, and `nonce` gives a
-    /// second `u32` that a peer picks, so it is the first time. Signet has the highest limit of a
-    /// network that changes its target, so it is the nearest to an overflow.
+    /// second `u32` that a peer picks, so it is the first time. Regtest has the highest limit, so
+    /// only it reaches a product above 32 bytes.
     pub(crate) fn retarget_check(header: &crate::block::BlockHeader) {
         for network in [
             crate::chainparams::Network::Mainnet,
             crate::chainparams::Network::Signet,
+            crate::chainparams::Network::Regtest,
         ] {
             let limit = network.pow_limit();
             let next = super::retargeted_bits(header.bits, header.nonce, header.time, limit);
@@ -534,8 +529,9 @@ mod tests {
     }
 
     #[test]
-    fn the_largest_change_of_each_limit_that_changes_fits() {
-        // These products are from big integers, not from this code.
+    fn the_largest_change_of_a_limit_is_four_times_it() {
+        // These answers are from big integers, not from this code. The cap is above each one, so it
+        // hides no wrong answer.
         let mainnet = "00000003fffffffffffffffffffffffffffffffffffffffffffffffffffffffc";
         for (network, expected) in [
             (crate::chainparams::Network::Mainnet, mainnet),
@@ -546,11 +542,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                super::scaled(
-                    network.pow_limit(),
-                    super::TIMESPAN_SECONDS_MAX,
-                    super::PERIOD_TIMESPAN_SECONDS
-                ),
+                super::scaled_up_to(network.pow_limit(), super::TIMESPAN_SECONDS_MAX, [0xff; 32]),
                 number(expected),
                 "{network:?}"
             );
@@ -558,25 +550,21 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "the product must fit in 32 bytes")]
-    fn the_largest_change_of_the_regtest_limit_does_not_fit() {
-        super::scaled(
-            crate::chainparams::Network::Regtest.pow_limit(),
-            super::TIMESPAN_SECONDS_MAX,
-            super::PERIOD_TIMESPAN_SECONDS,
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "the limit is above the highest limit that fits")]
-    fn a_limit_that_does_not_fit_panics_with_a_low_target() {
-        // The product of this target fits, so only the check of the limit can panic.
-        super::retargeted_bits(
-            0x1d00_ffff,
-            1_000_000,
-            2_209_600,
-            crate::chainparams::Network::Regtest.pow_limit(),
-        );
+    fn retargeted_bits_keep_a_product_above_32_bytes() {
+        // These answers are from big integers, not from this code.
+        let limit = crate::chainparams::Network::Regtest.pow_limit();
+        for (last_time, expected) in [
+            // The product passes 32 bytes, but the answer does not.
+            (1_302_400, 0x201f_ffff),
+            // The answer also passes 32 bytes, so it takes the limit.
+            (5_838_400, 0x207f_ffff),
+        ] {
+            assert_eq!(
+                super::retargeted_bits(0x207f_ffff, 1_000_000, last_time, limit),
+                Some(expected),
+                "{last_time}"
+            );
+        }
     }
 
     #[test]
