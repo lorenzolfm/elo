@@ -832,6 +832,53 @@ mod tests {
     }
 
     #[test]
+    fn header_far_after_the_local_clock_ends_the_connection() {
+        // The header has the last time of a `u32`. Until the year 2106, that is more than 2 h
+        // after the local clock in seconds, so only the driver decides here. A clock in
+        // milliseconds would take this header.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+        let peer_thread = std::thread::spawn(move || {
+            let mut stream = accept_handshake(&listener);
+            assert_ping(&read_message(&mut stream));
+            read_first_get_headers(&mut stream);
+            let genesis = crate::chainparams::Network::Regtest.genesis();
+            let header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
+                prev: genesis.hash(),
+                time: u32::MAX,
+                ..genesis
+            });
+            let frame = crate::transport::encode(
+                crate::chainparams::Network::Regtest,
+                crate::protocol::HEADERS,
+                &crate::fixtures::headers_payload_with(&[header]),
+            );
+            stream.write_all(&frame).unwrap();
+            // The driver closes the socket when it refuses the batch.
+            let mut rest = Vec::new();
+            stream.read_to_end(&mut rest).unwrap();
+        });
+
+        let result = block_on(async {
+            let (connection, _theirs) =
+                super::handshake(crate::chainparams::Network::Regtest, peer)
+                    .await
+                    .unwrap();
+            connection.sync().await
+        });
+        peer_thread.join().unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(super::RunError::NetProcessing(
+                    crate::net_processing::PeerError::Extend(crate::chain::ExtendError::TimeTooNew)
+                ))
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
     fn silent_peer_after_the_sync_is_ping_timeout() {
         // The peer completes the handshake, ends the sync with an empty `headers`, and then
         // sends nothing. The clock is paused only after the sync: while the peer thread
