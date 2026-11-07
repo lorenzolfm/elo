@@ -122,6 +122,15 @@ impl Chain {
             }
         }
 
+        self.extend_store(headers, time_max);
+        Ok(())
+    }
+
+    /// Puts each of `headers` on the tip, in order. `extend` checked each header against the batch,
+    /// and each assert here reads the chain. So with a check that skips a header, this panics.
+    fn extend_store(&mut self, headers: Vec<crate::block::BlockHeader>, time_max: u64) {
+        // `extend` returns before this on an empty batch, so each assert reads a new header.
+        assert!(!headers.is_empty());
         let genesis_time = self.network.genesis().time;
         for header in headers {
             self.below_tip
@@ -132,16 +141,16 @@ impl Chain {
             // The bound is the same for each header, so this holds that the check read each one.
             assert!(u64::from(self.tip.time) <= time_max);
             // The first header of a period is rarely the last of a batch, so this reads each
-            // header. It reads the chain, and the check above reads the batch.
+            // header. It reads the chain, and the check in `extend` reads the batch.
             assert!(
                 self.tip.time
                     >= crate::pow::timewarp_time_min(self.network, self.ancestors_of_tip())
             );
         }
         let ancestors = self.ancestors_of_tip();
-        // The checks above read the batch. These read the chain: the tip is on the header below it,
-        // it has proof of work, it has the `bits` that the headers below it require, and its time
-        // is above their median time.
+        // The checks of `extend` read the batch. These read the chain: the tip is on the header
+        // below it, it has proof of work, it has the `bits` that the headers below it require, and
+        // its time is above their median time.
         assert_eq!(self.tip.prev, ancestors.tip.hash());
         assert!(crate::pow::proven_hash(&self.tip, self.network).is_some());
         assert_eq!(
@@ -149,7 +158,6 @@ impl Chain {
             Some(self.tip.bits)
         );
         assert!(self.tip.time > ancestors.median_time_past());
-        Ok(())
     }
 
     /// The headers below the tip. A batch that is not empty puts the old tip below the new tip, so
