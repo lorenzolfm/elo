@@ -183,7 +183,7 @@ fn retargeted_bits(bits: u32, first_time: u32, last_time: u32, limit: [u8; 32]) 
 fn last_real_bits(ancestors: Ancestors<'_>, limit_bits: u32) -> u32 {
     let height_above = ancestors.height_above();
     assert!(!height_above.is_multiple_of(PERIOD_HEADERS));
-    let period_first = height_above / PERIOD_HEADERS * PERIOD_HEADERS;
+    let period_first = height_above - height_above % PERIOD_HEADERS;
     (period_first..height_above)
         .rev()
         .map(|height| ancestors.at(height).bits)
