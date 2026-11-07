@@ -209,7 +209,8 @@ pub(crate) mod fuzz {
     /// The first headers of a batch that go through the check. A median reads at most
     /// `MEDIAN_TIME_HEADERS_COUNT_MAX` times, so a later header reaches no new path. In a batch
     /// that is longer than its input, the later headers have only zeros. A check of each header
-    /// costs 40% of the runs of the `headers` target, and this bound costs 9%.
+    /// costs 40% of the runs of the `headers` target. With this bound, the cost is inside the noise
+    /// of a run.
     const MEDIAN_CHECK_HEADERS_COUNT_MAX: usize = 4 * super::MEDIAN_TIME_HEADERS_COUNT_MAX;
 
     /// A peer picks each `time` of `headers`, so the first headers go through the median time, as
