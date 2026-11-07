@@ -409,14 +409,14 @@ mod tests {
     }
 
     /// Each row mines the headers below, and splits them between the chain and the batch. On each
-    /// split, a batch with a time at the median must leave the chain as it was, and a batch with a
-    /// time one second above the median must pass.
+    /// split, a batch with a time at the median or one second below it must leave the chain as it
+    /// was, and a batch with a time one second above the median must pass.
     #[test]
     fn extend_takes_a_time_only_above_the_median_time_of_the_headers_below() {
         let genesis = crate::chainparams::Network::Regtest.genesis();
         // The seconds after the genesis time of each header above genesis, and of their median
         // time. A person wrote each median, from the times with genesis at 0.
-        let cases: [(&str, &[u32], u32); 6] = [
+        let cases: [(&str, &[u32], u32); 7] = [
             ("only genesis", &[], 0),
             // The lower of the two middle times is genesis.
             ("two times", &[100], 100),
@@ -439,14 +439,26 @@ mod tests {
                 ],
                 90,
             ),
+            // The 5000 and the 6000 are the twelfth and thirteenth times below, so they are not
+            // read. With two more times, the median is 100. The row above gives 90 there, because
+            // its two times are on each side of the median. This row gives 90 with four more
+            // times, and the row above does not.
+            (
+                "more than thirteen times",
+                &[
+                    10, 20, 6000, 5000, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140,
+                ],
+                90,
+            ),
         ];
         for (name, seconds, median_seconds) in cases {
             let times: Vec<_> = seconds.iter().map(|second| genesis.time + second).collect();
             let below = mined_on(genesis, &times);
             let top = *below.last().unwrap_or(&genesis);
             let median_time = genesis.time + median_seconds;
-            // The refused header is not the last, and the header on it has a legal time.
-            let refused = mined_on(top, &[median_time, genesis.time + 9000]);
+            // Each refused header is not the last, and the header on it has a legal time.
+            let refused = [median_time, median_time - 1]
+                .map(|time| mined_on(top, &[time, genesis.time + 9000]));
             let taken = mined_on(top, &[median_time + 1]);
             // Each split reads the times from other parts of the chain and the batch.
             for chain_count in [0, below.len() / 2, below.len()] {
@@ -458,14 +470,17 @@ mod tests {
                 );
                 let before = chain.tip();
 
-                assert_eq!(
-                    chain.extend(crate::fixtures::headers_batch(
-                        &[in_batch, &refused].concat()
-                    )),
-                    Err(super::ExtendError::TimeTooOld),
-                    "{name} {chain_count}"
-                );
-                assert_eq!(chain.tip(), before, "{name} {chain_count}");
+                for refused in &refused {
+                    let time = refused[0].time;
+                    assert_eq!(
+                        chain.extend(crate::fixtures::headers_batch(
+                            &[in_batch, refused.as_slice()].concat()
+                        )),
+                        Err(super::ExtendError::TimeTooOld),
+                        "{name} {chain_count} {time}"
+                    );
+                    assert_eq!(chain.tip(), before, "{name} {chain_count} {time}");
+                }
 
                 assert_eq!(
                     chain.extend(crate::fixtures::headers_batch(&[in_batch, &taken].concat())),
