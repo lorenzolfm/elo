@@ -80,8 +80,8 @@ fn to_bits(number: [u8; 32]) -> u32 {
     }
 }
 
-/// `number` times `factor`, over `divisor`. The multiply is first, so the divide sees all of the
-/// product. The product must fit in 32 bytes.
+/// `number` times `factor`, over `divisor`, rounded down. The multiply is first, so the divide sees
+/// all of the product. The product must fit in 32 bytes.
 fn scaled(mut number: [u8; 32], factor: u32, divisor: u32) -> [u8; 32] {
     // A byte times a `u32`, plus a carry of at most that `u32`, fits in a `u64`.
     let mut carry = 0_u64;
@@ -90,13 +90,16 @@ fn scaled(mut number: [u8; 32], factor: u32, divisor: u32) -> [u8; 32] {
         [.., *byte] = value.to_be_bytes();
         carry = value >> 8;
     }
-    assert_eq!(carry, 0);
+    assert_eq!(carry, 0, "the product must fit in 32 bytes");
     // A remainder is below a `u32`, so with one more byte it fits in a `u64`.
     let divisor = u64::from(divisor);
     let mut remainder = 0_u64;
     for byte in &mut number {
         let value = (remainder << 8) + u64::from(*byte);
-        [.., *byte] = (value / divisor).to_be_bytes();
+        let quotient = value / divisor;
+        // A remainder below `divisor` gives a quotient of one byte, so this drops no bit of it.
+        assert!(quotient <= u64::from(u8::MAX));
+        [.., *byte] = quotient.to_be_bytes();
         remainder = value % divisor;
     }
     number
@@ -530,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "assertion")]
+    #[should_panic(expected = "the product must fit in 32 bytes")]
     fn the_largest_change_of_the_regtest_limit_does_not_fit() {
         super::scaled(
             crate::chainparams::Network::Regtest.pow_limit(),
