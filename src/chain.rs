@@ -1,7 +1,11 @@
 //! The header chain.
 
+/// The most headers that a median time reads: the header below a new header, and the 10 below it.
+const MEDIAN_TIME_HEADERS_COUNT: usize = 11;
+
 /// One linear chain of headers, from genesis to the tip. It is never empty, each header has proof
-/// of work, and each header above genesis has the `bits` that the headers below it require.
+/// of work, and each header above genesis has the `bits` that the headers below it require and a
+/// time above their median time.
 #[derive(Debug)]
 pub(crate) struct Chain {
     /// The network of the chain. Its rules bound the target of each header.
@@ -31,6 +35,8 @@ pub enum ExtendError {
     /// The `bits` of a header are not the `bits` that the headers below it require. On testnet4 the
     /// answer also reads the time of the header.
     WrongBits,
+    /// The time of a header is at or below the median time of the headers below it.
+    TimeTooOld,
 }
 
 /// The headers below one header of a batch, by height: the chain, then the part of the batch that
@@ -55,7 +61,7 @@ impl Chain {
 
     /// Puts all of `headers` on the tip, in order, or none of them. An empty batch changes
     /// nothing. The first header that fails gives the error. For one header, its `prev` is checked
-    /// first, then its proof of work, then its `bits`.
+    /// first, then its proof of work, then its `bits`, then its time.
     pub(crate) fn extend(&mut self, headers: crate::protocol::Headers) -> Result<(), ExtendError> {
         let headers = headers.into_vec();
         let Some(first) = headers.first() else {
@@ -81,6 +87,9 @@ impl Chain {
             {
                 return Err(ExtendError::WrongBits);
             }
+            if header.time <= ancestors.median_time_past() {
+                return Err(ExtendError::TimeTooOld);
+            }
         }
 
         for header in headers {
@@ -88,22 +97,29 @@ impl Chain {
                 .push(std::mem::replace(&mut self.tip, header));
         }
         // The checks above read the batch. These read the chain: the tip is on the header below it,
-        // it has proof of work, and it has the `bits` that the headers below it require.
+        // it has proof of work, it has the `bits` that the headers below it require, and its time
+        // is above their median time.
         assert_eq!(
             Some(self.tip.prev),
             self.below_tip.last().map(crate::block::BlockHeader::hash)
         );
         assert!(crate::pow::proven_hash(&self.tip, self.network).is_some());
+        let below_new_tip = self
+            .below_tip
+            .split_last()
+            .map(|(last, below_last)| Ancestors {
+                below_tip: below_last,
+                tip: last,
+                batch: &[],
+            });
         assert_eq!(
-            self.below_tip.split_last().and_then(|(last, below_last)| {
-                let ancestors = Ancestors {
-                    below_tip: below_last,
-                    tip: last,
-                    batch: &[],
-                };
+            below_new_tip.and_then(|ancestors| {
                 crate::pow::required_bits(self.network, ancestors, self.tip.time)
             }),
             Some(self.tip.bits)
+        );
+        assert!(
+            below_new_tip.is_some_and(|ancestors| self.tip.time > ancestors.median_time_past())
         );
         Ok(())
     }
@@ -130,6 +146,25 @@ impl<'a> Ancestors<'a> {
             Some(0) => self.tip,
             Some(above_tip) => &self.batch[above_tip - 1],
         }
+    }
+
+    /// The median of the times of the last `MEDIAN_TIME_HEADERS_COUNT` headers, or of each header
+    /// if there are fewer. Times can go back, so this sorts them. With an even count, which only a
+    /// chain below that height has, this is the higher of the two middle times.
+    ///
+    /// A peer picks each time, so no value may panic. A peer also runs this once for each header
+    /// of a batch. So it reads at most `MEDIAN_TIME_HEADERS_COUNT` headers and uses no heap.
+    fn median_time_past(self) -> u32 {
+        let height_above = self.height_above();
+        let count = height_above.min(MEDIAN_TIME_HEADERS_COUNT);
+        assert!(count >= 1);
+        let mut times_buffer = [0; MEDIAN_TIME_HEADERS_COUNT];
+        let times = &mut times_buffer[..count];
+        for (time, height) in times.iter_mut().zip(height_above - count..height_above) {
+            *time = self.at(height).time;
+        }
+        times.sort_unstable();
+        times[count / 2]
     }
 }
 
@@ -158,11 +193,50 @@ impl std::fmt::Display for ExtendError {
             ExtendError::NotContinuous => write!(f, "headers do not form a chain"),
             ExtendError::ProofOfWork => write!(f, "a header fails proof of work"),
             ExtendError::WrongBits => write!(f, "a header has the wrong bits"),
+            ExtendError::TimeTooOld => write!(f, "a header has a time at or below the median"),
         }
     }
 }
 
 impl std::error::Error for ExtendError {}
+
+#[cfg(fuzzing)]
+// Only cargo-mutants reads this attribute. Its test runs do not build this module.
+#[cfg_attr(false, mutants::skip)]
+pub(crate) mod fuzz {
+    /// The first headers of a batch that go through the check. A median reads at most
+    /// `MEDIAN_TIME_HEADERS_COUNT` times, so a later header reaches no new path. In a batch that is
+    /// longer than its input, the later headers have only zeros. A check of each header costs 40%
+    /// of the runs of the `headers` target, and this bound costs 9%.
+    const MEDIAN_CHECK_HEADERS_COUNT: usize = 4 * super::MEDIAN_TIME_HEADERS_COUNT;
+
+    /// A peer picks each `time` of `headers`, so the first headers go through the median time, as
+    /// the header above the ones before it. It must return for any value. This check does not sort:
+    /// of `count` times, only the time at index `count / 2` of the sorted times has more than
+    /// `count / 2` times at or below it, and at least `count - count / 2` at or above it.
+    pub(crate) fn median_time_past_check(headers: &[crate::block::BlockHeader]) {
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        for index in 0..headers.len().min(MEDIAN_CHECK_HEADERS_COUNT) {
+            let batch = &headers[..index];
+            let ancestors = super::Ancestors {
+                below_tip: &[],
+                tip: &genesis,
+                batch,
+            };
+            let median = ancestors.median_time_past();
+            let times = || {
+                std::iter::once(&genesis)
+                    .chain(batch)
+                    .rev()
+                    .take(super::MEDIAN_TIME_HEADERS_COUNT)
+                    .map(|header| header.time)
+            };
+            let count = times().count();
+            assert!(times().filter(|time| *time <= median).count() > count / 2);
+            assert!(times().filter(|time| *time >= median).count() >= count - count / 2);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -301,9 +375,110 @@ mod tests {
         assert_eq!(chain.tip(), before);
     }
 
+    /// A regtest header for each of `times`, each on the header before it, the first on `below`.
+    fn mined_on(below: crate::block::BlockHeader, times: &[u32]) -> Vec<crate::block::BlockHeader> {
+        let mut prev = below.hash();
+        times
+            .iter()
+            .map(|time| {
+                let header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
+                    prev,
+                    time: *time,
+                    ..below
+                });
+                prev = header.hash();
+                header
+            })
+            .collect()
+    }
+
+    #[test]
+    fn extend_takes_a_time_only_above_the_median_time_of_the_headers_below() {
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        // The seconds after the genesis time of each header above genesis, and of their median
+        // time. A person wrote each median, from the times with genesis at 0.
+        let cases: [(&str, &[u32], u32); 6] = [
+            ("only genesis", &[], 0),
+            // The lower of the two middle times is genesis.
+            ("two times", &[100], 100),
+            // A time below the tip can pass.
+            ("three times", &[100, 200], 100),
+            // With no sort, the same index gives 200 or 100.
+            ("four times that go back", &[100, 200, 150], 150),
+            // With no sort, the same index gives 155.
+            (
+                "eleven times that go back",
+                &[100, 200, 150, 160, 155, 300, 156, 400, 157, 158],
+                157,
+            ),
+            // The 5000 is the twelfth time below, so it is not read. With one more time or one less
+            // time, the median is 100.
+            (
+                "more than eleven times",
+                &[
+                    10, 20, 30, 5000, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140,
+                ],
+                90,
+            ),
+        ];
+        for (name, seconds, median_seconds) in cases {
+            let times: Vec<_> = seconds.iter().map(|second| genesis.time + second).collect();
+            let below = mined_on(genesis, &times);
+            let top = *below.last().unwrap_or(&genesis);
+            let median_time = genesis.time + median_seconds;
+            // The refused header is not the last, and the header on it has a legal time.
+            let refused = mined_on(top, &[median_time, genesis.time + 9000]);
+            let taken = mined_on(top, &[median_time + 1]);
+            // Each split reads the times from other parts of the chain and the batch.
+            for chain_count in [0, below.len() / 2, below.len()] {
+                let (on_chain, in_batch) = below.split_at(chain_count);
+                let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
+                assert_eq!(
+                    chain.extend(crate::fixtures::headers_batch(on_chain)),
+                    Ok(())
+                );
+                let before = chain.tip();
+
+                assert_eq!(
+                    chain.extend(crate::fixtures::headers_batch(
+                        &[in_batch, &refused].concat()
+                    )),
+                    Err(super::ExtendError::TimeTooOld),
+                    "{name} {chain_count}"
+                );
+                assert_eq!(chain.tip(), before, "{name} {chain_count}");
+
+                assert_eq!(
+                    chain.extend(crate::fixtures::headers_batch(&[in_batch, &taken].concat())),
+                    Ok(()),
+                    "{name} {chain_count}"
+                );
+                assert_eq!(chain.tip().hash, taken[0].hash(), "{name} {chain_count}");
+            }
+        }
+    }
+
+    #[test]
+    fn extend_checks_the_bits_of_a_header_before_its_time() {
+        // The genesis time is the median time here, so these fail both checks.
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        let header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
+            prev: genesis.hash(),
+            bits: 0x207f_fffe,
+            ..genesis
+        });
+        let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
+
+        assert_eq!(
+            chain.extend(crate::fixtures::headers_batch(&[header])),
+            Err(super::ExtendError::WrongBits)
+        );
+    }
+
     /// A chain with `real` at their heights and the last of them as the tip. Each other height has
-    /// the genesis header, so only what the rules read is real. A test cannot mine a header on
-    /// these networks, so the tip must be a real header for the next real header to pass.
+    /// the genesis header, so only what the `bits` rule reads is real. A test cannot mine a header
+    /// on these networks, so the tip must be a real header for the next real header to pass. The
+    /// median time here is the old genesis time, so a test on this chain holds nothing about it.
     fn chain_with(
         network: crate::chainparams::Network,
         real: &[(usize, crate::block::BlockHeader)],

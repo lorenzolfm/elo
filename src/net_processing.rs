@@ -85,7 +85,7 @@ pub enum PeerError {
     /// Their `headers` payload did not decode, or it has too many headers or a transaction.
     Headers(crate::protocol::HeadersError),
     /// Our chain refused their batch: it is not on our tip, it is not a chain, or a header fails
-    /// proof of work or has the wrong `bits`.
+    /// proof of work, has the wrong `bits` or has a time at or below the median time below it.
     Extend(crate::chain::ExtendError),
     /// Their `headers` came when no `getheaders` of ours was outstanding.
     UnsolicitedHeaders,
@@ -590,7 +590,7 @@ pub(crate) mod fuzz {
     /// one second above the last, so it is above the times of all the headers below it, and each
     /// median of those times. This reads no byte of the script, so the layout of the corpus stays.
     /// Regtest is the only network where a script goes past its first header, so this starts from
-    /// the regtest genesis.
+    /// the regtest genesis, and no script ends at `TimeTooOld`.
     fn script_header_time(written_count: usize) -> u32 {
         assert!((1..=SCRIPT_HEADERS_COUNT_MAX).contains(&written_count));
         let seconds = u32::try_from(written_count).unwrap_or(u32::MAX);
@@ -750,7 +750,7 @@ pub(crate) mod fuzz {
     ///   The script stops at `SCRIPT_HEADERS_COUNT_MAX` headers, so a later batch can be shorter.
     ///   Then a byte `b`: header `b - 1` has a wrong `prev`, 255 is the last header, and 0 changes
     ///   none. The script mines each header after it picks the `prev`, so proof of work never
-    ///   decides between two ends on regtest.
+    ///   decides between two ends on regtest. `script_header_time` gives each time.
     /// - 6: another message type, which each machine skips.
     ///
     /// Then an `i8` to add to the length of the payload, so bytes come off its end or go after it.
