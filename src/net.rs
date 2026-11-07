@@ -662,6 +662,7 @@ pub(crate) mod fuzz {
 
 #[cfg(test)]
 mod tests {
+    use crate::serialize::Decode;
     use std::io::{Read, Write};
 
     fn block_on<F: Future>(future: F) -> F::Output {
@@ -764,6 +765,40 @@ mod tests {
         let verack = peer_thread.join().unwrap();
         assert_eq!(verack, crate::fixtures::hex(crate::fixtures::VERACK_FRAME));
         assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn our_version_has_the_local_clock_in_seconds() {
+        // A peer reads this time only for its offset from its own clock, so the bitcoind test
+        // passes with each value. Only this test reads it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+        let peer_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            // The stream closes when this returns, so the handshake of the driver ends.
+            read_message(&mut stream)
+        });
+
+        let seconds = || {
+            let elapsed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap();
+            i64::try_from(elapsed.as_secs()).unwrap()
+        };
+        let before = seconds();
+        let _closed = block_on(super::handshake(crate::chainparams::Network::Regtest, peer));
+        let after = seconds();
+        let message = peer_thread.join().unwrap();
+        assert_eq!(message.msg_type(), crate::protocol::VERSION);
+        let ours = crate::protocol::Version::decode(&mut message.payload()).unwrap();
+        assert!(
+            (before..=after).contains(&ours.timestamp),
+            "{before} {} {after}",
+            ours.timestamp
+        );
     }
 
     #[test]
