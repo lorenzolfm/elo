@@ -18,32 +18,6 @@ const _: () = assert!(PERIOD_TIMESPAN_SECONDS.is_multiple_of(4));
 /// On testnet4, a header more than this many seconds after the header below it has the limit.
 const MIN_DIFFICULTY_GAP_SECONDS: u32 = 20 * 60;
 
-/// The headers below one header of a batch, by height: the chain, then the part of the batch that
-/// comes before that header. A batch is not on the chain until each of its headers passes, so the
-/// rule reads it through this.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Ancestors<'a> {
-    pub(crate) below_tip: &'a [crate::block::BlockHeader],
-    pub(crate) tip: &'a crate::block::BlockHeader,
-    pub(crate) batch: &'a [crate::block::BlockHeader],
-}
-
-impl<'a> Ancestors<'a> {
-    /// The height of the header above these headers. It is at least 1, because a chain has genesis.
-    fn height_above(self) -> usize {
-        self.below_tip.len() + 1 + self.batch.len()
-    }
-
-    /// The header at `height`, which must be below `height_above`.
-    fn at(self, height: usize) -> &'a crate::block::BlockHeader {
-        match height.checked_sub(self.below_tip.len()) {
-            None => &self.below_tip[height],
-            Some(0) => self.tip,
-            Some(above_tip) => &self.batch[above_tip - 1],
-        }
-    }
-}
-
 /// The highest hash that a header may have. The bytes are big-endian, so the order of two arrays is
 /// the order of their numbers. Only `from_bits` makes one, so it is above zero and at most the
 /// limit that `from_bits` got.
@@ -180,7 +154,7 @@ fn retargeted_bits(bits: u32, first_time: u32, last_time: u32, limit: [u8; 32]) 
 /// limit, these are the limit. The header above `ancestors` must not start a period. The first
 /// header of a period comes from the change of the target, so this does not read below it. So this
 /// reads fewer than `PERIOD_HEADERS_COUNT` headers.
-fn last_real_bits(ancestors: Ancestors<'_>, limit_bits: u32) -> u32 {
+fn last_real_bits(ancestors: crate::chain::Ancestors<'_>, limit_bits: u32) -> u32 {
     let height_above = ancestors.height_above();
     assert!(!height_above.is_multiple_of(PERIOD_HEADERS_COUNT));
     let period_first = height_above - height_above % PERIOD_HEADERS_COUNT;
@@ -202,7 +176,7 @@ fn last_real_bits(ancestors: Ancestors<'_>, limit_bits: u32) -> u32 {
 #[must_use = "a dropped answer lets each `bits` pass"]
 pub(crate) fn required_bits(
     network: crate::chainparams::Network,
-    ancestors: Ancestors<'_>,
+    ancestors: crate::chain::Ancestors<'_>,
     time: u32,
 ) -> Option<u32> {
     let limit = network.pow_limit();
@@ -311,11 +285,7 @@ pub(crate) mod fuzz {
             let genesis = network.genesis();
             for (index, header) in headers.iter().enumerate() {
                 let batch = &headers[..index];
-                let ancestors = super::Ancestors {
-                    below_tip: &[],
-                    tip: &genesis,
-                    batch,
-                };
+                let ancestors = crate::chain::Ancestors::on_tip(&genesis, batch);
                 let required = super::required_bits(network, ancestors, header.time);
                 let last_bits = batch.last().unwrap_or(&genesis).bits;
                 match network {
@@ -736,13 +706,9 @@ mod tests {
     }
 
     /// `chain` as the headers below one header. The rule reads each part the same way.
-    fn ancestors(chain: &[crate::block::BlockHeader]) -> super::Ancestors<'_> {
+    fn ancestors(chain: &[crate::block::BlockHeader]) -> crate::chain::Ancestors<'_> {
         let (tip, batch) = chain.split_first().unwrap();
-        super::Ancestors {
-            below_tip: &[],
-            tip,
-            batch,
-        }
+        crate::chain::Ancestors::on_tip(tip, batch)
     }
 
     const REAL_BITS: u32 = 0x1c7f_ffff;

@@ -84,8 +84,7 @@ pub enum PeerError {
     PingTimeout,
     /// Their `headers` payload did not decode, or it has too many headers or a transaction.
     Headers(crate::protocol::HeadersError),
-    /// Our chain refused their batch: it is not on our tip, it is not a chain, or a header fails
-    /// proof of work or has the wrong `bits`.
+    /// Our chain refused their batch. The error says why.
     Extend(crate::chain::ExtendError),
     /// Their `headers` came when no `getheaders` of ours was outstanding.
     UnsolicitedHeaders,
@@ -586,6 +585,17 @@ pub(crate) mod fuzz {
     /// each height, so no script ends at `WrongBits`.
     const SCRIPT_HEADER_BITS: u32 = crate::chainparams::Network::Regtest.genesis().bits;
 
+    /// The time of the header that a script writes as its `written_count`th, from 1. Each time is
+    /// one second above the last, so it is above the times of all the headers below it, and each
+    /// median of those times. This reads no byte of the script, so the layout of the corpus stays.
+    /// Regtest is the only network where a script goes past its first header, so this starts from
+    /// the regtest genesis, and no script ends at `TimeTooOld`.
+    fn script_header_time(written_count: usize) -> u32 {
+        assert!((1..=SCRIPT_HEADERS_COUNT_MAX).contains(&written_count));
+        let seconds = u32::try_from(written_count).unwrap_or(u32::MAX);
+        crate::chainparams::Network::Regtest.genesis().time + seconds
+    }
+
     /// Spreads a byte over the places of a nonce. It is odd, so each byte gives another nonce.
     const NONCE_SPREAD: u64 = 0x0123_4567_89ab_cdef;
     const _: () = assert!(NONCE_SPREAD % 2 == 1);
@@ -739,7 +749,7 @@ pub(crate) mod fuzz {
     ///   The script stops at `SCRIPT_HEADERS_COUNT_MAX` headers, so a later batch can be shorter.
     ///   Then a byte `b`: header `b - 1` has a wrong `prev`, 255 is the last header, and 0 changes
     ///   none. The script mines each header after it picks the `prev`, so proof of work never
-    ///   decides between two ends on regtest.
+    ///   decides between two ends on regtest. `script_header_time` gives each time.
     /// - 6: another message type, which each machine skips.
     ///
     /// Then an `i8` to add to the length of the payload, so bytes come off its end or go after it.
@@ -1083,8 +1093,7 @@ pub(crate) mod fuzz {
                 byte => usize::from(byte),
             };
             let count = count_asked.min(SCRIPT_HEADERS_COUNT_MAX - self.headers_written_count);
-            self.headers_written_count += count;
-            assert!(self.headers_written_count <= SCRIPT_HEADERS_COUNT_MAX);
+            assert!(self.headers_written_count + count <= SCRIPT_HEADERS_COUNT_MAX);
             // The loop below takes its bound from this.
             assert!(count <= HEADERS_FULL_COUNT + 1);
             let wrong_prev_index = match self.byte() {
@@ -1097,6 +1106,7 @@ pub(crate) mod fuzz {
             crate::serialize::write_compact_size(&mut payload, count);
             let mut prev = tip;
             for index in 0..count {
+                self.headers_written_count += 1;
                 let header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
                     version: 0,
                     prev: if Some(index) == wrong_prev_index {
@@ -1105,7 +1115,7 @@ pub(crate) mod fuzz {
                         prev
                     },
                     merkle_root: [0; 32],
-                    time: 0,
+                    time: script_header_time(self.headers_written_count),
                     bits: SCRIPT_HEADER_BITS,
                     nonce: 0,
                 });
