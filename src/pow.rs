@@ -1,7 +1,16 @@
 //! Proof of work.
 
 /// The seconds that a period of headers should take: two weeks.
-const PERIOD_TIMESPAN: u32 = 14 * 24 * 60 * 60;
+const PERIOD_TIMESPAN_SECONDS: u32 = 14 * 24 * 60 * 60;
+
+/// A period that takes less time counts as this, so a target falls by at most a factor of 4.
+const TIMESPAN_SECONDS_MIN: u32 = PERIOD_TIMESPAN_SECONDS / 4;
+
+/// A period that takes more time counts as this, so a target rises by at most a factor of 4.
+const TIMESPAN_SECONDS_MAX: u32 = PERIOD_TIMESPAN_SECONDS * 4;
+
+// The divide in the smallest time is exact, so the two factors are the same.
+const _: () = assert!(PERIOD_TIMESPAN_SECONDS.is_multiple_of(4));
 
 /// The highest hash that a header may have. The bytes are big-endian, so the order of two arrays is
 /// the order of their numbers. Only `from_bits` makes one, so it is above zero and at most the
@@ -107,8 +116,8 @@ fn scaled(mut number: [u8; 32], factor: u32, divisor: u32) -> [u8; 32] {
 
 /// The `bits` of the next period. `bits` give the target to change, and `first_time` and
 /// `last_time` are the times of the first and the last header of the period that ends. The target
-/// changes by the time between them over `PERIOD_TIMESPAN`, by at most a factor of 4 in each
-/// direction, and it stays at most `limit`. A target below 4 can become zero, and that gives
+/// changes by the time between them over `PERIOD_TIMESPAN_SECONDS`, by at most a factor of 4 in
+/// each direction, and it stays at most `limit`. A target below 4 can become zero, and that gives
 /// `bits` of zero. Returns nothing if `bits` are no target up to `limit`.
 ///
 /// At the largest change, `limit` times the time must fit in 32 bytes. Regtest does not fit.
@@ -126,10 +135,10 @@ fn retargeted_bits(bits: u32, first_time: u32, last_time: u32, limit: [u8; 32]) 
     let target = Target::from_bits(bits, limit)?;
     // A time before `first_time` counts as zero, so it takes the smallest time, as any short time
     // does.
-    let timespan = last_time
+    let timespan_seconds = last_time
         .saturating_sub(first_time)
-        .clamp(PERIOD_TIMESPAN / 4, PERIOD_TIMESPAN * 4);
-    let next = to_bits(scaled(target.0, timespan, PERIOD_TIMESPAN).min(limit));
+        .clamp(TIMESPAN_SECONDS_MIN, TIMESPAN_SECONDS_MAX);
+    let next = to_bits(scaled(target.0, timespan_seconds, PERIOD_TIMESPAN_SECONDS).min(limit));
     // This reads the answer with `from_bits`, not with the code that wrote it. Zero is the one
     // answer that is no target.
     if next != 0 {
@@ -523,8 +532,8 @@ mod tests {
             assert_eq!(
                 super::scaled(
                     network.pow_limit(),
-                    super::PERIOD_TIMESPAN * 4,
-                    super::PERIOD_TIMESPAN
+                    super::TIMESPAN_SECONDS_MAX,
+                    super::PERIOD_TIMESPAN_SECONDS
                 ),
                 number(expected),
                 "{network:?}"
@@ -537,8 +546,8 @@ mod tests {
     fn the_largest_change_of_the_regtest_limit_does_not_fit() {
         super::scaled(
             crate::chainparams::Network::Regtest.pow_limit(),
-            super::PERIOD_TIMESPAN * 4,
-            super::PERIOD_TIMESPAN,
+            super::TIMESPAN_SECONDS_MAX,
+            super::PERIOD_TIMESPAN_SECONDS,
         );
     }
 
