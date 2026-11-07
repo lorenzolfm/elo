@@ -78,12 +78,14 @@ impl Chain {
     /// nothing. The first header that fails gives the error. For one header, its `prev` is checked
     /// first, then its proof of work, then its `bits`, then its time against the median time, then
     /// its time against the timewarp rule, then its time against `timestamp`. `timestamp` is the
-    /// local clock, in seconds since the Unix epoch.
+    /// local clock, in seconds since the Unix epoch, and it is not below zero.
     pub(crate) fn extend(
         &mut self,
         headers: crate::protocol::Headers,
         timestamp: i64,
     ) -> Result<(), ExtendError> {
+        // `net::timestamp` gives zero for a clock before the epoch, so no caller gives less.
+        assert!(timestamp >= 0);
         let headers = headers.into_vec();
         let Some(first) = headers.first() else {
             return Ok(());
@@ -91,8 +93,8 @@ impl Chain {
         if first.prev != self.tip.hash() {
             return Err(ExtendError::NotOnTip);
         }
-        // The host picks the clock, so no value may panic. The compare is in `i64`, so a bound
-        // above `u32::MAX` takes each time, and a bound below zero refuses each time.
+        // The clock can be `i64::MAX`, so the add saturates. The compare is in `i64`, so a bound
+        // above `u32::MAX` takes each time.
         let time_max = timestamp.saturating_add(TIME_AHEAD_SECONDS_MAX);
         // The hash of a header checks its proof of work and the `prev` of the next header, so one
         // pass hashes each header once.
@@ -932,8 +934,7 @@ mod tests {
 
     /// Each row has a clock and the time of one header. In one batch that header is the first and
     /// the header on it has a legal time, and in the other it is the last. So only that header
-    /// decides, but the first clock refuses each header. A refused batch must leave the chain as it
-    /// was.
+    /// decides. A refused batch must leave the chain as it was.
     #[test]
     fn extend_takes_a_time_only_up_to_two_hours_after_the_clock() {
         let genesis = crate::chainparams::Network::Regtest.genesis();
@@ -944,7 +945,7 @@ mod tests {
         // A person wrote the two hours.
         let clock = i64::from(genesis.time) + 100;
         let at_bound = genesis.time + 100 + 2 * 60 * 60;
-        let cases: [(&str, i64, u32, Result<(), super::ExtendError>); 5] = [
+        let cases: [(&str, i64, u32, Result<(), super::ExtendError>); 4] = [
             ("at the bound", clock, at_bound, Ok(())),
             (
                 "one second above the bound",
@@ -960,13 +961,6 @@ mod tests {
             ),
             // A plain add of the two hours to this clock panics.
             ("the last clock", i64::MAX, u32::MAX, Ok(())),
-            // A bound in an unsigned type can take this time, for example with `as u64`.
-            (
-                "the first clock",
-                i64::MIN,
-                genesis.time + 4,
-                Err(super::ExtendError::TimeTooNew),
-            ),
         ];
         for (name, clock, time, expected) in cases {
             let header = mined_on(below[2], &[time])[0];
@@ -1014,6 +1008,15 @@ mod tests {
             chain.extend(crate::fixtures::headers_batch(&[one_below]), 0),
             Err(super::ExtendError::TimeTimewarpAttack)
         );
+    }
+
+    /// The batch is empty, so this also holds that `extend` checks the clock before it returns
+    /// early.
+    #[test]
+    #[should_panic]
+    fn extend_panics_at_a_clock_below_zero() {
+        let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
+        let _ = chain.extend(crate::fixtures::headers_batch(&[]), -1);
     }
 
     #[test]
