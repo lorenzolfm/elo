@@ -1094,9 +1094,7 @@ pub(crate) mod fuzz {
                 byte => usize::from(byte),
             };
             let count = count_asked.min(SCRIPT_HEADERS_COUNT_MAX - self.headers_written_count);
-            let written_count_before = self.headers_written_count;
-            self.headers_written_count += count;
-            assert!(self.headers_written_count <= SCRIPT_HEADERS_COUNT_MAX);
+            assert!(self.headers_written_count + count <= SCRIPT_HEADERS_COUNT_MAX);
             // The loop below takes its bound from this.
             assert!(count <= HEADERS_FULL_COUNT + 1);
             let wrong_prev_index = match self.byte() {
@@ -1109,6 +1107,7 @@ pub(crate) mod fuzz {
             crate::serialize::write_compact_size(&mut payload, count);
             let mut prev = tip;
             for index in 0..count {
+                self.headers_written_count += 1;
                 let header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
                     version: 0,
                     prev: if Some(index) == wrong_prev_index {
@@ -1117,7 +1116,7 @@ pub(crate) mod fuzz {
                         prev
                     },
                     merkle_root: [0; 32],
-                    time: script_header_time(written_count_before + index + 1),
+                    time: script_header_time(self.headers_written_count),
                     bits: SCRIPT_HEADER_BITS,
                     nonce: 0,
                 });
