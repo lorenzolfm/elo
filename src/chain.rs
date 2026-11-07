@@ -103,9 +103,13 @@ impl Chain {
             }
         }
 
+        let genesis_time = self.network.genesis().time;
         for header in headers {
             self.below_tip
                 .push(std::mem::replace(&mut self.tip, header));
+            // A median only rises, and the first one reads genesis. So no peer bytes reach this
+            // while the check on the median holds.
+            assert!(self.tip.time > genesis_time);
             // The first header of a period is rarely the last of a batch, so this reads each
             // header. It reads the chain, and the check above reads the batch.
             assert!(

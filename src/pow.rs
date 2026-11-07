@@ -22,6 +22,10 @@ const MIN_DIFFICULTY_GAP_SECONDS: u32 = 20 * 60;
 /// header below it.
 const TIMEWARP_SECONDS_MAX: u32 = 10 * 60;
 
+// Each time above genesis is above the genesis time, so with this a real chain does not reach a
+// bound of zero. `Chain::extend` asserts the first half.
+const _: () = assert!(crate::chainparams::Network::Testnet4.genesis().time > TIMEWARP_SECONDS_MAX);
+
 /// The highest hash that a header may have. The bytes are big-endian, so the order of two arrays is
 /// the order of their numbers. Only `from_bits` makes one, so it is above zero and at most the
 /// limit that `from_bits` got.
