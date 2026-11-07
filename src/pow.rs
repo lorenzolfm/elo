@@ -768,6 +768,25 @@ mod tests {
     }
 
     #[test]
+    fn required_bits_read_the_end_of_a_period_in_a_batch() {
+        // A sync in full batches ends each batch at an even height, and the last header of a period
+        // has an odd height. So that header is always in the batch, and this reads it there. The
+        // answer is from big integers, not from this code.
+        let chain = headers(2016, REAL_BITS);
+        for network in [
+            crate::chainparams::Network::Mainnet,
+            crate::chainparams::Network::Testnet4,
+            crate::chainparams::Network::Signet,
+        ] {
+            assert_eq!(
+                super::required_bits(network, ancestors(&chain), u32::MAX),
+                Some(0x1c7f_efbd),
+                "{network:?}"
+            );
+        }
+    }
+
+    #[test]
     fn required_bits_on_testnet4_take_the_limit_after_a_late_time() {
         let network = crate::chainparams::Network::Testnet4;
         let limit_bits = network.genesis().bits;
