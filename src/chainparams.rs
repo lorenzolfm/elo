@@ -137,6 +137,13 @@ impl Network {
     }
 }
 
+// A chain starts at genesis with no check, and each header of a chain has at least the lowest
+// version of its height. So each genesis must have at least the lowest version of height 0.
+const _: () = assert!(Network::Mainnet.genesis().version >= Network::Mainnet.version_min(0));
+const _: () = assert!(Network::Testnet4.genesis().version >= Network::Testnet4.version_min(0));
+const _: () = assert!(Network::Signet.genesis().version >= Network::Signet.version_min(0));
+const _: () = assert!(Network::Regtest.genesis().version >= Network::Regtest.version_min(0));
+
 #[cfg(test)]
 mod tests {
     #[test]
