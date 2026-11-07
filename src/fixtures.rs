@@ -16,9 +16,9 @@
 //! v1. The script claimed `NODE_NETWORK` in its `version`, then sent its `verack`. Core sent
 //! the `getheaders` after its `ping`.
 //!
-//! The real headers of the other networks were captured on 2026-11-06 from the API of mempool.space.
-//! A script checked that each hash is the hash of the explorer and is at most its target, and that
-//! each `prev` of a next height is the hash below it.
+//! The real headers of the other networks were captured on 2026-11-06 from the API of
+//! mempool.space. A script checked that each hash is the hash of the explorer and is at most its
+//! target, and that each `prev` of a next height is the hash below it.
 
 use crate::serialize::{Decode, Encode};
 
