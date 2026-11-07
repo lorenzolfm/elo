@@ -120,9 +120,13 @@ fn retargeted_bits(bits: u32, first_time: u32, last_time: u32, limit: [u8; 32]) 
     let timespan = last_time
         .saturating_sub(first_time)
         .clamp(PERIOD_TIMESPAN / 4, PERIOD_TIMESPAN * 4);
-    Some(to_bits(
-        scaled(target.0, timespan, PERIOD_TIMESPAN).min(limit),
-    ))
+    let next = to_bits(scaled(target.0, timespan, PERIOD_TIMESPAN).min(limit));
+    // This reads the answer with `from_bits`, not with the code that wrote it. Zero is the one
+    // answer that is no target.
+    if next != 0 {
+        assert!(Target::from_bits(next, limit).is_some());
+    }
+    Some(next)
 }
 
 /// The hash of `header`, if its `bits` are a target in the range of `network` and the hash is at
@@ -159,22 +163,17 @@ pub(crate) fn mined_for_regtest(header: crate::block::BlockHeader) -> crate::blo
 #[cfg_attr(false, mutants::skip)]
 pub(crate) mod fuzz {
     /// A peer picks each field of `header`, so its `bits` and two of its fields go through the
-    /// change of a target, which must return for any value. Signet has the highest limit of a
-    /// network that changes its target, so it is the nearest to an overflow. The answer must be a
-    /// target up to the limit, or zero. This rule reads the answer with `from_bits`, not with the
-    /// code that wrote it.
+    /// change of a target, whose asserts must hold for any value. Signet has the highest limit of
+    /// a network that changes its target, so it is the nearest to an overflow.
     pub(crate) fn retarget_check(header: &crate::block::BlockHeader) {
         for network in [
             crate::chainparams::Network::Mainnet,
             crate::chainparams::Network::Signet,
         ] {
             let limit = network.pow_limit();
-            let Some(next) = super::retargeted_bits(header.bits, header.nonce, header.time, limit)
-            else {
-                assert_eq!(super::Target::from_bits(header.bits, limit), None);
-                continue;
-            };
-            assert!(next == 0 || super::Target::from_bits(next, limit).is_some());
+            let next = super::retargeted_bits(header.bits, header.nonce, header.time, limit);
+            let target = super::Target::from_bits(header.bits, limit);
+            assert_eq!(next.is_some(), target.is_some());
         }
     }
 }
