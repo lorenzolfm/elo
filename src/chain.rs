@@ -7,7 +7,7 @@ pub(crate) struct Chain {
     /// The network of the chain. Its rules bound the target of each header.
     network: crate::chainparams::Network,
     /// The headers below the tip, from genesis. The index of a header is its height.
-    ancestors: Vec<crate::block::BlockHeader>,
+    below_tip: Vec<crate::block::BlockHeader>,
     tip: crate::block::BlockHeader,
 }
 
@@ -37,7 +37,7 @@ impl Chain {
     pub(crate) fn new(network: crate::chainparams::Network) -> Chain {
         Chain {
             network,
-            ancestors: Vec::new(),
+            below_tip: Vec::new(),
             tip: network.genesis(),
         }
     }
@@ -62,7 +62,7 @@ impl Chain {
             }
             prev = crate::pow::proven_hash(header, self.network).ok_or(ExtendError::ProofOfWork)?;
             let ancestors = crate::pow::Ancestors {
-                below_tip: &self.ancestors,
+                below_tip: &self.below_tip,
                 tip: &self.tip,
                 batch: &headers[..index],
             };
@@ -73,21 +73,21 @@ impl Chain {
         }
 
         for header in headers {
-            self.ancestors
+            self.below_tip
                 .push(std::mem::replace(&mut self.tip, header));
         }
         // The checks above read the batch. These read the chain: the tip is on the header below it,
         // it has proof of work, and it has the `bits` that the headers below it require.
         assert_eq!(
             Some(self.tip.prev),
-            self.ancestors.last().map(crate::block::BlockHeader::hash)
+            self.below_tip.last().map(crate::block::BlockHeader::hash)
         );
         assert!(crate::pow::proven_hash(&self.tip, self.network).is_some());
         assert_eq!(
-            self.ancestors.split_last().and_then(|(tip, below_tip)| {
+            self.below_tip.split_last().and_then(|(last, below_last)| {
                 let ancestors = crate::pow::Ancestors {
-                    below_tip,
-                    tip,
+                    below_tip: below_last,
+                    tip: last,
                     batch: &[],
                 };
                 crate::pow::required_bits(self.network, ancestors, self.tip.time)
@@ -100,7 +100,7 @@ impl Chain {
     /// The height and the hash of the last header.
     pub(crate) fn tip(&self) -> Tip {
         Tip {
-            height: self.ancestors.len(),
+            height: self.below_tip.len(),
             hash: self.tip.hash(),
         }
     }
@@ -282,13 +282,13 @@ mod tests {
         real: &[(usize, crate::block::BlockHeader)],
     ) -> super::Chain {
         let (tip_height, tip) = *real.last().unwrap();
-        let mut ancestors = vec![network.genesis(); tip_height];
+        let mut below_tip = vec![network.genesis(); tip_height];
         for (height, header) in &real[..real.len() - 1] {
-            ancestors[*height] = *header;
+            below_tip[*height] = *header;
         }
         super::Chain {
             network,
-            ancestors,
+            below_tip,
             tip,
         }
     }
