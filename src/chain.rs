@@ -151,10 +151,12 @@ impl<'a> Ancestors<'a> {
         let height_above = self.height_above();
         let count = height_above.min(MEDIAN_TIME_HEADERS_COUNT);
         assert!(count >= 1);
+        let height_first = height_above - count;
         let mut times_buffer = [0; MEDIAN_TIME_HEADERS_COUNT];
         let times = &mut times_buffer[..count];
-        for (time, height) in times.iter_mut().zip(height_above - count..height_above) {
-            *time = self.at(height).time;
+        // Each place of `times` gets a time, so no zero of the buffer can reach the median.
+        for (index, time) in times.iter_mut().enumerate() {
+            *time = self.at(height_first + index).time;
         }
         times.sort_unstable();
         times[count / 2]
