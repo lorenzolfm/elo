@@ -590,6 +590,11 @@ pub(crate) mod fuzz {
     /// each height, so no script ends at `WrongBits`.
     const SCRIPT_HEADER_BITS: u32 = crate::chainparams::Network::Regtest.genesis().bits;
 
+    /// The `version` of each header that a script writes. It is the lowest version that regtest
+    /// takes at each height above genesis, so no script ends at `BadVersion`. A higher lowest
+    /// version moves rows of the seed table.
+    const SCRIPT_HEADER_VERSION: i32 = 4;
+
     /// The time of the header that a script writes as its `written_count`th, from 1. Each time is
     /// one second above the last, so it is above the times of all the headers below it, and each
     /// median of those times. This reads no byte of the script, so the layout of the corpus stays.
@@ -1117,7 +1122,7 @@ pub(crate) mod fuzz {
             for index in 0..count {
                 self.headers_written_count += 1;
                 let header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
-                    version: 0,
+                    version: SCRIPT_HEADER_VERSION,
                     prev: if Some(index) == wrong_prev_index {
                         hash_wrong(prev)
                     } else {
@@ -1379,6 +1384,7 @@ pub(crate) mod fuzz {
                     // each other limit. So only regtest takes what a script writes. A new script
                     // byte that writes other headers fails here, and must change this model.
                     assert_eq!(header.bits, SCRIPT_HEADER_BITS);
+                    assert_eq!(header.version, SCRIPT_HEADER_VERSION);
                     assert!(header.hash().as_byte_array()[31] < 0x7f);
                     if self.network != crate::chainparams::Network::Regtest {
                         return Err(super::PeerError::Extend(

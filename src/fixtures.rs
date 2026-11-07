@@ -172,6 +172,65 @@ pub(crate) const TESTNET4_TIMEWARP: [&str; 6] = [
     ),
 ];
 
+/// Made-up headers of mainnet at each height where the lowest version rises, which no real chain
+/// has: each real header near these heights already has the higher version. The tip is two below
+/// each height. It has no proof of work, a version of 4, and a time one second above the genesis
+/// time. Each pair is a header on the tip and a header on that header, one second apart. Both have
+/// the version one below the bound of the higher height. A test cannot mine at this limit, so a
+/// script mined the six once, on 2026-11-07, in about 3 min on 32 threads. Each has the `bits` of
+/// the limit and a merkle root of zeros.
+pub(crate) const MAINNET_VERSION_TIP: &str = concat!(
+    "040000000000000000000000000000000000000000000000000000000000000000000000",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "2aab5f49ffff001d00000000",
+);
+
+/// The pairs on `MAINNET_VERSION_TIP`, in the order of their heights.
+pub(crate) const MAINNET_VERSION_RISE: [[&str; 2]; 3] = [
+    [
+        // Height 227930, version 1.
+        concat!(
+            "01000000311c94dcd9b9616ed0f17d035b4087bebd67463b9bfdd9f1a301759093b52ea7",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "2bab5f49ffff001d1d0c43d1",
+        ),
+        // Height 227931, version 1.
+        concat!(
+            "01000000cfd1b41513dc62aa325fbf3089f90528fd65c037e28ea87a1b15a2f100000000",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "2cab5f49ffff001d6c54114a",
+        ),
+    ],
+    [
+        // Height 363724, version 2.
+        concat!(
+            "02000000311c94dcd9b9616ed0f17d035b4087bebd67463b9bfdd9f1a301759093b52ea7",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "2bab5f49ffff001db6a6079a",
+        ),
+        // Height 363725, version 2.
+        concat!(
+            "020000002666940377a7a458eb0a8affcb6927e7f9b8f93f7f1fb1ae07f698e900000000",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "2cab5f49ffff001de53ba714",
+        ),
+    ],
+    [
+        // Height 388380, version 3.
+        concat!(
+            "03000000311c94dcd9b9616ed0f17d035b4087bebd67463b9bfdd9f1a301759093b52ea7",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "2bab5f49ffff001dfea525cc",
+        ),
+        // Height 388381, version 3.
+        concat!(
+            "030000007f534b5ac5a6f5c787751a970dc067f080a748e628f8aaddf0e3293c00000000",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "2cab5f49ffff001d9d73947d",
+        ),
+    ],
+];
+
 /// The `version`. On loopback, the IPs and ports of both addresses are zero.
 pub(crate) const VERSION_FRAME: &str = concat!(
     "fabfb5da76657273696f6e000000000066000000b34372e3",
@@ -252,13 +311,18 @@ pub(crate) fn headers_payload() -> Vec<u8> {
     hex(HEADERS_FRAME).split_off(crate::transport::MESSAGE_HEADER_SIZE)
 }
 
+/// The `version` of each header that a test makes. It is the version of the blocks in
+/// `HEADERS_FRAME`, and it is legal at each height of each network.
+pub(crate) const VERSION: i32 = 0x2000_0000;
+
 /// `count` headers, each on the header before it, the first on the regtest genesis header. Each
-/// is the genesis header with its `prev`, its `time` and its `nonce` changed. Each time is one
-/// second above the header below it, so it is legal.
+/// is the genesis header with its `version`, its `prev`, its `time` and its `nonce` changed. Each
+/// time is one second above the header below it, so it is legal.
 pub(crate) fn headers_on_genesis(count: usize) -> Vec<crate::block::BlockHeader> {
     let genesis = crate::chainparams::Network::Regtest.genesis();
     let on = |below: &crate::block::BlockHeader| {
         crate::pow::mined_for_regtest(crate::block::BlockHeader {
+            version: VERSION,
             prev: below.hash(),
             time: below.time + 1,
             ..genesis

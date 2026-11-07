@@ -884,6 +884,7 @@ mod tests {
             read_first_get_headers(&mut stream);
             let genesis = crate::chainparams::Network::Regtest.genesis();
             let header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
+                version: crate::fixtures::VERSION,
                 prev: genesis.hash(),
                 time: u32::MAX,
                 ..genesis
