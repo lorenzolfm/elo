@@ -191,9 +191,11 @@ fn last_real_bits(ancestors: Ancestors<'_>, limit_bits: u32) -> u32 {
         .unwrap_or(limit_bits)
 }
 
-/// The `bits` that a header with `time` must have on `ancestors`. Returns nothing if no header can
-/// pass: a target below 4 fell to zero, or a header that this reads has no target up to the limit,
-/// and a chain does not hold such a header.
+/// The `bits` that a header with `time` must have on `ancestors`. Returns nothing if a change of
+/// the target has no answer, so no header can pass: a target below 4 fell to zero, or the `bits`
+/// that change are no target up to the limit, and a chain does not hold such `bits`. Inside a
+/// period this does not read `bits` as a target, so the answer is `bits` from below the header or
+/// the limit.
 ///
 /// Regtest has one target. Each header of its chain has the `bits` of the limit, because its genesis
 /// has them and no rule gives other `bits`. So it needs no period and no time.
