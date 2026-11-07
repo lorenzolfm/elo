@@ -408,8 +408,8 @@ mod tests {
                 0x2100_ffff,
             ),
         ];
-        for (number, expected) in cases {
-            assert_eq!(super::to_bits(self::number(number)), expected, "{number}");
+        for (hex, expected) in cases {
+            assert_eq!(super::to_bits(number(hex)), expected, "{hex}");
         }
     }
 
