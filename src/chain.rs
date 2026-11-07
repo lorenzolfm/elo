@@ -33,6 +33,16 @@ pub enum ExtendError {
     WrongBits,
 }
 
+/// The headers below one header of a batch, by height: the chain, then the part of the batch that
+/// comes before that header. A batch is not on the chain until each of its headers passes, so the
+/// rules read it through this.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Ancestors<'a> {
+    pub(crate) below_tip: &'a [crate::block::BlockHeader],
+    pub(crate) tip: &'a crate::block::BlockHeader,
+    pub(crate) batch: &'a [crate::block::BlockHeader],
+}
+
 impl Chain {
     /// A chain with only the genesis header of `network`.
     pub(crate) fn new(network: crate::chainparams::Network) -> Chain {
@@ -62,7 +72,7 @@ impl Chain {
                 return Err(ExtendError::NotContinuous);
             }
             prev = crate::pow::proven_hash(header, self.network).ok_or(ExtendError::ProofOfWork)?;
-            let ancestors = crate::pow::Ancestors {
+            let ancestors = Ancestors {
                 below_tip: &self.below_tip,
                 tip: &self.tip,
                 batch: &headers[..index],
@@ -86,7 +96,7 @@ impl Chain {
         assert!(crate::pow::proven_hash(&self.tip, self.network).is_some());
         assert_eq!(
             self.below_tip.split_last().and_then(|(last, below_last)| {
-                let ancestors = crate::pow::Ancestors {
+                let ancestors = Ancestors {
                     below_tip: below_last,
                     tip: last,
                     batch: &[],
@@ -103,6 +113,22 @@ impl Chain {
         Tip {
             height: self.below_tip.len(),
             hash: self.tip.hash(),
+        }
+    }
+}
+
+impl<'a> Ancestors<'a> {
+    /// The height of the header above these headers. It is at least 1, because a chain has genesis.
+    pub(crate) fn height_above(self) -> usize {
+        self.below_tip.len() + 1 + self.batch.len()
+    }
+
+    /// The header at `height`, which must be below `height_above`.
+    pub(crate) fn at(self, height: usize) -> &'a crate::block::BlockHeader {
+        match height.checked_sub(self.below_tip.len()) {
+            None => &self.below_tip[height],
+            Some(0) => self.tip,
+            Some(above_tip) => &self.batch[above_tip - 1],
         }
     }
 }
