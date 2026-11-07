@@ -77,15 +77,15 @@ impl Chain {
     /// Puts all of `headers` on the tip, in order, or none of them. An empty batch changes
     /// nothing. The first header that fails gives the error. For one header, its `prev` is checked
     /// first, then its proof of work, then its `bits`, then its time against the median time, then
-    /// its time against the timewarp rule, then its time against `timestamp`. `timestamp` is the
-    /// local clock, in seconds since the Unix epoch, and it is not below zero.
+    /// its time against the timewarp rule, then its time against `clock`. `clock` is the local
+    /// clock, in seconds since the Unix epoch, and it is not below zero.
     pub(crate) fn extend(
         &mut self,
         headers: crate::protocol::Headers,
-        timestamp: i64,
+        clock: i64,
     ) -> Result<(), ExtendError> {
         // `net::timestamp` gives zero for a clock before the epoch, so no caller gives less.
-        assert!(timestamp >= 0);
+        assert!(clock >= 0);
         let headers = headers.into_vec();
         let Some(first) = headers.first() else {
             return Ok(());
@@ -95,7 +95,7 @@ impl Chain {
         }
         // The clock can be `i64::MAX`, so the add saturates. The compare is in `i64`, so a bound
         // above `u32::MAX` takes each time.
-        let time_max = timestamp.saturating_add(TIME_AHEAD_SECONDS_MAX);
+        let time_max = clock.saturating_add(TIME_AHEAD_SECONDS_MAX);
         // The hash of a header checks its proof of work and the `prev` of the next header, so one
         // pass hashes each header once.
         let mut prev = first.prev;
@@ -364,14 +364,14 @@ mod tests {
         assert_eq!(
             chain.extend(
                 crate::fixtures::headers_batch(&headers[..2]),
-                crate::fixtures::TIMESTAMP
+                crate::fixtures::CLOCK
             ),
             Ok(())
         );
         assert_eq!(
             chain.extend(
                 crate::fixtures::headers_batch(&headers[2..]),
-                crate::fixtures::TIMESTAMP
+                crate::fixtures::CLOCK
             ),
             Ok(())
         );
@@ -395,7 +395,7 @@ mod tests {
         assert_eq!(
             chain.extend(
                 crate::fixtures::headers_batch(&headers[1..]),
-                crate::fixtures::TIMESTAMP
+                crate::fixtures::CLOCK
             ),
             Err(super::ExtendError::NotOnTip)
         );
@@ -413,7 +413,7 @@ mod tests {
         assert_eq!(
             chain.extend(
                 crate::fixtures::headers_batch(&headers),
-                crate::fixtures::TIMESTAMP
+                crate::fixtures::CLOCK
             ),
             Err(super::ExtendError::NotContinuous)
         );
@@ -441,7 +441,7 @@ mod tests {
         assert_eq!(
             chain.extend(
                 crate::fixtures::headers_batch(&headers),
-                crate::fixtures::TIMESTAMP
+                crate::fixtures::CLOCK
             ),
             Err(super::ExtendError::ProofOfWork)
         );
@@ -462,7 +462,7 @@ mod tests {
         assert_eq!(
             chain.extend(
                 crate::fixtures::headers_batch(&[header]),
-                crate::fixtures::TIMESTAMP
+                crate::fixtures::CLOCK
             ),
             Err(super::ExtendError::ProofOfWork)
         );
@@ -485,7 +485,7 @@ mod tests {
             assert_eq!(
                 chain.extend(
                     crate::fixtures::headers_batch(&headers),
-                    crate::fixtures::TIMESTAMP
+                    crate::fixtures::CLOCK
                 ),
                 Err(expected)
             );
@@ -508,7 +508,7 @@ mod tests {
         assert_eq!(
             chain.extend(
                 crate::fixtures::headers_batch(&headers),
-                crate::fixtures::TIMESTAMP
+                crate::fixtures::CLOCK
             ),
             Err(super::ExtendError::WrongBits)
         );
@@ -590,7 +590,7 @@ mod tests {
                 assert_eq!(
                     chain.extend(
                         crate::fixtures::headers_batch(on_chain),
-                        crate::fixtures::TIMESTAMP
+                        crate::fixtures::CLOCK
                     ),
                     Ok(())
                 );
@@ -603,7 +603,7 @@ mod tests {
                             crate::fixtures::headers_batch(
                                 &[in_batch, refused.as_slice()].concat()
                             ),
-                            crate::fixtures::TIMESTAMP
+                            crate::fixtures::CLOCK
                         ),
                         Err(super::ExtendError::TimeTooOld),
                         "{name} {chain_count} {time}"
@@ -614,7 +614,7 @@ mod tests {
                 assert_eq!(
                     chain.extend(
                         crate::fixtures::headers_batch(&[in_batch, &taken].concat()),
-                        crate::fixtures::TIMESTAMP
+                        crate::fixtures::CLOCK
                     ),
                     Ok(()),
                     "{name} {chain_count}"
@@ -638,7 +638,7 @@ mod tests {
         assert_eq!(
             chain.extend(
                 crate::fixtures::headers_batch(&[header]),
-                crate::fixtures::TIMESTAMP
+                crate::fixtures::CLOCK
             ),
             Err(super::ExtendError::WrongBits)
         );
@@ -693,7 +693,7 @@ mod tests {
             assert_eq!(
                 chain.extend(
                     crate::fixtures::headers_batch(&[next]),
-                    crate::fixtures::TIMESTAMP
+                    crate::fixtures::CLOCK
                 ),
                 Ok(()),
                 "{network:?}"
@@ -711,7 +711,7 @@ mod tests {
             assert_eq!(
                 chain.extend(
                     crate::fixtures::headers_batch(&[next]),
-                    crate::fixtures::TIMESTAMP
+                    crate::fixtures::CLOCK
                 ),
                 Err(super::ExtendError::WrongBits),
                 "{network:?}"
@@ -739,7 +739,7 @@ mod tests {
             assert_eq!(
                 chain.extend(
                     crate::fixtures::headers_batch(&[next]),
-                    crate::fixtures::TIMESTAMP
+                    crate::fixtures::CLOCK
                 ),
                 Err(super::ExtendError::WrongBits),
                 "{bits:#x}"
@@ -767,7 +767,7 @@ mod tests {
                 assert_eq!(
                     chain.extend(
                         crate::fixtures::headers_batch(batch),
-                        crate::fixtures::TIMESTAMP
+                        crate::fixtures::CLOCK
                     ),
                     Ok(())
                 );
@@ -825,7 +825,7 @@ mod tests {
                         crate::fixtures::headers_batch(
                             &[in_batch.as_slice(), refused.as_slice()].concat()
                         ),
-                        crate::fixtures::TIMESTAMP
+                        crate::fixtures::CLOCK
                     ),
                     Err(super::ExtendError::TimeTimewarpAttack),
                     "{height_tip} {time}"
@@ -837,7 +837,7 @@ mod tests {
             assert_eq!(
                 chain.extend(
                     crate::fixtures::headers_batch(&[in_batch.as_slice(), &[at_bound]].concat()),
-                    crate::fixtures::TIMESTAMP
+                    crate::fixtures::CLOCK
                 ),
                 Ok(()),
                 "{height_tip}"
@@ -906,7 +906,7 @@ mod tests {
             assert_eq!(
                 chain.extend(
                     crate::fixtures::headers_batch(&[header]),
-                    crate::fixtures::TIMESTAMP
+                    crate::fixtures::CLOCK
                 ),
                 expected,
                 "{network:?} {height_tip}"
@@ -926,7 +926,7 @@ mod tests {
         assert_eq!(
             chain.extend(
                 crate::fixtures::headers_batch(&[one_below]),
-                crate::fixtures::TIMESTAMP
+                crate::fixtures::CLOCK
             ),
             Err(super::ExtendError::TimeTooOld)
         );
@@ -973,7 +973,7 @@ mod tests {
                 assert_eq!(
                     chain.extend(
                         crate::fixtures::headers_batch(on_chain),
-                        crate::fixtures::TIMESTAMP
+                        crate::fixtures::CLOCK
                     ),
                     Ok(())
                 );
@@ -1025,10 +1025,7 @@ mod tests {
         let before = chain.tip();
 
         assert_eq!(
-            chain.extend(
-                crate::fixtures::headers_batch(&[]),
-                crate::fixtures::TIMESTAMP
-            ),
+            chain.extend(crate::fixtures::headers_batch(&[]), crate::fixtures::CLOCK),
             Ok(())
         );
         assert_eq!(chain.tip(), before);

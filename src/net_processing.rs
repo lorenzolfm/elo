@@ -366,12 +366,12 @@ enum SyncState {
 impl Peer {
     /// A `ping` gets a `pong` with its nonce. A `pong` must answer our outstanding `ping`, and a
     /// `headers` our outstanding `getheaders`. Each other message is skipped. Each result but an
-    /// error returns the peer, because an error ends the connection. `timestamp` is the local
+    /// error returns the peer, because an error ends the connection. `clock` is the local
     /// clock, in seconds since the Unix epoch, and only a `headers` reads it.
     pub(crate) fn receive(
         self,
         message: &crate::transport::Message,
-        timestamp: i64,
+        clock: i64,
     ) -> Result<(Peer, Received), PeerError> {
         let msg_type = message.msg_type();
         if msg_type == crate::protocol::PING {
@@ -383,7 +383,7 @@ impl Peer {
             let peer = self.receive_pong(message)?;
             Ok((peer, Received::NoReply))
         } else if msg_type == crate::protocol::HEADERS {
-            self.receive_headers(message, timestamp)
+            self.receive_headers(message, clock)
         } else {
             Ok((self, Received::NoReply))
         }
@@ -412,14 +412,14 @@ impl Peer {
     }
 
     /// The `headers` must answer our outstanding `getheaders`, and the chain must take the
-    /// batch at `timestamp`. Then no `getheaders` is outstanding. A full batch makes the next one
+    /// batch at `clock`. Then no `getheaders` is outstanding. A full batch makes the next one
     /// due. A batch that is not full ends the sync, an empty one too. The payload is checked
     /// first, also when no `getheaders` is outstanding. The bytes after the last transaction count
     /// are ignored.
     fn receive_headers(
         mut self,
         message: &crate::transport::Message,
-        timestamp: i64,
+        clock: i64,
     ) -> Result<(Peer, Received), PeerError> {
         assert_eq!(message.msg_type(), crate::protocol::HEADERS);
 
@@ -430,7 +430,7 @@ impl Peer {
         };
         let full = headers.is_full();
         self.chain
-            .extend(headers, timestamp)
+            .extend(headers, clock)
             .map_err(PeerError::Extend)?;
         if full {
             self.sync = SyncState::Due;
@@ -879,7 +879,7 @@ pub(crate) mod fuzz {
     ) -> ScriptEnd {
         let mut now = std::time::Instant::now();
         // The layout has no byte for it, so the layout of the corpus stays.
-        let timestamp = i64::from(script_header_time(SCRIPT_HEADERS_COUNT_MAX));
+        let clock = i64::from(script_header_time(SCRIPT_HEADERS_COUNT_MAX));
         let mut model = PeerModel::new(now, network);
         while !script.unread.is_empty() {
             let unread_count = script.unread.len();
@@ -898,7 +898,7 @@ pub(crate) mod fuzz {
             };
             // The wait of the driver can end with no message.
             if let Some(message) = script.message(&base) {
-                peer = match peer_receive(peer, &mut model, &message, timestamp) {
+                peer = match peer_receive(peer, &mut model, &message, clock) {
                     Ok(received) => received,
                     Err(error) => return ScriptEnd::PeerRefused(error),
                 };
@@ -971,15 +971,15 @@ pub(crate) mod fuzz {
         assert_eq!(encoded, expected);
     }
 
-    /// Gives `message` to `peer` at `timestamp`, and checks the result against `model`. Returns the
+    /// Gives `message` to `peer` at `clock`, and checks the result against `model`. Returns the
     /// peer, or the error if it refused the message.
     fn peer_receive(
         peer: super::Peer,
         model: &mut PeerModel,
         message: &crate::transport::Message,
-        timestamp: i64,
+        clock: i64,
     ) -> Result<super::Peer, super::PeerError> {
-        match (peer.receive(message, timestamp), model.receive(message)) {
+        match (peer.receive(message, clock), model.receive(message)) {
             (Ok((peer, super::Received::NoReply)), Ok(ReceivedExpected::NoReply)) => Ok(peer),
             (Ok((peer, super::Received::Pong(nonce))), Ok(ReceivedExpected::Pong(expected))) => {
                 assert_eq!(nonce, expected);
@@ -1522,7 +1522,7 @@ mod tests {
         chain
             .extend(
                 crate::fixtures::headers_batch(headers),
-                crate::fixtures::TIMESTAMP,
+                crate::fixtures::CLOCK,
             )
             .unwrap();
         chain.tip()
@@ -1577,7 +1577,7 @@ mod tests {
     /// The peer after `asked`, and after an empty `headers` that ended the sync. So only our
     /// `ping` with `nonce` is outstanding.
     fn pinged(now: std::time::Instant, nonce: u64) -> super::Peer {
-        match asked(now, nonce).receive(&headers_message(&[]), crate::fixtures::TIMESTAMP) {
+        match asked(now, nonce).receive(&headers_message(&[]), crate::fixtures::CLOCK) {
             Ok((peer, super::Received::Synced(_))) => peer,
             other => panic!("{other:?}"),
         }
@@ -1600,7 +1600,7 @@ mod tests {
 
     /// A message that the peer accepts with no reply.
     fn accept(peer: super::Peer, message: &crate::transport::Message) -> super::Peer {
-        match peer.receive(message, crate::fixtures::TIMESTAMP) {
+        match peer.receive(message, crate::fixtures::CLOCK) {
             Ok((peer, super::Received::NoReply)) => peer,
             other => panic!("{other:?}"),
         }
@@ -1723,7 +1723,7 @@ mod tests {
     fn their_ping_gets_a_pong_with_its_nonce() {
         let outbound = peer().receive(
             &core_message(crate::fixtures::PING_FRAME),
-            crate::fixtures::TIMESTAMP,
+            crate::fixtures::CLOCK,
         );
         assert!(
             matches!(
@@ -1738,14 +1738,14 @@ mod tests {
     fn their_ping_needs_a_nonce_and_may_have_bytes_after_it() {
         let short = ping_message(|payload| payload.truncate(size_of::<u64>() - 1));
         assert_eq!(
-            peer().receive(&short, crate::fixtures::TIMESTAMP).err(),
+            peer().receive(&short, crate::fixtures::CLOCK).err(),
             Some(super::PeerError::Ping(
                 crate::serialize::Error::UnexpectedEnd
             ))
         );
 
         let longer = ping_message(|payload| payload.push(0xaa));
-        let outbound = peer().receive(&longer, crate::fixtures::TIMESTAMP);
+        let outbound = peer().receive(&longer, crate::fixtures::CLOCK);
         assert!(
             matches!(
                 outbound,
@@ -1761,7 +1761,7 @@ mod tests {
         let start = std::time::Instant::now();
         let outbound = pinged(start, 7).receive(
             &core_message(crate::fixtures::PING_FRAME),
-            crate::fixtures::TIMESTAMP,
+            crate::fixtures::CLOCK,
         );
         let Ok((peer, super::Received::Pong(0x34e9_3229_8920_45d8))) = outbound else {
             panic!("{outbound:?}");
@@ -1862,7 +1862,7 @@ mod tests {
         let short = pong_message(&7_u64.to_le_bytes()[..size_of::<u64>() - 1]);
         for peer in [peer(), pinged(start, 7)] {
             assert_eq!(
-                peer.receive(&short, crate::fixtures::TIMESTAMP).err(),
+                peer.receive(&short, crate::fixtures::CLOCK).err(),
                 Some(super::PeerError::Pong(
                     crate::serialize::Error::UnexpectedEnd
                 ))
@@ -1881,7 +1881,7 @@ mod tests {
         let answered = accept(pinged(start, 7), &pong(7));
         for peer in [peer(), answered] {
             assert_eq!(
-                peer.receive(&pong(7), crate::fixtures::TIMESTAMP).err(),
+                peer.receive(&pong(7), crate::fixtures::CLOCK).err(),
                 Some(super::PeerError::UnsolicitedPong)
             );
         }
@@ -1892,7 +1892,7 @@ mod tests {
         let start = std::time::Instant::now();
         assert_eq!(
             pinged(start, 7)
-                .receive(&pong(8), crate::fixtures::TIMESTAMP)
+                .receive(&pong(8), crate::fixtures::CLOCK)
                 .err(),
             Some(super::PeerError::PongNonce)
         );
@@ -1913,7 +1913,7 @@ mod tests {
             core_message(crate::fixtures::WTXIDRELAY_FRAME),
             core_message(crate::fixtures::SENDADDRV2_FRAME),
         ] {
-            let outbound = peer().receive(&message, crate::fixtures::TIMESTAMP);
+            let outbound = peer().receive(&message, crate::fixtures::CLOCK);
             assert!(
                 matches!(outbound, Ok((_, super::Received::NoReply))),
                 "{:?}: {outbound:?}",
@@ -1953,8 +1953,7 @@ mod tests {
     fn short_batch_ends_the_sync_at_its_last_header() {
         let start = std::time::Instant::now();
         let headers = crate::fixtures::headers_on_genesis(2);
-        let received =
-            asked(start, 7).receive(&headers_message(&headers), crate::fixtures::TIMESTAMP);
+        let received = asked(start, 7).receive(&headers_message(&headers), crate::fixtures::CLOCK);
         let Ok((_, super::Received::Synced(tip))) = received else {
             panic!("{received:?}");
         };
@@ -1972,7 +1971,7 @@ mod tests {
             panic!("{ticked:?}");
         };
 
-        let received = peer.receive(&headers_message(&[]), crate::fixtures::TIMESTAMP);
+        let received = peer.receive(&headers_message(&[]), crate::fixtures::CLOCK);
         let Ok((_, super::Received::Synced(tip))) = received else {
             panic!("{received:?}");
         };
@@ -1994,7 +1993,7 @@ mod tests {
         let start = std::time::Instant::now();
         for peer in [peer(), pinged(start, 7)] {
             assert_eq!(
-                peer.receive(&headers_message(&[]), crate::fixtures::TIMESTAMP)
+                peer.receive(&headers_message(&[]), crate::fixtures::CLOCK)
                     .err(),
                 Some(super::PeerError::UnsolicitedHeaders)
             );
@@ -2007,7 +2006,7 @@ mod tests {
         let start = std::time::Instant::now();
         for peer in [peer(), asked(start, 7)] {
             assert_eq!(
-                peer.receive(&headers_payload_message(&[]), crate::fixtures::TIMESTAMP)
+                peer.receive(&headers_payload_message(&[]), crate::fixtures::CLOCK)
                     .err(),
                 Some(super::PeerError::Headers(
                     crate::protocol::HeadersError::Payload(crate::serialize::Error::UnexpectedEnd)
@@ -2023,7 +2022,7 @@ mod tests {
         let headers = crate::fixtures::headers_on_genesis(2);
         assert_eq!(
             asked(start, 7)
-                .receive(&headers_message(&headers[1..]), crate::fixtures::TIMESTAMP)
+                .receive(&headers_message(&headers[1..]), crate::fixtures::CLOCK)
                 .err(),
             Some(super::PeerError::Extend(
                 crate::chain::ExtendError::NotOnTip
