@@ -126,11 +126,11 @@ pub(crate) const TESTNET4_RUN: [&str; 5] = [
     ),
 ];
 
-/// Made-up headers of testnet4 at the end of a period, which no real chain has. A real chain cannot
-/// hold a first header that the rule on its time refuses, and a test cannot mine at this limit. So
-/// a script mined these once, on 2026-11-07, in about 60 s on 32 threads. Each has the `bits` of
-/// the limit, a merkle root that is made up, and a version and a time that are legal on a real
-/// chain.
+/// Made-up headers of testnet4 around the first header of a period, which no real chain has. A real
+/// chain cannot hold a first header that the rule on its time refuses, and a test cannot mine at
+/// this limit. So a script mined the last five once, on 2026-11-07, in about 60 s on 32 threads.
+/// Each has the `bits` of the limit, a merkle root that is made up, and a version and a time that
+/// are legal on a real chain.
 pub(crate) const TESTNET4_TIMEWARP: [&str; 6] = [
     // The header below the last header of the period. It has no proof of work, and its time is one
     // second above the genesis time.

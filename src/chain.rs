@@ -709,9 +709,9 @@ mod tests {
         }
     }
 
-    /// The first header of a period may go back to the bound. Each header has real proof of work
-    /// and each other rule takes it, so only this rule refuses it. Each batch reads the header
-    /// below through the tip and through the batch.
+    /// The first header of a period may go back to the bound. Each header of a batch has real proof
+    /// of work and each other rule takes it, so only this rule refuses it. Each batch reads the
+    /// header below through the tip and through the batch.
     #[test]
     fn extend_on_testnet4_bounds_the_time_of_the_first_header_of_a_period() {
         let [
