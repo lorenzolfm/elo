@@ -280,6 +280,10 @@ pub(crate) fn headers_payload_with(headers: &[crate::block::BlockHeader]) -> Vec
     payload
 }
 
+/// The local clock in each test that does not test it. It is the last second of a `u32` time, so
+/// the chain takes each time.
+pub(crate) const TIMESTAMP: i64 = u32::MAX as i64;
+
 /// `headers` as a batch for the chain. It goes through `decode`, so `Headers` has no constructor
 /// for the tests.
 pub(crate) fn headers_batch(headers: &[crate::block::BlockHeader]) -> crate::protocol::Headers {

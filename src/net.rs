@@ -323,7 +323,10 @@ async fn run_exchange(
     peer: crate::net_processing::Peer,
     message: &crate::transport::Message,
 ) -> Result<(crate::net_processing::Peer, Option<crate::chain::Tip>), RunError> {
-    let (peer, received) = peer.receive(message).map_err(RunError::NetProcessing)?;
+    // The clock is read when the message is there, so a long wait for it does not age the clock.
+    let (peer, received) = peer
+        .receive(message, timestamp())
+        .map_err(RunError::NetProcessing)?;
     match received {
         crate::net_processing::Received::NoReply => {
             // Each `ping` that the peer accepts gets a `pong`.
