@@ -1,13 +1,13 @@
 //! The header chain.
 
-/// One linear chain of headers, from genesis to the tip. It is never empty, and each header has
-/// proof of work.
+/// One linear chain of headers, from genesis to the tip. It is never empty, each header has proof
+/// of work, and each header above genesis has the `bits` that the headers below it require.
 #[derive(Debug)]
 pub(crate) struct Chain {
-    /// The network of the chain. Its limit bounds the target of each header.
+    /// The network of the chain. Its rules bound the target of each header.
     network: crate::chainparams::Network,
     /// The headers below the tip, from genesis. The index of a header is its height.
-    ancestors: Vec<crate::block::BlockHeader>,
+    below_tip: Vec<crate::block::BlockHeader>,
     tip: crate::block::BlockHeader,
 }
 
@@ -28,6 +28,9 @@ pub enum ExtendError {
     /// The `bits` of a header are not a target in the range of the network, or the hash of the
     /// header is above that target.
     ProofOfWork,
+    /// The `bits` of a header are not the `bits` that the headers below it require. On testnet4 the
+    /// answer also reads the time of the header.
+    WrongBits,
 }
 
 impl Chain {
@@ -35,14 +38,14 @@ impl Chain {
     pub(crate) fn new(network: crate::chainparams::Network) -> Chain {
         Chain {
             network,
-            ancestors: Vec::new(),
+            below_tip: Vec::new(),
             tip: network.genesis(),
         }
     }
 
     /// Puts all of `headers` on the tip, in order, or none of them. An empty batch changes
-    /// nothing. The first header that fails gives the error, and the `prev` of a header is checked
-    /// before its proof of work.
+    /// nothing. The first header that fails gives the error. For one header, its `prev` is checked
+    /// first, then its proof of work, then its `bits`.
     pub(crate) fn extend(&mut self, headers: crate::protocol::Headers) -> Result<(), ExtendError> {
         let headers = headers.into_vec();
         let Some(first) = headers.first() else {
@@ -54,31 +57,51 @@ impl Chain {
         // The hash of a header checks its proof of work and the `prev` of the next header, so one
         // pass hashes each header once.
         let mut prev = first.prev;
-        for header in &headers {
+        for (index, header) in headers.iter().enumerate() {
             if header.prev != prev {
                 return Err(ExtendError::NotContinuous);
             }
             prev = crate::pow::proven_hash(header, self.network).ok_or(ExtendError::ProofOfWork)?;
+            let ancestors = crate::pow::Ancestors {
+                below_tip: &self.below_tip,
+                tip: &self.tip,
+                batch: &headers[..index],
+            };
+            if crate::pow::required_bits(self.network, ancestors, header.time) != Some(header.bits)
+            {
+                return Err(ExtendError::WrongBits);
+            }
         }
 
         for header in headers {
-            self.ancestors
+            self.below_tip
                 .push(std::mem::replace(&mut self.tip, header));
         }
         // The checks above read the batch. These read the chain: the tip is on the header below it,
-        // and it has proof of work.
+        // it has proof of work, and it has the `bits` that the headers below it require.
         assert_eq!(
             Some(self.tip.prev),
-            self.ancestors.last().map(crate::block::BlockHeader::hash)
+            self.below_tip.last().map(crate::block::BlockHeader::hash)
         );
         assert!(crate::pow::proven_hash(&self.tip, self.network).is_some());
+        assert_eq!(
+            self.below_tip.split_last().and_then(|(last, below_last)| {
+                let ancestors = crate::pow::Ancestors {
+                    below_tip: below_last,
+                    tip: last,
+                    batch: &[],
+                };
+                crate::pow::required_bits(self.network, ancestors, self.tip.time)
+            }),
+            Some(self.tip.bits)
+        );
         Ok(())
     }
 
     /// The height and the hash of the last header.
     pub(crate) fn tip(&self) -> Tip {
         Tip {
-            height: self.ancestors.len(),
+            height: self.below_tip.len(),
             hash: self.tip.hash(),
         }
     }
@@ -108,6 +131,7 @@ impl std::fmt::Display for ExtendError {
             ExtendError::NotOnTip => write!(f, "headers do not start at our tip"),
             ExtendError::NotContinuous => write!(f, "headers do not form a chain"),
             ExtendError::ProofOfWork => write!(f, "a header fails proof of work"),
+            ExtendError::WrongBits => write!(f, "a header has the wrong bits"),
         }
     }
 }
@@ -228,6 +252,142 @@ mod tests {
                 chain.extend(crate::fixtures::headers_batch(&headers)),
                 Err(expected)
             );
+        }
+    }
+
+    #[test]
+    fn extend_refuses_a_batch_with_bits_that_are_not_required() {
+        let mut headers = crate::fixtures::headers_on_genesis(2);
+        // These `bits` are in the range, and the mined hash is below their target, so only the rule
+        // of the network refuses them.
+        headers[1] = crate::pow::mined_for_regtest(crate::block::BlockHeader {
+            bits: 0x207f_fffe,
+            ..headers[1]
+        });
+        let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
+        let before = chain.tip();
+
+        // The bad header is the last, and block 1 is good, so the chain takes none.
+        assert_eq!(
+            chain.extend(crate::fixtures::headers_batch(&headers)),
+            Err(super::ExtendError::WrongBits)
+        );
+        assert_eq!(chain.tip(), before);
+    }
+
+    /// A chain with `real` at their heights and the last of them as the tip. Each other height has
+    /// the genesis header, so only what the rules read is real. A test cannot mine a header on
+    /// these networks, so the tip must be a real header for the next real header to pass.
+    fn chain_with(
+        network: crate::chainparams::Network,
+        real: &[(usize, crate::block::BlockHeader)],
+    ) -> super::Chain {
+        let (tip_height, tip) = *real.last().unwrap();
+        let mut below_tip = vec![network.genesis(); tip_height];
+        for (height, header) in &real[..real.len() - 1] {
+            below_tip[*height] = *header;
+        }
+        super::Chain {
+            network,
+            below_tip,
+            tip,
+        }
+    }
+
+    #[test]
+    fn extend_takes_a_real_change_of_the_target() {
+        for (network, first_height, [first, last, next]) in [
+            (
+                crate::chainparams::Network::Mainnet,
+                30240,
+                crate::fixtures::MAINNET_RETARGET,
+            ),
+            (
+                crate::chainparams::Network::Signet,
+                199584,
+                crate::fixtures::SIGNET_RETARGET,
+            ),
+            // The last header has the limit, so only the `bits` of the first header give the
+            // answer.
+            (
+                crate::chainparams::Network::Testnet4,
+                38304,
+                crate::fixtures::TESTNET4_RETARGET,
+            ),
+        ] {
+            let first = crate::fixtures::header(first);
+            let last = crate::fixtures::header(last);
+            let next = crate::fixtures::header(next);
+            let last_height = first_height + 2015;
+            let mut chain = chain_with(network, &[(first_height, first), (last_height, last)]);
+            assert_eq!(
+                chain.extend(crate::fixtures::headers_batch(&[next])),
+                Ok(()),
+                "{network:?}"
+            );
+            assert_eq!(chain.tip().height, last_height + 1, "{network:?}");
+
+            // The same `next` has real proof of work, so with another first time only the rule
+            // refuses it.
+            let other_first = crate::block::BlockHeader {
+                time: first.time - 600,
+                ..first
+            };
+            let mut chain =
+                chain_with(network, &[(first_height, other_first), (last_height, last)]);
+            assert_eq!(
+                chain.extend(crate::fixtures::headers_batch(&[next])),
+                Err(super::ExtendError::WrongBits),
+                "{network:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extend_refuses_a_batch_when_no_bits_can_pass() {
+        // Testnet4 changes the `bits` of the first header of a period. That header is not the tip,
+        // so the real `next` still chains and has proof of work, and the rule reads these `bits`.
+        // `0` is no target, and in the smallest time a target of 3 falls to zero. So the rule has
+        // no answer, and that must be a refusal, not a pass.
+        let [first, last, next] = crate::fixtures::TESTNET4_RETARGET.map(crate::fixtures::header);
+        for bits in [0, 0x0103_0000] {
+            let first = crate::block::BlockHeader {
+                bits,
+                time: last.time,
+                ..first
+            };
+            let mut chain = chain_with(
+                crate::chainparams::Network::Testnet4,
+                &[(38304, first), (40319, last)],
+            );
+            assert_eq!(
+                chain.extend(crate::fixtures::headers_batch(&[next])),
+                Err(super::ExtendError::WrongBits),
+                "{bits:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn extend_takes_a_real_run_at_the_limit_of_testnet4() {
+        let network = crate::chainparams::Network::Testnet4;
+        let [real, late_1, late_2, late_3, back] =
+            crate::fixtures::TESTNET4_RUN.map(crate::fixtures::header);
+        let on_real = || chain_with(network, &[(40025, real)]);
+
+        // The last header goes back to the real `bits` through each part of what the rule reads:
+        // the batch, the tip and the headers below the tip.
+        let batches: [&[&[crate::block::BlockHeader]]; 3] = [
+            &[&[late_1, late_2, late_3, back]],
+            &[&[late_1, late_2], &[late_3, back]],
+            &[&[late_1], &[late_2], &[late_3], &[back]],
+        ];
+        for batches in batches {
+            let mut chain = on_real();
+            for batch in batches {
+                assert_eq!(chain.extend(crate::fixtures::headers_batch(batch)), Ok(()));
+            }
+            assert_eq!(chain.tip().hash, back.hash());
         }
     }
 

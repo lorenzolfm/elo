@@ -530,6 +530,7 @@ pub(crate) mod fuzz {
                 assert!(hash.as_byte_array()[31] <= 0x7f);
             }
         }
+        crate::pow::fuzz::required_bits_check(&headers);
         assert_eq!(encoded, taken);
     }
 }
