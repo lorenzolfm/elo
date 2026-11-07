@@ -179,8 +179,8 @@ impl<'a> Ancestors<'a> {
         }
         // This sort needs no heap, and two equal times are the same.
         times.sort_unstable();
-        // The floor of an odd count is its middle. An even count has two middles, and this is the
-        // higher.
+        // Half of an odd count, rounded down, is its middle. An even count has two middles, and
+        // half of it is the higher.
         let middle_index = times_count / 2;
         times[middle_index]
     }
@@ -223,10 +223,11 @@ impl std::error::Error for ExtendError {}
 #[cfg_attr(false, mutants::skip)]
 pub(crate) mod fuzz {
     /// The first headers of a batch that go through the check. A median reads at most
-    /// `MEDIAN_TIME_HEADERS_COUNT_MAX` times, so a later header reaches no new path. In a batch
-    /// that is longer than its input, the later headers have only zeros. A check of each header
-    /// costs 40% of the runs of the `headers` target. With this bound, the cost is inside the noise
-    /// of a run.
+    /// `MEDIAN_TIME_HEADERS_COUNT_MAX` times, so the first header with a time out of that window
+    /// reaches the last new path. The headers above it only give a run more windows of times. In a
+    /// batch that is longer than its input, the later headers have only zeros. A check of each
+    /// header costs 40% of the runs of the `headers` target. With this bound, the cost is inside the
+    /// noise of a run.
     const MEDIAN_CHECK_HEADERS_COUNT_MAX: usize = 4 * super::MEDIAN_TIME_HEADERS_COUNT_MAX;
 
     /// A peer picks each `time` of `headers`, so the first headers go through the median time, as
