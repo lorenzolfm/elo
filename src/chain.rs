@@ -106,18 +106,17 @@ impl Chain {
         for header in headers {
             self.below_tip
                 .push(std::mem::replace(&mut self.tip, header));
+            // The first header of a period is rarely the last of a batch, so this reads each
+            // header. It reads the chain, and the check above reads the batch.
+            assert!(
+                self.tip.time
+                    >= crate::pow::timewarp_time_min(self.network, self.ancestors_of_tip())
+            );
         }
-        // A batch that is not empty puts the old tip below the new tip.
-        assert!(!self.below_tip.is_empty());
-        let last_index = self.below_tip.len() - 1;
-        let ancestors = Ancestors {
-            below_tip: &self.below_tip[..last_index],
-            tip: &self.below_tip[last_index],
-            batch: &[],
-        };
+        let ancestors = self.ancestors_of_tip();
         // The checks above read the batch. These read the chain: the tip is on the header below it,
         // it has proof of work, it has the `bits` that the headers below it require, and its time
-        // is above their median time and at or above the bound of the timewarp rule.
+        // is above their median time.
         assert_eq!(self.tip.prev, ancestors.tip.hash());
         assert!(crate::pow::proven_hash(&self.tip, self.network).is_some());
         assert_eq!(
@@ -125,8 +124,19 @@ impl Chain {
             Some(self.tip.bits)
         );
         assert!(self.tip.time > ancestors.median_time_past());
-        assert!(self.tip.time >= crate::pow::timewarp_time_min(self.network, ancestors));
         Ok(())
+    }
+
+    /// The headers below the tip. A batch that is not empty puts the old tip below the new tip, so
+    /// only a chain above genesis calls this.
+    fn ancestors_of_tip(&self) -> Ancestors<'_> {
+        assert!(!self.below_tip.is_empty());
+        let last_index = self.below_tip.len() - 1;
+        Ancestors {
+            below_tip: &self.below_tip[..last_index],
+            tip: &self.below_tip[last_index],
+            batch: &[],
+        }
     }
 
     /// The height and the hash of the last header.
