@@ -120,8 +120,9 @@ fn scaled_up_to(mut number: [u8; 32], timespan_seconds: u32, limit: [u8; 32]) ->
 /// The `bits` of the next period. `bits` give the target to change, and `first_time` and
 /// `last_time` are the times of the first and the last header of the period that ends. The target
 /// changes by the time between them over `PERIOD_TIMESPAN_SECONDS`, by at most a factor of 4 in
-/// each direction, and it stays at most `limit`. A target below 4 can become zero, and that gives
-/// `bits` of zero. Returns nothing if `bits` are no target up to `limit`.
+/// each direction, and it stays at most `limit`. Returns nothing if `bits` are no target up to
+/// `limit`, or if the answer is zero, which a target below 4 can reach. No header can pass in either
+/// case, and each answer is a target.
 ///
 /// This takes `bits`, not a `Target`, and reads them with `limit`. So the limit that bounds the
 /// target and the limit that caps the answer cannot differ.
@@ -137,11 +138,11 @@ fn retargeted_bits(bits: u32, first_time: u32, last_time: u32, limit: [u8; 32]) 
         .saturating_sub(first_time)
         .clamp(TIMESPAN_SECONDS_MIN, TIMESPAN_SECONDS_MAX);
     let next = to_bits(scaled_up_to(target.0, timespan_seconds, limit));
-    // This reads the answer with `from_bits`, not with the code that wrote it. Zero is the one
-    // answer that is no target.
-    if next != 0 {
-        assert!(Target::from_bits(next, limit).is_some());
+    if next == 0 {
+        return None;
     }
+    // This reads the answer with `from_bits`, not with the code that wrote it.
+    assert!(Target::from_bits(next, limit).is_some());
     Some(next)
 }
 
@@ -190,8 +191,13 @@ pub(crate) mod fuzz {
         ] {
             let limit = network.pow_limit();
             let next = super::retargeted_bits(header.bits, header.nonce, header.time, limit);
-            let target = super::Target::from_bits(header.bits, limit);
-            assert_eq!(next.is_some(), target.is_some());
+            match super::Target::from_bits(header.bits, limit) {
+                None => assert_eq!(next, None),
+                // Only a target below 4 can have no answer.
+                Some(super::Target([high @ .., low])) => {
+                    assert!(next.is_some() || (high == [0; 31] && low < 4));
+                }
+            }
         }
     }
 }
@@ -511,8 +517,6 @@ mod tests {
             ("back", 0x1c7f_ffff, 1_302_401, 1_000_000, 0x1c1f_ffff),
             // The multiply is first: a divide first gives zero.
             ("one", 0x0101_0000, 1_000_000, 2_209_600, 0x0101_0000),
-            // The answer can be zero.
-            ("zero", 0x0101_0000, 1_000_000, 1_000_000, 0),
         ]);
     }
 
@@ -523,6 +527,19 @@ mod tests {
             assert_eq!(
                 super::retargeted_bits(bits, 1_000_000, 2_209_600, limit),
                 None,
+                "{bits:#010x}"
+            );
+        }
+    }
+
+    #[test]
+    fn retargeted_bits_refuse_an_answer_of_zero() {
+        let limit = crate::chainparams::Network::Mainnet.pow_limit();
+        // The time is the smallest, so the answer is a quarter of the target, rounded down.
+        for (bits, expected) in [(0x0103_0000, None), (0x0104_0000, Some(0x0101_0000))] {
+            assert_eq!(
+                super::retargeted_bits(bits, 1_000_000, 1_000_000, limit),
+                expected,
                 "{bits:#010x}"
             );
         }
