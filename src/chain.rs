@@ -6,10 +6,14 @@ const MEDIAN_TIME_HEADERS_COUNT_MAX: usize = 11;
 // This count has one middle, so only a chain below this height has two middle times.
 const _: () = assert!(!MEDIAN_TIME_HEADERS_COUNT_MAX.is_multiple_of(2));
 
+/// The most seconds that the time of a header may be after the local clock.
+const TIME_AHEAD_SECONDS_MAX: u64 = 2 * 60 * 60;
+
 /// One linear chain of headers, from genesis to the tip. It is never empty, each header has proof
 /// of work, and each header above genesis has the `bits` that the headers below it require and a
 /// time above their median time. On testnet4, each first header of a period above genesis also has
-/// a time at most 10 minutes below the header below it.
+/// a time at most 10 minutes below the header below it. When the chain took a header, its time was
+/// at most `TIME_AHEAD_SECONDS_MAX` after the local clock.
 #[derive(Debug)]
 pub(crate) struct Chain {
     /// The network of the chain. Its rules bound the target of each header and, on testnet4, the
@@ -45,6 +49,9 @@ pub enum ExtendError {
     /// On testnet4, the time of the first header of a period is more than 10 minutes below the
     /// header below it.
     TimeTimewarpAttack,
+    /// The time of a header is more than `TIME_AHEAD_SECONDS_MAX` after the local clock. The same
+    /// header can pass at a later clock.
+    TimeTooNew,
 }
 
 /// The headers below one header of a batch, by height: the chain, then the part of the batch that
@@ -70,8 +77,13 @@ impl Chain {
     /// Puts all of `headers` on the tip, in order, or none of them. An empty batch changes
     /// nothing. The first header that fails gives the error. For one header, its `prev` is checked
     /// first, then its proof of work, then its `bits`, then its time against the median time, then
-    /// its time against the timewarp rule.
-    pub(crate) fn extend(&mut self, headers: crate::protocol::Headers) -> Result<(), ExtendError> {
+    /// its time against the timewarp rule, then its time against `clock`. `clock` is the local
+    /// clock, in seconds since the Unix epoch.
+    pub(crate) fn extend(
+        &mut self,
+        headers: crate::protocol::Headers,
+        clock: u64,
+    ) -> Result<(), ExtendError> {
         let headers = headers.into_vec();
         let Some(first) = headers.first() else {
             return Ok(());
@@ -79,6 +91,9 @@ impl Chain {
         if first.prev != self.tip.hash() {
             return Err(ExtendError::NotOnTip);
         }
+        // The clock can be `u64::MAX`, so the add saturates. The compare is in `u64`, so a bound
+        // above `u32::MAX` takes each time.
+        let time_max = clock.saturating_add(TIME_AHEAD_SECONDS_MAX);
         // The hash of a header checks its proof of work and the `prev` of the next header, so one
         // pass hashes each header once.
         let mut prev = first.prev;
@@ -102,6 +117,9 @@ impl Chain {
             if header.time < crate::pow::timewarp_time_min(self.network, ancestors) {
                 return Err(ExtendError::TimeTimewarpAttack);
             }
+            if u64::from(header.time) > time_max {
+                return Err(ExtendError::TimeTooNew);
+            }
         }
 
         let genesis_time = self.network.genesis().time;
@@ -111,6 +129,8 @@ impl Chain {
             // A median only rises, and the first one reads genesis. So no peer bytes reach this
             // while the check on the median holds.
             assert!(self.tip.time > genesis_time);
+            // The bound is the same for each header, so this holds that the check read each one.
+            assert!(u64::from(self.tip.time) <= time_max);
             // The first header of a period is rarely the last of a batch, so this reads each
             // header. It reads the chain, and the check above reads the batch.
             assert!(
@@ -247,6 +267,10 @@ impl std::fmt::Display for ExtendError {
             ExtendError::TimeTimewarpAttack => {
                 write!(f, "the first header of a period has a time too far back")
             }
+            ExtendError::TimeTooNew => write!(
+                f,
+                "a header has a time more than {TIME_AHEAD_SECONDS_MAX} s after our clock"
+            ),
         }
     }
 }
@@ -336,11 +360,17 @@ mod tests {
         let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
 
         assert_eq!(
-            chain.extend(crate::fixtures::headers_batch(&headers[..2])),
+            chain.extend(
+                crate::fixtures::headers_batch(&headers[..2]),
+                crate::fixtures::CLOCK
+            ),
             Ok(())
         );
         assert_eq!(
-            chain.extend(crate::fixtures::headers_batch(&headers[2..])),
+            chain.extend(
+                crate::fixtures::headers_batch(&headers[2..]),
+                crate::fixtures::CLOCK
+            ),
             Ok(())
         );
 
@@ -361,7 +391,10 @@ mod tests {
 
         // The first header is on block 1, which the chain does not have.
         assert_eq!(
-            chain.extend(crate::fixtures::headers_batch(&headers[1..])),
+            chain.extend(
+                crate::fixtures::headers_batch(&headers[1..]),
+                crate::fixtures::CLOCK
+            ),
             Err(super::ExtendError::NotOnTip)
         );
         assert_eq!(chain.tip(), before);
@@ -376,7 +409,10 @@ mod tests {
 
         // Blocks 1 and 2 connect, but block 4 is not on block 2, so the chain takes none.
         assert_eq!(
-            chain.extend(crate::fixtures::headers_batch(&headers)),
+            chain.extend(
+                crate::fixtures::headers_batch(&headers),
+                crate::fixtures::CLOCK
+            ),
             Err(super::ExtendError::NotContinuous)
         );
         assert_eq!(chain.tip(), before);
@@ -401,7 +437,10 @@ mod tests {
 
         // The bad header is the last, and block 1 is good, so the chain takes none.
         assert_eq!(
-            chain.extend(crate::fixtures::headers_batch(&headers)),
+            chain.extend(
+                crate::fixtures::headers_batch(&headers),
+                crate::fixtures::CLOCK
+            ),
             Err(super::ExtendError::ProofOfWork)
         );
         assert_eq!(chain.tip(), before);
@@ -419,7 +458,10 @@ mod tests {
         let mut chain = super::Chain::new(network);
 
         assert_eq!(
-            chain.extend(crate::fixtures::headers_batch(&[header])),
+            chain.extend(
+                crate::fixtures::headers_batch(&[header]),
+                crate::fixtures::CLOCK
+            ),
             Err(super::ExtendError::ProofOfWork)
         );
     }
@@ -439,7 +481,10 @@ mod tests {
         ] {
             let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
             assert_eq!(
-                chain.extend(crate::fixtures::headers_batch(&headers)),
+                chain.extend(
+                    crate::fixtures::headers_batch(&headers),
+                    crate::fixtures::CLOCK
+                ),
                 Err(expected)
             );
         }
@@ -459,7 +504,10 @@ mod tests {
 
         // The bad header is the last, and block 1 is good, so the chain takes none.
         assert_eq!(
-            chain.extend(crate::fixtures::headers_batch(&headers)),
+            chain.extend(
+                crate::fixtures::headers_batch(&headers),
+                crate::fixtures::CLOCK
+            ),
             Err(super::ExtendError::WrongBits)
         );
         assert_eq!(chain.tip(), before);
@@ -538,7 +586,10 @@ mod tests {
                 let (on_chain, in_batch) = below.split_at(chain_count);
                 let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
                 assert_eq!(
-                    chain.extend(crate::fixtures::headers_batch(on_chain)),
+                    chain.extend(
+                        crate::fixtures::headers_batch(on_chain),
+                        crate::fixtures::CLOCK
+                    ),
                     Ok(())
                 );
                 let before = chain.tip();
@@ -546,9 +597,12 @@ mod tests {
                 for refused in &refused {
                     let time = refused[0].time;
                     assert_eq!(
-                        chain.extend(crate::fixtures::headers_batch(
-                            &[in_batch, refused.as_slice()].concat()
-                        )),
+                        chain.extend(
+                            crate::fixtures::headers_batch(
+                                &[in_batch, refused.as_slice()].concat()
+                            ),
+                            crate::fixtures::CLOCK
+                        ),
                         Err(super::ExtendError::TimeTooOld),
                         "{name} {chain_count} {time}"
                     );
@@ -556,7 +610,10 @@ mod tests {
                 }
 
                 assert_eq!(
-                    chain.extend(crate::fixtures::headers_batch(&[in_batch, &taken].concat())),
+                    chain.extend(
+                        crate::fixtures::headers_batch(&[in_batch, &taken].concat()),
+                        crate::fixtures::CLOCK
+                    ),
                     Ok(()),
                     "{name} {chain_count}"
                 );
@@ -577,7 +634,10 @@ mod tests {
         let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
 
         assert_eq!(
-            chain.extend(crate::fixtures::headers_batch(&[header])),
+            chain.extend(
+                crate::fixtures::headers_batch(&[header]),
+                crate::fixtures::CLOCK
+            ),
             Err(super::ExtendError::WrongBits)
         );
     }
@@ -629,7 +689,10 @@ mod tests {
             let last_height = first_height + 2015;
             let mut chain = chain_with(network, &[(first_height, first), (last_height, last)]);
             assert_eq!(
-                chain.extend(crate::fixtures::headers_batch(&[next])),
+                chain.extend(
+                    crate::fixtures::headers_batch(&[next]),
+                    crate::fixtures::CLOCK
+                ),
                 Ok(()),
                 "{network:?}"
             );
@@ -644,7 +707,10 @@ mod tests {
             let mut chain =
                 chain_with(network, &[(first_height, other_first), (last_height, last)]);
             assert_eq!(
-                chain.extend(crate::fixtures::headers_batch(&[next])),
+                chain.extend(
+                    crate::fixtures::headers_batch(&[next]),
+                    crate::fixtures::CLOCK
+                ),
                 Err(super::ExtendError::WrongBits),
                 "{network:?}"
             );
@@ -669,7 +735,10 @@ mod tests {
                 &[(38304, first), (40319, last)],
             );
             assert_eq!(
-                chain.extend(crate::fixtures::headers_batch(&[next])),
+                chain.extend(
+                    crate::fixtures::headers_batch(&[next]),
+                    crate::fixtures::CLOCK
+                ),
                 Err(super::ExtendError::WrongBits),
                 "{bits:#x}"
             );
@@ -693,7 +762,13 @@ mod tests {
         for batches in batches {
             let mut chain = on_real();
             for batch in batches {
-                assert_eq!(chain.extend(crate::fixtures::headers_batch(batch)), Ok(()));
+                assert_eq!(
+                    chain.extend(
+                        crate::fixtures::headers_batch(batch),
+                        crate::fixtures::CLOCK
+                    ),
+                    Ok(())
+                );
             }
             assert_eq!(chain.tip().hash, back.hash());
         }
@@ -744,9 +819,12 @@ mod tests {
                 let mut chain = chain_with(network, real);
                 let before = chain.tip();
                 assert_eq!(
-                    chain.extend(crate::fixtures::headers_batch(
-                        &[in_batch.as_slice(), refused.as_slice()].concat()
-                    )),
+                    chain.extend(
+                        crate::fixtures::headers_batch(
+                            &[in_batch.as_slice(), refused.as_slice()].concat()
+                        ),
+                        crate::fixtures::CLOCK
+                    ),
                     Err(super::ExtendError::TimeTimewarpAttack),
                     "{height_tip} {time}"
                 );
@@ -755,9 +833,10 @@ mod tests {
 
             let mut chain = chain_with(network, real);
             assert_eq!(
-                chain.extend(crate::fixtures::headers_batch(
-                    &[in_batch.as_slice(), &[at_bound]].concat()
-                )),
+                chain.extend(
+                    crate::fixtures::headers_batch(&[in_batch.as_slice(), &[at_bound]].concat()),
+                    crate::fixtures::CLOCK
+                ),
                 Ok(()),
                 "{height_tip}"
             );
@@ -823,7 +902,10 @@ mod tests {
             let height_tip = real.last().unwrap().0;
             let mut chain = chain_with(network, &real);
             assert_eq!(
-                chain.extend(crate::fixtures::headers_batch(&[header])),
+                chain.extend(
+                    crate::fixtures::headers_batch(&[header]),
+                    crate::fixtures::CLOCK
+                ),
                 expected,
                 "{network:?} {height_tip}"
             );
@@ -840,8 +922,90 @@ mod tests {
         let mut chain = chain_with(crate::chainparams::Network::Testnet4, &real);
 
         assert_eq!(
-            chain.extend(crate::fixtures::headers_batch(&[one_below])),
+            chain.extend(
+                crate::fixtures::headers_batch(&[one_below]),
+                crate::fixtures::CLOCK
+            ),
             Err(super::ExtendError::TimeTooOld)
+        );
+    }
+
+    /// Each row has a clock and the time of one header. In one batch that header is the first and
+    /// the header on it has a legal time, and in the other it is the last. So only that header
+    /// decides. A refused batch must leave the chain as it was.
+    #[test]
+    fn extend_takes_a_time_only_up_to_two_hours_after_the_clock() {
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        let below = mined_on(
+            genesis,
+            &[genesis.time + 1, genesis.time + 2, genesis.time + 3],
+        );
+        let clock_after_genesis = 100;
+        let clock = u64::from(genesis.time + clock_after_genesis);
+        // A person wrote the two hours.
+        let at_bound = genesis.time + clock_after_genesis + 2 * 60 * 60;
+        let cases: [(&str, u64, u32, Result<(), super::ExtendError>); 4] = [
+            ("at the bound", clock, at_bound, Ok(())),
+            (
+                "one second above the bound",
+                clock,
+                at_bound + 1,
+                Err(super::ExtendError::TimeTooNew),
+            ),
+            (
+                "far above the bound",
+                clock,
+                u32::MAX,
+                Err(super::ExtendError::TimeTooNew),
+            ),
+            // A plain add of the two hours to this clock panics.
+            ("the last clock", u64::MAX, u32::MAX, Ok(())),
+        ];
+        for (name, clock, time, expected) in cases {
+            let header = mined_on(below[2], &[time])[0];
+            let on_header = mined_on(header, &[genesis.time + 4])[0];
+            for (on_chain, batch) in [
+                (&below[..], vec![header, on_header]),
+                (&below[..2], vec![below[2], header]),
+            ] {
+                let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
+                assert_eq!(
+                    chain.extend(
+                        crate::fixtures::headers_batch(on_chain),
+                        crate::fixtures::CLOCK
+                    ),
+                    Ok(())
+                );
+                let before = chain.tip();
+                let height_tip = on_chain.len();
+
+                assert_eq!(
+                    chain.extend(crate::fixtures::headers_batch(&batch), clock),
+                    expected,
+                    "{name} {height_tip}"
+                );
+                let tip = match expected {
+                    Ok(()) => batch[batch.len() - 1].hash(),
+                    Err(_) => before.hash,
+                };
+                assert_eq!(chain.tip().hash, tip, "{name} {height_tip}");
+            }
+        }
+    }
+
+    #[test]
+    fn extend_checks_the_timewarp_rule_before_the_time_against_the_clock() {
+        // The clock is far below the time of this header, so it fails both rules.
+        let [_, last, _, one_below, ..] =
+            crate::fixtures::TESTNET4_TIMEWARP.map(crate::fixtures::header);
+        let mut chain = chain_with(
+            crate::chainparams::Network::Testnet4,
+            &[(0, timewarp_first(last)), (2015, last)],
+        );
+
+        assert_eq!(
+            chain.extend(crate::fixtures::headers_batch(&[one_below]), 0),
+            Err(super::ExtendError::TimeTimewarpAttack)
         );
     }
 
@@ -850,7 +1014,10 @@ mod tests {
         let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
         let before = chain.tip();
 
-        assert_eq!(chain.extend(crate::fixtures::headers_batch(&[])), Ok(()));
+        assert_eq!(
+            chain.extend(crate::fixtures::headers_batch(&[]), crate::fixtures::CLOCK),
+            Ok(())
+        );
         assert_eq!(chain.tip(), before);
     }
 

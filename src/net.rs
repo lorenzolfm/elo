@@ -323,7 +323,10 @@ async fn run_exchange(
     peer: crate::net_processing::Peer,
     message: &crate::transport::Message,
 ) -> Result<(crate::net_processing::Peer, Option<crate::chain::Tip>), RunError> {
-    let (peer, received) = peer.receive(message).map_err(RunError::NetProcessing)?;
+    // The clock is read when the message is there, so a long wait for it does not age the clock.
+    let (peer, received) = peer
+        .receive(message, clock())
+        .map_err(RunError::NetProcessing)?;
     match received {
         crate::net_processing::Received::NoReply => {
             // Each `ping` that the peer accepts gets a `pong`.
@@ -516,11 +519,16 @@ fn nonce_payload(nonce: u64) -> Vec<u8> {
 }
 
 /// Seconds since the Unix epoch, or zero if the clock is before it.
-fn timestamp() -> i64 {
+fn clock() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(elapsed) => i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX),
+        Ok(elapsed) => elapsed.as_secs(),
         Err(_before_epoch) => 0,
     }
+}
+
+/// `clock` as the `timestamp` of our `version`, which is an `i64` on the wire.
+fn timestamp() -> i64 {
+    i64::try_from(clock()).unwrap_or(i64::MAX)
 }
 
 /// A SipHash with keys from the OS. The nonce in our `version` only detects a connection to
@@ -654,6 +662,7 @@ pub(crate) mod fuzz {
 
 #[cfg(test)]
 mod tests {
+    use crate::serialize::Decode;
     use std::io::{Read, Write};
 
     fn block_on<F: Future>(future: F) -> F::Output {
@@ -759,6 +768,40 @@ mod tests {
     }
 
     #[test]
+    fn our_version_has_the_local_clock_in_seconds() {
+        // A peer reads this time only for its offset from its own clock, so the bitcoind test
+        // passes with each value. Only this test reads it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+        let peer_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            // The stream closes when this returns, so the handshake of the driver ends.
+            read_message(&mut stream)
+        });
+
+        let seconds = || {
+            let elapsed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap();
+            i64::try_from(elapsed.as_secs()).unwrap()
+        };
+        let before = seconds();
+        let _closed = block_on(super::handshake(crate::chainparams::Network::Regtest, peer));
+        let after = seconds();
+        let message = peer_thread.join().unwrap();
+        assert_eq!(message.msg_type(), crate::protocol::VERSION);
+        let ours = crate::protocol::Version::decode(&mut message.payload()).unwrap();
+        assert!(
+            (before..=after).contains(&ours.timestamp),
+            "{before} {} {after}",
+            ours.timestamp
+        );
+    }
+
+    #[test]
     fn silent_peer_is_handshake_timeout() {
         // The listener never accepts, so no `version` comes. The clock is paused after the
         // connect. When no task can run, tokio moves the clock to the next timer.
@@ -825,6 +868,53 @@ mod tests {
         assert_eq!(
             elapsed.as_secs(),
             std::time::Duration::from_mins(2).as_secs()
+        );
+    }
+
+    #[test]
+    fn header_far_after_the_local_clock_ends_the_connection() {
+        // The header has the last time of a `u32`. Until the year 2106, that is more than 2 h
+        // after the local clock in seconds, so only the driver decides here. A clock in
+        // milliseconds would take this header.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+        let peer_thread = std::thread::spawn(move || {
+            let mut stream = accept_handshake(&listener);
+            assert_ping(&read_message(&mut stream));
+            read_first_get_headers(&mut stream);
+            let genesis = crate::chainparams::Network::Regtest.genesis();
+            let header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
+                prev: genesis.hash(),
+                time: u32::MAX,
+                ..genesis
+            });
+            let frame = crate::transport::encode(
+                crate::chainparams::Network::Regtest,
+                crate::protocol::HEADERS,
+                &crate::fixtures::headers_payload_with(&[header]),
+            );
+            stream.write_all(&frame).unwrap();
+            // The driver closes the socket when it refuses the batch.
+            let mut rest = Vec::new();
+            stream.read_to_end(&mut rest).unwrap();
+        });
+
+        let result = block_on(async {
+            let (connection, _theirs) =
+                super::handshake(crate::chainparams::Network::Regtest, peer)
+                    .await
+                    .unwrap();
+            connection.sync().await
+        });
+        peer_thread.join().unwrap();
+        assert!(
+            matches!(
+                result,
+                Err(super::RunError::NetProcessing(
+                    crate::net_processing::PeerError::Extend(crate::chain::ExtendError::TimeTooNew)
+                ))
+            ),
+            "{result:?}"
         );
     }
 
