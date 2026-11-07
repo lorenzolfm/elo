@@ -371,7 +371,7 @@ impl Peer {
     pub(crate) fn receive(
         self,
         message: &crate::transport::Message,
-        clock: i64,
+        clock: u64,
     ) -> Result<(Peer, Received), PeerError> {
         let msg_type = message.msg_type();
         if msg_type == crate::protocol::PING {
@@ -419,7 +419,7 @@ impl Peer {
     fn receive_headers(
         mut self,
         message: &crate::transport::Message,
-        clock: i64,
+        clock: u64,
     ) -> Result<(Peer, Received), PeerError> {
         assert_eq!(message.msg_type(), crate::protocol::HEADERS);
 
@@ -879,7 +879,7 @@ pub(crate) mod fuzz {
     ) -> ScriptEnd {
         let mut now = std::time::Instant::now();
         // The layout has no byte for it, so the layout of the corpus stays.
-        let clock = i64::from(script_header_time(SCRIPT_HEADERS_COUNT_MAX));
+        let clock = u64::from(script_header_time(SCRIPT_HEADERS_COUNT_MAX));
         let mut model = PeerModel::new(now, network);
         while !script.unread.is_empty() {
             let unread_count = script.unread.len();
@@ -977,7 +977,7 @@ pub(crate) mod fuzz {
         peer: super::Peer,
         model: &mut PeerModel,
         message: &crate::transport::Message,
-        clock: i64,
+        clock: u64,
     ) -> Result<super::Peer, super::PeerError> {
         match (peer.receive(message, clock), model.receive(message)) {
             (Ok((peer, super::Received::NoReply)), Ok(ReceivedExpected::NoReply)) => Ok(peer),
@@ -2036,7 +2036,7 @@ mod tests {
         // gets the clock of `receive`.
         let start = std::time::Instant::now();
         let headers = crate::fixtures::headers_on_genesis(2);
-        let clock = i64::from(headers[1].time) - 2 * 60 * 60 - 1;
+        let clock = u64::from(headers[1].time) - 2 * 60 * 60 - 1;
         assert_eq!(
             asked(start, 7)
                 .receive(&headers_message(&headers), clock)

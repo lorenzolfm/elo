@@ -325,7 +325,7 @@ async fn run_exchange(
 ) -> Result<(crate::net_processing::Peer, Option<crate::chain::Tip>), RunError> {
     // The clock is read when the message is there, so a long wait for it does not age the clock.
     let (peer, received) = peer
-        .receive(message, timestamp())
+        .receive(message, clock())
         .map_err(RunError::NetProcessing)?;
     match received {
         crate::net_processing::Received::NoReply => {
@@ -519,11 +519,16 @@ fn nonce_payload(nonce: u64) -> Vec<u8> {
 }
 
 /// Seconds since the Unix epoch, or zero if the clock is before it.
-fn timestamp() -> i64 {
+fn clock() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(elapsed) => i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX),
+        Ok(elapsed) => elapsed.as_secs(),
         Err(_before_epoch) => 0,
     }
+}
+
+/// `clock` as the `timestamp` of our `version`, which is an `i64` on the wire.
+fn timestamp() -> i64 {
+    i64::try_from(clock()).unwrap_or(i64::MAX)
 }
 
 /// A SipHash with keys from the OS. The nonce in our `version` only detects a connection to
