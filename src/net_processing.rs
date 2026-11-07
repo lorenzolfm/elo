@@ -85,7 +85,7 @@ pub enum PeerError {
     /// Their `headers` payload did not decode, or it has too many headers or a transaction.
     Headers(crate::protocol::HeadersError),
     /// Our chain refused their batch: it is not on our tip, it is not a chain, or a header fails
-    /// proof of work.
+    /// proof of work or has the wrong `bits`.
     Extend(crate::chain::ExtendError),
     /// Their `headers` came when no `getheaders` of ours was outstanding.
     UnsolicitedHeaders,
