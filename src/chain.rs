@@ -8,10 +8,12 @@ const _: () = assert!(!MEDIAN_TIME_HEADERS_COUNT_MAX.is_multiple_of(2));
 
 /// One linear chain of headers, from genesis to the tip. It is never empty, each header has proof
 /// of work, and each header above genesis has the `bits` that the headers below it require and a
-/// time above their median time.
+/// time above their median time. On testnet4, each first header of a period above genesis also has
+/// a time at most 10 minutes below the header below it.
 #[derive(Debug)]
 pub(crate) struct Chain {
-    /// The network of the chain. Its rules bound the target of each header.
+    /// The network of the chain. Its rules bound the target of each header and, on testnet4, the
+    /// time of each first header of a period.
     network: crate::chainparams::Network,
     /// The headers below the tip, from genesis. The index of a header is its height.
     below_tip: Vec<crate::block::BlockHeader>,
@@ -40,6 +42,9 @@ pub enum ExtendError {
     WrongBits,
     /// The time of a header is at or below the median time of the headers below it.
     TimeTooOld,
+    /// On testnet4, the time of the first header of a period is more than 10 minutes below the
+    /// header below it.
+    TimeTimewarpAttack,
 }
 
 /// The headers below one header of a batch, by height: the chain, then the part of the batch that
@@ -64,7 +69,8 @@ impl Chain {
 
     /// Puts all of `headers` on the tip, in order, or none of them. An empty batch changes
     /// nothing. The first header that fails gives the error. For one header, its `prev` is checked
-    /// first, then its proof of work, then its `bits`, then its time.
+    /// first, then its proof of work, then its `bits`, then its time against the median time, then
+    /// its time against the timewarp rule.
     pub(crate) fn extend(&mut self, headers: crate::protocol::Headers) -> Result<(), ExtendError> {
         let headers = headers.into_vec();
         let Some(first) = headers.first() else {
@@ -93,20 +99,26 @@ impl Chain {
             if header.time <= ancestors.median_time_past() {
                 return Err(ExtendError::TimeTooOld);
             }
+            if header.time < crate::pow::timewarp_time_min(self.network, ancestors) {
+                return Err(ExtendError::TimeTimewarpAttack);
+            }
         }
 
+        let genesis_time = self.network.genesis().time;
         for header in headers {
             self.below_tip
                 .push(std::mem::replace(&mut self.tip, header));
+            // A median only rises, and the first one reads genesis. So no peer bytes reach this
+            // while the check on the median holds.
+            assert!(self.tip.time > genesis_time);
+            // The first header of a period is rarely the last of a batch, so this reads each
+            // header. It reads the chain, and the check above reads the batch.
+            assert!(
+                self.tip.time
+                    >= crate::pow::timewarp_time_min(self.network, self.ancestors_of_tip())
+            );
         }
-        // A batch that is not empty puts the old tip below the new tip.
-        assert!(!self.below_tip.is_empty());
-        let last_index = self.below_tip.len() - 1;
-        let ancestors = Ancestors {
-            below_tip: &self.below_tip[..last_index],
-            tip: &self.below_tip[last_index],
-            batch: &[],
-        };
+        let ancestors = self.ancestors_of_tip();
         // The checks above read the batch. These read the chain: the tip is on the header below it,
         // it has proof of work, it has the `bits` that the headers below it require, and its time
         // is above their median time.
@@ -118,6 +130,18 @@ impl Chain {
         );
         assert!(self.tip.time > ancestors.median_time_past());
         Ok(())
+    }
+
+    /// The headers below the tip. A batch that is not empty puts the old tip below the new tip, so
+    /// only a chain above genesis calls this.
+    fn ancestors_of_tip(&self) -> Ancestors<'_> {
+        assert!(!self.below_tip.is_empty());
+        let last_index = self.below_tip.len() - 1;
+        Ancestors {
+            below_tip: &self.below_tip[..last_index],
+            tip: &self.below_tip[last_index],
+            batch: &[],
+        }
     }
 
     /// The height and the hash of the last header.
@@ -149,6 +173,14 @@ impl<'a> Ancestors<'a> {
     /// The height of the header above these headers. It is at least 1, because a chain has genesis.
     pub(crate) fn height_above(self) -> usize {
         self.below_tip.len() + 1 + self.batch.len()
+    }
+
+    /// The highest of these headers. There is always one, because `tip` is a header.
+    pub(crate) fn last(self) -> &'a crate::block::BlockHeader {
+        match self.batch {
+            [.., last] => last,
+            [] => self.tip,
+        }
     }
 
     /// The header at `height`, which must be below `height_above`.
@@ -212,6 +244,9 @@ impl std::fmt::Display for ExtendError {
             ExtendError::ProofOfWork => write!(f, "a header fails proof of work"),
             ExtendError::WrongBits => write!(f, "a header has the wrong bits"),
             ExtendError::TimeTooOld => write!(f, "a header has a time at or below the median"),
+            ExtendError::TimeTimewarpAttack => {
+                write!(f, "the first header of a period has a time too far back")
+            }
         }
     }
 }
@@ -229,6 +264,43 @@ pub(crate) mod fuzz {
     /// header costs 40% of the runs of the `headers` target. With this bound, the cost is inside the
     /// noise of a run.
     const MEDIAN_CHECK_HEADERS_COUNT_MAX: usize = 4 * super::MEDIAN_TIME_HEADERS_COUNT_MAX;
+
+    /// The headers below the tip in the timewarp check. The rule reads only their count, and a
+    /// `static` means that a run copies nothing.
+    static BELOW_TIP: [crate::block::BlockHeader; 2016] =
+        [crate::chainparams::Network::Testnet4.genesis(); 2016];
+
+    /// A peer picks each `time`, so `header` goes through the timewarp rule as the header below a
+    /// first header of a period, on each network. A batch has fewer headers than a period, so it
+    /// does not reach this height by itself. Each height next to the first header and each other
+    /// network has no bound. A person wrote the heights and the 600, and the answer is in wider
+    /// numbers, so a wrong constant or a subtract that wraps fails here.
+    pub(crate) fn timewarp_time_min_check(header: &crate::block::BlockHeader) {
+        let ancestors = |height_above: usize| super::Ancestors {
+            below_tip: &BELOW_TIP[..height_above - 1],
+            tip: header,
+            batch: &[],
+        };
+        for network in [
+            crate::chainparams::Network::Mainnet,
+            crate::chainparams::Network::Testnet4,
+            crate::chainparams::Network::Signet,
+            crate::chainparams::Network::Regtest,
+        ] {
+            assert_eq!(crate::pow::timewarp_time_min(network, ancestors(2015)), 0);
+            assert_eq!(crate::pow::timewarp_time_min(network, ancestors(2017)), 0);
+            let expected = match network {
+                crate::chainparams::Network::Testnet4 => (i64::from(header.time) - 600).max(0),
+                crate::chainparams::Network::Mainnet
+                | crate::chainparams::Network::Signet
+                | crate::chainparams::Network::Regtest => 0,
+            };
+            assert_eq!(
+                i64::from(crate::pow::timewarp_time_min(network, ancestors(2016))),
+                expected
+            );
+        }
+    }
 
     /// A peer picks each `time` of `headers`, so the first headers go through the median time, as
     /// the header above the ones before it. It must return for any value. This check does not sort:
@@ -625,6 +697,152 @@ mod tests {
             }
             assert_eq!(chain.tip().hash, back.hash());
         }
+    }
+
+    /// The first header of the period of `last`, in the chains of the timewarp tests. It is two
+    /// weeks below `last`, so a change of the target keeps the `bits`, on each network that changes
+    /// them.
+    fn timewarp_first(last: crate::block::BlockHeader) -> crate::block::BlockHeader {
+        crate::block::BlockHeader {
+            time: last.time - 14 * 24 * 60 * 60,
+            ..last
+        }
+    }
+
+    /// The first header of a period may go back to the bound. Each header has real proof of work
+    /// and each other rule takes it, so only this rule refuses it. Each batch reads the header
+    /// below through the tip and through the batch.
+    #[test]
+    fn extend_on_testnet4_bounds_the_time_of_the_first_header_of_a_period() {
+        let [
+            below_last,
+            last,
+            at_bound,
+            one_below,
+            far_below,
+            on_one_below,
+        ] = crate::fixtures::TESTNET4_TIMEWARP.map(crate::fixtures::header);
+        let network = crate::chainparams::Network::Testnet4;
+        // These are what the names say, so a wrong fixture cannot hold another bound.
+        assert_eq!(last.time - at_bound.time, 600);
+        assert_eq!(last.time - one_below.time, 601);
+        assert!(last.time - far_below.time > 1_000_000);
+        // A read of the tip in place of the header below gives a bound below this time in the
+        // second split, so that read lets this header pass.
+        assert!(below_last.time < one_below.time - 600);
+
+        let first = timewarp_first(last);
+        let splits = [
+            (vec![(0, first), (2015, last)], vec![]),
+            (vec![(0, first), (2014, below_last)], vec![last]),
+        ];
+        for (real, in_batch) in &splits {
+            let height_tip = real.last().unwrap().0;
+            // In the first batch the refused header is not the last, and the header on it is legal.
+            for refused in [vec![one_below, on_one_below], vec![far_below]] {
+                let time = refused[0].time;
+                let mut chain = chain_with(network, real);
+                let before = chain.tip();
+                assert_eq!(
+                    chain.extend(crate::fixtures::headers_batch(
+                        &[in_batch.as_slice(), refused.as_slice()].concat()
+                    )),
+                    Err(super::ExtendError::TimeTimewarpAttack),
+                    "{height_tip} {time}"
+                );
+                assert_eq!(chain.tip(), before, "{height_tip} {time}");
+            }
+
+            let mut chain = chain_with(network, real);
+            assert_eq!(
+                chain.extend(crate::fixtures::headers_batch(
+                    &[in_batch.as_slice(), &[at_bound]].concat()
+                )),
+                Ok(()),
+                "{height_tip}"
+            );
+            assert_eq!(chain.tip().hash, at_bound.hash(), "{height_tip}");
+        }
+    }
+
+    /// One header goes back past the bound in each row. Only the first header of a period on
+    /// testnet4 is refused. The rows are the heights on each side of one first header, the next
+    /// first header, and each other network at a first header.
+    #[test]
+    fn extend_refuses_a_time_far_back_only_at_the_start_of_a_period_on_testnet4() {
+        let [_, last, _, one_below, ..] =
+            crate::fixtures::TESTNET4_TIMEWARP.map(crate::fixtures::header);
+        let first = timewarp_first(last);
+        // A test can mine on regtest, so this row needs no fixture, and the `bits` of the fixture
+        // are not the `bits` of regtest.
+        let regtest_genesis = crate::chainparams::Network::Regtest.genesis();
+        let regtest_last = crate::block::BlockHeader {
+            time: regtest_genesis.time + 9000,
+            ..regtest_genesis
+        };
+        let regtest_one_below = mined_on(regtest_last, &[regtest_last.time - 601])[0];
+
+        for (network, real, header, expected) in [
+            (
+                crate::chainparams::Network::Testnet4,
+                vec![(2014, last)],
+                one_below,
+                Ok(()),
+            ),
+            (
+                crate::chainparams::Network::Testnet4,
+                vec![(2016, last)],
+                one_below,
+                Ok(()),
+            ),
+            (
+                crate::chainparams::Network::Testnet4,
+                vec![(2016, first), (4031, last)],
+                one_below,
+                Err(super::ExtendError::TimeTimewarpAttack),
+            ),
+            (
+                crate::chainparams::Network::Mainnet,
+                vec![(0, first), (2015, last)],
+                one_below,
+                Ok(()),
+            ),
+            (
+                crate::chainparams::Network::Signet,
+                vec![(0, first), (2015, last)],
+                one_below,
+                Ok(()),
+            ),
+            (
+                crate::chainparams::Network::Regtest,
+                vec![(2015, regtest_last)],
+                regtest_one_below,
+                Ok(()),
+            ),
+        ] {
+            let height_tip = real.last().unwrap().0;
+            let mut chain = chain_with(network, &real);
+            assert_eq!(
+                chain.extend(crate::fixtures::headers_batch(&[header])),
+                expected,
+                "{network:?} {height_tip}"
+            );
+        }
+    }
+
+    #[test]
+    fn extend_checks_the_median_time_before_the_timewarp_rule() {
+        // The headers below the tip have the time of the tip, so this header fails both rules.
+        let [_, last, _, one_below, ..] =
+            crate::fixtures::TESTNET4_TIMEWARP.map(crate::fixtures::header);
+        let mut real = vec![(0, timewarp_first(last))];
+        real.extend((2005..=2015).map(|height| (height, last)));
+        let mut chain = chain_with(crate::chainparams::Network::Testnet4, &real);
+
+        assert_eq!(
+            chain.extend(crate::fixtures::headers_batch(&[one_below])),
+            Err(super::ExtendError::TimeTooOld)
+        );
     }
 
     #[test]
