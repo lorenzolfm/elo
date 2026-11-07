@@ -743,11 +743,11 @@ mod tests {
             crate::chainparams::Network::Signet,
         ] {
             for count in [1, 2015, 2017] {
-                let mut headers = headers(count, REAL_BITS);
-                headers.last_mut().unwrap().bits = LOW_BITS;
+                let mut chain = headers(count, REAL_BITS);
+                chain.last_mut().unwrap().bits = LOW_BITS;
                 // A late time changes nothing on these networks.
                 assert_eq!(
-                    super::required_bits(network, ancestors(&headers), u32::MAX),
+                    super::required_bits(network, ancestors(&chain), u32::MAX),
                     Some(LOW_BITS),
                     "{network:?} {count}"
                 );
@@ -759,8 +759,8 @@ mod tests {
     fn required_bits_on_testnet4_take_the_limit_after_a_late_time() {
         let network = crate::chainparams::Network::Testnet4;
         let limit_bits = network.genesis().bits;
-        let headers = headers(2, REAL_BITS);
-        let last_time = headers[1].time;
+        let chain = headers(2, REAL_BITS);
+        let last_time = chain[1].time;
         for (time, expected) in [
             (last_time + 1201, limit_bits),
             (last_time + 1200, REAL_BITS),
@@ -768,7 +768,7 @@ mod tests {
             (last_time - 1, REAL_BITS),
         ] {
             assert_eq!(
-                super::required_bits(network, ancestors(&headers), time),
+                super::required_bits(network, ancestors(&chain), time),
                 Some(expected),
                 "{time}"
             );
