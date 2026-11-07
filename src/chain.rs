@@ -242,6 +242,43 @@ pub(crate) mod fuzz {
     /// noise of a run.
     const MEDIAN_CHECK_HEADERS_COUNT_MAX: usize = 4 * super::MEDIAN_TIME_HEADERS_COUNT_MAX;
 
+    /// The headers below the tip in the timewarp check. The rule reads only their count, and a
+    /// `static` means that a run copies nothing.
+    static BELOW_TIP: [crate::block::BlockHeader; 2016] =
+        [crate::chainparams::Network::Testnet4.genesis(); 2016];
+
+    /// A peer picks each `time`, so `header` goes through the timewarp rule as the header below a
+    /// first header of a period, on each network. A batch has fewer headers than a period, so it
+    /// does not reach this height by itself. Each height next to the first header and each other
+    /// network has no bound. A person wrote the heights and the 600, and the answer is in wider
+    /// numbers, so a wrong constant or a subtract that wraps fails here.
+    pub(crate) fn timewarp_time_min_check(header: &crate::block::BlockHeader) {
+        let ancestors = |height_above: usize| super::Ancestors {
+            below_tip: &BELOW_TIP[..height_above - 1],
+            tip: header,
+            batch: &[],
+        };
+        for network in [
+            crate::chainparams::Network::Mainnet,
+            crate::chainparams::Network::Testnet4,
+            crate::chainparams::Network::Signet,
+            crate::chainparams::Network::Regtest,
+        ] {
+            assert_eq!(crate::pow::timewarp_time_min(network, ancestors(2015)), 0);
+            assert_eq!(crate::pow::timewarp_time_min(network, ancestors(2017)), 0);
+            let expected = match network {
+                crate::chainparams::Network::Testnet4 => (i64::from(header.time) - 600).max(0),
+                crate::chainparams::Network::Mainnet
+                | crate::chainparams::Network::Signet
+                | crate::chainparams::Network::Regtest => 0,
+            };
+            assert_eq!(
+                i64::from(crate::pow::timewarp_time_min(network, ancestors(2016))),
+                expected
+            );
+        }
+    }
+
     /// A peer picks each `time` of `headers`, so the first headers go through the median time, as
     /// the header above the ones before it. It must return for any value. This check does not sort:
     /// of `times_count` times, only the time at index `times_count / 2` of the sorted times has

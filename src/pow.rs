@@ -224,6 +224,10 @@ pub(crate) fn required_bits(
 /// step from one period to the next. A chain could write a last time far ahead and then a first
 /// time far back. Each period then looks long, so the target rises while the clock of the chain
 /// stands still. This bounds that step. Only testnet4 has this rule.
+///
+/// A peer picks each time, so no value may panic. A last time of at most `TIMEWARP_SECONDS_MAX`
+/// gives zero, so each time passes. Each time above genesis is above the genesis time, so a real
+/// chain does not reach zero.
 #[must_use = "a dropped answer lets each time pass"]
 pub(crate) fn timewarp_time_min(
     network: crate::chainparams::Network,
@@ -236,20 +240,15 @@ pub(crate) fn timewarp_time_min(
         crate::chainparams::Network::Testnet4 => {
             let height_above = ancestors.height_above();
             if height_above.is_multiple_of(PERIOD_HEADERS_COUNT) {
-                timewarp_time_min_above(ancestors.at(height_above - 1).time)
+                ancestors
+                    .at(height_above - 1)
+                    .time
+                    .saturating_sub(TIMEWARP_SECONDS_MAX)
             } else {
                 0
             }
         }
     }
-}
-
-/// The lowest time that the first header of a period may have on a header with `last_time`. A
-/// `last_time` of at most `TIMEWARP_SECONDS_MAX` gives zero, so each time passes. Each time above
-/// genesis is above the genesis time, so a real chain does not reach zero. A peer picks each time,
-/// so no value may panic.
-fn timewarp_time_min_above(last_time: u32) -> u32 {
-    last_time.saturating_sub(TIMEWARP_SECONDS_MAX)
 }
 
 /// The hash of `header`, if its `bits` are a target in the range of `network` and the hash is at
@@ -305,20 +304,6 @@ pub(crate) mod fuzz {
                 }
             }
         }
-    }
-
-    /// A peer picks each `time`, so each one goes through the bound of the timewarp rule. A batch
-    /// has fewer headers than a period, so this reads the bound without a period. A header has one
-    /// time, and `nonce` gives a second `u32` that a peer picks, so it is the last time. This
-    /// checks the answer against wider numbers, where a bound can be negative and no time is below
-    /// it.
-    pub(crate) fn timewarp_check(header: &crate::block::BlockHeader) {
-        let last_time = header.nonce;
-        let bound = i64::from(last_time) - i64::from(super::TIMEWARP_SECONDS_MAX);
-        assert_eq!(
-            header.time < super::timewarp_time_min_above(last_time),
-            i64::from(header.time) < bound
-        );
     }
 
     /// A peer picks each `bits` and each `time` of `headers`, so each header goes through the rule
@@ -902,6 +887,7 @@ mod tests {
         // A real chain has no last time below 600, because each time above genesis is above the
         // genesis time. So the rows of `Chain::extend` do not reach zero. A person wrote each
         // answer.
+        let mut chain = headers(2016, REAL_BITS);
         for (last_time, expected) in [
             (0, 0),
             (1, 0),
@@ -910,8 +896,9 @@ mod tests {
             (601, 1),
             (u32::MAX, u32::MAX - 600),
         ] {
+            chain.last_mut().unwrap().time = last_time;
             assert_eq!(
-                super::timewarp_time_min_above(last_time),
+                super::timewarp_time_min(crate::chainparams::Network::Testnet4, ancestors(&chain)),
                 expected,
                 "{last_time}"
             );
