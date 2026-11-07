@@ -67,7 +67,7 @@ impl Target {
 
 /// The compact form of `number`, as `Target::from_bits` reads it. Only the first three bytes of the
 /// number stay. A first byte with its top bit set would read as the sign, so it moves one byte
-/// down and the size goes up by one. A number of zero gives zero.
+/// down and the size goes up by one. A number of zero gives zero, so `number` is no `Target`.
 fn to_bits(number: [u8; 32]) -> u32 {
     let mut size = 32_u8;
     let mut rest = number.as_slice();
@@ -90,7 +90,8 @@ fn to_bits(number: [u8; 32]) -> u32 {
 }
 
 /// `number` times `factor`, over `divisor`, rounded down. The multiply is first, so the divide sees
-/// all of the product. The product must fit in 32 bytes.
+/// all of the product. The product must fit in 32 bytes. The answer can be zero or above a limit,
+/// so it is no `Target`.
 fn scaled(mut number: [u8; 32], factor: u32, divisor: u32) -> [u8; 32] {
     // A byte times a `u32`, plus a carry of at most that `u32`, fits in a `u64`.
     let mut carry = 0_u64;
@@ -121,6 +122,9 @@ fn scaled(mut number: [u8; 32], factor: u32, divisor: u32) -> [u8; 32] {
 /// `bits` of zero. Returns nothing if `bits` are no target up to `limit`.
 ///
 /// At the largest change, `limit` times the time must fit in 32 bytes. Regtest does not fit.
+///
+/// This takes `bits`, not a `Target`, and reads them with `limit`. So the limit that bounds the
+/// target and the limit that caps the answer cannot differ.
 #[cfg_attr(
     not(any(test, fuzzing)),
     expect(dead_code, reason = "until the exact `bits` check calls it")
@@ -180,9 +184,10 @@ pub(crate) fn mined_for_regtest(header: crate::block::BlockHeader) -> crate::blo
 // Only cargo-mutants reads this attribute. Its test runs do not build this module.
 #[cfg_attr(false, mutants::skip)]
 pub(crate) mod fuzz {
-    /// A peer picks each field of `header`, so its `bits` and two of its fields go through the
-    /// change of a target, whose asserts must hold for any value. Signet has the highest limit of
-    /// a network that changes its target, so it is the nearest to an overflow.
+    /// A peer picks each field of `header`, so its `bits` and its times go through the change of a
+    /// target, whose asserts must hold for any value. A header has one time, and `nonce` gives a
+    /// second `u32` that a peer picks, so it is the first time. Signet has the highest limit of a
+    /// network that changes its target, so it is the nearest to an overflow.
     pub(crate) fn retarget_check(header: &crate::block::BlockHeader) {
         for network in [
             crate::chainparams::Network::Mainnet,
