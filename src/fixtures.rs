@@ -313,7 +313,7 @@ pub(crate) fn headers_payload() -> Vec<u8> {
 
 /// The `version` of each header that a test makes. It is the version of the blocks in
 /// `HEADERS_FRAME`, and it is legal at each height of each network.
-pub(crate) const VERSION: i32 = 0x2000_0000;
+pub(crate) const HEADER_VERSION: i32 = 0x2000_0000;
 
 /// `count` headers, each on the header before it, the first on the regtest genesis header. Each
 /// is the genesis header with its `version`, its `prev`, its `time` and its `nonce` changed. Each
@@ -322,7 +322,7 @@ pub(crate) fn headers_on_genesis(count: usize) -> Vec<crate::block::BlockHeader>
     let genesis = crate::chainparams::Network::Regtest.genesis();
     let on = |below: &crate::block::BlockHeader| {
         crate::pow::mined_for_regtest(crate::block::BlockHeader {
-            version: VERSION,
+            version: HEADER_VERSION,
             prev: below.hash(),
             time: below.time + 1,
             ..genesis

@@ -534,13 +534,13 @@ mod tests {
     }
 
     /// A regtest header for each of `times`, each on the header before it, the first on `below`.
-    /// Each has `fixtures::VERSION`, so `below` can be genesis.
+    /// Each has `fixtures::HEADER_VERSION`, so `below` can be genesis.
     fn mined_on(below: crate::block::BlockHeader, times: &[u32]) -> Vec<crate::block::BlockHeader> {
         let mut headers = Vec::with_capacity(times.len());
         let mut prev = below.hash();
         for time in times {
             let header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
-                version: crate::fixtures::VERSION,
+                version: crate::fixtures::HEADER_VERSION,
                 prev,
                 time: *time,
                 ..below
