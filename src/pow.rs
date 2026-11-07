@@ -122,8 +122,8 @@ fn to_bits(number: [u8; 32]) -> u32 {
 }
 
 /// `number` times `timespan_seconds`, over `PERIOD_TIMESPAN_SECONDS`, rounded down, and at most
-/// `limit`. The multiply is first, so the divide sees all of the product. The answer can be zero, so
-/// it is no `Target`.
+/// `limit`. The multiply is first, so the divide sees all of the product. The answer can be zero,
+/// so it is no `Target`.
 fn scaled_up_to(mut number: [u8; 32], timespan_seconds: u32, limit: [u8; 32]) -> [u8; 32] {
     // `high` holds the bytes of the product above the 32. A byte times a `u32`, plus a `high` of at
     // most that `u32`, fits in a `u64`. So no number and no time can overflow.
@@ -155,8 +155,8 @@ fn scaled_up_to(mut number: [u8; 32], timespan_seconds: u32, limit: [u8; 32]) ->
 /// `last_time` are the times of the first and the last header of the period that ends. The target
 /// changes by the time between them over `PERIOD_TIMESPAN_SECONDS`, by at most a factor of 4 in
 /// each direction, and it stays at most `limit`. Returns nothing if `bits` are no target up to
-/// `limit`, or if the answer is zero, which a target below 4 can reach. No header can pass in either
-/// case, and each answer is a target.
+/// `limit`, or if the answer is zero, which a target below 4 can reach. No header can pass in
+/// either case, and each answer is a target.
 ///
 /// This takes `bits`, not a `Target`, and reads them with `limit`. So the limit that bounds the
 /// target and the limit that caps the answer cannot differ.
@@ -197,8 +197,8 @@ fn last_real_bits(ancestors: Ancestors<'_>, limit_bits: u32) -> u32 {
 /// period this does not read `bits` as a target, so the answer is `bits` from below the header or
 /// the limit.
 ///
-/// Regtest has one target. Each header of its chain has the `bits` of the limit, because its genesis
-/// has them and no rule gives other `bits`. So it needs no period and no time.
+/// Regtest has one target. Each header of its chain has the `bits` of the limit, because its
+/// genesis has them and no rule gives other `bits`. So it needs no period and no time.
 #[must_use = "a dropped answer lets each `bits` pass"]
 pub(crate) fn required_bits(
     network: crate::chainparams::Network,
