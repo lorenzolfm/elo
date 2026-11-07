@@ -96,31 +96,24 @@ impl Chain {
             self.below_tip
                 .push(std::mem::replace(&mut self.tip, header));
         }
+        // A batch that is not empty puts the old tip below the new tip.
+        assert!(!self.below_tip.is_empty());
+        let last_index = self.below_tip.len() - 1;
+        let ancestors = Ancestors {
+            below_tip: &self.below_tip[..last_index],
+            tip: &self.below_tip[last_index],
+            batch: &[],
+        };
         // The checks above read the batch. These read the chain: the tip is on the header below it,
         // it has proof of work, it has the `bits` that the headers below it require, and its time
         // is above their median time.
-        assert_eq!(
-            Some(self.tip.prev),
-            self.below_tip.last().map(crate::block::BlockHeader::hash)
-        );
+        assert_eq!(self.tip.prev, ancestors.tip.hash());
         assert!(crate::pow::proven_hash(&self.tip, self.network).is_some());
-        let below_new_tip = self
-            .below_tip
-            .split_last()
-            .map(|(last, below_last)| Ancestors {
-                below_tip: below_last,
-                tip: last,
-                batch: &[],
-            });
         assert_eq!(
-            below_new_tip.and_then(|ancestors| {
-                crate::pow::required_bits(self.network, ancestors, self.tip.time)
-            }),
+            crate::pow::required_bits(self.network, ancestors, self.tip.time),
             Some(self.tip.bits)
         );
-        assert!(
-            below_new_tip.is_some_and(|ancestors| self.tip.time > ancestors.median_time_past())
-        );
+        assert!(self.tip.time > ancestors.median_time_past());
         Ok(())
     }
 
