@@ -586,6 +586,17 @@ pub(crate) mod fuzz {
     /// each height, so no script ends at `WrongBits`.
     const SCRIPT_HEADER_BITS: u32 = crate::chainparams::Network::Regtest.genesis().bits;
 
+    /// The time of the header that a script writes as its `written_count`th, from 1. Each time is
+    /// one second above the last, so it is above the times of all the headers below it, and each
+    /// median of those times. This reads no byte of the script, so the layout of the corpus stays.
+    /// Regtest is the only network where a script goes past its first header, so this starts from
+    /// the regtest genesis.
+    fn script_header_time(written_count: usize) -> u32 {
+        assert!((1..=SCRIPT_HEADERS_COUNT_MAX).contains(&written_count));
+        let seconds = u32::try_from(written_count).unwrap_or(u32::MAX);
+        crate::chainparams::Network::Regtest.genesis().time + seconds
+    }
+
     /// Spreads a byte over the places of a nonce. It is odd, so each byte gives another nonce.
     const NONCE_SPREAD: u64 = 0x0123_4567_89ab_cdef;
     const _: () = assert!(NONCE_SPREAD % 2 == 1);
@@ -1083,6 +1094,7 @@ pub(crate) mod fuzz {
                 byte => usize::from(byte),
             };
             let count = count_asked.min(SCRIPT_HEADERS_COUNT_MAX - self.headers_written_count);
+            let written_count_before = self.headers_written_count;
             self.headers_written_count += count;
             assert!(self.headers_written_count <= SCRIPT_HEADERS_COUNT_MAX);
             // The loop below takes its bound from this.
@@ -1105,7 +1117,7 @@ pub(crate) mod fuzz {
                         prev
                     },
                     merkle_root: [0; 32],
-                    time: 0,
+                    time: script_header_time(written_count_before + index + 1),
                     bits: SCRIPT_HEADER_BITS,
                     nonce: 0,
                 });
