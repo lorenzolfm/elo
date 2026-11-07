@@ -1,7 +1,10 @@
 //! The header chain.
 
 /// The most headers that a median time reads: the header below a new header, and the 10 below it.
-const MEDIAN_TIME_HEADERS_COUNT: usize = 11;
+const MEDIAN_TIME_HEADERS_COUNT_MAX: usize = 11;
+
+// This count has one middle, so only a chain below this height has two middle times.
+const _: () = assert!(!MEDIAN_TIME_HEADERS_COUNT_MAX.is_multiple_of(2));
 
 /// One linear chain of headers, from genesis to the tip. It is never empty, each header has proof
 /// of work, and each header above genesis has the `bits` that the headers below it require and a
@@ -141,25 +144,29 @@ impl<'a> Ancestors<'a> {
         }
     }
 
-    /// The median of the times of the last `MEDIAN_TIME_HEADERS_COUNT` headers, or of each header
-    /// if there are fewer. Times can go back, so this sorts them. With an even count, which only a
-    /// chain below that height has, this is the higher of the two middle times.
+    /// The median of the times of the last `MEDIAN_TIME_HEADERS_COUNT_MAX` headers, or of each
+    /// header if there are fewer. Times can go back, so this sorts them. With an even count, which
+    /// only a chain below that height has, this is the higher of the two middle times.
     ///
     /// A peer picks each time, so no value may panic. A peer also runs this once for each header
-    /// of a batch. So it reads at most `MEDIAN_TIME_HEADERS_COUNT` headers and uses no heap.
+    /// of a batch. So it reads at most `MEDIAN_TIME_HEADERS_COUNT_MAX` headers and uses no heap.
     fn median_time_past(self) -> u32 {
         let height_above = self.height_above();
-        let count = height_above.min(MEDIAN_TIME_HEADERS_COUNT);
-        assert!(count >= 1);
-        let height_first = height_above - count;
-        let mut times_buffer = [0; MEDIAN_TIME_HEADERS_COUNT];
-        let times = &mut times_buffer[..count];
+        let times_count = height_above.min(MEDIAN_TIME_HEADERS_COUNT_MAX);
+        assert!(times_count >= 1);
+        let height_first = height_above - times_count;
+        let mut times_buffer = [0; MEDIAN_TIME_HEADERS_COUNT_MAX];
+        let times = &mut times_buffer[..times_count];
         // Each place of `times` gets a time, so no zero of the buffer can reach the median.
         for (index, time) in times.iter_mut().enumerate() {
             *time = self.at(height_first + index).time;
         }
+        // This sort needs no heap, and two equal times are the same.
         times.sort_unstable();
-        times[count / 2]
+        // The floor of an odd count is its middle. An even count has two middles, and this is the
+        // higher.
+        let middle_index = times_count / 2;
+        times[middle_index]
     }
 }
 
@@ -200,18 +207,19 @@ impl std::error::Error for ExtendError {}
 #[cfg_attr(false, mutants::skip)]
 pub(crate) mod fuzz {
     /// The first headers of a batch that go through the check. A median reads at most
-    /// `MEDIAN_TIME_HEADERS_COUNT` times, so a later header reaches no new path. In a batch that is
-    /// longer than its input, the later headers have only zeros. A check of each header costs 40%
-    /// of the runs of the `headers` target, and this bound costs 9%.
-    const MEDIAN_CHECK_HEADERS_COUNT: usize = 4 * super::MEDIAN_TIME_HEADERS_COUNT;
+    /// `MEDIAN_TIME_HEADERS_COUNT_MAX` times, so a later header reaches no new path. In a batch
+    /// that is longer than its input, the later headers have only zeros. A check of each header
+    /// costs 40% of the runs of the `headers` target, and this bound costs 9%.
+    const MEDIAN_CHECK_HEADERS_COUNT_MAX: usize = 4 * super::MEDIAN_TIME_HEADERS_COUNT_MAX;
 
     /// A peer picks each `time` of `headers`, so the first headers go through the median time, as
     /// the header above the ones before it. It must return for any value. This check does not sort:
-    /// of `count` times, only the time at index `count / 2` of the sorted times has more than
-    /// `count / 2` times at or below it, and at least `count - count / 2` at or above it.
+    /// of `times_count` times, only the time at index `times_count / 2` of the sorted times has
+    /// more than `times_count / 2` times at or below it, and at least
+    /// `times_count - times_count / 2` at or above it.
     pub(crate) fn median_time_past_check(headers: &[crate::block::BlockHeader]) {
         let genesis = crate::chainparams::Network::Regtest.genesis();
-        for index in 0..headers.len().min(MEDIAN_CHECK_HEADERS_COUNT) {
+        for index in 0..headers.len().min(MEDIAN_CHECK_HEADERS_COUNT_MAX) {
             let batch = &headers[..index];
             let ancestors = super::Ancestors {
                 below_tip: &[],
@@ -223,12 +231,14 @@ pub(crate) mod fuzz {
                 std::iter::once(&genesis)
                     .chain(batch)
                     .rev()
-                    .take(super::MEDIAN_TIME_HEADERS_COUNT)
+                    .take(super::MEDIAN_TIME_HEADERS_COUNT_MAX)
                     .map(|header| header.time)
             };
-            let count = times().count();
-            assert!(times().filter(|time| *time <= median).count() > count / 2);
-            assert!(times().filter(|time| *time >= median).count() >= count - count / 2);
+            let times_count = times().count();
+            let at_or_below_count = times().filter(|time| *time <= median).count();
+            let at_or_above_count = times().filter(|time| *time >= median).count();
+            assert!(at_or_below_count > times_count / 2);
+            assert!(at_or_above_count >= times_count - times_count / 2);
         }
     }
 }
