@@ -343,6 +343,31 @@ mod tests {
     }
 
     #[test]
+    fn extend_refuses_a_batch_when_no_bits_can_pass() {
+        // Testnet4 changes the `bits` of the first header of a period. That header is not the tip,
+        // so the real `next` still chains and has proof of work, and the rule reads these `bits`.
+        // `0` is no target, and in the smallest time a target of 3 falls to zero. So the rule has
+        // no answer, and that must be a refusal, not a pass.
+        let [first, last, next] = crate::fixtures::TESTNET4_RETARGET.map(crate::fixtures::header);
+        for bits in [0, 0x0103_0000] {
+            let first = crate::block::BlockHeader {
+                bits,
+                time: last.time,
+                ..first
+            };
+            let mut chain = chain_with(
+                crate::chainparams::Network::Testnet4,
+                &[(38304, first), (40319, last)],
+            );
+            assert_eq!(
+                chain.extend(crate::fixtures::headers_batch(&[next])),
+                Err(super::ExtendError::WrongBits),
+                "{bits:#x}"
+            );
+        }
+    }
+
+    #[test]
     fn extend_takes_a_real_run_at_the_limit_of_testnet4() {
         let network = crate::chainparams::Network::Testnet4;
         let [real, late_1, late_2, late_3, back] =
