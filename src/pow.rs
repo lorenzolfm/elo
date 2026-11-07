@@ -208,7 +208,12 @@ pub(crate) fn required_bits(
     let last = ancestors.at(height - 1);
     let period_ends = height.is_multiple_of(PERIOD_HEADERS);
     match network {
-        crate::chainparams::Network::Regtest => Some(to_bits(limit)),
+        // `extend` checks the `bits` of a header before the rule reads that header, so peer bytes
+        // cannot reach this assert.
+        crate::chainparams::Network::Regtest => {
+            assert_eq!(last.bits, to_bits(limit));
+            Some(last.bits)
+        }
         crate::chainparams::Network::Mainnet | crate::chainparams::Network::Signet => {
             if period_ends {
                 let first = ancestors.at(height - PERIOD_HEADERS);
@@ -288,10 +293,12 @@ pub(crate) mod fuzz {
     }
 
     /// A peer picks each `bits` and each `time` of `headers`, so each header goes through the rule
-    /// of each network, as the header above the ones before it. The rule must return for any value.
-    /// A batch has fewer headers than a period, so no period ends here, and a period that ends would
-    /// fail the assert on mainnet. These checks do not repeat the walk of testnet4: its answer must
-    /// only be the limit or `bits` from below the header.
+    /// of each network, as the header above the ones before it. The rule must return for any value,
+    /// apart from one case: on regtest it asserts that the header below has the limit, because a
+    /// chain holds no other `bits`. So on regtest this stops at a header with other `bits`. A batch
+    /// has fewer headers than a period, so no period ends here, and a period that ends would fail
+    /// the assert on mainnet. These checks do not repeat the walk of testnet4: its answer must only
+    /// be the limit or `bits` from below the header.
     pub(crate) fn required_bits_check(headers: &[crate::block::BlockHeader]) {
         for network in [
             crate::chainparams::Network::Mainnet,
@@ -312,6 +319,9 @@ pub(crate) mod fuzz {
                 match network {
                     crate::chainparams::Network::Regtest => {
                         assert_eq!(required, Some(genesis.bits));
+                        if header.bits != genesis.bits {
+                            break;
+                        }
                     }
                     crate::chainparams::Network::Mainnet | crate::chainparams::Network::Signet => {
                         assert_eq!(required, Some(last_bits));
