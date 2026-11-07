@@ -5,9 +5,10 @@ v1 `version`/`verack` handshake and prints the peer's `version`. Then it syncs
 the header chain from genesis to the peer's tip and prints `tip <height> <hash>`.
 The chain is in memory, and elo checks only that each header is on the one
 before it, has proof of work, has the `bits` that the network requires and has a
-time above the median of the 11 headers before it. After the sync, elo stays
-connected and answers each `ping` with a `pong`. From the handshake on, it pings
-the peer every 2 min.
+time above the median of the 11 headers before it. On testnet4, the first header
+of a period also has a time at most 10 min below the header before it. After the
+sync, elo stays connected and answers each `ping` with a `pong`. From the
+handshake on, it pings the peer every 2 min.
 It drops a peer that does not answer a `ping` within 20 min, or a `getheaders`
 within 2 min.
 
