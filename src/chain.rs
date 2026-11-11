@@ -161,11 +161,18 @@ impl Chain {
         // Each header has work, so the work of the chain rises. Only a sum above 256 bits can stay
         // the same, and no hash can meet the targets that give it.
         assert!(work > self.work);
+        // `extend` adds up the work of the batch in its checks, and this adds it up again from the
+        // stored headers. So a sum that reads the wrong header, or one header twice, fails at the
+        // end. It needs no hash. A header with no target gives no sum, and the assert fails too.
+        let mut stored_work = Some(self.work);
         self.work = work;
         let genesis_time = self.network.genesis().time;
         for header in headers {
             self.below_tip
                 .push(std::mem::replace(&mut self.tip, header));
+            stored_work = stored_work
+                .zip(crate::pow::work(self.tip.bits, self.network))
+                .map(|(sum, header_work)| sum.saturating_add(header_work));
             // A median only rises, and the first one reads genesis. So no peer bytes reach this
             // while the check on the median holds.
             assert!(self.tip.time > genesis_time);
@@ -181,6 +188,7 @@ impl Chain {
                     >= crate::pow::timewarp_time_min(self.network, self.ancestors_of_tip())
             );
         }
+        assert_eq!(stored_work, Some(self.work));
         let ancestors = self.ancestors_of_tip();
         // The checks of `extend` read the batch. These read the chain: the tip is on the header
         // below it, it has proof of work, it has the `bits` that the headers below it require, and

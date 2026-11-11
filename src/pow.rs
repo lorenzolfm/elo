@@ -421,6 +421,12 @@ pub(crate) fn proven(
     target.is_met_by(hash).then(|| (hash, Work::of(target)))
 }
 
+/// The work of a header with `bits`, if they are a target in the range of `network`. It reads no
+/// hash, so it does not check proof of work: `proven` does.
+pub(crate) fn work(bits: u32, network: crate::chainparams::Network) -> Option<Work> {
+    Target::from_bits(bits, network.pow_limit()).map(Work::of)
+}
+
 /// `header` with the first `nonce` that gives a hash below the regtest target, whatever its `bits`
 /// are. A top byte below 0x7f is below that target, so about every second nonce passes. The top
 /// byte of a hash is its last byte in wire order. This does not call the check above, so a check
