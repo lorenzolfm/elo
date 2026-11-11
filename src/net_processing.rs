@@ -441,7 +441,7 @@ impl Peer {
         if full {
             self.sync = SyncState::Due;
             Ok((self, Received::NoReply))
-        } else if !self.chain.has_work_min() {
+        } else if !self.chain.reaches_work_min() {
             Err(PeerError::ChainWorkTooLow)
         } else {
             self.sync = SyncState::Synced;

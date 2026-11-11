@@ -429,7 +429,7 @@ pub(crate) fn work(bits: u32, network: crate::chainparams::Network) -> Option<Wo
 
 /// The work of a chain is at least the minimum of `network`. A saturated sum means "at least the
 /// highest number", so it passes.
-pub(crate) fn has_chain_work_min(work: Work, network: crate::chainparams::Network) -> bool {
+pub(crate) fn reaches_chain_work_min(work: Work, network: crate::chainparams::Network) -> bool {
     work >= Work::from_be_bytes(network.chain_work_min())
 }
 
@@ -1156,19 +1156,22 @@ mod tests {
         ] {
             let minimum =
                 super::Work::from_be_bytes(crate::fixtures::hex(minimum).try_into().unwrap());
-            assert!(super::has_chain_work_min(minimum, network), "{network:?}");
             assert!(
-                super::has_chain_work_min(super::Work::MAX, network),
+                super::reaches_chain_work_min(minimum, network),
                 "{network:?}"
             );
             assert!(
-                !super::has_chain_work_min(minimum.minus(super::Work::ONE), network),
+                super::reaches_chain_work_min(super::Work::MAX, network),
+                "{network:?}"
+            );
+            assert!(
+                !super::reaches_chain_work_min(minimum.minus(super::Work::ONE), network),
                 "{network:?}"
             );
         }
         // Regtest has no work below its minimum.
         let regtest = crate::chainparams::Network::Regtest;
-        assert!(super::has_chain_work_min(super::Work::ZERO, regtest));
+        assert!(super::reaches_chain_work_min(super::Work::ZERO, regtest));
     }
 
     #[test]

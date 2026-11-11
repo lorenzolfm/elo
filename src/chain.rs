@@ -215,8 +215,8 @@ impl Chain {
     }
 
     /// The work of the chain is at least the minimum of its network.
-    pub(crate) fn has_work_min(&self) -> bool {
-        crate::pow::has_chain_work_min(self.work, self.network)
+    pub(crate) fn reaches_work_min(&self) -> bool {
+        crate::pow::reaches_chain_work_min(self.work, self.network)
     }
 
     /// The height and the hash of the last header, and the work of the chain.
