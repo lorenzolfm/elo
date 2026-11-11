@@ -1009,9 +1009,14 @@ pub(crate) mod fuzz {
                     crate::chainparams::Network::Signet => 0x49_d414,
                     crate::chainparams::Network::Regtest => 2,
                 };
+                // Each step saturates, so a height past `u64` fails the assert below, not an add.
                 let height = u64::try_from(model.height).unwrap_or(u64::MAX);
-                let work = format!(" {:064x}", genesis_work + 2 * height);
-                assert!(tip.to_string().ends_with(&work), "{tip}, not {work}");
+                let work = genesis_work.saturating_add(height.saturating_mul(2));
+                let work_text = format!(" {work:064x}");
+                assert!(
+                    tip.to_string().ends_with(&work_text),
+                    "{tip}, not {work_text}"
+                );
                 Ok(peer)
             }
             (Err(error), Err(expected)) => {
