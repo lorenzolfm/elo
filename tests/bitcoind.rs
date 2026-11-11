@@ -315,7 +315,9 @@ fn sync_from_bitcoind_prints_its_tip() {
             }
         }
     };
-    assert_eq!(tip, format!("2001 {}", best.trim_end()));
+    let chain_work = bitcoind.cli(&["getblockheader", best.trim_end()]);
+    let chain_work = string_field(&chain_work, "chainwork");
+    assert_eq!(tip, format!("2001 {} {chain_work}", best.trim_end()));
 }
 
 /// What `child` wrote to its stderr pipe. Call it only after the exit, or it blocks.
@@ -323,6 +325,13 @@ fn stderr(child: &mut std::process::Child) -> String {
     let mut stderr = String::new();
     std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
     stderr
+}
+
+/// The value of the string `field` in `object`, as `bitcoin-cli` writes it.
+fn string_field<'a>(object: &'a str, field: &str) -> &'a str {
+    let key = format!("\"{field}\": \"");
+    let (_, rest) = object.split_once(&key).unwrap();
+    rest.split_once('"').unwrap().0
 }
 
 /// The text of the `field` object in `getpeerinfo`, or nothing before elo connects. elo is the

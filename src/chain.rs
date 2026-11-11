@@ -23,13 +23,16 @@ pub(crate) struct Chain {
     /// The headers below the tip, from genesis. The index of a header is its height.
     below_tip: Vec<crate::block::BlockHeader>,
     tip: crate::block::BlockHeader,
+    /// The sum of the work of each header, genesis too.
+    work: crate::pow::Work,
 }
 
-/// The height and the hash of the last header of a chain.
+/// The height and the hash of the last header of a chain, and the work of the chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tip {
     height: usize,
     hash: bitcoin_hashes::sha256d::Hash,
+    work: crate::pow::Work,
 }
 
 /// Why `Chain::extend` refused a batch.
@@ -70,10 +73,16 @@ pub(crate) struct Ancestors<'a> {
 impl Chain {
     /// A chain with only the genesis header of `network`.
     pub(crate) fn new(network: crate::chainparams::Network) -> Chain {
+        let genesis = network.genesis();
+        // A test holds that each genesis has proof of work, so peer bytes cannot reach this.
+        let Some((_, work)) = crate::pow::proven(&genesis, network) else {
+            panic!("the genesis of {network:?} has no proof of work");
+        };
         Chain {
             network,
             below_tip: Vec::new(),
-            tip: network.genesis(),
+            tip: genesis,
+            work,
         }
     }
 
@@ -100,11 +109,15 @@ impl Chain {
         // The hash of a header checks its proof of work and the `prev` of the next header, so one
         // pass hashes each header once.
         let mut prev = first.prev;
+        let mut work = self.work;
         for (index, header) in headers.iter().enumerate() {
             if header.prev != prev {
                 return Err(ExtendError::NotContinuous);
             }
-            prev = crate::pow::proven_hash(header, self.network).ok_or(ExtendError::ProofOfWork)?;
+            let (hash, header_work) =
+                crate::pow::proven(header, self.network).ok_or(ExtendError::ProofOfWork)?;
+            prev = hash;
+            work = work.saturating_add(header_work);
             let ancestors = Ancestors {
                 below_tip: &self.below_tip,
                 tip: &self.tip,
@@ -128,21 +141,38 @@ impl Chain {
             }
         }
 
-        self.extend_store(headers, time_max);
+        self.extend_store(headers, time_max, work);
         // The loop proved the last header of the batch, so this holds that the store took each one.
         assert_eq!(self.tip.hash(), prev);
         Ok(())
     }
 
-    /// Puts each of `headers` on the tip, in order. `extend` checked each header against the batch,
-    /// and each assert here reads the chain. So with a check that skips a header, this panics.
-    fn extend_store(&mut self, headers: Vec<crate::block::BlockHeader>, time_max: u64) {
+    /// Puts each of `headers` on the tip, in order, and `work` as the work of the chain. `extend`
+    /// checked each header against the batch, and each assert here reads the chain. So with a check
+    /// that skips a header, this panics.
+    fn extend_store(
+        &mut self,
+        headers: Vec<crate::block::BlockHeader>,
+        time_max: u64,
+        work: crate::pow::Work,
+    ) {
         // `extend` returns before this on an empty batch, so each assert reads a new header.
         assert!(!headers.is_empty());
+        // Each header has work, so the work of the chain rises. Only a sum above 256 bits can stay
+        // the same, and no hash can meet the targets that give it.
+        assert!(work > self.work);
+        // `extend` adds up the work of the batch in its checks, and this adds it up again from the
+        // stored headers. So a sum that reads the wrong header, or one header twice, fails at the
+        // end. It needs no hash. A header with no target gives no sum, and the assert fails too.
+        let mut stored_work = Some(self.work);
+        self.work = work;
         let genesis_time = self.network.genesis().time;
         for header in headers {
             self.below_tip
                 .push(std::mem::replace(&mut self.tip, header));
+            stored_work = stored_work
+                .zip(crate::pow::work(self.tip.bits, self.network))
+                .map(|(sum, header_work)| sum.saturating_add(header_work));
             // A median only rises, and the first one reads genesis. So no peer bytes reach this
             // while the check on the median holds.
             assert!(self.tip.time > genesis_time);
@@ -158,12 +188,13 @@ impl Chain {
                     >= crate::pow::timewarp_time_min(self.network, self.ancestors_of_tip())
             );
         }
+        assert_eq!(stored_work, Some(self.work));
         let ancestors = self.ancestors_of_tip();
         // The checks of `extend` read the batch. These read the chain: the tip is on the header
         // below it, it has proof of work, it has the `bits` that the headers below it require, and
         // its time is above their median time.
         assert_eq!(self.tip.prev, ancestors.tip.hash());
-        assert!(crate::pow::proven_hash(&self.tip, self.network).is_some());
+        assert!(crate::pow::proven(&self.tip, self.network).is_some());
         assert_eq!(
             crate::pow::required_bits(self.network, ancestors, self.tip.time),
             Some(self.tip.bits)
@@ -183,11 +214,12 @@ impl Chain {
         }
     }
 
-    /// The height and the hash of the last header.
+    /// The height and the hash of the last header, and the work of the chain.
     pub(crate) fn tip(&self) -> Tip {
         Tip {
             height: self.below_tip.len(),
             hash: self.tip.hash(),
+            work: self.work,
         }
     }
 }
@@ -264,14 +296,15 @@ impl Tip {
     }
 }
 
-/// Writes `<height> <hash>`. The hash is in display order: the reverse of the wire order.
+/// Writes `<height> <hash> <work>`. The hash is in display order: the reverse of the wire order.
+/// The work is 64 hex digits.
 impl std::fmt::Display for Tip {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} ", self.height)?;
         for byte in self.hash.as_byte_array().iter().rev() {
             write!(f, "{byte:02x}")?;
         }
-        Ok(())
+        write!(f, " {}", self.work)
     }
 }
 
@@ -396,13 +429,8 @@ mod tests {
             Ok(())
         );
 
-        assert_eq!(
-            chain.tip(),
-            super::Tip {
-                height: 3,
-                hash: headers[2].hash(),
-            }
-        );
+        assert_eq!(chain.tip().height, 3);
+        assert_eq!(chain.tip().hash, headers[2].hash());
     }
 
     #[test]
@@ -670,6 +698,8 @@ mod tests {
     /// the genesis header, so only what the `bits` rule reads is real. A test cannot mine a header
     /// on these networks, so the tip must be a real header for the next real header to pass. The
     /// median time here is the old genesis time, so a test on this chain holds nothing about it.
+    /// The work of the chain is the work of genesis, so a test reads only the work that a batch
+    /// adds.
     fn chain_with(
         network: crate::chainparams::Network,
         real: &[(usize, crate::block::BlockHeader)],
@@ -683,6 +713,7 @@ mod tests {
             network,
             below_tip,
             tip,
+            work: super::Chain::new(network).work,
         }
     }
 
@@ -795,6 +826,12 @@ mod tests {
                 );
             }
             assert_eq!(chain.tip().hash, back.hash());
+            // The work of genesis, of three headers at the limit, and of one at the real `bits`.
+            // The sum is from big integers, not from this code.
+            assert_eq!(
+                chain.tip().work.to_string(),
+                "000000000000000000000000000000000000000000000000030339533015bcbf"
+            );
         }
     }
 
@@ -1169,11 +1206,14 @@ mod tests {
     }
 
     #[test]
-    fn tip_writes_the_hash_in_display_order() {
+    fn tip_writes_the_hash_in_display_order_and_the_work() {
         let chain = super::Chain::new(crate::chainparams::Network::Regtest);
         assert_eq!(
             chain.tip().to_string(),
-            "0 0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206"
+            concat!(
+                "0 0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206 ",
+                "0000000000000000000000000000000000000000000000000000000000000002",
+            )
         );
     }
 }
