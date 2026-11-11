@@ -315,6 +315,16 @@ pub(crate) fn headers_payload() -> Vec<u8> {
 /// `HEADERS_FRAME`, and it is legal at each height of each network.
 pub(crate) const HEADER_VERSION: i32 = 0x2000_0000;
 
+// The lowest version only rises with the height, so the bound at the top height is the highest.
+const _: () =
+    assert!(HEADER_VERSION >= crate::chainparams::Network::Mainnet.version_min(usize::MAX));
+const _: () =
+    assert!(HEADER_VERSION >= crate::chainparams::Network::Testnet4.version_min(usize::MAX));
+const _: () =
+    assert!(HEADER_VERSION >= crate::chainparams::Network::Signet.version_min(usize::MAX));
+const _: () =
+    assert!(HEADER_VERSION >= crate::chainparams::Network::Regtest.version_min(usize::MAX));
+
 /// `count` headers, each on the header before it, the first on the regtest genesis header. Each
 /// is the genesis header with its `version`, its `prev`, its `time` and its `nonce` changed. Each
 /// time is one second above the header below it, so it is legal.

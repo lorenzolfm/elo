@@ -591,9 +591,16 @@ pub(crate) mod fuzz {
     const SCRIPT_HEADER_BITS: u32 = crate::chainparams::Network::Regtest.genesis().bits;
 
     /// The `version` of each header that a script writes. It is the lowest version that regtest
-    /// takes at each height above genesis, so no script ends at `VersionTooLow`. A higher lowest
-    /// version moves rows of the seed table.
+    /// takes at each height above genesis, so no script ends at `VersionTooLow`. A person wrote
+    /// the 4, so another lowest version stops the build at the asserts below.
     const SCRIPT_HEADER_VERSION: i32 = 4;
+    // The lowest version only rises with the height. So with the same bound at the first height
+    // above genesis and at the top height, the bound is the same at each height between them.
+    const _: () =
+        assert!(SCRIPT_HEADER_VERSION == crate::chainparams::Network::Regtest.version_min(1));
+    const _: () = assert!(
+        SCRIPT_HEADER_VERSION == crate::chainparams::Network::Regtest.version_min(usize::MAX)
+    );
 
     /// The time of the header that a script writes as its `written_count`th, from 1. Each time is
     /// one second above the last, so it is above the times of all the headers below it, and each
