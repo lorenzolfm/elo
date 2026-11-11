@@ -441,12 +441,12 @@ impl Peer {
         if full {
             self.sync = SyncState::Due;
             Ok((self, Received::NoReply))
-        } else if !self.chain.reaches_work_min() {
-            Err(PeerError::ChainWorkTooLow)
-        } else {
+        } else if self.chain.reaches_work_min() {
             self.sync = SyncState::Synced;
             let tip = self.chain.tip();
             Ok((self, Received::Synced(tip)))
+        } else {
+            Err(PeerError::ChainWorkTooLow)
         }
     }
 
@@ -1432,11 +1432,11 @@ pub(crate) mod fuzz {
             if headers.len() == HEADERS_FULL_COUNT {
                 self.get_headers = GetHeadersModel::Due;
                 Ok(ReceivedExpected::NoReply)
-            } else if self.work() < chain_work_min(self.network) {
-                Err(super::PeerError::ChainWorkTooLow)
-            } else {
+            } else if self.work() >= chain_work_min(self.network) {
                 self.get_headers = GetHeadersModel::Ended;
                 Ok(ReceivedExpected::Synced)
+            } else {
+                Err(super::PeerError::ChainWorkTooLow)
             }
         }
 
