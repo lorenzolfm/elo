@@ -90,6 +90,8 @@ pub enum PeerError {
     UnsolicitedHeaders,
     /// Our `getheaders` had no `headers` within `HEADERS_TIMEOUT`.
     HeadersTimeout,
+    /// Their sync ended, and our chain has less work than the minimum of the network.
+    ChainWorkTooLow,
 }
 
 impl std::fmt::Display for PeerError {
@@ -107,6 +109,9 @@ impl std::fmt::Display for PeerError {
             PeerError::UnsolicitedHeaders => write!(f, "headers without our getheaders"),
             PeerError::HeadersTimeout => {
                 write!(f, "no headers within {} s", HEADERS_TIMEOUT.as_secs())
+            }
+            PeerError::ChainWorkTooLow => {
+                write!(f, "the sync ended on a chain below the minimum work")
             }
         }
     }
@@ -200,7 +205,8 @@ pub(crate) enum Received {
     NoReply,
     /// Send a `pong` with the nonce of their `ping`.
     Pong(u64),
-    /// Their batch was not full, so the sync ended. It holds the tip of our chain.
+    /// Their batch was not full, so the sync ended, and our chain has at least the minimum work
+    /// of the network. It holds the tip of our chain.
     Synced(crate::chain::Tip),
 }
 
@@ -358,8 +364,8 @@ enum SyncState {
     Due,
     /// Our `getheaders` went at `sent`. Its `headers` has not come.
     Outstanding { sent: std::time::Instant },
-    /// A batch that was not full came, so our tip is the tip of the peer. No `getheaders` goes
-    /// again.
+    /// A batch that was not full came, so our tip is the tip of the peer. Our chain has at least
+    /// the minimum work of the network. No `getheaders` goes again, so the chain stays the same.
     Synced,
 }
 
@@ -415,7 +421,8 @@ impl Peer {
     /// batch at `clock`. Then no `getheaders` is outstanding. A full batch makes the next one
     /// due. A batch that is not full ends the sync, an empty one too. The payload is checked
     /// first, also when no `getheaders` is outstanding. The bytes after the last transaction count
-    /// are ignored.
+    /// are ignored. The sync must end on a chain with at least the minimum work of the network.
+    /// Only the end reads the work, so a peer can send full batches below it.
     fn receive_headers(
         mut self,
         message: &crate::transport::Message,
@@ -435,10 +442,12 @@ impl Peer {
         if full {
             self.sync = SyncState::Due;
             Ok((self, Received::NoReply))
-        } else {
+        } else if self.chain.reaches_work_min() {
             self.sync = SyncState::Synced;
             let tip = self.chain.tip();
             Ok((self, Received::Synced(tip)))
+        } else {
+            Err(PeerError::ChainWorkTooLow)
         }
     }
 
@@ -543,7 +552,12 @@ impl SyncState {
                     Err(PeerError::HeadersTimeout)
                 }
             }
-            SyncState::Synced => Ok((self, None, None)),
+            SyncState::Synced => {
+                // Only a sync that reaches the minimum work ends at `Synced`, and the work of a
+                // chain does not go down.
+                assert!(chain.reaches_work_min());
+                Ok((self, None, None))
+            }
         }
     }
 }
@@ -722,6 +736,9 @@ pub(crate) mod fuzz {
         seed!("sync-full-late-tick-then-empty", "PeerOpen { height: 2000, synced: true }"),
         seed!("sync-full-then-short", "PeerOpen { height: 2002, synced: true }"),
         seed!("sync-longest-short-byte", "PeerOpen { height: 252, synced: true }"),
+        seed!("sync-low-work-mainnet", "PeerRefused(ChainWorkTooLow)"),
+        seed!("sync-low-work-signet", "PeerRefused(ChainWorkTooLow)"),
+        seed!("sync-low-work-testnet4", "PeerRefused(ChainWorkTooLow)"),
         seed!("sync-one-header", "PeerOpen { height: 1, synced: true }"),
         seed!("sync-short-batch", "PeerOpen { height: 2, synced: true }"),
         seed!("sync-then-idle-turns", "PeerOpen { height: 2, synced: true }"),
@@ -1001,18 +1018,7 @@ pub(crate) mod fuzz {
                 assert_eq!(tip.hash(), model.tip);
                 let height = format!("{} ", model.height);
                 assert!(tip.to_string().starts_with(&height), "{tip}, not {height}");
-                // A person wrote the work of each genesis. Each script header has the regtest
-                // limit, whose work is 2, and off regtest no script header passes.
-                let genesis_work: u64 = match model.network {
-                    crate::chainparams::Network::Mainnet
-                    | crate::chainparams::Network::Testnet4 => 0x1_0001_0001,
-                    crate::chainparams::Network::Signet => 0x49_d414,
-                    crate::chainparams::Network::Regtest => 2,
-                };
-                // Each step saturates, so a height past `u64` fails the assert below, not an add.
-                let height = u64::try_from(model.height).unwrap_or(u64::MAX);
-                let work = genesis_work.saturating_add(height.saturating_mul(2));
-                let work_text = format!(" {work:064x}");
+                let work_text = format!(" {:064x}", model.work());
                 assert!(
                     tip.to_string().ends_with(&work_text),
                     "{tip}, not {work_text}"
@@ -1432,10 +1438,39 @@ pub(crate) mod fuzz {
             if headers.len() == HEADERS_FULL_COUNT {
                 self.get_headers = GetHeadersModel::Due;
                 Ok(ReceivedExpected::NoReply)
-            } else {
+            } else if self.work() >= chain_work_min(self.network) {
                 self.get_headers = GetHeadersModel::Ended;
                 Ok(ReceivedExpected::Synced)
+            } else {
+                Err(super::PeerError::ChainWorkTooLow)
             }
+        }
+
+        /// The work of the chain. A person wrote the work of each genesis. Each script header has
+        /// the regtest limit, whose work is 2, and off regtest no script header passes. A height
+        /// has at most 64 bits, so the work fits a `u128` with no overflow.
+        fn work(&self) -> u128 {
+            let genesis_work: u128 = match self.network {
+                crate::chainparams::Network::Mainnet | crate::chainparams::Network::Testnet4 => {
+                    0x1_0001_0001
+                }
+                crate::chainparams::Network::Signet => 0x49_d414,
+                crate::chainparams::Network::Regtest => 2,
+            };
+            const { assert!(usize::BITS <= 64) };
+            genesis_work + self.height as u128 * 2
+        }
+    }
+
+    /// The lowest work of a chain at the end of a sync. A person wrote each minimum. Each one but
+    /// regtest is above the work of its genesis, and off regtest no script header passes. So off
+    /// regtest each sync that a script ends fails.
+    fn chain_work_min(network: crate::chainparams::Network) -> u128 {
+        match network {
+            crate::chainparams::Network::Mainnet => 0x1_1287_50f8_2f4c_3661_53a3_a030,
+            crate::chainparams::Network::Testnet4 => 0x9a0_fe15_d017_7d08_6304,
+            crate::chainparams::Network::Signet => 0xb46_3ea0_a4b8,
+            crate::chainparams::Network::Regtest => 0,
         }
     }
 
@@ -1558,8 +1593,14 @@ mod tests {
     }
 
     fn start() -> super::Handshake {
+        start_on(crate::chainparams::Network::Regtest)
+    }
+
+    /// The handshake with a peer on `network`. The machines do not read the magic, so the frames
+    /// of the tests can stay on regtest.
+    fn start_on(network: crate::chainparams::Network) -> super::Handshake {
         let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 18444));
-        super::Handshake::start(crate::chainparams::Network::Regtest, peer, 0, 0).0
+        super::Handshake::start(network, peer, 0, 0).0
     }
 
     fn wait(step: Result<super::Step, super::HandshakeError>) -> super::Handshake {
@@ -1580,7 +1621,13 @@ mod tests {
 
     /// The peer as the handshake makes it, after Core's `version` and `verack`.
     fn peer() -> super::Peer {
-        let (handshake, _) = reply(start().receive(&core_message(crate::fixtures::VERSION_FRAME)));
+        peer_on(crate::chainparams::Network::Regtest)
+    }
+
+    /// `peer`, on `network`.
+    fn peer_on(network: crate::chainparams::Network) -> super::Peer {
+        let (handshake, _) =
+            reply(start_on(network).receive(&core_message(crate::fixtures::VERSION_FRAME)));
         match handshake.receive(&core_message(crate::fixtures::VERACK_FRAME)) {
             Ok(super::Step::Done(peer, _)) => peer,
             other => panic!("{other:?}"),
@@ -1590,7 +1637,16 @@ mod tests {
     /// The peer after its first tick at `now`, which sent our `ping` with `nonce` and our
     /// `getheaders`.
     fn asked(now: std::time::Instant, nonce: u64) -> super::Peer {
-        match peer().tick(now, nonce) {
+        asked_on(crate::chainparams::Network::Regtest, now, nonce)
+    }
+
+    /// `asked`, on `network`.
+    fn asked_on(
+        network: crate::chainparams::Network,
+        now: std::time::Instant,
+        nonce: u64,
+    ) -> super::Peer {
+        match peer_on(network).tick(now, nonce) {
             Ok((
                 peer,
                 super::TickOutbound {
@@ -2005,6 +2061,27 @@ mod tests {
             panic!("{received:?}");
         };
         assert_eq!(tip, tip_after(&headers));
+    }
+
+    #[test]
+    fn sync_that_ends_below_the_minimum_work_ends_the_connection() {
+        // Genesis has less work than the minimum of each network but regtest, and the empty batch
+        // ends the sync on it. Regtest has a minimum of zero, so the same batch ends its sync.
+        let start = std::time::Instant::now();
+        for (network, expected) in [
+            (crate::chainparams::Network::Mainnet, false),
+            (crate::chainparams::Network::Testnet4, false),
+            (crate::chainparams::Network::Signet, false),
+            (crate::chainparams::Network::Regtest, true),
+        ] {
+            let received =
+                asked_on(network, start, 7).receive(&headers_message(&[]), crate::fixtures::CLOCK);
+            match received {
+                Ok((_, super::Received::Synced(_))) => assert!(expected, "{network:?}"),
+                Err(super::PeerError::ChainWorkTooLow) => assert!(!expected, "{network:?}"),
+                other => panic!("{network:?}: {other:?}"),
+            }
+        }
     }
 
     #[test]

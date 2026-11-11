@@ -44,6 +44,25 @@ const POW_LIMIT_REGTEST: [u8; 32] = [
     0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
 ];
 
+/// The lowest work of a mainnet chain at the end of a sync, big-endian. It is the work of the real
+/// chain at a height in the past, so a real chain has more.
+const CHAIN_WORK_MIN_MAINNET: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x01, 0x12, 0x87, 0x50, 0xf8, 0x2f, 0x4c, 0x36, 0x61, 0x53, 0xa3, 0xa0, 0x30,
+];
+
+/// The lowest work of a testnet4 chain at the end of a sync, big-endian.
+const CHAIN_WORK_MIN_TESTNET4: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0xa0, 0xfe, 0x15, 0xd0, 0x17, 0x7d, 0x08, 0x63, 0x04,
+];
+
+/// The lowest work of a signet chain at the end of a sync, big-endian.
+const CHAIN_WORK_MIN_SIGNET: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b, 0x46, 0x3e, 0xa0, 0xa4, 0xb8,
+];
+
 impl Network {
     /// The bytes that start every message.
     pub(crate) const fn magic(self) -> [u8; MAGIC_SIZE] {
@@ -71,6 +90,19 @@ impl Network {
             Network::Mainnet | Network::Testnet4 => POW_LIMIT,
             Network::Signet => POW_LIMIT_SIGNET,
             Network::Regtest => POW_LIMIT_REGTEST,
+        }
+    }
+
+    /// The lowest work that a chain of the network must have when its sync ends, big-endian. A
+    /// peer can make a chain of cheap headers, or send only part of its chain. With less work than
+    /// the real chain had at a height in the past, the chain of the peer is not the chain of the
+    /// network. Regtest has no real chain, so its minimum is zero and each chain passes.
+    pub(crate) const fn chain_work_min(self) -> [u8; 32] {
+        match self {
+            Network::Mainnet => CHAIN_WORK_MIN_MAINNET,
+            Network::Testnet4 => CHAIN_WORK_MIN_TESTNET4,
+            Network::Signet => CHAIN_WORK_MIN_SIGNET,
+            Network::Regtest => [0; 32],
         }
     }
 

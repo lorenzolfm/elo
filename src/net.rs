@@ -237,14 +237,15 @@ async fn handshake_stream_exchange(
 }
 
 impl Connection {
-    /// Runs one turn after the other until a batch that is not full ends the sync. Returns the
-    /// peer for `Synced::run`, and the tip of our chain. The loop has no count bound, because
-    /// only the chain of the peer bounds the sync, and elo has no minimum chain work yet. It ends
-    /// on the errors of `run`, and also when elo refuses a `headers` or none comes within the
-    /// headers timeout. Each wait for a message ends at the wake from `tick`, but the read takes
-    /// a message that is already there, also after the wake. `tick` checks the headers timeout
-    /// only at the start of a turn. One turn can write our `ping` and our `getheaders`, and then
-    /// a `pong`, and each write can take up to `SEND_TIMEOUT`. So the connection can end up to
+    /// Runs one turn after the other until a batch that is not full ends the sync. Returns the peer
+    /// for `Synced::run`, and the tip of our chain. The loop has no count bound, because only the
+    /// chain of the peer bounds the sync. Only the end of the sync reads the minimum chain work, so
+    /// the minimum does not bound the loop. It ends on the errors of `run`, and also when elo
+    /// refuses a `headers`, none comes within the headers timeout, or the sync ends on a chain
+    /// below the minimum work. Each wait for a message ends at the wake from `tick`, but the read
+    /// takes a message that is already there, also after the wake. `tick` checks the headers
+    /// timeout only at the start of a turn. One turn can write our `ping` and our `getheaders`, and
+    /// then a `pong`, and each write can take up to `SEND_TIMEOUT`. So the connection can end up to
     /// three times `SEND_TIMEOUT` after the tick that sent our `getheaders`, with `SendTimeout`,
     /// `PingTimeout` or `HeadersTimeout`.
     pub async fn sync(self) -> Result<(Synced, crate::chain::Tip), RunError> {
