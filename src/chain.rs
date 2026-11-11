@@ -54,7 +54,7 @@ pub enum ExtendError {
     /// header can pass at a later clock.
     TimeTooNew,
     /// The `version` of a header is below the lowest version of its height on the network.
-    BadVersion,
+    VersionTooLow,
 }
 
 /// The headers below one header of a batch, by height: the chain, then the part of the batch that
@@ -124,7 +124,7 @@ impl Chain {
                 return Err(ExtendError::TimeTooNew);
             }
             if header.version < self.network.version_min(ancestors.height_above()) {
-                return Err(ExtendError::BadVersion);
+                return Err(ExtendError::VersionTooLow);
             }
         }
 
@@ -290,7 +290,7 @@ impl std::fmt::Display for ExtendError {
                 f,
                 "a header has a time more than {TIME_AHEAD_SECONDS_MAX} s after our clock"
             ),
-            ExtendError::BadVersion => {
+            ExtendError::VersionTooLow => {
                 write!(f, "a header has a version below the lowest of its height")
             }
         }
@@ -1048,10 +1048,14 @@ mod tests {
             (
                 "one below the bound",
                 3,
-                Err(super::ExtendError::BadVersion),
+                Err(super::ExtendError::VersionTooLow),
             ),
             // The top bit is set. As a `u32`, this version is above the bound.
-            ("the lowest", i32::MIN, Err(super::ExtendError::BadVersion)),
+            (
+                "the lowest",
+                i32::MIN,
+                Err(super::ExtendError::VersionTooLow),
+            ),
         ];
         for (name, version, expected) in cases {
             let with_version = |header: crate::block::BlockHeader| {
@@ -1121,7 +1125,7 @@ mod tests {
                     crate::fixtures::headers_batch(&[below, at]),
                     crate::fixtures::CLOCK
                 ),
-                Err(super::ExtendError::BadVersion),
+                Err(super::ExtendError::VersionTooLow),
                 "{height}"
             );
             assert_eq!(chain.tip(), before, "{height}");

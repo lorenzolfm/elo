@@ -591,7 +591,7 @@ pub(crate) mod fuzz {
     const SCRIPT_HEADER_BITS: u32 = crate::chainparams::Network::Regtest.genesis().bits;
 
     /// The `version` of each header that a script writes. It is the lowest version that regtest
-    /// takes at each height above genesis, so no script ends at `BadVersion`. A higher lowest
+    /// takes at each height above genesis, so no script ends at `VersionTooLow`. A higher lowest
     /// version moves rows of the seed table.
     const SCRIPT_HEADER_VERSION: i32 = 4;
 
