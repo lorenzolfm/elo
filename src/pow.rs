@@ -101,6 +101,8 @@ impl Work {
     /// inverse over `target + 1`, plus one.
     fn of(target: Target) -> Work {
         let target = Work::from_be_bytes(target.0);
+        // `from_bits` gives no target of zero, so the divisor is at least 2.
+        assert_ne!(target, Work::ZERO);
         // `from_bits` keeps at most three bytes of a number, so no target has all bits set, and
         // the add does not saturate.
         assert_ne!(target, Work::MAX);
@@ -109,8 +111,11 @@ impl Work {
             high: !target.high,
             low: !target.low,
         };
-        // The quotient is at most half of the highest number, so the add does not saturate.
-        inverse.divided_by(divisor).saturating_add(Work::ONE)
+        let quotient = inverse.divided_by(divisor);
+        // The divisor is at least 2, so the quotient is below 2^255: its top bit is clear, and the
+        // add does not saturate.
+        assert_eq!(quotient.high >> 127, 0);
+        quotient.saturating_add(Work::ONE)
     }
 
     /// `self` plus `other`, or the highest number if the sum does not fit. Each header of a real
