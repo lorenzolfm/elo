@@ -2,8 +2,9 @@
 
 A Bitcoin node daemon. Work in progress: the binary dials one peer, does the
 v1 `version`/`verack` handshake and prints the peer's `version`. Then it syncs
-the header chain from genesis to the peer's tip and prints `tip <height> <hash>`.
-The chain is in memory, and elo checks only that each header is on the one
+the header chain from genesis to the peer's tip and prints
+`tip <height> <hash> <work>`. The work is the sum of the work of each header,
+in 64 hex digits. The chain is in memory, and elo checks only that each header is on the one
 before it, has proof of work, has the `bits` that the network requires and has a
 time above the median of the 11 headers before it. On testnet4, the first header
 of a period also has a time at most 10 min below the header before it. Each time

@@ -79,6 +79,145 @@ impl Target {
     }
 }
 
+/// An amount of work: the count of hashes that a header, or a chain of headers, takes on average.
+/// It is a number of 256 bits in two halves. The high half is the first field, so the order of two
+/// amounts is the order of their fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Work {
+    high: u128,
+    low: u128,
+}
+
+impl Work {
+    const ZERO: Work = Work { high: 0, low: 0 };
+    const ONE: Work = Work { high: 0, low: 1 };
+    const MAX: Work = Work {
+        high: u128::MAX,
+        low: u128::MAX,
+    };
+
+    /// The work of one header with `target`: 2^256 over `target + 1`, rounded down. 2^256 does not
+    /// fit in 256 bits. But it is the inverse of `target` plus `target + 1`, so the answer is the
+    /// inverse over `target + 1`, plus one.
+    fn of(target: Target) -> Work {
+        let target = Work::from_be_bytes(target.0);
+        // `from_bits` keeps at most three bytes of a number, so no target has all bits set, and
+        // the add does not saturate.
+        assert_ne!(target, Work::MAX);
+        let divisor = target.saturating_add(Work::ONE);
+        let inverse = Work {
+            high: !target.high,
+            low: !target.low,
+        };
+        // The quotient is at most half of the highest number, so the add does not saturate.
+        inverse.divided_by(divisor).saturating_add(Work::ONE)
+    }
+
+    /// `self` plus `other`, or the highest number if the sum does not fit. Each header of a real
+    /// chain has far less work than this, so only peer bytes that no hash can meet reach it.
+    pub(crate) fn saturating_add(self, other: Work) -> Work {
+        let (low, carry) = self.low.overflowing_add(other.low);
+        match self
+            .high
+            .checked_add(other.high)
+            .and_then(|high| high.checked_add(u128::from(carry)))
+        {
+            Some(high) => Work { high, low },
+            None => Work::MAX,
+        }
+    }
+
+    /// `self` minus `other`, which must be at most `self`.
+    fn minus(self, other: Work) -> Work {
+        assert!(other <= self);
+        let (low, borrow) = self.low.overflowing_sub(other.low);
+        Work {
+            high: self.high - other.high - u128::from(borrow),
+            low,
+        }
+    }
+
+    /// `self` over `divisor`, rounded down, by long division in base 2. The first step puts the
+    /// highest bit of `divisor` under the highest bit of `self`, and each step gives one bit of the
+    /// answer. So a small answer takes few steps.
+    fn divided_by(self, divisor: Work) -> Work {
+        assert_ne!(divisor, Work::ZERO);
+        // `divisor` has a higher bit than `self`, so it is above `self`.
+        let Some(shift) = divisor.leading_zeros().checked_sub(self.leading_zeros()) else {
+            return Work::ZERO;
+        };
+        let mut step_divisor = divisor.shifted_left(shift);
+        let mut remainder = self;
+        let mut quotient = Work::ZERO;
+        for _ in 0..=shift {
+            quotient = quotient.shifted_left(1);
+            if remainder >= step_divisor {
+                remainder = remainder.minus(step_divisor);
+                quotient.low |= 1;
+            }
+            step_divisor = step_divisor.shifted_right_once();
+        }
+        assert!(remainder < divisor);
+        quotient
+    }
+
+    /// `self` times 2^`bits`, without the bits that pass 256. `bits` must be below 256.
+    fn shifted_left(self, bits: u32) -> Work {
+        assert!(bits < 256);
+        if bits >= 128 {
+            Work {
+                high: self.low << (bits - 128),
+                low: 0,
+            }
+        } else {
+            // A shift of 128 does not fit a `u128`, so a shift of zero moves no bit up.
+            let low_to_high = self.low.checked_shr(128 - bits).unwrap_or(0);
+            // The parts of each sum here share no bit, so the add is an or.
+            Work {
+                high: (self.high << bits) + low_to_high,
+                low: self.low << bits,
+            }
+        }
+    }
+
+    /// `self` over 2, rounded down.
+    fn shifted_right_once(self) -> Work {
+        // The two parts of the sum share no bit, so the add is an or.
+        Work {
+            high: self.high >> 1,
+            low: (self.low >> 1) + (self.high << 127),
+        }
+    }
+
+    /// The count of zero bits above the highest one bit.
+    fn leading_zeros(self) -> u32 {
+        if self.high == 0 {
+            128 + self.low.leading_zeros()
+        } else {
+            self.high.leading_zeros()
+        }
+    }
+
+    /// The number of 32 big-endian bytes.
+    fn from_be_bytes(bytes: [u8; 32]) -> Work {
+        bytes.into_iter().fold(Work::ZERO, |number, byte| {
+            let shifted = number.shifted_left(8);
+            // The shift leaves the low byte zero, so the add is an or.
+            Work {
+                low: shifted.low + u128::from(byte),
+                ..shifted
+            }
+        })
+    }
+}
+
+/// Writes the number as 64 hex digits, with the zeros at the start.
+impl std::fmt::Display for Work {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:032x}{:032x}", self.high, self.low)
+    }
+}
+
 /// The compact form of `number`, as `Target::from_bits` reads it. Only the first three bytes of the
 /// number stay. A first byte with its top bit set would read as the sign, so it moves one byte
 /// down and the size goes up by one. A number of zero gives zero, so `number` is no `Target`.
@@ -258,16 +397,16 @@ pub(crate) fn timewarp_time_min(
     }
 }
 
-/// The hash of `header`, if its `bits` are a target in the range of `network` and the hash is at
-/// most that target.
+/// The hash and the work of `header`, if its `bits` are a target in the range of `network` and the
+/// hash is at most that target.
 #[must_use = "a dropped answer lets each header pass"]
-pub(crate) fn proven_hash(
+pub(crate) fn proven(
     header: &crate::block::BlockHeader,
     network: crate::chainparams::Network,
-) -> Option<bitcoin_hashes::sha256d::Hash> {
+) -> Option<(bitcoin_hashes::sha256d::Hash, Work)> {
     let target = Target::from_bits(header.bits, network.pow_limit())?;
     let hash = header.hash();
-    target.is_met_by(hash).then_some(hash)
+    target.is_met_by(hash).then(|| (hash, Work::of(target)))
 }
 
 /// `header` with the first `nonce` that gives a hash below the regtest target, whatever its `bits`
@@ -310,6 +449,15 @@ pub(crate) mod fuzz {
                     assert!(next.is_some() || (high == [0; 31] && low < 4));
                 }
             }
+        }
+    }
+
+    /// A peer picks `bits`, so each target goes through the work of a header, whose asserts must
+    /// hold for any target. No limit bounds it here, so a small target reaches the longest division
+    /// and a target above half of 2^256 the shortest.
+    pub(crate) fn work_check(header: &crate::block::BlockHeader) {
+        if let Some(target) = super::Target::from_bits(header.bits, [0xff; 32]) {
+            assert!(super::Work::of(target) >= super::Work::ONE);
         }
     }
 
@@ -913,6 +1061,59 @@ mod tests {
     }
 
     #[test]
+    fn work_is_two_to_the_256_over_the_target_plus_one() {
+        // These answers are from big integers, not from this code. The limit is above each target.
+        let limit = [0xff; 32];
+        for (bits, expected) in [
+            // Mainnet and testnet4 genesis, signet genesis and regtest genesis.
+            (0x1d00_ffff, "100010001"),
+            (0x1e03_77ae, "49d414"),
+            (0x207f_ffff, "2"),
+            // A real mainnet `bits` from 2026.
+            (0x1703_4219, "4e9235f043634662e0cb"),
+            // A target of 1 gives the highest work: 256 steps of the division.
+            (
+                0x0101_0000,
+                "8000000000000000000000000000000000000000000000000000000000000000",
+            ),
+            // Each bit of the answer is in use, in both halves.
+            (
+                0x0300_8000,
+                "1fffc0007fff0001fffc0007fff0001fffc0007fff0001fffc0007fff0001",
+            ),
+            (0x107f_ffff, "200000400000800001000002000003ffc"),
+            // At the edge of the two halves.
+            (0x1100_8000, "1fffffffffffffffffffffffffffffffc"),
+            (0x1101_0000, "ffffffffffffffffffffffffffffffff"),
+            // A target above half of 2^256 has the lowest work.
+            (0x2100_ffff, "1"),
+        ] {
+            let target = super::Target::from_bits(bits, limit).unwrap();
+            assert_eq!(
+                super::Work::of(target).to_string(),
+                format!("{expected:0>64}"),
+                "{bits:#010x}"
+            );
+        }
+    }
+
+    #[test]
+    fn work_adds_with_a_carry_and_stops_at_the_highest_number() {
+        let work = |high, low| super::Work { high, low };
+        for (left, right, expected) in [
+            (work(0, u128::MAX), work(0, 1), work(1, 0)),
+            // Exactly the highest number fits.
+            (work(u128::MAX, 0), work(0, u128::MAX), super::Work::MAX),
+            // Only the carry passes 256 bits.
+            (super::Work::MAX, work(0, 1), super::Work::MAX),
+            // Only the high halves pass 256 bits.
+            (work(u128::MAX, 0), work(1, 0), super::Work::MAX),
+        ] {
+            assert_eq!(left.saturating_add(right), expected, "{left} {right}");
+        }
+    }
+
+    #[test]
     fn each_genesis_has_proof_of_work() {
         // Real headers, so this also shows the byte order of the hash: in wire order, each hash
         // but the regtest one starts with bytes above its target.
@@ -924,7 +1125,7 @@ mod tests {
         ] {
             let genesis = network.genesis();
             assert_eq!(
-                super::proven_hash(&genesis, network),
+                super::proven(&genesis, network).map(|(hash, _)| hash),
                 Some(genesis.hash()),
                 "{network:?}"
             );

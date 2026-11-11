@@ -1001,6 +1001,17 @@ pub(crate) mod fuzz {
                 assert_eq!(tip.hash(), model.tip);
                 let height = format!("{} ", model.height);
                 assert!(tip.to_string().starts_with(&height), "{tip}, not {height}");
+                // A person wrote the work of each genesis. Each script header has the regtest
+                // limit, whose work is 2, and off regtest no script header passes.
+                let genesis_work: u64 = match model.network {
+                    crate::chainparams::Network::Mainnet
+                    | crate::chainparams::Network::Testnet4 => 0x1_0001_0001,
+                    crate::chainparams::Network::Signet => 0x49_d414,
+                    crate::chainparams::Network::Regtest => 2,
+                };
+                let height = u64::try_from(model.height).unwrap_or(u64::MAX);
+                let work = format!(" {:064x}", genesis_work + 2 * height);
+                assert!(tip.to_string().ends_with(&work), "{tip}, not {work}");
                 Ok(peer)
             }
             (Err(error), Err(expected)) => {

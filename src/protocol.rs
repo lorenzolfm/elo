@@ -524,9 +524,10 @@ pub(crate) mod fuzz {
             header.encode(&mut encoded);
             crate::serialize::write_compact_size(&mut encoded, 0);
             crate::pow::fuzz::retarget_check(header);
+            crate::pow::fuzz::work_check(header);
             crate::chain::fuzz::timewarp_time_min_check(header);
             let network = crate::chainparams::Network::Regtest;
-            if let Some(hash) = crate::pow::proven_hash(header, network) {
+            if let Some((hash, _)) = crate::pow::proven(header, network) {
                 // The regtest limit starts with 0x7f, so no hash that passes has a higher top byte.
                 // The top byte of a hash is its last byte in wire order. This rule does not call
                 // the check, so a check that takes too many hashes fails here.
