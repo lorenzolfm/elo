@@ -205,7 +205,8 @@ pub(crate) enum Received {
     NoReply,
     /// Send a `pong` with the nonce of their `ping`.
     Pong(u64),
-    /// Their batch was not full, so the sync ended. It holds the tip of our chain.
+    /// Their batch was not full, so the sync ended, and our chain has at least the minimum work
+    /// of the network. It holds the tip of our chain.
     Synced(crate::chain::Tip),
 }
 
@@ -363,8 +364,8 @@ enum SyncState {
     Due,
     /// Our `getheaders` went at `sent`. Its `headers` has not come.
     Outstanding { sent: std::time::Instant },
-    /// A batch that was not full came, so our tip is the tip of the peer. No `getheaders` goes
-    /// again.
+    /// A batch that was not full came, so our tip is the tip of the peer. Our chain has at least
+    /// the minimum work of the network. No `getheaders` goes again, so the chain stays the same.
     Synced,
 }
 
