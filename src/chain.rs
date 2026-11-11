@@ -13,7 +13,8 @@ const TIME_AHEAD_SECONDS_MAX: u64 = 2 * 60 * 60;
 /// of work, and each header above genesis has the `bits` that the headers below it require and a
 /// time above their median time. On testnet4, each first header of a period above genesis also has
 /// a time at most 10 minutes below the header below it. When the chain took a header, its time was
-/// at most `TIME_AHEAD_SECONDS_MAX` after the local clock.
+/// at most `TIME_AHEAD_SECONDS_MAX` after the local clock. Each header has at least the lowest
+/// `version` of its height on the network.
 #[derive(Debug)]
 pub(crate) struct Chain {
     /// The network of the chain. Its rules bound the target of each header and, on testnet4, the
@@ -52,6 +53,8 @@ pub enum ExtendError {
     /// The time of a header is more than `TIME_AHEAD_SECONDS_MAX` after the local clock. The same
     /// header can pass at a later clock.
     TimeTooNew,
+    /// The `version` of a header is below the lowest version of its height on the network.
+    VersionTooLow,
 }
 
 /// The headers below one header of a batch, by height: the chain, then the part of the batch that
@@ -77,8 +80,8 @@ impl Chain {
     /// Puts all of `headers` on the tip, in order, or none of them. An empty batch changes
     /// nothing. The first header that fails gives the error. For one header, its `prev` is checked
     /// first, then its proof of work, then its `bits`, then its time against the median time, then
-    /// its time against the timewarp rule, then its time against `clock`. `clock` is the local
-    /// clock, in seconds since the Unix epoch.
+    /// its time against the timewarp rule, then its time against `clock`, then its `version`.
+    /// `clock` is the local clock, in seconds since the Unix epoch.
     pub(crate) fn extend(
         &mut self,
         headers: crate::protocol::Headers,
@@ -120,8 +123,22 @@ impl Chain {
             if u64::from(header.time) > time_max {
                 return Err(ExtendError::TimeTooNew);
             }
+            if header.version < self.network.version_min(ancestors.height_above()) {
+                return Err(ExtendError::VersionTooLow);
+            }
         }
 
+        self.extend_store(headers, time_max);
+        // The loop proved the last header of the batch, so this holds that the store took each one.
+        assert_eq!(self.tip.hash(), prev);
+        Ok(())
+    }
+
+    /// Puts each of `headers` on the tip, in order. `extend` checked each header against the batch,
+    /// and each assert here reads the chain. So with a check that skips a header, this panics.
+    fn extend_store(&mut self, headers: Vec<crate::block::BlockHeader>, time_max: u64) {
+        // `extend` returns before this on an empty batch, so each assert reads a new header.
+        assert!(!headers.is_empty());
         let genesis_time = self.network.genesis().time;
         for header in headers {
             self.below_tip
@@ -131,17 +148,20 @@ impl Chain {
             assert!(self.tip.time > genesis_time);
             // The bound is the same for each header, so this holds that the check read each one.
             assert!(u64::from(self.tip.time) <= time_max);
+            // The lowest version reads only the height, so this check of each header is cheap. It
+            // holds that the check in `extend` read each header.
+            assert!(self.tip.version >= self.network.version_min(self.below_tip.len()));
             // The first header of a period is rarely the last of a batch, so this reads each
-            // header. It reads the chain, and the check above reads the batch.
+            // header. It reads the chain, and the check in `extend` reads the batch.
             assert!(
                 self.tip.time
                     >= crate::pow::timewarp_time_min(self.network, self.ancestors_of_tip())
             );
         }
         let ancestors = self.ancestors_of_tip();
-        // The checks above read the batch. These read the chain: the tip is on the header below it,
-        // it has proof of work, it has the `bits` that the headers below it require, and its time
-        // is above their median time.
+        // The checks of `extend` read the batch. These read the chain: the tip is on the header
+        // below it, it has proof of work, it has the `bits` that the headers below it require, and
+        // its time is above their median time.
         assert_eq!(self.tip.prev, ancestors.tip.hash());
         assert!(crate::pow::proven_hash(&self.tip, self.network).is_some());
         assert_eq!(
@@ -149,7 +169,6 @@ impl Chain {
             Some(self.tip.bits)
         );
         assert!(self.tip.time > ancestors.median_time_past());
-        Ok(())
     }
 
     /// The headers below the tip. A batch that is not empty puts the old tip below the new tip, so
@@ -271,6 +290,9 @@ impl std::fmt::Display for ExtendError {
                 f,
                 "a header has a time more than {TIME_AHEAD_SECONDS_MAX} s after our clock"
             ),
+            ExtendError::VersionTooLow => {
+                write!(f, "a header has a version below the lowest of its height")
+            }
         }
     }
 }
@@ -514,11 +536,13 @@ mod tests {
     }
 
     /// A regtest header for each of `times`, each on the header before it, the first on `below`.
+    /// Each has `fixtures::HEADER_VERSION`, so `below` can be genesis.
     fn mined_on(below: crate::block::BlockHeader, times: &[u32]) -> Vec<crate::block::BlockHeader> {
         let mut headers = Vec::with_capacity(times.len());
         let mut prev = below.hash();
         for time in times {
             let header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
+                version: crate::fixtures::HEADER_VERSION,
                 prev,
                 time: *time,
                 ..below
@@ -1006,6 +1030,129 @@ mod tests {
         assert_eq!(
             chain.extend(crate::fixtures::headers_batch(&[one_below]), 0),
             Err(super::ExtendError::TimeTimewarpAttack)
+        );
+    }
+
+    /// Each row has the `version` of one header. In one batch that header is at height 1, the first
+    /// height with a lowest version, and the header on it is legal. In the other batch it is the
+    /// last, at height 3. So only that header decides. A refused batch must leave the chain as it
+    /// was.
+    #[test]
+    fn extend_takes_a_version_only_at_or_above_the_lowest_of_its_height() {
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        let block_1 = mined_on(genesis, &[genesis.time + 1])[0];
+        let block_2 = mined_on(block_1, &[genesis.time + 2])[0];
+        // A person wrote the 4.
+        let cases: [(&str, i32, Result<(), super::ExtendError>); 3] = [
+            ("at the bound", 4, Ok(())),
+            (
+                "one below the bound",
+                3,
+                Err(super::ExtendError::VersionTooLow),
+            ),
+            // The top bit is set. As a `u32`, this version is above the bound.
+            (
+                "the lowest",
+                i32::MIN,
+                Err(super::ExtendError::VersionTooLow),
+            ),
+        ];
+        for (name, version, expected) in cases {
+            let with_version = |header: crate::block::BlockHeader| {
+                crate::pow::mined_for_regtest(crate::block::BlockHeader { version, ..header })
+            };
+            let first = with_version(block_1);
+            let on_first = mined_on(first, &[genesis.time + 2])[0];
+            let last = with_version(mined_on(block_2, &[genesis.time + 3])[0]);
+            for (on_chain, batch) in [
+                (vec![], vec![first, on_first]),
+                (vec![block_1], vec![block_2, last]),
+            ] {
+                let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
+                assert_eq!(
+                    chain.extend(
+                        crate::fixtures::headers_batch(&on_chain),
+                        crate::fixtures::CLOCK
+                    ),
+                    Ok(())
+                );
+                let before = chain.tip();
+                let height_tip = on_chain.len();
+
+                assert_eq!(
+                    chain.extend(
+                        crate::fixtures::headers_batch(&batch),
+                        crate::fixtures::CLOCK
+                    ),
+                    expected,
+                    "{name} {height_tip}"
+                );
+                let tip = match expected {
+                    Ok(()) => batch[batch.len() - 1].hash(),
+                    Err(_) => before.hash,
+                };
+                assert_eq!(chain.tip().hash, tip, "{name} {height_tip}");
+            }
+        }
+    }
+
+    /// On mainnet, the lowest version rises at three heights. At each, a header one below the
+    /// height and a header at the height both have the version one below the new bound. So only
+    /// the height decides: the first passes, and a batch with both is refused. The second is in a
+    /// batch, so the height must also count the batch.
+    #[test]
+    fn extend_on_mainnet_raises_the_lowest_version_at_each_height() {
+        let network = crate::chainparams::Network::Mainnet;
+        let tip = crate::fixtures::header(crate::fixtures::MAINNET_VERSION_TIP);
+        // A person wrote each height and each version.
+        let heights = [(227_931, 1), (363_725, 2), (388_381, 3)];
+        for ((height, version), [below, at]) in heights
+            .into_iter()
+            .zip(crate::fixtures::MAINNET_VERSION_RISE)
+        {
+            let below = crate::fixtures::header(below);
+            let at = crate::fixtures::header(at);
+            // These are what the names say, so a wrong fixture cannot hold another bound.
+            assert_eq!(below.prev, tip.hash());
+            assert_eq!(at.prev, below.hash());
+            assert_eq!(below.version, version);
+            assert_eq!(at.version, version);
+
+            let mut chain = chain_with(network, &[(height - 2, tip)]);
+            let before = chain.tip();
+            assert_eq!(
+                chain.extend(
+                    crate::fixtures::headers_batch(&[below, at]),
+                    crate::fixtures::CLOCK
+                ),
+                Err(super::ExtendError::VersionTooLow),
+                "{height}"
+            );
+            assert_eq!(chain.tip(), before, "{height}");
+            assert_eq!(
+                chain.extend(
+                    crate::fixtures::headers_batch(&[below]),
+                    crate::fixtures::CLOCK
+                ),
+                Ok(()),
+                "{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn extend_checks_the_time_against_the_clock_before_the_version() {
+        // The clock is far below the time of this header, so it fails both rules.
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        let header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
+            version: 3,
+            ..mined_on(genesis, &[genesis.time + 1])[0]
+        });
+        let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
+
+        assert_eq!(
+            chain.extend(crate::fixtures::headers_batch(&[header]), 0),
+            Err(super::ExtendError::TimeTooNew)
         );
     }
 

@@ -74,6 +74,28 @@ impl Network {
         }
     }
 
+    /// The lowest `version` that a header at `height` may have. Three rules raise it, to 2, 3 and
+    /// 4, each from its own height. Below all three heights, each version passes, so the answer is
+    /// `i32::MIN`. On each network other than mainnet, the three heights are 1. So each header
+    /// above genesis needs 4, and genesis keeps its version of 1.
+    pub(crate) const fn version_min(self, height: usize) -> i32 {
+        let [version_2_height, version_3_height, version_4_height] = match self {
+            Network::Mainnet => [227_931, 363_725, 388_381],
+            Network::Testnet4 | Network::Signet | Network::Regtest => [1, 1, 1],
+        };
+        // The highest version comes first, so a height at or above two of the heights gets the
+        // higher version.
+        if height >= version_4_height {
+            4
+        } else if height >= version_3_height {
+            3
+        } else if height >= version_2_height {
+            2
+        } else {
+            i32::MIN
+        }
+    }
+
     /// The first header of the chain.
     pub(crate) const fn genesis(self) -> crate::block::BlockHeader {
         // No header comes before genesis.
@@ -115,6 +137,13 @@ impl Network {
     }
 }
 
+// A chain starts at genesis with no check, and each header of a chain has at least the lowest
+// version of its height. So each genesis must have at least the lowest version of height 0.
+const _: () = assert!(Network::Mainnet.genesis().version >= Network::Mainnet.version_min(0));
+const _: () = assert!(Network::Testnet4.genesis().version >= Network::Testnet4.version_min(0));
+const _: () = assert!(Network::Signet.genesis().version >= Network::Signet.version_min(0));
+const _: () = assert!(Network::Regtest.genesis().version >= Network::Regtest.version_min(0));
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -129,6 +158,37 @@ mod tests {
         let hash = bitcoin_hashes::sha256d::Hash::hash(&serialized).to_byte_array();
 
         assert_eq!(super::Network::Signet.magic(), *hash.first_chunk().unwrap());
+    }
+
+    /// A person wrote each height and each version. Each height of mainnet has a row one below it.
+    #[test]
+    fn version_min_rises_at_each_height() {
+        let cases = [
+            (super::Network::Mainnet, 0, i32::MIN),
+            (super::Network::Mainnet, 227_930, i32::MIN),
+            (super::Network::Mainnet, 227_931, 2),
+            (super::Network::Mainnet, 363_724, 2),
+            (super::Network::Mainnet, 363_725, 3),
+            (super::Network::Mainnet, 388_380, 3),
+            (super::Network::Mainnet, 388_381, 4),
+            (super::Network::Mainnet, usize::MAX, 4),
+            (super::Network::Testnet4, 0, i32::MIN),
+            (super::Network::Testnet4, 1, 4),
+            (super::Network::Testnet4, usize::MAX, 4),
+            (super::Network::Signet, 0, i32::MIN),
+            (super::Network::Signet, 1, 4),
+            (super::Network::Signet, usize::MAX, 4),
+            (super::Network::Regtest, 0, i32::MIN),
+            (super::Network::Regtest, 1, 4),
+            (super::Network::Regtest, usize::MAX, 4),
+        ];
+        for (network, height, expected) in cases {
+            assert_eq!(
+                network.version_min(height),
+                expected,
+                "{network:?} {height}"
+            );
+        }
     }
 
     #[test]

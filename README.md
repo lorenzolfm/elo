@@ -7,8 +7,10 @@ The chain is in memory, and elo checks only that each header is on the one
 before it, has proof of work, has the `bits` that the network requires and has a
 time above the median of the 11 headers before it. On testnet4, the first header
 of a period also has a time at most 10 min below the header before it. Each time
-is also at most 2 h after the local clock. After the
-sync, elo stays connected and answers each `ping` with a `pong`. From the
+is also at most 2 h after the local clock. On testnet4, signet and regtest, each
+header above genesis has a version of at least 4. On mainnet, a header needs a
+version of at least 2 from height 227931, 3 from 363725 and 4 from 388381. After
+the sync, elo stays connected and answers each `ping` with a `pong`. From the
 handshake on, it pings the peer every 2 min.
 It drops a peer that does not answer a `ping` within 20 min, or a `getheaders`
 within 2 min.
