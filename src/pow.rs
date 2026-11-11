@@ -427,6 +427,12 @@ pub(crate) fn work(bits: u32, network: crate::chainparams::Network) -> Option<Wo
     Target::from_bits(bits, network.pow_limit()).map(Work::of)
 }
 
+/// The work of a chain is at least the minimum of `network`. A saturated sum means "at least the
+/// highest number", so it passes.
+pub(crate) fn has_chain_work_min(work: Work, network: crate::chainparams::Network) -> bool {
+    work >= Work::from_be_bytes(network.chain_work_min())
+}
+
 /// `header` with the first `nonce` that gives a hash below the regtest target, whatever its `bits`
 /// are. A top byte below 0x7f is below that target, so about every second nonce passes. The top
 /// byte of a hash is its last byte in wire order. This does not call the check above, so a check
@@ -1129,6 +1135,40 @@ mod tests {
         ] {
             assert_eq!(left.saturating_add(right), expected, "{left} {right}");
         }
+    }
+
+    #[test]
+    fn chain_work_passes_from_the_minimum_of_its_network() {
+        // A person copied each minimum from the source of the network.
+        for (network, minimum) in [
+            (
+                crate::chainparams::Network::Mainnet,
+                "0000000000000000000000000000000000000001128750f82f4c366153a3a030",
+            ),
+            (
+                crate::chainparams::Network::Testnet4,
+                "0000000000000000000000000000000000000000000009a0fe15d0177d086304",
+            ),
+            (
+                crate::chainparams::Network::Signet,
+                "00000000000000000000000000000000000000000000000000000b463ea0a4b8",
+            ),
+        ] {
+            let minimum =
+                super::Work::from_be_bytes(crate::fixtures::hex(minimum).try_into().unwrap());
+            assert!(super::has_chain_work_min(minimum, network), "{network:?}");
+            assert!(
+                super::has_chain_work_min(super::Work::MAX, network),
+                "{network:?}"
+            );
+            assert!(
+                !super::has_chain_work_min(minimum.minus(super::Work::ONE), network),
+                "{network:?}"
+            );
+        }
+        // Regtest has no work below its minimum.
+        let regtest = crate::chainparams::Network::Regtest;
+        assert!(super::has_chain_work_min(super::Work::ZERO, regtest));
     }
 
     #[test]
