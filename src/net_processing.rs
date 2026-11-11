@@ -551,7 +551,12 @@ impl SyncState {
                     Err(PeerError::HeadersTimeout)
                 }
             }
-            SyncState::Synced => Ok((self, None, None)),
+            SyncState::Synced => {
+                // Only a sync that reaches the minimum work ends at `Synced`, and the work of a
+                // chain does not go down.
+                assert!(chain.reaches_work_min());
+                Ok((self, None, None))
+            }
         }
     }
 }
