@@ -1446,8 +1446,8 @@ pub(crate) mod fuzz {
         }
 
         /// The work of the chain. A person wrote the work of each genesis. Each script header has
-        /// the regtest limit, whose work is 2, and off regtest no script header passes. Each step
-        /// saturates, so a height past `u128` fails a compare, not an add.
+        /// the regtest limit, whose work is 2, and off regtest no script header passes. A height
+        /// has at most 64 bits, so the work fits a `u128` with no overflow.
         fn work(&self) -> u128 {
             let genesis_work: u128 = match self.network {
                 crate::chainparams::Network::Mainnet | crate::chainparams::Network::Testnet4 => {
@@ -1456,8 +1456,8 @@ pub(crate) mod fuzz {
                 crate::chainparams::Network::Signet => 0x49_d414,
                 crate::chainparams::Network::Regtest => 2,
             };
-            let height = u128::try_from(self.height).unwrap_or(u128::MAX);
-            genesis_work.saturating_add(height.saturating_mul(2))
+            const { assert!(usize::BITS <= 64) };
+            genesis_work + self.height as u128 * 2
         }
     }
 
