@@ -122,14 +122,19 @@ impl Work {
     /// chain has far less work than this, so only peer bytes that no hash can meet reach it.
     pub(crate) fn saturating_add(self, other: Work) -> Work {
         let (low, carry) = self.low.overflowing_add(other.low);
-        match self
+        let sum = match self
             .high
             .checked_add(other.high)
             .and_then(|high| high.checked_add(u128::from(carry)))
         {
             Some(high) => Work { high, low },
             None => Work::MAX,
-        }
+        };
+        // A sum, saturated or not, is at least each part. `Chain::extend_store` reads this, when it
+        // asserts that the work of the chain rises.
+        assert!(sum >= self);
+        assert!(sum >= other);
+        sum
     }
 
     /// `self` minus `other`, which must be at most `self`.
@@ -163,6 +168,8 @@ impl Work {
             step_divisor = step_divisor.shifted_right_once();
         }
         assert!(remainder < divisor);
+        // The divisor is at least 1.
+        assert!(quotient <= self);
         quotient
     }
 
