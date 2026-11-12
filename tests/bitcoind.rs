@@ -235,7 +235,7 @@ fn ping_from_bitcoind_gets_a_pong() {
 #[test]
 fn our_ping_gets_a_pong_from_bitcoind() {
     let bitcoind = Bitcoind::start();
-    let mut elo = Elo::start(&bitcoind);
+    let elo = Elo::start(&bitcoind);
 
     // elo pings right after the handshake, and bitcoind sends a `pong` only to a `ping`. The
     // wait also needs our `pong` to the `ping` of bitcoind, the last message that elo sends. A
@@ -251,9 +251,10 @@ fn our_ping_gets_a_pong_from_bitcoind() {
         {
             break;
         }
-        if let Some(status) = elo.process.0.try_wait().unwrap() {
-            panic!("elo exited with {status}: {}", elo.stderr_so_far());
-        }
+        // An early end does not exit elo: it dials again, and then node 0 is gone. So the test
+        // fails here, with the reason of elo, and not on `disconnectnode`.
+        let ended = elo.stderr_so_far();
+        assert!(ended.is_empty(), "elo ended the connection: {ended}");
         assert!(
             start.elapsed() < PEER_INFO_TIMEOUT,
             "bitcoind shows no pong for our ping: {peer_info}"
@@ -305,7 +306,8 @@ fn sync_from_bitcoind_prints_its_tip() {
 /// elo connected to a `bitcoind`, with the lines of its stdout and its stderr. elo does not
 /// exit while it can dial the peer, so the drop kills it.
 struct Elo {
-    process: Process,
+    // No test reads it: it is here for its drop.
+    _process: Process,
     stdout: std::sync::mpsc::Receiver<String>,
     stderr: std::sync::mpsc::Receiver<String>,
 }
@@ -322,7 +324,7 @@ impl Elo {
         let stdout = lines(child.stdout.take().unwrap());
         let stderr = lines(child.stderr.take().unwrap());
         Self {
-            process: Process(child),
+            _process: Process(child),
             stdout,
             stderr,
         }
