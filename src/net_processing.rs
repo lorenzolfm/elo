@@ -736,10 +736,11 @@ fn receive_on_genesis(
 /// A batch on the tip of `chain`, which has at least `work_min`. Returns where the next batch
 /// goes, or `None` if the batch was not full and so ended the sync.
 ///
-/// A batch that is not on the tip comes from a peer whose chain does not hold our tip: our tip is
-/// on another branch. elo cannot choose a branch yet, so the chain starts again from genesis, and
-/// the next connection syncs the branch of the peer. Without this, each connection to that peer
-/// ends with the same error.
+/// Our locator holds only our tip, so a peer whose chain does not hold our tip sends the headers
+/// after genesis: our tip is on another branch. elo cannot choose a branch yet, so the chain starts
+/// again from genesis, and the next connection syncs the branch of the peer. Without this, each
+/// connection to that peer ends with the same error. Each other batch off our tip is only a bad
+/// batch, so it keeps the chain: one header with any `prev` must not cost a sync from genesis.
 fn receive_on_tip(
     chain: &mut crate::chain::Chain,
     work_min: crate::pow::Work,
@@ -747,8 +748,11 @@ fn receive_on_tip(
     clock: u64,
 ) -> Result<Option<Download>, PeerError> {
     let full = headers.is_full();
+    // The batch goes into `extend`, so its first `prev` is read before.
+    let genesis = chain.network().genesis().hash();
+    let on_genesis = headers.first().is_some_and(|first| first.prev == genesis);
     if let Err(error) = chain.extend(headers, clock) {
-        if error == crate::chain::ExtendError::NotOnTip {
+        if error == crate::chain::ExtendError::NotOnTip && on_genesis {
             *chain = crate::chain::Chain::new(chain.network());
         }
         return Err(PeerError::Extend(error));
@@ -2729,8 +2733,9 @@ mod tests {
 
     #[test]
     fn batch_off_our_tip_starts_the_chain_again_from_genesis_and_each_other_refusal_keeps_it() {
-        // A peer whose chain does not hold our tip sends the headers after genesis. A break in a
-        // batch on our tip is a refusal that says nothing about our tip.
+        // A peer whose chain does not hold our tip sends the headers after genesis. A batch on
+        // another header below our tip, and a break in a batch on our tip, are refusals that say
+        // nothing about our tip.
         let headers = crate::fixtures::headers_on_genesis(3);
         let on_tip = crate::fixtures::headers_on(&headers[2], 1);
         for (batch, error, tip) in [
@@ -2738,6 +2743,11 @@ mod tests {
                 crate::fixtures::headers_on_genesis(1),
                 crate::chain::ExtendError::NotOnTip,
                 tip_after(&[]),
+            ),
+            (
+                headers[1..].to_vec(),
+                crate::chain::ExtendError::NotOnTip,
+                tip_after(&headers),
             ),
             (
                 vec![on_tip[0], on_tip[0]],
