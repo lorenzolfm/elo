@@ -62,9 +62,8 @@ nix build .#elo-image && docker load --input result
 docker run --rm --read-only --cap-drop ALL --network host elo:local regtest 127.0.0.1
 ```
 
-tini is PID 1. elo has no signal handler, and the kernel gives PID 1 no default action for a
-signal. So without tini, a stop waits for its timeout and ends in SIGKILL. With tini, SIGTERM ends
-elo at once, and the container exits with 143.
+elo is PID 1. The kernel gives PID 1 no default action for a signal, but elo has a handler for
+SIGTERM. So a stop ends elo at once, and the container exits with 0.
 
 ## Fuzz
 

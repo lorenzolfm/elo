@@ -131,8 +131,8 @@ jobs:
       - run: nix build --print-build-logs .#elo-image
 
       # No build runs the entry point, so the image syncs from a regtest bitcoind on the runner,
-      # with the bitcoind of `flake.lock`. Then the job stops the container. Exit 143 is SIGTERM,
-      # so the stop got to elo through tini. With elo as PID 1, the stop ends in SIGKILL: 137.
+      # with the bitcoind of `flake.lock`. Then the job stops the container. Exit 0 is the handler
+      # of elo, as PID 1. With no handler, the stop ends in SIGKILL: 137.
       - run: |
           docker load --input result
           # The push tags the image `sha-<commit>`, so its label must name the same commit, and
@@ -158,7 +158,7 @@ jobs:
           docker logs elo
           has_tip
           docker stop --timeout 10 elo
-          test "$(docker inspect elo --format '{{.State.ExitCode}}')" = 143
+          test "$(docker inspect elo --format '{{.State.ExitCode}}')" = 0
 
       # `sha-` first, so `main` never names an image that has no commit tag.
       - env:

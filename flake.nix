@@ -271,15 +271,15 @@
           };
         };
 
-        # The daemon. The deployment gives the arguments of elo: the network and the peer. elo
-        # has no signal handler (#13), and the kernel gives PID 1 no default action for a signal.
-        # So tini is PID 1, and a stop signal ends elo at once. The image needs no volume, no
-        # port and no writable path.
+        # The daemon. The deployment gives the arguments of elo: the network and the peer. elo is
+        # PID 1. The kernel gives PID 1 no default action for a signal, so elo handles SIGTERM
+        # itself, and a stop ends it at once. elo starts no child process, so no init needs to
+        # reap one. The image needs no volume, no port and no writable path.
         elo-image = pkgs.dockerTools.buildLayeredImage {
           name = "elo";
           tag = "local";
           config = {
-            Entrypoint = ["${pkgs.lib.getExe pkgs.tini}" "--" "${pkgs.lib.getExe elo}"];
+            Entrypoint = ["${pkgs.lib.getExe elo}"];
             User = "65534:65534";
             Env = ["RUST_BACKTRACE=1"];
             Labels = {
