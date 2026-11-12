@@ -408,7 +408,8 @@ enum SyncState {
 /// Where the next batch of the sync goes. Only `Chain` puts a batch on the tip of our chain as it
 /// comes. In a low-work sync our chain takes only the headers that the second download releases,
 /// and they go on the tip that the first download read. So no other path may extend the chain
-/// before the sync ends.
+/// before the sync ends. The boxes keep `Chain` small, because it holds nothing and each download
+/// holds its commitments and links. A sync above the minimum moves only `Chain`.
 #[derive(Debug)]
 enum Download {
     /// On the tip of our chain.
