@@ -63,7 +63,7 @@ async fn run(
         // has nothing else to finish.
         let end = match signals.unless(dial(peer, &mut chain)).await {
             Ok(end) => end,
-            Err(signal) => return stopped(signal),
+            Err(signal) => return stop(signal),
         };
         // The line says if elo dials again, so a reader of stderr does not need the list of
         // ends that exit.
@@ -73,13 +73,13 @@ async fn run(
         }
         eprintln!("elo: {end}; dial again in {} s", RECONNECT_WAIT.as_secs());
         if let Err(signal) = signals.unless(tokio::time::sleep(RECONNECT_WAIT)).await {
-            return stopped(signal);
+            return stop(signal);
         }
     }
 }
 
 /// Prints the `signal` that stops elo, and gives the exit code of a stop: 0.
-fn stopped(signal: Signal) -> std::process::ExitCode {
+fn stop(signal: Signal) -> std::process::ExitCode {
     eprintln!("elo: {signal}; stop");
     std::process::ExitCode::SUCCESS
 }
