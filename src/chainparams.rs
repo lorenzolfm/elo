@@ -106,6 +106,34 @@ impl Network {
         }
     }
 
+    /// The headers for each commitment of a low-work sync. Its first download keeps a bit of one
+    /// header in each run of this many headers, so its memory is about the height of the chain
+    /// over this count, in bits. Regtest has no real chain, so its count only makes its tests
+    /// cheap.
+    pub(crate) const fn commitment_period(self) -> usize {
+        match self {
+            Network::Mainnet => 641,
+            Network::Testnet4 => 606,
+            Network::Signet => 620,
+            Network::Regtest => 275,
+        }
+    }
+
+    /// The headers that the second download of a low-work sync holds before it gives the first of
+    /// them to the chain. So each header that the chain gets has about this count over
+    /// `commitment_period` commitments above it, about 24. A peer that sends another chain the
+    /// second time passes each commitment by chance, with odds of one half.
+    // The peer starts a low-work sync in the next pull request.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) const fn redownload_buffer_size(self) -> usize {
+        match self {
+            Network::Mainnet => 15_218,
+            Network::Testnet4 => 16_092,
+            Network::Signet => 15_724,
+            Network::Regtest => 7_017,
+        }
+    }
+
     /// The lowest `version` that a header at `height` may have. Three rules raise it, to 2, 3 and
     /// 4, each from its own height. Below all three heights, each version passes, so the answer is
     /// `i32::MIN`. On each network other than mainnet, the three heights are 1. So each header
@@ -175,6 +203,12 @@ const _: () = assert!(Network::Mainnet.genesis().version >= Network::Mainnet.ver
 const _: () = assert!(Network::Testnet4.genesis().version >= Network::Testnet4.version_min(0));
 const _: () = assert!(Network::Signet.genesis().version >= Network::Signet.version_min(0));
 const _: () = assert!(Network::Regtest.genesis().version >= Network::Regtest.version_min(0));
+
+// A low-work sync reads each height modulo the period.
+const _: () = assert!(Network::Mainnet.commitment_period() > 0);
+const _: () = assert!(Network::Testnet4.commitment_period() > 0);
+const _: () = assert!(Network::Signet.commitment_period() > 0);
+const _: () = assert!(Network::Regtest.commitment_period() > 0);
 
 #[cfg(test)]
 mod tests {
