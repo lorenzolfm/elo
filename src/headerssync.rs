@@ -51,14 +51,17 @@ struct Link {
     bits: u32,
 }
 
-/// One commitment, one bit, for each header at a height of `offset` modulo `period`, in the order
-/// of the heights.
+/// One commitment, one bit, for each header above `start_height` at a height of `offset` modulo
+/// `period`, in the order of the heights.
 #[derive(Debug)]
 struct Commitments {
     keys: [u64; 2],
     period: usize,
     /// Below `period`.
     offset: usize,
+    /// The height of the tip of our chain. The first height with a commitment is above it, by at
+    /// most `period`.
+    start_height: usize,
     /// Bit `index` is bit `index % WORD_BITS` of word `index / WORD_BITS`.
     words: Vec<u64>,
     count: usize,
@@ -101,8 +104,6 @@ pub(crate) struct Redownload {
     network: crate::chainparams::Network,
     work_min: crate::pow::Work,
     commitments: Commitments,
-    /// The commitments that this download read, from the first.
-    commitments_read_count: usize,
     /// The headers that the chain did not get yet, in order. The first is on the tip of our
     /// chain, or on the last header that the chain got.
     buffer: std::collections::VecDeque<crate::block::BlockHeader>,
@@ -123,12 +124,13 @@ pub(crate) enum RedownloadStep {
 }
 
 impl Commitments {
-    fn new(network: crate::chainparams::Network, salt: Salt) -> Commitments {
+    fn new(network: crate::chainparams::Network, salt: Salt, start_height: usize) -> Commitments {
         let period = network.commitment_period();
         Commitments {
             keys: salt.keys,
             period,
             offset: salt.offset % period,
+            start_height,
             words: Vec::new(),
             count: 0,
         }
@@ -139,6 +141,15 @@ impl Commitments {
         height % self.period == self.offset
     }
 
+    /// The index of the commitment at `height`, which is above the start and has a commitment.
+    /// The heights with a commitment are `period` apart, and the first is at most `period` above
+    /// the start, so the index is the count of whole periods from the height above the start.
+    fn index(&self, height: usize) -> usize {
+        assert!(height > self.start_height);
+        assert!(self.is_at(height));
+        (height - self.start_height - 1) / self.period
+    }
+
     /// The commitment of the header with `hash`: its salted hash is even.
     fn commitment(&self, hash: bitcoin_hashes::sha256d::Hash) -> bool {
         let [key_0, key_1] = self.keys;
@@ -146,8 +157,11 @@ impl Commitments {
             .is_multiple_of(2)
     }
 
-    /// Keeps the commitment of the header with `hash`, after the others.
-    fn push(&mut self, hash: bitcoin_hashes::sha256d::Hash) {
+    /// Keeps the commitment of the header at `height` with `hash`, after the others.
+    fn push(&mut self, height: usize, hash: bitcoin_hashes::sha256d::Hash) {
+        // The heights come in order and none is skipped. This also bounds the memory: one
+        // commitment in each period above the start.
+        assert_eq!(self.index(height), self.count);
         let bit_index = self.count % WORD_BITS;
         if bit_index == 0 {
             self.words.push(0);
@@ -163,11 +177,12 @@ impl Commitments {
         assert_eq!(self.words.len(), self.count.div_ceil(WORD_BITS));
     }
 
-    /// The commitment at `index`, if the first download kept that many.
-    fn get(&self, index: usize) -> Option<bool> {
+    /// The commitment at `height`, if the first download kept one there.
+    fn get(&self, height: usize) -> Option<bool> {
         // The pair of the assert in `push`. Without it, a word that is not there would read as
         // "no more commitments", and the peer would get the error.
         assert_eq!(self.words.len(), self.count.div_ceil(WORD_BITS));
+        let index = self.index(height);
         if index < self.count {
             let word = self.words.get(index / WORD_BITS)?;
             Some((word >> (index % WORD_BITS)) & 1 == 1)
@@ -211,7 +226,7 @@ impl Presync {
             start_work: tip.work(),
             work_min,
             height_max: start.height.saturating_add(headers_count_max),
-            commitments: Commitments::new(network, salt),
+            commitments: Commitments::new(network, salt, start.height),
             last: start,
             work: tip.work(),
         }
@@ -231,14 +246,9 @@ impl Presync {
             if link.height > self.height_max {
                 return Err(HeadersSyncError::TooLong);
             }
+            // With the height bound above, `push` bounds the memory of the commitments.
             if self.commitments.is_at(link.height) {
-                self.commitments.push(link.hash);
-                // At most one commitment in each period above the start. With the height bound
-                // above, this is the bound on the memory of the commitments.
-                assert!(
-                    self.commitments.count
-                        <= (link.height - self.start.height) / self.commitments.period + 1
-                );
+                self.commitments.push(link.height, link.hash);
             }
             self.work = self.work.saturating_add(work);
             self.last = link;
@@ -261,7 +271,6 @@ impl Redownload {
             network: presync.network,
             work_min: presync.work_min,
             commitments: presync.commitments,
-            commitments_read_count: 0,
             buffer: std::collections::VecDeque::new(),
             last: presync.start,
             work: presync.start_work,
@@ -291,11 +300,10 @@ impl Redownload {
                 // The chain does not show the work yet, so it must be the chain of the first
                 // download.
                 if self.commitments.is_at(link.height) {
-                    let kept = self.commitments.get(self.commitments_read_count);
+                    let kept = self.commitments.get(link.height);
                     if kept != Some(self.commitments.commitment(link.hash)) {
                         return Err(HeadersSyncError::CommitmentMismatch);
                     }
-                    self.commitments_read_count += 1;
                 }
             }
             self.buffer.push_back(header);
@@ -306,7 +314,6 @@ impl Redownload {
         if let Some(buffer_last) = self.buffer.back() {
             assert_eq!(buffer_last.hash(), self.last.hash);
         }
-        assert!(self.commitments_read_count <= self.commitments.count);
         if self.work >= self.work_min {
             Ok(RedownloadStep::Done(Vec::from(self.buffer)))
         } else if full {
@@ -808,5 +815,36 @@ mod tests {
                 .unwrap_err(),
             super::HeadersSyncError::CommitmentMismatch
         );
+    }
+
+    /// Our chain ends at height 15, which has a commitment. So the first commitment of the sync is
+    /// one whole period above the tip, at 290, and the first download keeps 7, up to 1,940. The
+    /// chain of the peer reaches the minimum at 2,015, so each download takes one batch. A person
+    /// wrote these.
+    #[test]
+    fn sync_on_a_tip_with_a_commitment_keeps_the_first_commitment_a_period_above() {
+        let headers = chain_on_genesis(2_015, 0);
+        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        chain
+            .extend(batch(&headers[..15]), crate::fixtures::CLOCK)
+            .unwrap();
+        let presync = super::Presync::new(
+            &chain,
+            work_on_genesis(&headers),
+            crate::fixtures::CLOCK,
+            SALT,
+        );
+
+        let step = presync.receive(batch(&headers[15..]));
+        let Ok(super::PresyncStep::Redownload(redownload)) = step else {
+            panic!("{step:?}");
+        };
+        assert_eq!(redownload.commitments.count, 7);
+        let step = redownload.receive(batch(&headers[15..]));
+        let Ok(super::RedownloadStep::Done(released)) = step else {
+            panic!("{step:?}");
+        };
+
+        assert_eq!(released, headers[15..]);
     }
 }
