@@ -182,8 +182,8 @@ mod tests {
     }
 
     // The L3 tests also hold a closed connection, which retries, and a stdout fault, which
-    // exits. The stdout row is here too: a retry on that fault does not end the L3 test, so
-    // only its deadline fails it, and this row gives the reason.
+    // exits. The stdout row is here too: a retry on that fault fails the L3 test on its
+    // `dial again` line, but slower, and through a process. This row gives the reason at L0.
     #[test]
     fn a_fault_of_this_host_ends_elo_and_a_failed_connect_retries() {
         for (end, retries) in [
