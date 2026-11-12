@@ -102,3 +102,54 @@ jobs:
             docker tag elo-fuzz:local "ghcr.io/lorenzolfm/elo-fuzz:$tag"
             docker push "ghcr.io/lorenzolfm/elo-fuzz:$tag"
           done
+
+  # A deployment of elo takes this image. As for `fuzz-image`, only a push to main reaches this job.
+  image:
+    name: image
+    if: github.event_name == 'push'
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+
+      - run: nix build --print-build-logs .#elo-image
+
+      # No build runs the entry point, so the image syncs from a regtest bitcoind on the runner,
+      # with the bitcoind of `flake.lock`. Then the job stops the container. Exit 143 is SIGTERM,
+      # so the stop got to elo through tini. With elo as PID 1, the stop ends in SIGKILL: 137.
+      - run: |
+          docker load --input result
+          datadir="$(mktemp --directory)"
+          nix shell --inputs-from . nixpkgs#bitcoind --command bitcoind -regtest \
+            -datadir="$datadir" -daemonwait -bind=127.0.0.1 -listenonion=0 -natpmp=0 -server=0
+          docker run --detach --name elo --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --network host elo:local regtest 127.0.0.1
+          # Height 0, the regtest genesis and its work.
+          genesis=0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206
+          tip="tip 0 $genesis $(printf '%064x' 2)"
+          for _ in $(seq 60); do
+            docker logs elo | grep --fixed-strings --line-regexp --quiet "$tip" && break
+            sleep 1
+          done
+          docker logs elo
+          docker logs elo | grep --fixed-strings --line-regexp --quiet "$tip"
+          docker stop --timeout 10 elo
+          test "$(docker inspect elo --format '{{.State.ExitCode}}')" = 143
+
+      # `sha-` first, so `main` never names an image that has no commit tag.
+      - env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          for tag in "sha-$GITHUB_SHA" main; do
+            docker tag elo:local "ghcr.io/lorenzolfm/elo:$tag"
+            docker push "ghcr.io/lorenzolfm/elo:$tag"
+          done

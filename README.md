@@ -48,6 +48,22 @@ nix flake check    # every CI gate: build, clippy, tests, doctests, rustfmt, fuz
 nix develop        # a shell with the pinned toolchain (direnv: `direnv allow`)
 ```
 
+## Image
+
+Each commit on `main` also pushes an image of elo to GHCR, as `ghcr.io/lorenzolfm/elo:main` and
+`:sha-<commit>`. Before the push, CI runs the image against a regtest `bitcoind` until it prints the
+`tip`. The arguments of the image are the arguments of elo. It runs as user 65534 and needs no
+volume, no port and no writable path:
+
+```sh
+nix build .#elo-image && docker load --input result
+docker run --rm --read-only --cap-drop ALL --network host elo:local regtest 127.0.0.1
+```
+
+tini is PID 1. elo has no signal handler, and the kernel gives PID 1 no default action for a
+signal. So without tini, a stop waits for its timeout and ends in SIGKILL. With tini, SIGTERM ends
+elo at once, and the container exits with 143.
+
 ## Fuzz
 
 Each target in `fuzz/fuzz_targets/` calls a function that only a build with
