@@ -50,10 +50,11 @@ nix develop        # a shell with the pinned toolchain (direnv: `direnv allow`)
 
 ## Image
 
-Each commit on `main` also pushes an image of elo to GHCR, as `ghcr.io/lorenzolfm/elo:main` and
-`:sha-<commit>`. Before the push, CI runs the image against a regtest `bitcoind` until it prints the
-`tip`. The arguments of the image are the arguments of elo. It runs as user 65534 and needs no
-volume, no port and no writable path:
+Each push to `main` also pushes an image of elo to GHCR, as `ghcr.io/lorenzolfm/elo:main` and
+`:sha-<commit>`. CI runs one push at a time and drops a push that waits when a newer one comes, so
+a burst of merges gets an image for its last commit only. Before the push, CI runs the image against
+a regtest `bitcoind` until it prints the `tip`. The arguments of the image are the arguments of
+elo. It runs as user 65534 and needs no volume, no port and no writable path:
 
 ```sh
 nix build .#elo-image && docker load --input result
