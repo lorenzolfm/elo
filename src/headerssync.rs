@@ -270,6 +270,10 @@ impl Redownload {
     /// headers above the first chain. Then the chain gets each header and the sync ends. Else the
     /// chain gets only the headers with more than `redownload_buffer_size` headers above them, and
     /// a batch that is not full fails, an empty one too.
+    ///
+    /// This download has no height bound of its own. Below the minimum, the first height with a
+    /// bit above the last bit of the first download fails, because no bit is kept for it. So the
+    /// chain ends at most one period above that bit, and the bit is at most at `height_max`.
     pub(crate) fn receive(
         mut self,
         headers: crate::protocol::Headers,
