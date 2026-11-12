@@ -10,8 +10,12 @@ const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long `getpeerinfo` may take to show what a test waits for.
 const PEER_INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How long elo may take to exit after `bitcoind` closes the connection.
-const EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long elo may take to print the end of the connection after `bitcoind` closes it.
+const END_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long elo may take to do the handshake again after the end of a connection. It waits 5 s
+/// before it dials again.
+const RECONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long elo may take to sync the headers of `bitcoind` and print its tip.
 const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -186,9 +190,11 @@ fn stdout_error_after_the_handshake_exits_with_1() {
         .unwrap();
 
     assert_eq!(output.status.code(), Some(1));
-    // A failed handshake also exits with 1.
+    // An end that the peer causes dials again, so the exit comes from stdout.
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.starts_with("elo: stdout: "), "{stderr}");
+    // The line of an end that exits does not say that elo dials again.
+    assert!(!stderr.contains("dial again"), "{stderr}");
 }
 
 #[test]
@@ -220,15 +226,7 @@ fn ping_from_bitcoind_gets_a_pong() {
 #[test]
 fn our_ping_gets_a_pong_from_bitcoind() {
     let bitcoind = Bitcoind::start();
-    let mut elo = Process(
-        std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
-            .arg("regtest")
-            .arg(bitcoind.peer.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap(),
-    );
+    let mut elo = Elo::start(&bitcoind);
 
     // elo pings right after the handshake, and bitcoind sends a `pong` only to a `ping`. The
     // wait also needs our `pong` to the `ping` of bitcoind, the last message that elo sends. A
@@ -244,8 +242,8 @@ fn our_ping_gets_a_pong_from_bitcoind() {
         {
             break;
         }
-        if let Some(status) = elo.0.try_wait().unwrap() {
-            panic!("elo exited with {status}: {}", stderr(&mut elo.0));
+        if let Some(status) = elo.process.0.try_wait().unwrap() {
+            panic!("elo exited with {status}: {}", elo.stderr_so_far());
         }
         assert!(
             start.elapsed() < PEER_INFO_TIMEOUT,
@@ -258,16 +256,28 @@ fn our_ping_gets_a_pong_from_bitcoind() {
     // close, so elo checks the `pong` first. A `pong` that elo refuses ends with its reason,
     // and so does a second `pong` for a stray `ping`.
     bitcoind.cli(&["-named", "disconnectnode", "nodeid=0"]);
-    let start = std::time::Instant::now();
-    let status = loop {
-        if let Some(status) = elo.0.try_wait().unwrap() {
-            break status;
-        }
-        assert!(start.elapsed() < EXIT_TIMEOUT, "elo did not exit");
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    };
-    assert_eq!(status.code(), Some(1));
-    assert_eq!(stderr(&mut elo.0), "elo: the peer closed the connection\n");
+    let end = elo.line(&elo.stderr, "elo: ", END_TIMEOUT);
+    assert_eq!(end, "the peer closed the connection; dial again in 5 s");
+}
+
+#[test]
+fn closed_connection_gets_a_new_handshake_and_sync() {
+    let bitcoind = Bitcoind::start();
+    let elo = Elo::start(&bitcoind);
+    let tip = elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT);
+
+    // elo is the only peer of bitcoind, so it is node 0. The test does not check the reason of
+    // the end: bitcoind can close with bytes from elo that it has not read, and then elo sees a
+    // reset.
+    let close = std::time::Instant::now();
+    bitcoind.cli(&["-named", "disconnectnode", "nodeid=0"]);
+    elo.line(&elo.stderr, "elo: ", END_TIMEOUT);
+    let version = elo.line(&elo.stdout, "version ", RECONNECT_TIMEOUT);
+    assert_eq!(version, "70016");
+    // The close comes after `close`, and the wait of 5 s comes after the close.
+    let wait = close.elapsed();
+    assert!(wait >= std::time::Duration::from_secs(5), "{wait:?}");
+    assert_eq!(elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT), tip);
 }
 
 #[test]
@@ -276,55 +286,88 @@ fn sync_from_bitcoind_prints_its_tip() {
     // 2001 blocks: a full batch of 2000 headers, our next `getheaders`, and a batch of 1.
     bitcoind.cli(&["generatetodescriptor", "2001", "raw(51)"]);
     let best = bitcoind.cli(&["getbestblockhash"]);
-    let mut elo = Process(
-        std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
-            .arg("regtest")
-            .arg(bitcoind.peer.to_string())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap(),
-    );
-
-    // elo stays connected after the sync, so its stdout does not end. A thread reads each line,
-    // and the test waits for the `tip` line with a timeout.
-    let stdout = elo.0.stdout.take().unwrap();
-    let (lines, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        for line in std::io::BufRead::lines(std::io::BufReader::new(stdout)) {
-            if lines.send(line.unwrap()).is_err() {
-                break;
-            }
-        }
-    });
-    let deadline = std::time::Instant::now() + SYNC_TIMEOUT;
-    let tip = loop {
-        let timeout = deadline.saturating_duration_since(std::time::Instant::now());
-        match receiver.recv_timeout(timeout) {
-            Ok(line) => {
-                if let Some(tip) = line.strip_prefix("tip ") {
-                    break tip.to_owned();
-                }
-            }
-            // The thread ends only when stdout ends, so elo exited.
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("elo exited: {}", stderr(&mut elo.0))
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                panic!("elo printed no tip within {} s", SYNC_TIMEOUT.as_secs())
-            }
-        }
-    };
+    let elo = Elo::start(&bitcoind);
+    let tip = elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT);
     let chain_work = bitcoind.cli(&["getblockheader", best.trim_end()]);
     let chain_work = string_field(&chain_work, "chainwork");
     assert_eq!(tip, format!("2001 {} {chain_work}", best.trim_end()));
 }
 
-/// What `child` wrote to its stderr pipe. Call it only after the exit, or it blocks.
-fn stderr(child: &mut std::process::Child) -> String {
-    let mut stderr = String::new();
-    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
-    stderr
+/// elo connected to a `bitcoind`, with the lines of its stdout and its stderr. elo does not
+/// exit while it can dial the peer, so the drop kills it.
+struct Elo {
+    process: Process,
+    stdout: std::sync::mpsc::Receiver<String>,
+    stderr: std::sync::mpsc::Receiver<String>,
+}
+
+impl Elo {
+    fn start(bitcoind: &Bitcoind) -> Self {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
+            .arg("regtest")
+            .arg(bitcoind.peer.to_string())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = lines(child.stdout.take().unwrap());
+        let stderr = lines(child.stderr.take().unwrap());
+        Self {
+            process: Process(child),
+            stdout,
+            stderr,
+        }
+    }
+
+    /// The rest of the next line from `lines` that starts with `prefix`. It skips the lines
+    /// before it, and panics if none comes within `timeout`.
+    fn line(
+        &self,
+        lines: &std::sync::mpsc::Receiver<String>,
+        prefix: &str,
+        timeout: std::time::Duration,
+    ) -> String {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match lines.recv_timeout(left) {
+                Ok(line) => {
+                    if let Some(rest) = line.strip_prefix(prefix) {
+                        return rest.to_owned();
+                    }
+                }
+                // The thread ends only when the pipe ends, so elo exited, and its stderr ends.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    let stderr = self.stderr.iter().collect::<Vec<_>>().join("\n");
+                    panic!("elo exited: {stderr}")
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                    "elo printed no {prefix:?} line within {} s: {}",
+                    timeout.as_secs(),
+                    self.stderr_so_far()
+                ),
+            }
+        }
+    }
+
+    /// The lines of stderr that no `line` call took yet.
+    fn stderr_so_far(&self) -> String {
+        self.stderr.try_iter().collect::<Vec<_>>().join("\n")
+    }
+}
+
+/// Each line of `pipe`, from a thread. Each test waits for a line with a timeout, and elo does
+/// not exit, so a read on the test thread can block forever. The channel ends when the pipe ends.
+fn lines(pipe: impl std::io::Read + Send + 'static) -> std::sync::mpsc::Receiver<String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufRead::lines(std::io::BufReader::new(pipe)) {
+            if sender.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    receiver
 }
 
 /// The value of the string `field` in `object`, as `bitcoin-cli` writes it.
