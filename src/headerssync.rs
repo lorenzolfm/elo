@@ -278,16 +278,26 @@ impl Redownload {
         for header in headers.into_vec() {
             let (below, work) = checked(self.network, self.last, &header)?;
             self.work = self.work.saturating_add(work);
-            if self.work < self.work_min && self.commitments.is_at(below.height) {
-                let kept = self.commitments.get(self.commitments_read_count);
-                if kept != Some(self.commitments.bit(below.hash)) {
-                    return Err(HeadersSyncError::CommitmentMismatch);
+            if self.work < self.work_min {
+                // The chain does not show the work yet, so it must be the chain of the first
+                // download.
+                if self.commitments.is_at(below.height) {
+                    let kept = self.commitments.get(self.commitments_read_count);
+                    if kept != Some(self.commitments.bit(below.hash)) {
+                        return Err(HeadersSyncError::CommitmentMismatch);
+                    }
+                    self.commitments_read_count += 1;
                 }
-                self.commitments_read_count += 1;
             }
             self.buffer.push_back(header);
             self.last = below;
         }
+        // `last` is the last header of `buffer`, with the height and the `bits` that the buffer
+        // does not keep.
+        if let Some(buffer_last) = self.buffer.back() {
+            assert_eq!(buffer_last.hash(), self.last.hash);
+        }
+        assert!(self.commitments_read_count <= self.commitments.count);
         if self.work >= self.work_min {
             Ok(RedownloadStep::Done(Vec::from(self.buffer)))
         } else if full {
