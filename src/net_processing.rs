@@ -733,6 +733,11 @@ fn receive_on_genesis(
 
 /// A batch on the tip of `chain`, which has at least `work_min`. Returns where the next batch
 /// goes, or `None` if the batch was not full and so ended the sync.
+///
+/// A batch that is not on the tip comes from a peer whose chain does not hold our tip: our tip is
+/// on another branch. elo cannot choose a branch yet, so the chain starts again from genesis, and
+/// the next connection syncs the branch of the peer. Without this, each connection to that peer
+/// ends with the same error.
 fn receive_on_tip(
     chain: &mut crate::chain::Chain,
     work_min: crate::pow::Work,
@@ -740,7 +745,12 @@ fn receive_on_tip(
     clock: u64,
 ) -> Result<Option<Download>, PeerError> {
     let full = headers.is_full();
-    chain.extend(headers, clock).map_err(PeerError::Extend)?;
+    if let Err(error) = chain.extend(headers, clock) {
+        if error == crate::chain::ExtendError::NotOnTip {
+            *chain = crate::chain::Chain::new(chain.network());
+        }
+        return Err(PeerError::Extend(error));
+    }
     // Only the handshake on a chain at the minimum and a sync that reached it give
     // `Download::Chain`, and the work of a chain does not go down.
     assert!(chain.tip().work() >= work_min);
@@ -2713,6 +2723,39 @@ mod tests {
             crate::protocol::GetHeaders::new(tip_after(&[]).hash())
         );
         assert_eq!(chain.tip(), tip_after(&[]));
+    }
+
+    #[test]
+    fn batch_off_our_tip_starts_the_chain_again_from_genesis_and_each_other_refusal_keeps_it() {
+        // A peer whose chain does not hold our tip sends the headers after genesis. A break in a
+        // batch on our tip is a refusal that says nothing about our tip.
+        let headers = crate::fixtures::headers_on_genesis(3);
+        let on_tip = crate::fixtures::headers_on(&headers[2], 1);
+        for (batch, error, tip) in [
+            (
+                crate::fixtures::headers_on_genesis(1),
+                crate::chain::ExtendError::NotOnTip,
+                tip_after(&[]),
+            ),
+            (
+                vec![on_tip[0], on_tip[0]],
+                crate::chain::ExtendError::NotContinuous,
+                tip_after(&headers),
+            ),
+        ] {
+            let mut chain = regtest();
+            chain
+                .extend(
+                    crate::fixtures::headers_batch(&headers),
+                    crate::fixtures::CLOCK,
+                )
+                .unwrap();
+            let refused = asked(&mut chain, std::time::Instant::now(), 7)
+                .receive(&headers_message(&batch), crate::fixtures::CLOCK)
+                .err();
+            assert_eq!(refused, Some(super::PeerError::Extend(error)));
+            assert_eq!(chain.tip(), tip, "{error:?}");
+        }
     }
 
     #[test]

@@ -177,7 +177,8 @@ enum PartialFrame {
 /// Dials `peer` on the network of `chain` and runs the handshake. Returns the connection for the
 /// messages after it, and their `version`. The sync of the connection extends `chain` from its
 /// tip, so the next connection with the same chain does not get those headers again. A chain
-/// below the minimum work starts again from genesis.
+/// below the minimum work starts again from genesis, and so does a chain whose tip the peer does
+/// not have.
 pub async fn handshake(
     peer: std::net::SocketAddr,
     chain: &mut crate::chain::Chain,
