@@ -300,7 +300,7 @@ fn signal_in_a_connection_exits_with_0() {
         let mut elo = Elo::start(&bitcoind);
         elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT);
         elo.signal(signal);
-        assert_eq!(elo.exit(), Some(0), "SIG{signal}");
+        assert_eq!(elo.exit_code(), Some(0), "SIG{signal}");
         assert_eq!(
             elo.line(&elo.stderr, "elo: ", END_TIMEOUT),
             format!("SIG{signal}; stop")
@@ -320,7 +320,7 @@ fn signal_in_the_wait_before_a_dial_exits_with_0() {
     let end = elo.line(&elo.stderr, "elo: ", END_TIMEOUT);
     assert!(end.ends_with("; dial again in 5 s"), "{end}");
     elo.signal("TERM");
-    assert_eq!(elo.exit(), Some(0));
+    assert_eq!(elo.exit_code(), Some(0));
     assert_eq!(elo.line(&elo.stderr, "elo: ", END_TIMEOUT), "SIGTERM; stop");
 }
 
@@ -448,7 +448,7 @@ impl Elo {
 
     /// The exit code of elo, which must exit within `STOP_TIMEOUT`. `None` is an end by a
     /// signal.
-    fn exit(&mut self) -> Option<i32> {
+    fn exit_code(&mut self) -> Option<i32> {
         let deadline = std::time::Instant::now() + STOP_TIMEOUT;
         loop {
             if let Some(status) = self.process.0.try_wait().unwrap() {
