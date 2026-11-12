@@ -224,6 +224,12 @@ impl Presync {
             }
             if self.commitments.is_at(below.height) {
                 self.commitments.push(below.hash);
+                // At most one bit in each period above the start. With the height bound above,
+                // this is the bound on the memory of the bits.
+                assert!(
+                    self.commitments.count
+                        <= (below.height - self.start.height) / self.commitments.period + 1
+                );
             }
             self.work = self.work.saturating_add(work);
             self.last = below;
