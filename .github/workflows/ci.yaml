@@ -127,6 +127,10 @@ jobs:
       # so the stop got to elo through tini. With elo as PID 1, the stop ends in SIGKILL: 137.
       - run: |
           docker load --input result
+          # The push tags the image `sha-<commit>`, so its label must name the same commit, and
+          # not `dirty`.
+          revision='{{index .Config.Labels "org.opencontainers.image.revision"}}'
+          test "$(docker inspect elo:local --format "$revision")" = "$GITHUB_SHA"
           datadir="$(mktemp --directory)"
           nix shell --inputs-from . nixpkgs#bitcoind --command bitcoind -regtest \
             -datadir="$datadir" -daemonwait -bind=127.0.0.1 -listenonion=0 -natpmp=0 -server=0
