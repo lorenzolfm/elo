@@ -60,11 +60,27 @@ enum End {
 impl End {
     /// Whether elo dials the peer again. Each end that the peer or the network causes retries,
     /// also a peer that sent bytes that elo refuses: the user named that peer. A fault of this
-    /// host does not, because a new connection cannot fix it.
+    /// host does not, because a new connection cannot fix it. The match names each variant, so
+    /// a new error does not compile until it has a side.
     fn retries(&self) -> bool {
         match self {
             End::Handshake(elo::net::HandshakeError::Salt(_)) | End::Stdout(_) => false,
-            End::Handshake(_) | End::Run(_) => true,
+            End::Handshake(
+                elo::net::HandshakeError::Connect(_)
+                | elo::net::HandshakeError::ConnectTimeout
+                | elo::net::HandshakeError::HandshakeTimeout
+                | elo::net::HandshakeError::Io(_)
+                | elo::net::HandshakeError::Closed
+                | elo::net::HandshakeError::Transport(_)
+                | elo::net::HandshakeError::NetProcessing(_),
+            ) => true,
+            End::Run(
+                elo::net::RunError::SendTimeout
+                | elo::net::RunError::Io(_)
+                | elo::net::RunError::Closed
+                | elo::net::RunError::Transport(_)
+                | elo::net::RunError::NetProcessing(_),
+            ) => true,
         }
     }
 }
