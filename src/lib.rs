@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod block;
-mod chain;
+pub mod chain;
 pub mod chainparams;
 mod headerssync;
 pub mod net;
