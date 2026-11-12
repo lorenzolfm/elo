@@ -1865,6 +1865,8 @@ pub(crate) mod fuzz {
         /// The chain takes the headers with `hashes`, in order, on its tip.
         fn extend(&mut self, hashes: &[bitcoin_hashes::sha256d::Hash]) {
             if let Some(last) = hashes.last() {
+                // Only an empty batch keeps the tip.
+                assert_ne!(*last, self.tip);
                 self.tip = *last;
             }
             self.height += hashes.len();
