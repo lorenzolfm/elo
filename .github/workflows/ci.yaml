@@ -133,7 +133,7 @@ jobs:
           test "$(docker inspect elo:local --format "$revision")" = "$GITHUB_SHA"
           datadir="$(mktemp --directory)"
           nix shell --inputs-from . nixpkgs#bitcoind --command bitcoind -regtest \
-            -datadir="$datadir" -daemonwait -bind=127.0.0.1 -listenonion=0 -natpmp=0 -server=0
+            -datadir="$datadir" -daemonwait
           docker run --detach --name elo --read-only --cap-drop ALL \
             --security-opt no-new-privileges --network host elo:local regtest 127.0.0.1
           # Height 0, the regtest genesis and its work.
