@@ -157,7 +157,14 @@ jobs:
           GHCR_TOKEN: ${{ github.token }}
         run: |
           echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          for tag in "sha-$GITHUB_SHA" main; do
+          # A re-run of an older run pushes its `sha-` tag again, but must not move `main` back.
+          # The concurrency group runs one push run at a time, so the run of a newer head waits and
+          # moves `main` after this one. No pipe, because the step has no `pipefail`, and a failed
+          # read must fail the step.
+          head="$(git ls-remote --exit-code origin refs/heads/main)"
+          tags="sha-$GITHUB_SHA"
+          if test "${head%%[[:space:]]*}" = "$GITHUB_SHA"; then tags="$tags main"; fi
+          for tag in $tags; do
             docker tag elo:local "ghcr.io/lorenzolfm/elo:$tag"
             docker push "ghcr.io/lorenzolfm/elo:$tag"
           done
