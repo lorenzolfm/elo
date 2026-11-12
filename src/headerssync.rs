@@ -42,9 +42,9 @@ pub(crate) enum HeadersSyncError {
     CommitmentMismatch,
 }
 
-/// The header that the next header of the peer goes on.
+/// A header that the next header of the peer links to: its hash, its height and its `bits`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Below {
+struct Link {
     hash: bitcoin_hashes::sha256d::Hash,
     height: usize,
     bits: u32,
@@ -67,7 +67,7 @@ struct Commitments {
 pub(crate) struct Presync {
     network: crate::chainparams::Network,
     /// The tip of our chain, which the chain of the peer goes on.
-    start: Below,
+    start: Link,
     /// The work of our chain.
     start_work: crate::pow::Work,
     /// The work that the chain of the peer must reach. It is above `start_work`.
@@ -76,7 +76,7 @@ pub(crate) struct Presync {
     height_max: usize,
     commitments: Commitments,
     /// The last header that the peer sent, or `start`.
-    last: Below,
+    last: Link,
     /// `start_work` plus the work of each header that the peer sent.
     work: crate::pow::Work,
 }
@@ -103,7 +103,7 @@ pub(crate) struct Redownload {
     /// chain, or on the last header that the chain got.
     buffer: std::collections::VecDeque<crate::block::BlockHeader>,
     /// The last header of `buffer`, or the tip of our chain.
-    last: Below,
+    last: Link,
     /// The work of our chain plus the work of each header of this download.
     work: crate::pow::Work,
 }
@@ -188,7 +188,7 @@ impl Presync {
         let network = chain.network();
         let tip = chain.tip();
         assert!(tip.work() < work_min);
-        let start = Below {
+        let start = Link {
             hash: tip.hash(),
             height: tip.height(),
             bits: chain.tip_bits(),
@@ -223,21 +223,21 @@ impl Presync {
     ) -> Result<PresyncStep, HeadersSyncError> {
         let full = headers.is_full();
         for header in headers.into_vec() {
-            let (below, work) = checked(self.network, self.last, &header)?;
-            if below.height > self.height_max {
+            let (link, work) = checked(self.network, self.last, &header)?;
+            if link.height > self.height_max {
                 return Err(HeadersSyncError::TooLong);
             }
-            if self.commitments.is_at(below.height) {
-                self.commitments.push(below.hash);
+            if self.commitments.is_at(link.height) {
+                self.commitments.push(link.hash);
                 // At most one bit in each period above the start. With the height bound above,
                 // this is the bound on the memory of the bits.
                 assert!(
                     self.commitments.count
-                        <= (below.height - self.start.height) / self.commitments.period + 1
+                        <= (link.height - self.start.height) / self.commitments.period + 1
                 );
             }
             self.work = self.work.saturating_add(work);
-            self.last = below;
+            self.last = link;
         }
         if self.work >= self.work_min {
             Ok(PresyncStep::Redownload(Redownload::new(self)))
@@ -280,21 +280,21 @@ impl Redownload {
     ) -> Result<RedownloadStep, HeadersSyncError> {
         let full = headers.is_full();
         for header in headers.into_vec() {
-            let (below, work) = checked(self.network, self.last, &header)?;
+            let (link, work) = checked(self.network, self.last, &header)?;
             self.work = self.work.saturating_add(work);
             if self.work < self.work_min {
                 // The chain does not show the work yet, so it must be the chain of the first
                 // download.
-                if self.commitments.is_at(below.height) {
+                if self.commitments.is_at(link.height) {
                     let kept = self.commitments.get(self.commitments_read_count);
-                    if kept != Some(self.commitments.bit(below.hash)) {
+                    if kept != Some(self.commitments.bit(link.hash)) {
                         return Err(HeadersSyncError::CommitmentMismatch);
                     }
                     self.commitments_read_count += 1;
                 }
             }
             self.buffer.push_back(header);
-            self.last = below;
+            self.last = link;
         }
         // `last` is the last header of `buffer`, with the height and the `bits` that the buffer
         // does not keep.
@@ -320,12 +320,12 @@ impl Redownload {
 }
 
 /// Checks `header` on `below`: its `prev`, then its proof of work, then its `bits`. Returns the
-/// header as the header below the next one, and its work.
+/// header as the link of the next one, and its work.
 fn checked(
     network: crate::chainparams::Network,
-    below: Below,
+    below: Link,
     header: &crate::block::BlockHeader,
-) -> Result<(Below, crate::pow::Work), HeadersSyncError> {
+) -> Result<(Link, crate::pow::Work), HeadersSyncError> {
     if header.prev != below.hash {
         return Err(HeadersSyncError::NotContinuous);
     }
@@ -334,7 +334,7 @@ fn checked(
     if !crate::pow::permits_bits_change(network, height, below.bits, header.bits) {
         return Err(HeadersSyncError::BitsChange);
     }
-    let above = Below {
+    let above = Link {
         hash,
         height,
         bits: header.bits,
