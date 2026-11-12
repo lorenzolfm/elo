@@ -270,6 +270,24 @@
             Labels."org.opencontainers.image.source" = "https://github.com/lorenzolfm/elo";
           };
         };
+
+        # The daemon. The deployment gives the arguments of elo: the network and the peer. elo
+        # has no signal handler (#13), and the kernel gives PID 1 no default action for a signal.
+        # So tini is PID 1, and a stop signal ends elo at once. The image needs no volume, no
+        # port and no writable path.
+        elo-image = pkgs.dockerTools.buildLayeredImage {
+          name = "elo";
+          tag = "local";
+          config = {
+            Entrypoint = ["${pkgs.lib.getExe pkgs.tini}" "--" "${pkgs.lib.getExe elo}"];
+            User = "65534:65534";
+            Env = ["RUST_BACKTRACE=1"];
+            Labels = {
+              "org.opencontainers.image.source" = "https://github.com/lorenzolfm/elo";
+              "org.opencontainers.image.revision" = inputs.self.rev or "dirty";
+            };
+          };
+        };
       in {
         _module.args.pkgs = import nixpkgs {
           inherit system;
@@ -286,7 +304,7 @@
             default = elo;
           }
           // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-            inherit elo-fuzz-image;
+            inherit elo-fuzz-image elo-image;
           };
 
         apps.default = {
