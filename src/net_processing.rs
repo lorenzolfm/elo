@@ -1008,10 +1008,10 @@ pub(crate) mod fuzz {
     /// doc of each function a second time, and each result must be what they expect. Each error
     /// ends the run, as it ends the connection.
     ///
-    /// A script holds a network byte (`script_network`, and `script_work_min` on regtest), a nonce
-    /// byte for our `version`, messages until the handshake ends, and then turns. A turn holds a
-    /// nonce byte for the tick, a message, and a byte for `now_next`. A read after the end of `data`
-    /// gives 0. A message is a kind byte, modulo 7, then:
+    /// A script holds a network byte (`script_network_work_min`), a nonce byte for our `version`,
+    /// messages until the handshake ends, and then turns. A turn holds a nonce byte for the tick, a
+    /// message, and a byte for `now_next`. A read after the end of `data` gives 0. A message is a
+    /// kind byte, modulo 7, then:
     ///
     /// - 0: no message.
     /// - 1: `version`. A byte to add to our nonce in the handshake, so 0 is our nonce, and an `i8`
@@ -1041,18 +1041,10 @@ pub(crate) mod fuzz {
             unread: data,
             headers_written_count: 0,
         };
-        let network_byte = script.byte();
-        let network = script_network(network_byte);
-        // Off regtest, the minimum is the minimum of the network. No old seed has a first byte
-        // above 3, so each old seed has zero steps, and keeps its end.
-        let work_min_step_count = match network {
-            crate::chainparams::Network::Regtest => network_byte / 4,
-            _ => 0,
-        };
+        let (network, work_min, work_min_model) = script_network_work_min(script.byte());
         let nonce = script.nonce();
         // The layout has no byte for it. A value from the script still shows a fixed timestamp.
         let timestamp = nonce.cast_signed();
-        let work_min = script_work_min(network, work_min_step_count);
         let (handshake, outbound) = super::Handshake::start(
             network,
             PEER_ADDRESS,
@@ -1063,10 +1055,7 @@ pub(crate) mod fuzz {
         );
         machines_start_check(&outbound, timestamp, nonce);
         match handshake_run(&mut script, handshake, nonce) {
-            Ok(peer) => {
-                let work_min = script_work_min_model(network, work_min_step_count);
-                peer_run(&mut script, peer, network, work_min)
-            }
+            Ok(peer) => peer_run(&mut script, peer, network, work_min_model),
             Err(end) => end,
         }
     }
@@ -1081,24 +1070,48 @@ pub(crate) mod fuzz {
         }
     }
 
-    /// The minimum work of a script on `network`. Off regtest, it is the minimum of the network, and
-    /// `step_count` must be zero. On regtest, it is the work of a chain of script headers
-    /// `step_count` steps of `SCRIPT_WORK_MIN_STEP` above genesis. So a sync can end at it, one
-    /// header below it, or one header above it. With zero steps, it is the work of genesis, so each
-    /// chain has it, and each old seed has it.
-    fn script_work_min(network: crate::chainparams::Network, step_count: u8) -> crate::pow::Work {
-        // A step count is a byte over 4, so the loop below has at most 63 steps of headers.
-        assert!(step_count <= u8::MAX / 4);
-        if network != crate::chainparams::Network::Regtest {
-            assert_eq!(step_count, 0);
-            return crate::pow::chain_work_min(network);
-        }
-        // Regtest genesis has the `bits` of each script header.
-        let Some(header_work) = crate::pow::work(SCRIPT_HEADER_BITS, network) else {
-            panic!("the script bits {SCRIPT_HEADER_BITS:#x} are not a regtest target");
+    /// The network of a script, and the lowest work of a chain at the end of its sync: for the
+    /// machine, then for the model. Off regtest, it is the minimum of the network. A person wrote
+    /// each one, and each one is above the work of its genesis. Off regtest no script header
+    /// passes, so each sync that a script ends fails. On regtest, `byte / 4` is a count of steps of
+    /// `SCRIPT_WORK_MIN_STEP`, and the minimum is the work of a chain of script headers that many
+    /// steps above genesis. So a sync can end at it, one header below it, or one header above it.
+    /// With zero steps, it is the work of genesis, so each chain has it. No old seed has a first
+    /// byte above 3, so each old seed has zero steps, and keeps its end.
+    ///
+    /// The machine side adds the work of a script header once for each header. The model has its
+    /// own formula, so a wrong sum makes the two disagree.
+    fn script_network_work_min(byte: u8) -> (crate::chainparams::Network, crate::pow::Work, u128) {
+        let network = script_network(byte);
+        let (work_min, work_min_model) = match network {
+            crate::chainparams::Network::Mainnet => (
+                crate::pow::chain_work_min(network),
+                0x1_1287_50f8_2f4c_3661_53a3_a030,
+            ),
+            crate::chainparams::Network::Testnet4 => (
+                crate::pow::chain_work_min(network),
+                0x9a0_fe15_d017_7d08_6304,
+            ),
+            crate::chainparams::Network::Signet => {
+                (crate::pow::chain_work_min(network), 0xb46_3ea0_a4b8)
+            }
+            crate::chainparams::Network::Regtest => {
+                // A byte over 4, so the loop below has at most 63 steps of headers.
+                let step_count = byte / 4;
+                // Regtest genesis has the `bits` of each script header.
+                let Some(header_work) = crate::pow::work(SCRIPT_HEADER_BITS, network) else {
+                    panic!("the script bits {SCRIPT_HEADER_BITS:#x} are not a regtest target");
+                };
+                let headers_count = usize::from(step_count) * SCRIPT_WORK_MIN_STEP;
+                let work_min = (0..headers_count)
+                    .fold(header_work, |work, _| work.saturating_add(header_work));
+                // Genesis and each script header have a work of 2.
+                const { assert!(usize::BITS <= 64) };
+                let work_min_model = 2 + u128::from(step_count) * SCRIPT_WORK_MIN_STEP as u128 * 2;
+                (work_min, work_min_model)
+            }
         };
-        let headers_count = usize::from(step_count) * SCRIPT_WORK_MIN_STEP;
-        (0..headers_count).fold(header_work, |work, _| work.saturating_add(header_work))
+        (network, work_min, work_min_model)
     }
 
     /// Checks each field of `outbound`, our `version`. It claims no services and asks for no
@@ -1936,27 +1949,6 @@ pub(crate) mod fuzz {
             }
             HeaderFault::ProofOfWork => crate::headerssync::HeadersSyncError::ProofOfWork,
         })
-    }
-
-    /// The lowest work of a chain at the end of a sync, as `script_work_min` says. A person wrote
-    /// each minimum of a network. Each one is above the work of its genesis, and off regtest no
-    /// script header passes. So off regtest each sync that a script ends fails. On regtest, genesis
-    /// and each script header have a work of 2.
-    fn script_work_min_model(network: crate::chainparams::Network, step_count: u8) -> u128 {
-        assert!(step_count <= u8::MAX / 4);
-        if network != crate::chainparams::Network::Regtest {
-            assert_eq!(step_count, 0);
-        }
-        match network {
-            crate::chainparams::Network::Mainnet => 0x1_1287_50f8_2f4c_3661_53a3_a030,
-            crate::chainparams::Network::Testnet4 => 0x9a0_fe15_d017_7d08_6304,
-            crate::chainparams::Network::Signet => 0xb46_3ea0_a4b8,
-            crate::chainparams::Network::Regtest => {
-                const { assert!(usize::BITS <= 64) };
-                let headers_count = u128::from(step_count) * SCRIPT_WORK_MIN_STEP as u128;
-                2 + headers_count * 2
-            }
-        }
     }
 
     /// The first 8 bytes of the payload, little-endian. Each byte after them is ignored.
