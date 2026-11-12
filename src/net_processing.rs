@@ -706,6 +706,12 @@ fn extend_released(
     released: Vec<crate::block::BlockHeader>,
     clock: u64,
 ) -> Result<(), PeerError> {
+    // The second download keeps at most `redownload_buffer_size` headers between two batches, and
+    // a batch adds at most `HEADERS_COUNT_MAX`. So this bounds the loop below.
+    assert!(
+        released.len()
+            <= chain.network().redownload_buffer_size() + crate::protocol::HEADERS_COUNT_MAX
+    );
     // The second download starts on the tip of the chain, and only it extends the chain in the
     // sync. So a refusal of the first header with `NotOnTip` would be our error.
     if let Some(first) = released.first() {

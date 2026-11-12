@@ -6,7 +6,7 @@ use crate::serialize::{Decode, Encode};
 pub(crate) const PROTOCOL_VERSION: i32 = 70016;
 
 /// The most headers a `headers` may carry. A peer that sends fewer has no more to send.
-const HEADERS_COUNT_MAX: usize = 2000;
+pub(crate) const HEADERS_COUNT_MAX: usize = 2000;
 
 /// The longest user agent a `version` may carry.
 const USER_AGENT_LENGTH_MAX: usize = 256;
