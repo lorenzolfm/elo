@@ -704,11 +704,18 @@ mod tests {
 
     /// Reads one frame on the peer's side of the socket.
     fn read_frame(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        read_frame_on(stream, crate::chainparams::Network::Regtest)
+    }
+
+    /// `read_frame`, with the magic of `network`.
+    fn read_frame_on(
+        stream: &mut std::net::TcpStream,
+        network: crate::chainparams::Network,
+    ) -> Vec<u8> {
         let mut frame = vec![0; crate::transport::MESSAGE_HEADER_SIZE];
         stream.read_exact(&mut frame).unwrap();
         let header = frame.first_chunk().unwrap();
-        let header =
-            crate::transport::decode_header(crate::chainparams::Network::Regtest, header).unwrap();
+        let header = crate::transport::decode_header(network, header).unwrap();
         let mut payload = vec![0; header.payload_length()];
         stream.read_exact(&mut payload).unwrap();
         frame.extend(payload);
@@ -941,6 +948,71 @@ mod tests {
                 result,
                 Err(super::RunError::NetProcessing(
                     crate::net_processing::PeerError::Extend(crate::chain::ExtendError::TimeTooNew)
+                ))
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn sync_that_ends_below_the_minimum_of_the_network_ends_the_connection() {
+        // Regtest has a minimum of zero, so only a test on another network shows that the driver
+        // gives the peer the minimum of its network. The empty batch ends the sync on genesis,
+        // which has less work than the signet minimum.
+        let network = crate::chainparams::Network::Signet;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+        let peer_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let frame =
+                |msg_type, payload: &[u8]| crate::transport::encode(network, msg_type, payload);
+            // The reply to each frame of the driver. Our `ping` gets no `pong`, because the ping
+            // timeout is far after the end of the test.
+            let replies = [
+                Some(frame(
+                    crate::protocol::VERSION,
+                    &crate::fixtures::version_payload(),
+                )),
+                Some(frame(crate::protocol::VERACK, &[])),
+                None,
+                Some(frame(crate::protocol::HEADERS, &[0])),
+            ];
+            let mut msg_types = Vec::new();
+            for reply in replies {
+                let ours = read_frame_on(&mut stream, network);
+                let msg_type: [u8; crate::protocol::MESSAGE_TYPE_SIZE] =
+                    ours[4..16].try_into().unwrap();
+                msg_types.push(msg_type);
+                if let Some(reply) = reply {
+                    stream.write_all(&reply).unwrap();
+                }
+            }
+            // The driver closes the socket when the sync fails.
+            let mut rest = Vec::new();
+            stream.read_to_end(&mut rest).unwrap();
+            msg_types
+        });
+
+        let result = block_on(async {
+            let (connection, _theirs) = super::handshake(network, peer).await.unwrap();
+            connection.sync().await
+        });
+        let expected = [
+            crate::protocol::VERSION,
+            crate::protocol::VERACK,
+            crate::protocol::PING,
+            crate::protocol::GETHEADERS,
+        ]
+        .map(|msg_type| *msg_type.as_bytes());
+        assert_eq!(peer_thread.join().unwrap(), expected);
+        assert!(
+            matches!(
+                result,
+                Err(super::RunError::NetProcessing(
+                    crate::net_processing::PeerError::ChainWorkTooLow
                 ))
             ),
             "{result:?}"
