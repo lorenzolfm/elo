@@ -444,10 +444,16 @@ pub(crate) fn permits_bits_change(
                     .and_then(|bits| Target::from_bits(bits, limit))
             };
             let highest = bound(u32::MAX);
-            // Only a target below 4 has a lowest change of zero, and then no target is below it.
-            let lowest = bound(0);
-            highest.is_some_and(|highest| target.0 <= highest.0)
-                && lowest.is_none_or(|lowest| lowest.0 <= target.0)
+            // The highest change is at most the limit and never zero, so each target up to the
+            // limit has one.
+            assert!(highest.is_some());
+            if highest.is_some_and(|highest| target.0 <= highest.0) {
+                // Only a target below 4 has a lowest change of zero, and then no target is below
+                // it.
+                bound(0).is_none_or(|lowest| lowest.0 <= target.0)
+            } else {
+                false
+            }
         }
     }
 }
