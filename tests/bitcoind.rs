@@ -10,7 +10,8 @@ const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long `getpeerinfo` may take to show what a test waits for.
 const PEER_INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How long elo may take to print the end of the connection after `bitcoind` closes it.
+/// How long elo may take to print the end of a connection: after `bitcoind` closes it, or after
+/// the start when the first write to stdout fails.
 const END_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long elo may take to do the handshake again after the end of a connection. It waits 5 s
@@ -182,19 +183,27 @@ fn stdout_error_after_the_handshake_exits_with_1() {
     // The pipe has no reader, so the first write to stdout fails.
     let (reader, writer) = std::io::pipe().unwrap();
     drop(reader);
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
-        .arg("regtest")
-        .arg(bitcoind.peer.to_string())
-        .stdout(writer)
-        .output()
-        .unwrap();
+    let mut elo = Process(
+        std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
+            .arg("regtest")
+            .arg(bitcoind.peer.to_string())
+            .stdout(writer)
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stderr = lines(elo.0.stderr.take().unwrap());
 
-    assert_eq!(output.status.code(), Some(1));
+    // The test waits for the line with a deadline, and not for the exit: an elo that dials
+    // again does not exit, and the drop kills it.
+    let end = stderr
+        .recv_timeout(END_TIMEOUT)
+        .expect("elo printed no end line");
     // An end that the peer causes dials again, so the exit comes from stdout.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.starts_with("elo: stdout: "), "{stderr}");
+    assert!(end.starts_with("elo: stdout: "), "{end}");
     // The line of an end that exits does not say that elo dials again.
-    assert!(!stderr.contains("dial again"), "{stderr}");
+    assert!(!end.contains("dial again"), "{end}");
+    assert_eq!(elo.0.wait().unwrap().code(), Some(1));
 }
 
 #[test]
