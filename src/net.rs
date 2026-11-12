@@ -3,6 +3,7 @@
 
 use crate::serialize::Encode;
 use std::hash::{BuildHasher, Hasher};
+use std::io::Read;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// How long the TCP connect may take.
@@ -32,6 +33,8 @@ pub enum HandshakeError {
     Transport(crate::transport::Error),
     /// elo refused the peer: a bad `version`, our own `version`, or too many messages.
     NetProcessing(crate::net_processing::HandshakeError),
+    /// The read of `RANDOM_SOURCE` for the salt of the peer failed.
+    Salt(std::io::Error),
 }
 
 impl std::fmt::Display for HandshakeError {
@@ -56,6 +59,7 @@ impl std::fmt::Display for HandshakeError {
             HandshakeError::Closed => write!(f, "the peer closed the connection"),
             HandshakeError::Transport(error) => write!(f, "frame: {error}"),
             HandshakeError::NetProcessing(error) => write!(f, "peer: {error}"),
+            HandshakeError::Salt(error) => write!(f, "salt: {RANDOM_SOURCE}: {error}"),
         }
     }
 }
@@ -205,8 +209,16 @@ async fn handshake_stream_exchange(
     stream: tokio::net::TcpStream,
 ) -> Result<(Connection, crate::protocol::Version), HandshakeError> {
     let mut socket = Socket::new(stream, network);
-    let (mut handshake, outbound) =
-        crate::net_processing::Handshake::start(network, peer, timestamp(), nonce());
+    let work_min = crate::pow::chain_work_min(network);
+    let salt = salt().map_err(HandshakeError::Salt)?;
+    let (mut handshake, outbound) = crate::net_processing::Handshake::start(
+        network,
+        peer,
+        timestamp(),
+        nonce(),
+        work_min,
+        salt,
+    );
     socket
         .send_handshake_outbound(&outbound)
         .await
@@ -239,8 +251,9 @@ async fn handshake_stream_exchange(
 impl Connection {
     /// Runs one turn after the other until a batch that is not full ends the sync. Returns the peer
     /// for `Synced::run`, and the tip of our chain. The loop has no count bound, because only the
-    /// chain of the peer bounds the sync. Only the end of the sync reads the minimum chain work, so
-    /// the minimum does not bound the loop. It ends on the errors of `run`, and also when elo
+    /// chain of the peer bounds the sync. A low-work sync gets the chain twice, and the clock
+    /// bounds the height of its first download. But above the minimum work the peer can send
+    /// headers for as long as it has them. It ends on the errors of `run`, and also when elo
     /// refuses a `headers`, none comes within the headers timeout, or the sync ends on a chain
     /// below the minimum work. Each wait for a message ends at the wake from `tick`, but the read
     /// takes a message that is already there, also after the wake. `tick` checks the headers
@@ -538,6 +551,26 @@ fn nonce() -> u64 {
     std::hash::RandomState::new().build_hasher().finish()
 }
 
+/// The random source of the OS.
+const RANDOM_SOURCE: &str = "/dev/urandom";
+
+/// A salt for a low-work sync, each byte from `RANDOM_SOURCE`. The peer must not know it, and a
+/// peer sees each nonce. `nonce` does not give that: the keys of `RandomState` come from the OS
+/// once, and each later one is the last plus one. So the salt reads the OS for each value.
+fn salt() -> std::io::Result<crate::headerssync::Salt> {
+    let mut source = std::fs::File::open(RANDOM_SOURCE)?;
+    let mut key_0 = [0; size_of::<u64>()];
+    let mut key_1 = [0; size_of::<u64>()];
+    let mut offset = [0; size_of::<usize>()];
+    source.read_exact(&mut key_0)?;
+    source.read_exact(&mut key_1)?;
+    source.read_exact(&mut offset)?;
+    Ok(crate::headerssync::Salt {
+        keys: [u64::from_le_bytes(key_0), u64::from_le_bytes(key_1)],
+        offset: usize::from_le_bytes(offset),
+    })
+}
+
 /// The entry point of the `frame` fuzz target.
 #[cfg(fuzzing)]
 // Only cargo-mutants reads this attribute. Its test runs do not build this module.
@@ -677,11 +710,18 @@ mod tests {
 
     /// Reads one frame on the peer's side of the socket.
     fn read_frame(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        read_frame_on(stream, crate::chainparams::Network::Regtest)
+    }
+
+    /// `read_frame`, with the magic of `network`.
+    fn read_frame_on(
+        stream: &mut std::net::TcpStream,
+        network: crate::chainparams::Network,
+    ) -> Vec<u8> {
         let mut frame = vec![0; crate::transport::MESSAGE_HEADER_SIZE];
         stream.read_exact(&mut frame).unwrap();
         let header = frame.first_chunk().unwrap();
-        let header =
-            crate::transport::decode_header(crate::chainparams::Network::Regtest, header).unwrap();
+        let header = crate::transport::decode_header(network, header).unwrap();
         let mut payload = vec![0; header.payload_length()];
         stream.read_exact(&mut payload).unwrap();
         frame.extend(payload);
@@ -914,6 +954,71 @@ mod tests {
                 result,
                 Err(super::RunError::NetProcessing(
                     crate::net_processing::PeerError::Extend(crate::chain::ExtendError::TimeTooNew)
+                ))
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn sync_that_ends_below_the_minimum_of_the_network_ends_the_connection() {
+        // Regtest has a minimum of zero, so only a test on another network shows that the driver
+        // gives the peer the minimum of its network. The empty batch ends the sync on genesis,
+        // which has less work than the signet minimum.
+        let network = crate::chainparams::Network::Signet;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+        let peer_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let frame =
+                |msg_type, payload: &[u8]| crate::transport::encode(network, msg_type, payload);
+            // The reply to each frame of the driver. Our `ping` gets no `pong`, because the ping
+            // timeout is far after the end of the test.
+            let replies = [
+                Some(frame(
+                    crate::protocol::VERSION,
+                    &crate::fixtures::version_payload(),
+                )),
+                Some(frame(crate::protocol::VERACK, &[])),
+                None,
+                Some(frame(crate::protocol::HEADERS, &[0])),
+            ];
+            let mut msg_types = Vec::new();
+            for reply in replies {
+                let ours = read_frame_on(&mut stream, network);
+                let msg_type: [u8; crate::protocol::MESSAGE_TYPE_SIZE] =
+                    ours[4..16].try_into().unwrap();
+                msg_types.push(msg_type);
+                if let Some(reply) = reply {
+                    stream.write_all(&reply).unwrap();
+                }
+            }
+            // The driver closes the socket when the sync fails.
+            let mut rest = Vec::new();
+            stream.read_to_end(&mut rest).unwrap();
+            msg_types
+        });
+
+        let result = block_on(async {
+            let (connection, _theirs) = super::handshake(network, peer).await.unwrap();
+            connection.sync().await
+        });
+        let expected = [
+            crate::protocol::VERSION,
+            crate::protocol::VERACK,
+            crate::protocol::PING,
+            crate::protocol::GETHEADERS,
+        ]
+        .map(|msg_type| *msg_type.as_bytes());
+        assert_eq!(peer_thread.join().unwrap(), expected);
+        assert!(
+            matches!(
+                result,
+                Err(super::RunError::NetProcessing(
+                    crate::net_processing::PeerError::ChainWorkTooLow
                 ))
             ),
             "{result:?}"

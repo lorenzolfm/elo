@@ -6,7 +6,7 @@ use crate::serialize::{Decode, Encode};
 pub(crate) const PROTOCOL_VERSION: i32 = 70016;
 
 /// The most headers a `headers` may carry. A peer that sends fewer has no more to send.
-const HEADERS_COUNT_MAX: usize = 2000;
+pub(crate) const HEADERS_COUNT_MAX: usize = 2000;
 
 /// The longest user agent a `version` may carry.
 const USER_AGENT_LENGTH_MAX: usize = 256;
@@ -267,28 +267,28 @@ impl Decode for Version {
     }
 }
 
-/// The `getheaders` payload. It asks for the headers after `tip`.
+/// The `getheaders` payload. It asks for the headers after the header with the hash `after`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GetHeaders {
     /// The only hash in the locator.
-    tip: bitcoin_hashes::sha256d::Hash,
+    after: bitcoin_hashes::sha256d::Hash,
 }
 
 impl GetHeaders {
-    /// Asks for the headers after the tip of our chain. Only a chain makes a `Tip`, so the
-    /// locator cannot be another hash.
-    pub(crate) fn new(tip: crate::chain::Tip) -> GetHeaders {
-        GetHeaders { tip: tip.hash() }
+    /// Asks for the headers after the header with the hash `after`: the tip of our chain, or the
+    /// last header of a download of a low-work sync.
+    pub(crate) fn new(after: bitcoin_hashes::sha256d::Hash) -> GetHeaders {
+        GetHeaders { after }
     }
 }
 
-/// The version is `PROTOCOL_VERSION`. The locator holds only `tip`. `hash_stop` is all zeros,
+/// The version is `PROTOCOL_VERSION`. The locator holds only `after`. `hash_stop` is all zeros,
 /// so the peer sends as many headers as a `headers` can carry.
 impl Encode for GetHeaders {
     fn encode(&self, out: &mut Vec<u8>) {
         PROTOCOL_VERSION.encode(out);
         crate::serialize::write_compact_size(out, 1);
-        self.tip.encode(out);
+        self.after.encode(out);
         let hash_stop = [0_u8; 32];
         hash_stop.encode(out);
     }
@@ -330,6 +330,19 @@ impl Headers {
             headers.push(header);
         }
         Ok(Self(headers))
+    }
+
+    /// `headers`, in order, in batches of `HEADERS_COUNT_MAX` and a last batch with the rest. No
+    /// headers give no batch. The second download of a low-work sync releases more headers than
+    /// one batch, and the chain takes only a batch. So `is_full` on one of these does not say that
+    /// the peer can have more.
+    pub(crate) fn batches(headers: Vec<crate::block::BlockHeader>) -> Vec<Self> {
+        let batches: Vec<Self> = headers
+            .chunks(HEADERS_COUNT_MAX)
+            .map(|batch| Self(batch.to_vec()))
+            .collect();
+        assert_eq!(batches.len(), headers.len().div_ceil(HEADERS_COUNT_MAX));
+        batches
     }
 
     /// True for `HEADERS_COUNT_MAX` headers. Then the peer can have more.
@@ -585,9 +598,8 @@ mod tests {
 
     #[test]
     fn get_headers_encodes_to_core_bytes() {
-        let get_headers = super::GetHeaders {
-            tip: crate::chainparams::Network::Regtest.genesis().hash(),
-        };
+        let get_headers =
+            super::GetHeaders::new(crate::chainparams::Network::Regtest.genesis().hash());
         let mut payload = Vec::new();
         get_headers.encode(&mut payload);
         assert_eq!(
@@ -598,6 +610,31 @@ mod tests {
             ),
             crate::fixtures::hex(crate::fixtures::GETHEADERS_FRAME)
         );
+    }
+
+    #[test]
+    fn batches_cut_headers_at_2000_in_order() {
+        // The headers need no proof of work here, so each one is genesis with its own nonce.
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        for (count, expected) in [
+            (0, &[][..]),
+            (1, &[1][..]),
+            (2_000, &[2_000][..]),
+            (2_001, &[2_000, 1][..]),
+            (4_001, &[2_000, 2_000, 1][..]),
+        ] {
+            let headers: Vec<_> = (0..count)
+                .map(|nonce| crate::block::BlockHeader { nonce, ..genesis })
+                .collect();
+            let batches = super::Headers::batches(headers.clone());
+            let counts: Vec<_> = batches.iter().map(|batch| batch.0.len()).collect();
+            assert_eq!(counts, expected, "{count}");
+            let joined: Vec<_> = batches
+                .into_iter()
+                .flat_map(super::Headers::into_vec)
+                .collect();
+            assert_eq!(joined, headers, "{count}");
+        }
     }
 
     #[test]

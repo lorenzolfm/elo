@@ -215,23 +215,17 @@ impl Chain {
     }
 
     /// The network of the chain.
-    // The peer starts a low-work sync in the next pull request.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn network(&self) -> crate::chainparams::Network {
         self.network
     }
 
     /// The `bits` of the tip.
-    // The peer starts a low-work sync in the next pull request.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn tip_bits(&self) -> u32 {
         self.tip.bits
     }
 
     /// The median time of the tip and the 10 headers below it, or of each header if there are
     /// fewer. A header on the tip needs a time above it.
-    // The peer starts a low-work sync in the next pull request.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn median_time_past(&self) -> u32 {
         let ancestors = Ancestors {
             below_tip: &self.below_tip,
@@ -239,11 +233,6 @@ impl Chain {
             batch: &[],
         };
         ancestors.median_time_past()
-    }
-
-    /// The work of the chain is at least the minimum of its network.
-    pub(crate) fn reaches_work_min(&self) -> bool {
-        crate::pow::reaches_chain_work_min(self.work, self.network)
     }
 
     /// The height and the hash of the last header, and the work of the chain.
@@ -328,15 +317,11 @@ impl Tip {
     }
 
     /// The height of the last header.
-    // The peer starts a low-work sync in the next pull request.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn height(&self) -> usize {
         self.height
     }
 
     /// The work of the chain.
-    // The peer starts a low-work sync in the next pull request.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn work(&self) -> crate::pow::Work {
         self.work
     }
