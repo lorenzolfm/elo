@@ -688,6 +688,9 @@ fn receive_on_tip(
     }
     chain.extend(headers, clock).map_err(PeerError::Extend)?;
     if full {
+        // A full batch below the minimum went to the first download above, and the work of a
+        // chain does not go down. So only the last batch of a sync can leave the chain below it.
+        assert!(chain.tip().work() >= work_min);
         Ok(Some(Download::Chain))
     } else if chain.tip().work() >= work_min {
         Ok(None)
