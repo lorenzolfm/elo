@@ -137,8 +137,10 @@ jobs:
           tip="tip 0 $genesis $(printf '%064x' 2)"
           # The wait and the check after it read the same line.
           has_tip() { docker logs elo | grep --fixed-strings --line-regexp --quiet "$tip"; }
+          # A container that stopped cannot print the line later, so the wait ends there too.
           for _ in $(seq 60); do
             has_tip && break
+            test "$(docker inspect elo --format '{{.State.Running}}')" = true || break
             sleep 1
           done
           docker logs elo
