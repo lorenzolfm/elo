@@ -259,7 +259,7 @@ impl<'a> Handshake<'a> {
         // connection ended. A peer can make such headers cheaply, so a kept chain could grow
         // without a bound.
         if chain.tip().work() < work_min {
-            *chain = crate::chain::Chain::new(chain.network());
+            chain.restart();
         }
         if chain.tip().work() < work_min {
             assert_eq!(chain.tip().height(), 0);
@@ -753,7 +753,7 @@ fn receive_on_tip(
     let on_genesis = headers.first().is_some_and(|first| first.prev == genesis);
     if let Err(error) = chain.extend(headers, clock) {
         if error == crate::chain::ExtendError::NotOnTip && on_genesis {
-            *chain = crate::chain::Chain::new(chain.network());
+            chain.restart();
         }
         return Err(PeerError::Extend(error));
     }

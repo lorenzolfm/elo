@@ -86,6 +86,11 @@ impl Chain {
         }
     }
 
+    /// Drops each header above genesis. The network stays, so a chain never changes its network.
+    pub(crate) fn restart(&mut self) {
+        *self = Chain::new(self.network);
+    }
+
     /// Puts all of `headers` on the tip, in order, or none of them. An empty batch changes
     /// nothing. The first header that fails gives the error. For one header, its `prev` is checked
     /// first, then its proof of work, then its `bits`, then its time against the median time, then
