@@ -1563,8 +1563,9 @@ pub(crate) mod fuzz {
         }
     }
 
-    /// What `Peer::tick` and `Peer::receive` return, by their docs. It holds deadlines, not the
-    /// states of the peer, so a change to those states needs no change here.
+    /// What `Peer::tick` and `Peer::receive` return, by their docs. It holds deadlines and where
+    /// the next batch goes, not the states of the peer. So a change to those states needs a change
+    /// here only if it changes where a batch goes.
     struct PeerModel {
         /// When our next `ping` is due, or when our outstanding one times out.
         ping_deadline: std::time::Instant,
@@ -1615,12 +1616,12 @@ pub(crate) mod fuzz {
         Due,
         /// One is outstanding, and it times out at this instant.
         Outstanding(std::time::Instant),
-        /// A batch that was not full came, so none goes again.
+        /// The sync ended, so none goes again.
         Ended,
     }
 
-    /// What `Peer::tick` returns, without the peer. The tick nonce and `PeerModel::tip` give the
-    /// contents of what it sends.
+    /// What `Peer::tick` returns, without the peer. The tick nonce and `PeerModel::download_last`
+    /// give the contents of what it sends.
     #[derive(Debug)]
     struct TickExpected {
         ping: bool,
