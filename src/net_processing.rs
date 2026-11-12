@@ -1087,6 +1087,8 @@ pub(crate) mod fuzz {
     /// header below it, or one header above it. With zero steps, it is the work of genesis, so each
     /// chain has it, and each old seed has it.
     fn script_work_min(network: crate::chainparams::Network, step_count: u8) -> crate::pow::Work {
+        // A step count is a byte over 4, so the loop below has at most 63 steps of headers.
+        assert!(step_count <= u8::MAX / 4);
         if network != crate::chainparams::Network::Regtest {
             assert_eq!(step_count, 0);
             return crate::pow::chain_work_min(network);
@@ -1095,7 +1097,6 @@ pub(crate) mod fuzz {
         let Some(header_work) = crate::pow::work(SCRIPT_HEADER_BITS, network) else {
             panic!("the script bits {SCRIPT_HEADER_BITS:#x} are not a regtest target");
         };
-        // A step count is a byte over 4, so the loop has at most 63 steps of headers.
         let headers_count = usize::from(step_count) * SCRIPT_WORK_MIN_STEP;
         (0..headers_count).fold(header_work, |work, _| work.saturating_add(header_work))
     }
@@ -1941,6 +1942,10 @@ pub(crate) mod fuzz {
     /// script header passes. So off regtest each sync that a script ends fails. On regtest, genesis
     /// and each script header have a work of 2.
     fn work_min_model(network: crate::chainparams::Network, step_count: u8) -> u128 {
+        assert!(step_count <= u8::MAX / 4);
+        if network != crate::chainparams::Network::Regtest {
+            assert_eq!(step_count, 0);
+        }
         let headers_count = u128::from(step_count) * SCRIPT_WORK_MIN_STEP as u128;
         match network {
             crate::chainparams::Network::Mainnet => 0x1_1287_50f8_2f4c_3661_53a3_a030,
