@@ -178,21 +178,30 @@ mod tests {
         super::parse(&args)
     }
 
-    // The L3 tests hold a closed connection, which retries, and a stdout fault, which exits.
+    // The L3 tests also hold a closed connection, which retries, and a stdout fault, which
+    // exits. The stdout row is here too: a retry on that fault does not end the L3 test, so
+    // only its deadline fails it, and this row gives the reason.
     #[test]
-    fn a_failed_salt_read_ends_elo_and_a_failed_connect_retries() {
+    fn a_fault_of_this_host_ends_elo_and_a_failed_connect_retries() {
         for (end, retries) in [
             (
-                elo::net::HandshakeError::Salt(std::io::Error::other("salt")),
+                super::End::Handshake(elo::net::HandshakeError::Salt(std::io::Error::other(
+                    "salt",
+                ))),
                 false,
             ),
+            (super::End::Stdout(std::io::Error::other("stdout")), false),
             (
-                elo::net::HandshakeError::Connect(std::io::Error::other("connect")),
+                super::End::Handshake(elo::net::HandshakeError::Connect(std::io::Error::other(
+                    "connect",
+                ))),
                 true,
             ),
-            (elo::net::HandshakeError::ConnectTimeout, true),
+            (
+                super::End::Handshake(elo::net::HandshakeError::ConnectTimeout),
+                true,
+            ),
         ] {
-            let end = super::End::Handshake(end);
             assert_eq!(end.retries(), retries, "{end}");
         }
     }
