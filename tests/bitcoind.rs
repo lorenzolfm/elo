@@ -21,6 +21,10 @@ const RECONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 /// How long elo may take to sync the headers of `bitcoind` and print its tip.
 const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long elo may take to exit after a signal. Below the wait of 5 s before a dial, so a
+/// signal in that wait must end it, and not the next dial.
+const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// A directory that the drop removes.
 struct TempDir(std::path::PathBuf);
 
@@ -289,6 +293,38 @@ fn closed_connection_gets_a_new_handshake_and_sync() {
 }
 
 #[test]
+fn signal_in_a_connection_exits_with_0() {
+    let bitcoind = Bitcoind::start();
+    // elo exits each time, so the next elo is again the only peer of bitcoind.
+    for signal in ["TERM", "INT"] {
+        let mut elo = Elo::start(&bitcoind);
+        elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT);
+        elo.signal(signal);
+        assert_eq!(elo.exit_code(), Some(0), "SIG{signal}");
+        assert_eq!(
+            elo.line(&elo.stderr, "elo: ", END_TIMEOUT),
+            format!("SIG{signal}; stop")
+        );
+    }
+}
+
+#[test]
+fn signal_in_the_wait_before_a_dial_exits_with_0() {
+    let bitcoind = Bitcoind::start();
+    let mut elo = Elo::start(&bitcoind);
+    elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT);
+
+    // elo is the only peer of bitcoind, so it is node 0. elo prints the end line, and then it
+    // waits 5 s.
+    bitcoind.cli(&["-named", "disconnectnode", "nodeid=0"]);
+    let end = elo.line(&elo.stderr, "elo: ", END_TIMEOUT);
+    assert!(end.ends_with("; dial again in 5 s"), "{end}");
+    elo.signal("TERM");
+    assert_eq!(elo.exit_code(), Some(0));
+    assert_eq!(elo.line(&elo.stderr, "elo: ", END_TIMEOUT), "SIGTERM; stop");
+}
+
+#[test]
 fn next_connection_syncs_from_our_tip_and_a_tip_off_the_chain_of_bitcoind_starts_again() {
     let bitcoind = Bitcoind::start();
     bitcoind.cli(&["generatetodescriptor", "1", "raw(51)"]);
@@ -344,8 +380,7 @@ fn sync_from_bitcoind_prints_its_tip() {
 /// elo connected to a `bitcoind`, with the lines of its stdout and its stderr. elo does not
 /// exit while it can dial the peer, so the drop kills it.
 struct Elo {
-    // No test reads it: it is here for its drop.
-    _process: Process,
+    process: Process,
     stdout: std::sync::mpsc::Receiver<String>,
     stderr: std::sync::mpsc::Receiver<String>,
 }
@@ -362,7 +397,7 @@ impl Elo {
         let stdout = lines(child.stdout.take().unwrap());
         let stderr = lines(child.stderr.take().unwrap());
         Self {
-            _process: Process(child),
+            process: Process(child),
             stdout,
             stderr,
         }
@@ -396,6 +431,35 @@ impl Elo {
                     self.stderr_so_far()
                 ),
             }
+        }
+    }
+
+    /// Sends the signal `name`, for example `TERM`, to elo. The `kill` of coreutils, because
+    /// `std` sends only SIGKILL.
+    fn signal(&self, name: &str) {
+        let status = std::process::Command::new("kill")
+            .arg("-s")
+            .arg(name)
+            .arg(self.process.0.id().to_string())
+            .status()
+            .unwrap();
+        assert!(status.success(), "kill -s {name}: {status}");
+    }
+
+    /// The exit code of elo, which must exit within `STOP_TIMEOUT`. `None` is an end by a
+    /// signal.
+    fn exit_code(&mut self) -> Option<i32> {
+        let deadline = std::time::Instant::now() + STOP_TIMEOUT;
+        loop {
+            if let Some(status) = self.process.0.try_wait().unwrap() {
+                return status.code();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "elo did not exit within {} s",
+                STOP_TIMEOUT.as_secs()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 

@@ -32,10 +32,11 @@ branches yet.
 elo <mainnet|testnet4|signet|regtest> <ip>[:port]    # IPv6 as [::1]:8333
 ```
 
-elo exits with 1 only on a fault of this host: its async runtime does not
-start, a write to stdout fails, or a read of `/dev/urandom` fails. Ctrl-C
-stops it, and the shell shows its signal code (130). elo never exits with 0.
-Bad usage exits with 2.
+SIGTERM and SIGINT (Ctrl-C) stop elo at any step, also in the wait before a
+dial. It prints the signal to stderr, for example `elo: SIGTERM; stop`, and
+exits with 0. elo exits with 1 only on a fault of this host: its async runtime
+or its signal handlers do not start, a write to stdout fails, or a read of
+`/dev/urandom` fails. Bad usage exits with 2.
 
 ## Build
 
@@ -61,9 +62,8 @@ nix build .#elo-image && docker load --input result
 docker run --rm --read-only --cap-drop ALL --network host elo:local regtest 127.0.0.1
 ```
 
-tini is PID 1. elo has no signal handler, and the kernel gives PID 1 no default action for a
-signal. So without tini, a stop waits for its timeout and ends in SIGKILL. With tini, SIGTERM ends
-elo at once, and the container exits with 143.
+elo is PID 1. The kernel gives PID 1 no default action for a signal, but elo has a handler for
+SIGTERM. So a stop ends elo at once, and the container exits with 0.
 
 ## Fuzz
 
