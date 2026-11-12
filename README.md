@@ -13,7 +13,12 @@ testnet4, signet and regtest, each header above genesis has a version of at
 least 4. On mainnet, a header needs a version of at least 2 from height 227931,
 3 from 363725 and 4 from 388381. When the sync ends, the work of the chain must
 be at least the minimum of the network, or elo drops the peer. On regtest the
-minimum is zero. After the sync, elo stays connected and answers each `ping`
+minimum is zero. Below the minimum, a peer can make cheap headers for as long
+as it wants, so elo gets the chain twice. The first time, it keeps no header,
+only a salted bit of one header in each run of about 600. The second time, each
+of those headers must match its bit, and a header goes on the chain when about
+15,000 headers are above it, or when the chain reaches the minimum. After the
+sync, elo stays connected and answers each `ping`
 with a `pong`. From the handshake on, it pings the peer every 2 min. It drops a
 peer that does not answer a `ping` within 20 min, or a `getheaders`
 within 2 min.

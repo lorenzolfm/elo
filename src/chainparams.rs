@@ -123,8 +123,6 @@ impl Network {
     /// them to the chain. So each header that the chain gets has about this count over
     /// `commitment_period` commitments above it, about 24. A peer that sends another chain the
     /// second time passes each commitment by chance, with odds of one half.
-    // The peer starts a low-work sync in the next pull request.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) const fn redownload_buffer_size(self) -> usize {
         match self {
             Network::Mainnet => 15_218,

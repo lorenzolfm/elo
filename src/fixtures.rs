@@ -337,6 +337,14 @@ const _: () =
 /// is the genesis header with its `version`, its `prev`, its `time` and its `nonce` changed. Each
 /// time is one second above the header below it, so it is legal.
 pub(crate) fn headers_on_genesis(count: usize) -> Vec<crate::block::BlockHeader> {
+    headers_on(&crate::chainparams::Network::Regtest.genesis(), count)
+}
+
+/// `headers_on_genesis`, with the first header on `below`.
+pub(crate) fn headers_on(
+    below: &crate::block::BlockHeader,
+    count: usize,
+) -> Vec<crate::block::BlockHeader> {
     let genesis = crate::chainparams::Network::Regtest.genesis();
     let on = |below: &crate::block::BlockHeader| {
         crate::pow::mined_for_regtest(crate::block::BlockHeader {
@@ -346,7 +354,7 @@ pub(crate) fn headers_on_genesis(count: usize) -> Vec<crate::block::BlockHeader>
             ..genesis
         })
     };
-    std::iter::successors(Some(on(&genesis)), |below| Some(on(below)))
+    std::iter::successors(Some(on(below)), |below| Some(on(below)))
         .take(count)
         .collect()
 }

@@ -5,8 +5,6 @@
 mod block;
 mod chain;
 pub mod chainparams;
-// The peer starts a low-work sync in the next pull request.
-#[cfg_attr(not(test), expect(dead_code))]
 mod headerssync;
 pub mod net;
 mod net_processing;

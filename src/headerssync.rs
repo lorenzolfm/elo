@@ -25,7 +25,7 @@ pub(crate) struct Salt {
 
 /// Why a sync refused a batch. Each one ends the sync.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HeadersSyncError {
+pub enum HeadersSyncError {
     /// The `prev` of a header is not the hash of the header below it: the tip of our chain, or the
     /// last header that the peer sent in this download.
     NotContinuous,
@@ -232,6 +232,12 @@ impl Presync {
         }
     }
 
+    /// The hash of the last header that the peer sent, or of the tip of our chain. The next batch
+    /// goes on it.
+    pub(crate) fn last_hash(&self) -> bitcoin_hashes::sha256d::Hash {
+        self.last.hash
+    }
+
     /// Checks each of `headers`, in order, on the last header. For one header, its `prev` is
     /// checked first, then its proof of work, then its `bits`, then its height. When the work
     /// reaches the minimum, the next download starts after the batch. Else a batch that is not
@@ -275,6 +281,12 @@ impl Redownload {
             last: presync.start,
             work: presync.start_work,
         }
+    }
+
+    /// The hash of the last header of this download, or of the tip of our chain. The next batch
+    /// goes on it.
+    pub(crate) fn last_hash(&self) -> bitcoin_hashes::sha256d::Hash {
+        self.last.hash
     }
 
     /// Checks each of `headers`, in order, on the last header, as the first download did. Each
@@ -777,10 +789,10 @@ mod tests {
         }
     }
 
-    /// The first chain has harder headers above height 1,940, its last commitment. Each has 15
-    /// times the work of the limit, so the chain reaches the minimum at height 2,000. The second
-    /// chain is the first up to 1,940, then headers at the limit. So at height 2,215 it is still
-    /// below the minimum, and the first download kept no commitment for that height.
+    /// The first chain has harder headers above height 1,940, its last commitment. Each has a work
+    /// of 15, where a header at the limit has 2, so the chain reaches the minimum at height 2,000.
+    /// The second chain is the first up to 1,940, then headers at the limit. So at height 2,215 it
+    /// is still below the minimum, and the first download kept no commitment for that height.
     #[test]
     fn redownload_refuses_a_chain_after_the_last_commitment() {
         let bits_hard = 0x2010_0000;

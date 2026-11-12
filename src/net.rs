@@ -3,6 +3,7 @@
 
 use crate::serialize::Encode;
 use std::hash::{BuildHasher, Hasher};
+use std::io::Read;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// How long the TCP connect may take.
@@ -86,6 +87,8 @@ pub enum RunError {
     /// elo refused the peer: a bad `ping`, `pong` or `headers`, or no `pong` or `headers` in
     /// time.
     NetProcessing(crate::net_processing::PeerError),
+    /// The read of `RANDOM_SOURCE` for a salt failed.
+    Random(std::io::Error),
 }
 
 impl std::fmt::Display for RunError {
@@ -98,6 +101,7 @@ impl std::fmt::Display for RunError {
             RunError::Closed => write!(f, "the peer closed the connection"),
             RunError::Transport(error) => write!(f, "frame: {error}"),
             RunError::NetProcessing(error) => write!(f, "peer: {error}"),
+            RunError::Random(error) => write!(f, "{RANDOM_SOURCE}: {error}"),
         }
     }
 }
@@ -205,8 +209,9 @@ async fn handshake_stream_exchange(
     stream: tokio::net::TcpStream,
 ) -> Result<(Connection, crate::protocol::Version), HandshakeError> {
     let mut socket = Socket::new(stream, network);
+    let work_min = crate::pow::chain_work_min(network);
     let (mut handshake, outbound) =
-        crate::net_processing::Handshake::start(network, peer, timestamp(), nonce());
+        crate::net_processing::Handshake::start(network, peer, timestamp(), nonce(), work_min);
     socket
         .send_handshake_outbound(&outbound)
         .await
@@ -239,8 +244,9 @@ async fn handshake_stream_exchange(
 impl Connection {
     /// Runs one turn after the other until a batch that is not full ends the sync. Returns the peer
     /// for `Synced::run`, and the tip of our chain. The loop has no count bound, because only the
-    /// chain of the peer bounds the sync. Only the end of the sync reads the minimum chain work, so
-    /// the minimum does not bound the loop. It ends on the errors of `run`, and also when elo
+    /// chain of the peer bounds the sync. A low-work sync gets the chain twice, and the clock
+    /// bounds the height of its first download. But above the minimum work the peer can send
+    /// headers for as long as it has them. It ends on the errors of `run`, and also when elo
     /// refuses a `headers`, none comes within the headers timeout, or the sync ends on a chain
     /// below the minimum work. Each wait for a message ends at the wake from `tick`, but the read
     /// takes a message that is already there, also after the wake. `tick` checks the headers
@@ -325,8 +331,9 @@ async fn run_exchange(
     message: &crate::transport::Message,
 ) -> Result<(crate::net_processing::Peer, Option<crate::chain::Tip>), RunError> {
     // The clock is read when the message is there, so a long wait for it does not age the clock.
+    let salt = salt().map_err(RunError::Random)?;
     let (peer, received) = peer
-        .receive(message, clock())
+        .receive(message, clock(), salt)
         .map_err(RunError::NetProcessing)?;
     match received {
         crate::net_processing::Received::NoReply => {
@@ -536,6 +543,26 @@ fn timestamp() -> i64 {
 /// self, and the nonce in our `ping` only matches its `pong`. So neither needs to be secret.
 fn nonce() -> u64 {
     std::hash::RandomState::new().build_hasher().finish()
+}
+
+/// The random source of the OS.
+const RANDOM_SOURCE: &str = "/dev/urandom";
+
+/// A salt for a low-work sync, each byte from `RANDOM_SOURCE`. The peer must not know it, and a
+/// peer sees each nonce. `nonce` does not give that: the keys of `RandomState` come from the OS
+/// once, and each later one is the last plus one. So the salt reads the OS for each value.
+fn salt() -> std::io::Result<crate::headerssync::Salt> {
+    let mut source = std::fs::File::open(RANDOM_SOURCE)?;
+    let mut key_0 = [0; size_of::<u64>()];
+    let mut key_1 = [0; size_of::<u64>()];
+    let mut offset = [0; size_of::<usize>()];
+    source.read_exact(&mut key_0)?;
+    source.read_exact(&mut key_1)?;
+    source.read_exact(&mut offset)?;
+    Ok(crate::headerssync::Salt {
+        keys: [u64::from_le_bytes(key_0), u64::from_le_bytes(key_1)],
+        offset: usize::from_le_bytes(offset),
+    })
 }
 
 /// The entry point of the `frame` fuzz target.
