@@ -63,7 +63,7 @@ enum End {
 impl End {
     /// Whether elo dials the peer again. Each end that the peer or the network causes retries,
     /// also a peer that sent bytes that elo refuses: the user named that peer. A fault of this
-    /// host does not, because a new connection cannot fix it. The match names each variant, so
+    /// host that a new connection cannot fix does not. The match names each variant, so
     /// a new error does not compile until it has a side.
     fn retries(&self) -> bool {
         match self {
