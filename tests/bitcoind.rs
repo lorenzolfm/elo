@@ -10,7 +10,8 @@ const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long `getpeerinfo` may take to show what a test waits for.
 const PEER_INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How long elo may take to print the end of the connection after `bitcoind` closes it.
+/// How long elo may take to print the end of a connection: after `bitcoind` closes it, or after
+/// the start when the first write to stdout fails.
 const END_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long elo may take to do the handshake again after the end of a connection. It waits 5 s
@@ -182,19 +183,27 @@ fn stdout_error_after_the_handshake_exits_with_1() {
     // The pipe has no reader, so the first write to stdout fails.
     let (reader, writer) = std::io::pipe().unwrap();
     drop(reader);
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
-        .arg("regtest")
-        .arg(bitcoind.peer.to_string())
-        .stdout(writer)
-        .output()
-        .unwrap();
+    let mut elo = Process(
+        std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
+            .arg("regtest")
+            .arg(bitcoind.peer.to_string())
+            .stdout(writer)
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stderr = lines(elo.0.stderr.take().unwrap());
 
-    assert_eq!(output.status.code(), Some(1));
+    // The test waits for the line with a deadline, and not for the exit: an elo that dials
+    // again does not exit, and the drop kills it.
+    let end = stderr
+        .recv_timeout(END_TIMEOUT)
+        .expect("elo printed no end line");
     // An end that the peer causes dials again, so the exit comes from stdout.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.starts_with("elo: stdout: "), "{stderr}");
+    assert!(end.starts_with("elo: stdout: "), "{end}");
     // The line of an end that exits does not say that elo dials again.
-    assert!(!stderr.contains("dial again"), "{stderr}");
+    assert!(!end.contains("dial again"), "{end}");
+    assert_eq!(elo.0.wait().unwrap().code(), Some(1));
 }
 
 #[test]
@@ -226,7 +235,7 @@ fn ping_from_bitcoind_gets_a_pong() {
 #[test]
 fn our_ping_gets_a_pong_from_bitcoind() {
     let bitcoind = Bitcoind::start();
-    let mut elo = Elo::start(&bitcoind);
+    let elo = Elo::start(&bitcoind);
 
     // elo pings right after the handshake, and bitcoind sends a `pong` only to a `ping`. The
     // wait also needs our `pong` to the `ping` of bitcoind, the last message that elo sends. A
@@ -242,9 +251,10 @@ fn our_ping_gets_a_pong_from_bitcoind() {
         {
             break;
         }
-        if let Some(status) = elo.process.0.try_wait().unwrap() {
-            panic!("elo exited with {status}: {}", elo.stderr_so_far());
-        }
+        // An early end does not exit elo: it dials again, and then node 0 is gone. So the test
+        // fails here, with the reason of elo, and not on `disconnectnode`.
+        let ended = elo.stderr_so_far();
+        assert!(ended.is_empty(), "elo ended the connection: {ended}");
         assert!(
             start.elapsed() < PEER_INFO_TIMEOUT,
             "bitcoind shows no pong for our ping: {peer_info}"
@@ -296,7 +306,8 @@ fn sync_from_bitcoind_prints_its_tip() {
 /// elo connected to a `bitcoind`, with the lines of its stdout and its stderr. elo does not
 /// exit while it can dial the peer, so the drop kills it.
 struct Elo {
-    process: Process,
+    // No test reads it: it is here for its drop.
+    _process: Process,
     stdout: std::sync::mpsc::Receiver<String>,
     stderr: std::sync::mpsc::Receiver<String>,
 }
@@ -313,7 +324,7 @@ impl Elo {
         let stdout = lines(child.stdout.take().unwrap());
         let stderr = lines(child.stderr.take().unwrap());
         Self {
-            process: Process(child),
+            _process: Process(child),
             stdout,
             stderr,
         }
