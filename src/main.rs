@@ -1,14 +1,19 @@
 //! `elo <network> <ip>[:port]`: dials one peer, does the handshake, and prints the peer's
 //! `version`. Then it syncs the header chain from the peer and prints the tip. It pings the
-//! peer and answers its `ping` messages until the connection ends.
+//! peer and answers its `ping` messages until the connection ends. Then it waits and dials the
+//! peer again, and the next connection syncs from genesis again.
 
 use std::io::Write;
 
 const USAGE: &str = "usage: elo <mainnet|testnet4|signet|regtest> <ip>[:port]";
 
-/// The exit code for bad usage. Every other exit is 1, because the connection has no
-/// successful end. elo has no signal handler, so Ctrl-C ends it with the shell's signal code.
+/// The exit code for bad usage. Every other exit is 1, because only a fault of this host ends
+/// elo. elo has no signal handler, so Ctrl-C ends it with the shell's signal code.
 const EXIT_USAGE: u8 = 2;
+
+/// How long elo waits after a connection ends before it dials the peer again. So a peer that is
+/// down, or that ends each connection at once, gets at most one try in each wait.
+const RECONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn main() -> std::process::ExitCode {
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
@@ -28,12 +33,58 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    let (connection, version) = match runtime.block_on(elo::net::handshake(network, peer)) {
-        Ok(handshake) => handshake,
-        Err(error) => {
-            eprintln!("elo: {error}");
+    // The loop has no count bound, because elo keeps its one peer for as long as it runs. Only
+    // an end that a new connection cannot fix gets out.
+    loop {
+        let end = runtime.block_on(connection(network, peer));
+        eprintln!("elo: {end}");
+        if !end.retries() {
             return std::process::ExitCode::FAILURE;
         }
+        // No task runs between two connections, so the wait needs no timer of the runtime.
+        std::thread::sleep(RECONNECT_WAIT);
+    }
+}
+
+/// How one connection ended.
+#[derive(Debug)]
+enum End {
+    /// The connect or the handshake failed.
+    Handshake(elo::net::HandshakeError),
+    /// The connection ended in the sync or after it.
+    Run(elo::net::RunError),
+    /// A write to stdout failed.
+    Stdout(std::io::Error),
+}
+
+impl End {
+    /// Whether elo dials the peer again. Each end that the peer or the network causes retries,
+    /// also a peer that sent bytes that elo refuses: the user named that peer. A fault of this
+    /// host does not, because a new connection cannot fix it.
+    fn retries(&self) -> bool {
+        match self {
+            End::Handshake(elo::net::HandshakeError::Salt(_)) | End::Stdout(_) => false,
+            End::Handshake(_) | End::Run(_) => true,
+        }
+    }
+}
+
+impl std::fmt::Display for End {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            End::Handshake(error) => write!(f, "{error}"),
+            End::Run(error) => write!(f, "{error}"),
+            End::Stdout(error) => write!(f, "stdout: {error}"),
+        }
+    }
+}
+
+/// Dials `peer`, does the handshake and prints the `version` of the peer. Then syncs, prints
+/// the tip, and runs until the connection ends. Each connection has its own chain, from genesis.
+async fn connection(network: elo::chainparams::Network, peer: std::net::SocketAddr) -> End {
+    let (connection, version) = match elo::net::handshake(network, peer).await {
+        Ok(handshake) => handshake,
+        Err(error) => return End::Handshake(error),
     };
 
     let printed = print(format_args!(
@@ -45,25 +96,18 @@ fn main() -> std::process::ExitCode {
         version.relay(),
     ));
     if let Err(error) = printed {
-        eprintln!("elo: stdout: {error}");
-        return std::process::ExitCode::FAILURE;
+        return End::Stdout(error);
     }
 
-    let (synced, tip) = match runtime.block_on(connection.sync()) {
+    let (synced, tip) = match connection.sync().await {
         Ok(sync) => sync,
-        Err(error) => {
-            eprintln!("elo: {error}");
-            return std::process::ExitCode::FAILURE;
-        }
+        Err(error) => return End::Run(error),
     };
     if let Err(error) = print(format_args!("tip {tip}")) {
-        eprintln!("elo: stdout: {error}");
-        return std::process::ExitCode::FAILURE;
+        return End::Stdout(error);
     }
 
-    let error = runtime.block_on(synced.run());
-    eprintln!("elo: {error}");
-    std::process::ExitCode::FAILURE
+    End::Run(synced.run().await)
 }
 
 /// Writes `text` and a newline to stdout. `println!` panics when stdout fails, for example on
@@ -113,6 +157,25 @@ mod tests {
     fn parse(args: &[&str]) -> Option<(elo::chainparams::Network, std::net::SocketAddr)> {
         let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
         super::parse(&args)
+    }
+
+    // The L3 tests hold a closed connection, which retries, and a stdout fault, which exits.
+    #[test]
+    fn a_failed_salt_read_ends_elo_and_a_failed_connect_retries() {
+        for (end, retries) in [
+            (
+                elo::net::HandshakeError::Salt(std::io::Error::other("salt")),
+                false,
+            ),
+            (
+                elo::net::HandshakeError::Connect(std::io::Error::other("connect")),
+                true,
+            ),
+            (elo::net::HandshakeError::ConnectTimeout, true),
+        ] {
+            let end = super::End::Handshake(end);
+            assert_eq!(end.retries(), retries, "{end}");
+        }
     }
 
     #[test]
