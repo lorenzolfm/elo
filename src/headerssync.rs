@@ -14,8 +14,9 @@ const HEADERS_PER_SECOND_MAX: u64 = 6;
 const WORD_BITS: usize = 64;
 
 /// The random numbers of one sync. The peer must not know them. With them, it could make a second
-/// chain that matches the commitments of the first.
-#[derive(Clone, Copy, Debug)]
+/// chain that matches the commitments of the first. It is not `Copy`, so a sync moves it, and no
+/// other sync can read it.
+#[derive(Debug)]
 pub(crate) struct Salt {
     /// The keys of the hash that gives each commitment.
     pub(crate) keys: [u64; 2],

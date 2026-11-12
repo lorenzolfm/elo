@@ -233,8 +233,8 @@ pub(crate) enum Step {
 impl Handshake {
     /// Returns our `version` to `peer` on `network`, to send first. The sync after the handshake
     /// must end on a chain with at least `work_min`. A low-work sync in it reads `salt`, which
-    /// must be new and secret. A connection has at most one low-work sync, because it ends at the
-    /// minimum and the work of a chain does not go down.
+    /// must be new and secret. Only the first batch on a genesis below `work_min` can start one,
+    /// so a connection has at most one, and the sync moves the salt into it.
     pub(crate) fn start(
         network: crate::chainparams::Network,
         peer: std::net::SocketAddr,
@@ -306,12 +306,17 @@ impl Handshake {
                 assert_ne!(theirs.nonce, self.nonce);
 
                 if message.msg_type() == crate::protocol::VERACK {
+                    let chain = crate::chain::Chain::new(self.network);
+                    let download = if chain.tip().work() < self.work_min {
+                        Download::Genesis(self.salt)
+                    } else {
+                        Download::Chain
+                    };
                     let peer = Peer {
                         ping: PingState::Unsent,
-                        sync: SyncState::Due(Download::Chain),
-                        chain: crate::chain::Chain::new(self.network),
+                        sync: SyncState::Due(download),
+                        chain,
                         work_min: self.work_min,
-                        salt: self.salt,
                     };
                     Ok(Step::Done(peer, theirs))
                 } else {
@@ -385,8 +390,6 @@ pub(crate) struct Peer {
     chain: crate::chain::Chain,
     /// The work that `chain` must reach in the sync.
     work_min: crate::pow::Work,
-    /// The salt of a low-work sync, from the handshake.
-    salt: crate::headerssync::Salt,
 }
 
 /// Where our `ping` is. At most one is outstanding.
@@ -419,14 +422,18 @@ enum SyncState {
     Synced,
 }
 
-/// Where the next batch of the sync goes. Only `Chain` puts a batch on the tip of our chain as it
-/// comes. In a low-work sync our chain takes only the headers that the second download releases,
-/// and they go on the tip that the first download read. So no other path may extend the chain
-/// before the sync ends. The boxes keep `Chain` small, because it holds nothing and each download
+/// Where the next batch of the sync goes. Only `Genesis` and `Chain` put a batch on the tip of our
+/// chain as it comes. In a low-work sync our chain takes only the headers that the second download
+/// releases, and they go on the tip that the first download read. So no other path may extend the
+/// chain before the sync ends. The boxes keep `Genesis` and `Chain` small, because each download
 /// holds its commitments and links. A sync above the minimum moves only `Chain`.
 #[derive(Debug)]
 enum Download {
-    /// On the tip of our chain.
+    /// On genesis, the only header of our chain, which is below the minimum work. A full batch
+    /// starts a low-work sync with the salt. Only the handshake makes this, so only the first
+    /// batch of a connection can start a low-work sync.
+    Genesis(crate::headerssync::Salt),
+    /// On the tip of our chain, which has at least the minimum work.
     Chain,
     /// The first download of a low-work sync, on its last header.
     Presync(Box<crate::headerssync::Presync>),
@@ -487,10 +494,10 @@ impl Peer {
     /// payload is checked first, also when no `getheaders` is outstanding. The bytes after the
     /// last transaction count are ignored.
     ///
-    /// A full batch on the tip of a chain below the minimum work starts a low-work sync with the
-    /// salt, and the batch goes to its first download. Else our chain takes a batch on its tip,
-    /// and then a full batch makes the next one due. A batch that is not full ends the sync, an
-    /// empty one too, and the sync must end on a chain with at least the minimum work.
+    /// A full batch on a genesis below the minimum work starts a low-work sync with the salt, and
+    /// the batch goes to its first download. Else our chain takes a batch on its tip, and then a
+    /// full batch makes the next one due. A batch that is not full ends the sync, an empty one
+    /// too, and the sync must end on a chain with at least the minimum work.
     ///
     /// In a low-work sync, each download makes the next batch due, until the second download
     /// reaches the minimum. Our chain takes each header that it releases, with the checks of each
@@ -509,9 +516,10 @@ impl Peer {
         };
         let full = headers.is_full();
         let next = match download {
-            Download::Chain => {
-                receive_on_tip(&mut self.chain, self.work_min, headers, clock, self.salt)?
+            Download::Genesis(salt) => {
+                receive_on_genesis(&mut self.chain, self.work_min, headers, clock, salt)?
             }
+            Download::Chain => receive_on_tip(&mut self.chain, self.work_min, headers, clock)?,
             Download::Presync(presync) => {
                 let step = presync.receive(headers).map_err(PeerError::HeadersSync)?;
                 Some(presync_next(step))
@@ -566,7 +574,6 @@ impl Peer {
             sync,
             chain,
             work_min,
-            salt,
         } = self;
         let (ping, ping_nonce, ping_wake) = ping.tick(now, nonce)?;
         let (sync, get_headers, headers_wake) = sync.tick(now, &chain, work_min)?;
@@ -585,7 +592,6 @@ impl Peer {
             sync,
             chain,
             work_min,
-            salt,
         };
         Ok((peer, outbound, wake))
     }
@@ -651,7 +657,7 @@ impl SyncState {
         match self {
             SyncState::Due(download) => {
                 let after = match &download {
-                    Download::Chain => chain.tip().hash(),
+                    Download::Genesis(_) | Download::Chain => chain.tip().hash(),
                     Download::Presync(presync) => presync.last_hash(),
                     Download::Redownload(redownload) => redownload.last_hash(),
                 };
@@ -682,18 +688,21 @@ impl SyncState {
     }
 }
 
-/// A batch on the tip of `chain`, which must reach `work_min`. Returns where the next batch goes,
-/// or `None` if the sync ended. A saturated work means "at least the highest number", so it
-/// reaches the minimum.
-fn receive_on_tip(
+/// The first batch, on genesis, which is below `work_min`. A full batch starts a low-work sync
+/// with `salt`. Our chain takes a batch that is not full, and it ends the sync, which must reach
+/// `work_min`. Returns where the next batch goes, or `None` if the sync ended. A saturated work
+/// means "at least the highest number", so it reaches the minimum.
+fn receive_on_genesis(
     chain: &mut crate::chain::Chain,
     work_min: crate::pow::Work,
     headers: crate::protocol::Headers,
     clock: u64,
     salt: crate::headerssync::Salt,
 ) -> Result<Option<Download>, PeerError> {
-    let full = headers.is_full();
-    if full && chain.tip().work() < work_min {
+    // Only the handshake makes `Download::Genesis`, and only on a chain below the minimum.
+    assert_eq!(chain.tip().height(), 0);
+    assert!(chain.tip().work() < work_min);
+    if headers.is_full() {
         // The peer can make cheap headers for as long as it wants, so the chain keeps none of
         // them until the chain of the peer shows the minimum.
         let presync = crate::headerssync::Presync::new(chain, work_min, clock, salt);
@@ -701,16 +710,27 @@ fn receive_on_tip(
         return Ok(Some(presync_next(step)));
     }
     chain.extend(headers, clock).map_err(PeerError::Extend)?;
-    if full {
-        // A full batch below the minimum went to the first download above, and the work of a
-        // chain does not go down. So only the last batch of a sync can leave the chain below it.
-        assert!(chain.tip().work() >= work_min);
-        Ok(Some(Download::Chain))
-    } else if chain.tip().work() >= work_min {
+    if chain.tip().work() >= work_min {
         Ok(None)
     } else {
         Err(PeerError::ChainWorkTooLow)
     }
+}
+
+/// A batch on the tip of `chain`, which has at least `work_min`. Returns where the next batch
+/// goes, or `None` if the batch was not full and so ended the sync.
+fn receive_on_tip(
+    chain: &mut crate::chain::Chain,
+    work_min: crate::pow::Work,
+    headers: crate::protocol::Headers,
+    clock: u64,
+) -> Result<Option<Download>, PeerError> {
+    let full = headers.is_full();
+    chain.extend(headers, clock).map_err(PeerError::Extend)?;
+    // Only the handshake on a chain at the minimum and a sync that reached it give
+    // `Download::Chain`, and the work of a chain does not go down.
+    assert!(chain.tip().work() >= work_min);
+    Ok(full.then_some(Download::Chain))
 }
 
 /// Puts each header that the second download of a low-work sync released on `chain`, in order,
