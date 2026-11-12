@@ -798,11 +798,27 @@ pub(crate) mod fuzz {
 
     /// The most headers that one script writes. A full batch costs about 7 ms and 160 KB of chain,
     /// and a few bytes of a script ask for one. So this bounds the cost of a run.
-    const SCRIPT_HEADERS_COUNT_MAX: usize = 3 * HEADERS_FULL_COUNT;
+    const SCRIPT_HEADERS_COUNT_MAX: usize = 5 * HEADERS_FULL_COUNT;
 
-    // The seeds need two full batches and then a batch that is not empty. Below this, those batches
-    // get shorter. A row fails, but a new end in that row hides the lost case.
-    const _: () = assert!(SCRIPT_HEADERS_COUNT_MAX >= 2 * HEADERS_FULL_COUNT + 2);
+    // A low-work sync gets the chain twice. The seeds need two full batches in each download, and
+    // then a batch that is not empty. Below this, those batches get shorter. A row fails, but a new
+    // end in that row hides the lost case.
+    const _: () = assert!(SCRIPT_HEADERS_COUNT_MAX >= 4 * HEADERS_FULL_COUNT + 2);
+
+    // Below the minimum, the second download of a low-work sync is shorter than the first, so it
+    // gets fewer than half of the headers of a script. So it keeps at most its buffer size, and
+    // only its last batch releases headers. `PeerModel::receive_redownload` asserts this. A higher
+    // count must model the release of the other batches.
+    const _: () = assert!(
+        SCRIPT_HEADERS_COUNT_MAX / 2
+            <= crate::chainparams::Network::Regtest.redownload_buffer_size()
+    );
+
+    /// The headers above genesis in one step of the regtest minimum of a script. 16 steps are a full
+    /// batch, so the minimum can be inside a batch or at its end. A short batch has at most 252
+    /// headers or 1,999, so a short batch on genesis can end at 1 or 2 steps.
+    const SCRIPT_WORK_MIN_STEP: usize = HEADERS_FULL_COUNT / 16;
+    const _: () = assert!(SCRIPT_WORK_MIN_STEP * 16 == HEADERS_FULL_COUNT);
 
     /// The `bits` of each header that a script writes. They are above the limit of each other
     /// network, so a script goes past its first header only on regtest. Regtest requires them at
@@ -821,15 +837,17 @@ pub(crate) mod fuzz {
         SCRIPT_HEADER_VERSION == crate::chainparams::Network::Regtest.version_min(usize::MAX)
     );
 
-    /// The time of the header that a script writes as its `written_count`th, from 1. Each time is
-    /// one second above the last, so it is above the times of all the headers below it, and each
-    /// median of those times. This reads no byte of the script, so the layout of the corpus stays.
-    /// Regtest is the only network where a script goes past its first header, so this starts from
-    /// the regtest genesis, and no script ends at `TimeTooOld`. The local clock of a script is the
-    /// last of these times, so no script ends at `TimeTooNew`.
-    fn script_header_time(written_count: usize) -> u32 {
-        assert!((1..=SCRIPT_HEADERS_COUNT_MAX).contains(&written_count));
-        let seconds = u32::try_from(written_count).unwrap_or(u32::MAX);
+    /// The time of a script header at `height`. Each time is one second above the time below it,
+    /// so it is above the times of all the headers below it, and each median of those times. It
+    /// reads only the height, so the second download of a low-work sync gets the headers of the
+    /// first. This reads no byte of the script, so the layout of the corpus stays. Regtest is the
+    /// only network where a script goes past its first header, so this starts from the regtest
+    /// genesis, and no script ends at `TimeTooOld`. A script writes each header on a header that it
+    /// wrote before, so the height is at most the count of headers that it wrote. The local clock
+    /// of a script is the time at that bound, so no script ends at `TimeTooNew`.
+    fn script_header_time(height: usize) -> u32 {
+        assert!((1..=SCRIPT_HEADERS_COUNT_MAX).contains(&height));
+        let seconds = u32::try_from(height).unwrap_or(u32::MAX);
         crate::chainparams::Network::Regtest.genesis().time + seconds
     }
 
@@ -916,7 +934,7 @@ pub(crate) mod fuzz {
         seed!("headers-break-last", "PeerRefused(Extend(NotContinuous))"),
         seed!("headers-break-last-of-full", "PeerRefused(Extend(NotContinuous))"),
         seed!("headers-break-second", "PeerRefused(Extend(NotContinuous))"),
-        seed!("headers-budget-ends", "PeerOpen { height: 6000, synced: true }"),
+        seed!("headers-budget-ends", "PeerOpen { height: 10000, synced: true }"),
         seed!("headers-bytes-after", "PeerOpen { height: 2, synced: true }"),
         seed!("headers-cut", "PeerRefused(Headers(Payload(UnexpectedEnd)))"),
         seed!("headers-cut-after-sync", "PeerRefused(Headers(Payload(UnexpectedEnd)))"),
@@ -951,6 +969,15 @@ pub(crate) mod fuzz {
         seed!("sync-low-work-full-mainnet", "PeerRefused(HeadersSync(ProofOfWork))"),
         seed!("sync-low-work-full-off-tip-signet", "PeerRefused(HeadersSync(NotContinuous))"),
         seed!("sync-low-work-mainnet", "PeerRefused(ChainWorkTooLow)"),
+        seed!("sync-low-work-regtest", "PeerOpen { height: 4002, synced: true }"),
+        seed!("sync-low-work-regtest-at-batch-end", "PeerOpen { height: 2000, synced: true }"),
+        seed!("sync-low-work-regtest-first-short", "PeerRefused(HeadersSync(WorkTooLow))"),
+        seed!("sync-low-work-regtest-second-above-first", "PeerOpen { height: 4002, synced: true }"),
+        seed!("sync-low-work-regtest-second-off-last", "PeerRefused(HeadersSync(NotContinuous))"),
+        seed!("sync-low-work-regtest-second-short", "PeerRefused(HeadersSync(WorkTooLow))"),
+        seed!("sync-low-work-regtest-short-at-min", "PeerOpen { height: 250, synced: true }"),
+        seed!("sync-low-work-regtest-short-below-min", "PeerRefused(ChainWorkTooLow)"),
+        seed!("sync-low-work-regtest-short-ends", "PeerOpen { height: 2125, synced: true }"),
         seed!("sync-low-work-signet", "PeerRefused(ChainWorkTooLow)"),
         seed!("sync-low-work-testnet4", "PeerRefused(ChainWorkTooLow)"),
         seed!("sync-one-header", "PeerOpen { height: 1, synced: true }"),
@@ -981,10 +1008,10 @@ pub(crate) mod fuzz {
     /// doc of each function a second time, and each result must be what they expect. Each error
     /// ends the run, as it ends the connection.
     ///
-    /// A script holds a network byte (`script_network`), a nonce byte for our `version`, messages
-    /// until the handshake ends, and then turns. A turn holds a nonce byte for the tick, a message,
-    /// and a byte for `now_next`. A read after the end of `data` gives 0. A message is a kind byte,
-    /// modulo 7, then:
+    /// A script holds a network byte (`script_network`, and `script_work_min` on regtest), a nonce
+    /// byte for our `version`, messages until the handshake ends, and then turns. A turn holds a
+    /// nonce byte for the tick, a message, and a byte for `now_next`. A read after the end of `data`
+    /// gives 0. A message is a kind byte, modulo 7, then:
     ///
     /// - 0: no message.
     /// - 1: `version`. A byte to add to our nonce in the handshake, so 0 is our nonce, and an `i8`
@@ -993,12 +1020,13 @@ pub(crate) mod fuzz {
     /// - 3: `ping`. A nonce byte.
     /// - 4: `pong` with the nonce of our last `ping`. A byte: 0 keeps the nonce, and each other
     ///   byte `b` flips bit `b % 64`.
-    /// - 5: `headers`, each on the header below it, from our tip. A count byte: 253 is one above a
-    ///   full batch, 254 is one below it, 255 is a full batch, and each other byte is the count.
-    ///   The script stops at `SCRIPT_HEADERS_COUNT_MAX` headers, so a later batch can be shorter.
-    ///   Then a byte `b`: header `b - 1` has a wrong `prev`, 255 is the last header, and 0 changes
-    ///   none. The script mines each header after it picks the `prev`, so proof of work never
-    ///   decides between two ends on regtest. `script_header_time` gives each time.
+    /// - 5: `headers`, each on the header below it, from the last header of the download. A count
+    ///   byte: 253 is one above a full batch, 254 is one below it, 255 is a full batch, and each
+    ///   other byte is the count. The script stops at `SCRIPT_HEADERS_COUNT_MAX` headers, so a
+    ///   later batch can be shorter. Then a byte `b`: header `b - 1` has a wrong `prev`, 255 is the
+    ///   last header, and 0 changes none. The script mines each header after it picks the `prev`,
+    ///   so proof of work never decides between two ends on regtest. `script_header_time` gives
+    ///   each time.
     /// - 6: another message type, which each machine skips.
     ///
     /// Then an `i8` to add to the length of the payload, so bytes come off its end or go after it.
@@ -1013,11 +1041,18 @@ pub(crate) mod fuzz {
             unread: data,
             headers_written_count: 0,
         };
-        let network = script_network(script.byte());
+        let network_byte = script.byte();
+        let network = script_network(network_byte);
+        // Off regtest, the minimum is the minimum of the network. No old seed has a first byte
+        // above 3, so each old seed has zero steps, and keeps its end.
+        let work_min_step_count = match network {
+            crate::chainparams::Network::Regtest => network_byte / 4,
+            _ => 0,
+        };
         let nonce = script.nonce();
         // The layout has no byte for it. A value from the script still shows a fixed timestamp.
         let timestamp = nonce.cast_signed();
-        let work_min = crate::pow::chain_work_min(network);
+        let work_min = script_work_min(network, work_min_step_count);
         let (handshake, outbound) = super::Handshake::start(
             network,
             PEER_ADDRESS,
@@ -1028,7 +1063,10 @@ pub(crate) mod fuzz {
         );
         machines_start_check(&outbound, timestamp, nonce);
         match handshake_run(&mut script, handshake, nonce) {
-            Ok(peer) => peer_run(&mut script, peer, network),
+            Ok(peer) => {
+                let work_min = work_min_model(network, work_min_step_count);
+                peer_run(&mut script, peer, network, work_min)
+            }
             Err(end) => end,
         }
     }
@@ -1041,6 +1079,25 @@ pub(crate) mod fuzz {
             2 => crate::chainparams::Network::Testnet4,
             _ => crate::chainparams::Network::Signet,
         }
+    }
+
+    /// The minimum work of a script on `network`. Off regtest, it is the minimum of the network, and
+    /// `step_count` must be zero. On regtest, it is the work of a chain of script headers
+    /// `step_count` steps of `SCRIPT_WORK_MIN_STEP` above genesis. So a sync can end at it, one
+    /// header below it, or one header above it. With zero steps, it is the work of genesis, so each
+    /// chain has it, and each old seed has it.
+    fn script_work_min(network: crate::chainparams::Network, step_count: u8) -> crate::pow::Work {
+        if network != crate::chainparams::Network::Regtest {
+            assert_eq!(step_count, 0);
+            return crate::pow::chain_work_min(network);
+        }
+        // Regtest genesis has the `bits` of each script header.
+        let Some(header_work) = crate::pow::work(SCRIPT_HEADER_BITS, network) else {
+            panic!("the script bits {SCRIPT_HEADER_BITS:#x} are not a regtest target");
+        };
+        // A step count is a byte over 4, so the loop has at most 63 steps of headers.
+        let headers_count = usize::from(step_count) * SCRIPT_WORK_MIN_STEP;
+        (0..headers_count).fold(header_work, |work, _| work.saturating_add(header_work))
     }
 
     /// Checks each field of `outbound`, our `version`. It claims no services and asks for no
@@ -1086,7 +1143,8 @@ pub(crate) mod fuzz {
         let base = MessageBase {
             our_nonce: nonce,
             ping_nonce: 0,
-            tip: bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]),
+            last: bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]),
+            last_height: 0,
         };
         let mut model = HandshakeModel {
             nonce,
@@ -1126,11 +1184,12 @@ pub(crate) mod fuzz {
         script: &mut Script,
         mut peer: super::Peer,
         network: crate::chainparams::Network,
+        work_min: u128,
     ) -> ScriptEnd {
         let mut now = std::time::Instant::now();
         // The layout has no byte for it, so the layout of the corpus stays.
         let clock = u64::from(script_header_time(SCRIPT_HEADERS_COUNT_MAX));
-        let mut model = PeerModel::new(now, network);
+        let mut model = PeerModel::new(now, network, work_min);
         while !script.unread.is_empty() {
             let unread_count = script.unread.len();
             let nonce = script.nonce();
@@ -1141,10 +1200,12 @@ pub(crate) mod fuzz {
             };
             peer = ticked;
             // The peer skips each `version`, so its base does not matter.
+            let (last, last_height) = model.download_last();
             let base = MessageBase {
                 our_nonce: 0,
                 ping_nonce: model.ping_nonce,
-                tip: model.tip,
+                last,
+                last_height,
             };
             // The wait of the driver can end with no message.
             if let Some(message) = script.message(&base) {
@@ -1187,7 +1248,7 @@ pub(crate) mod fuzz {
                 if expected.get_headers {
                     match outbounds.next() {
                         Some(super::PeerOutbound::GetHeaders(get_headers)) => {
-                            peer_get_headers_check(get_headers, model.tip);
+                            peer_get_headers_check(get_headers, model.download_last().0);
                         }
                         other => panic!("{other:?}, not a getheaders"),
                     }
@@ -1204,11 +1265,11 @@ pub(crate) mod fuzz {
         }
     }
 
-    /// Checks that `get_headers` asks for the headers after `tip`, and for as many as a `headers`
+    /// Checks that `get_headers` asks for the headers after `last`, and for as many as a `headers`
     /// can carry.
     fn peer_get_headers_check(
         get_headers: crate::protocol::GetHeaders,
-        tip: bitcoin_hashes::sha256d::Hash,
+        last: bitcoin_hashes::sha256d::Hash,
     ) {
         let mut encoded = Vec::new();
         get_headers.encode(&mut encoded);
@@ -1216,7 +1277,7 @@ pub(crate) mod fuzz {
         let mut expected = Vec::new();
         expected.extend_from_slice(&crate::protocol::PROTOCOL_VERSION.to_le_bytes());
         expected.push(1);
-        expected.extend_from_slice(tip.as_byte_array());
+        expected.extend_from_slice(last.as_byte_array());
         expected.extend_from_slice(&[0; 32]);
         assert_eq!(encoded, expected);
     }
@@ -1317,7 +1378,10 @@ pub(crate) mod fuzz {
                 2 => (crate::protocol::VERACK, Vec::new()),
                 3 => (crate::protocol::PING, self.nonce().to_le_bytes().to_vec()),
                 4 => (crate::protocol::PONG, self.pong_payload(base.ping_nonce)),
-                5 => (crate::protocol::HEADERS, self.headers_payload(base.tip)),
+                5 => (
+                    crate::protocol::HEADERS,
+                    self.headers_payload(base.last, base.last_height),
+                ),
                 _ => (OTHER, Vec::new()),
             };
             let length = payload
@@ -1347,9 +1411,16 @@ pub(crate) mod fuzz {
             theirs.to_le_bytes().to_vec()
         }
 
-        /// A batch from `tip`. Random bytes never match the hash of the tip, so this builds each
-        /// `prev`. Without this, each batch stops at `NotOnTip`.
-        fn headers_payload(&mut self, tip: bitcoin_hashes::sha256d::Hash) -> Vec<u8> {
+        /// A batch on `last`, at `last_height`. Random bytes never match the hash of the last header,
+        /// so this builds each `prev`. Without this, each batch stops at `NotOnTip`.
+        fn headers_payload(
+            &mut self,
+            last: bitcoin_hashes::sha256d::Hash,
+            last_height: usize,
+        ) -> Vec<u8> {
+            // The last header is one that the script wrote, or genesis. So the heights of the
+            // batch are at most the count of headers that the script wrote.
+            assert!(last_height <= self.headers_written_count);
             let count_asked = match self.byte() {
                 253 => HEADERS_FULL_COUNT + 1,
                 254 => HEADERS_FULL_COUNT - 1,
@@ -1368,9 +1439,10 @@ pub(crate) mod fuzz {
 
             let mut payload = Vec::new();
             crate::serialize::write_compact_size(&mut payload, count);
-            let mut prev = tip;
+            let mut prev = last;
             for index in 0..count {
                 self.headers_written_count += 1;
+                let height = last_height + index + 1;
                 let header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
                     version: SCRIPT_HEADER_VERSION,
                     prev: if Some(index) == wrong_prev_index {
@@ -1379,7 +1451,7 @@ pub(crate) mod fuzz {
                         prev
                     },
                     merkle_root: [0; 32],
-                    time: script_header_time(self.headers_written_count),
+                    time: script_header_time(height),
                     bits: SCRIPT_HEADER_BITS,
                     nonce: 0,
                 });
@@ -1397,8 +1469,9 @@ pub(crate) mod fuzz {
         our_nonce: u64,
         /// The nonce of our last `ping`. A `pong` starts from it, so a `pong` can repeat.
         ping_nonce: u64,
-        /// The hash of the tip of our chain. A batch starts from it.
-        tip: bitcoin_hashes::sha256d::Hash,
+        /// The hash and the height of the last header of the download. A batch starts from it.
+        last: bitcoin_hashes::sha256d::Hash,
+        last_height: usize,
     }
 
     /// `hash` with one bit of its last byte flipped, so a compare of only its start does not see
@@ -1503,6 +1576,36 @@ pub(crate) mod fuzz {
         tip: bitcoin_hashes::sha256d::Hash,
         height: usize,
         network: crate::chainparams::Network,
+        /// The work that the chain must reach in the sync.
+        work_min: u128,
+        download: DownloadModel,
+    }
+
+    /// Where the next batch goes, as `Download` says. A low-work sync starts only on genesis, so
+    /// each of its downloads starts on genesis.
+    enum DownloadModel {
+        /// On the tip of the chain: `Genesis` and `Chain`.
+        Chain,
+        /// The first download of a low-work sync. It holds the hash of each header that it took, in
+        /// order.
+        Presync(Vec<bitcoin_hashes::sha256d::Hash>),
+        /// The second download. It holds the hashes of the first download, and the hash of each
+        /// header that it took, in order.
+        Redownload {
+            presync: Vec<bitcoin_hashes::sha256d::Hash>,
+            buffer: Vec<bitcoin_hashes::sha256d::Hash>,
+        },
+    }
+
+    /// Why the model refuses a script header.
+    #[derive(Debug)]
+    enum HeaderFault {
+        /// The `prev` of the first header is not the hash of the last header.
+        FirstPrev,
+        /// The `prev` of a later header is not the hash of the header below it.
+        Prev,
+        /// Off regtest, no script header has proof of work.
+        ProofOfWork,
     }
 
     /// Where our `getheaders` is.
@@ -1533,8 +1636,13 @@ pub(crate) mod fuzz {
     }
 
     impl PeerModel {
-        /// The model of a new peer on the genesis header of `network`. Its first tick is at `now`.
-        fn new(now: std::time::Instant, network: crate::chainparams::Network) -> PeerModel {
+        /// The model of a new peer on the genesis header of `network`, whose sync must reach
+        /// `work_min`. Its first tick is at `now`.
+        fn new(
+            now: std::time::Instant,
+            network: crate::chainparams::Network,
+            work_min: u128,
+        ) -> PeerModel {
             PeerModel {
                 ping_deadline: now,
                 ping_nonce: 0,
@@ -1543,7 +1651,22 @@ pub(crate) mod fuzz {
                 tip: network.genesis().hash(),
                 height: 0,
                 network,
+                work_min,
+                download: DownloadModel::Chain,
             }
+        }
+
+        /// The hash and the height of the last header of the download. Our `getheaders` goes from
+        /// it, and the next batch goes on it.
+        fn download_last(&self) -> (bitcoin_hashes::sha256d::Hash, usize) {
+            let hashes = match &self.download {
+                DownloadModel::Chain => return (self.tip, self.height),
+                DownloadModel::Presync(hashes) => hashes,
+                DownloadModel::Redownload { buffer, .. } => buffer,
+            };
+            // The chain stays on genesis until the low-work sync ends.
+            assert_eq!(self.height, 0);
+            (hashes.last().copied().unwrap_or(self.tip), hashes.len())
         }
 
         fn is_synced(&self) -> bool {
@@ -1626,64 +1749,137 @@ pub(crate) mod fuzz {
             let GetHeadersModel::Outstanding(_) = self.get_headers else {
                 return Err(super::PeerError::UnsolicitedHeaders);
             };
-            if headers.len() == HEADERS_FULL_COUNT && self.work() < chain_work_min(self.network) {
-                // A low-work sync starts, and its first download checks the batch. Only off
-                // regtest is a chain below the minimum, and there no script header passes. So the
-                // first header gives the error: its `prev` first, then its proof of work.
-                assert_ne!(self.network, crate::chainparams::Network::Regtest);
-                let error = match headers.first() {
-                    Some(first) if first.prev == self.tip => {
-                        crate::headerssync::HeadersSyncError::ProofOfWork
-                    }
-                    _ => crate::headerssync::HeadersSyncError::NotContinuous,
-                };
-                return Err(super::PeerError::HeadersSync(error));
-            }
-
-            let mut tip = self.tip;
-            for (index, header) in headers.iter().enumerate() {
-                if header.prev == tip {
-                    // A script mines each header for regtest, and `SCRIPT_HEADER_BITS` are above
-                    // each other limit. So only regtest takes what a script writes. A new script
-                    // byte that writes other headers fails here, and must change this model.
-                    assert_eq!(header.bits, SCRIPT_HEADER_BITS);
-                    assert_eq!(header.version, SCRIPT_HEADER_VERSION);
-                    assert!(header.hash().as_byte_array()[31] < 0x7f);
-                    if self.network != crate::chainparams::Network::Regtest {
-                        return Err(super::PeerError::Extend(
-                            crate::chain::ExtendError::ProofOfWork,
-                        ));
-                    }
-                    tip = header.hash();
-                } else if index == 0 {
-                    return Err(super::PeerError::Extend(
-                        crate::chain::ExtendError::NotOnTip,
-                    ));
-                } else {
-                    return Err(super::PeerError::Extend(
-                        crate::chain::ExtendError::NotContinuous,
-                    ));
+            let full = headers.len() == HEADERS_FULL_COUNT;
+            // An error ends the run, so it leaves the download as it is.
+            let download = std::mem::replace(&mut self.download, DownloadModel::Chain);
+            let next = match download {
+                DownloadModel::Chain if full && self.work() < self.work_min => {
+                    // Only genesis is below the minimum when a full batch comes: each other chain
+                    // got there in a sync that reached it.
+                    assert_eq!(self.height, 0);
+                    self.receive_presync(Vec::new(), &headers)?
+                }
+                DownloadModel::Chain => self.receive_on_tip(&headers)?,
+                DownloadModel::Presync(hashes) => self.receive_presync(hashes, &headers)?,
+                DownloadModel::Redownload { presync, buffer } => {
+                    self.receive_redownload(presync, buffer, &headers)?
+                }
+            };
+            match next {
+                Some(download) => {
+                    self.download = download;
+                    self.get_headers = GetHeadersModel::Due;
+                    Ok(ReceivedExpected::NoReply)
+                }
+                None => {
+                    self.get_headers = GetHeadersModel::Ended;
+                    Ok(ReceivedExpected::Synced)
                 }
             }
-            // Only an empty batch keeps the tip.
-            assert_eq!(tip == self.tip, headers.is_empty());
-            self.tip = tip;
-            self.height += headers.len();
+        }
+
+        /// The chain takes the batch on its tip. A full batch makes the next one due. Else the sync
+        /// ends, and the chain must have the minimum work.
+        fn receive_on_tip(
+            &mut self,
+            headers: &[crate::block::BlockHeader],
+        ) -> Result<Option<DownloadModel>, super::PeerError> {
+            let hashes = script_hashes(self.network, self.tip, headers).map_err(|fault| {
+                super::PeerError::Extend(match fault {
+                    HeaderFault::FirstPrev => crate::chain::ExtendError::NotOnTip,
+                    HeaderFault::Prev => crate::chain::ExtendError::NotContinuous,
+                    HeaderFault::ProofOfWork => crate::chain::ExtendError::ProofOfWork,
+                })
+            })?;
+            self.extend(&hashes);
             if headers.len() == HEADERS_FULL_COUNT {
-                self.get_headers = GetHeadersModel::Due;
-                Ok(ReceivedExpected::NoReply)
-            } else if self.work() >= chain_work_min(self.network) {
-                self.get_headers = GetHeadersModel::Ended;
-                Ok(ReceivedExpected::Synced)
+                Ok(Some(DownloadModel::Chain))
+            } else if self.work() >= self.work_min {
+                Ok(None)
             } else {
                 Err(super::PeerError::ChainWorkTooLow)
             }
         }
 
-        /// The work of the chain. A person wrote the work of each genesis. Each script header has
-        /// the regtest limit, whose work is 2, and off regtest no script header passes. A height
-        /// has at most 64 bits, so the work fits a `u128` with no overflow.
+        /// The first download takes the batch on its last header, which `hashes` ends with. When
+        /// the work reaches the minimum, the second download is due on genesis. Else a full batch
+        /// makes the next one due, and a batch that is not full fails. The clock of a script is
+        /// far after the time of genesis, so no script header is above the height bound.
+        fn receive_presync(
+            &mut self,
+            mut hashes: Vec<bitcoin_hashes::sha256d::Hash>,
+            headers: &[crate::block::BlockHeader],
+        ) -> Result<Option<DownloadModel>, super::PeerError> {
+            assert_eq!(self.height, 0);
+            let last = hashes.last().copied().unwrap_or(self.tip);
+            hashes.extend(script_hashes(self.network, last, headers).map_err(sync_error)?);
+            if self.work_at(hashes.len()) >= self.work_min {
+                Ok(Some(DownloadModel::Redownload {
+                    presync: hashes,
+                    buffer: Vec::new(),
+                }))
+            } else if headers.len() == HEADERS_FULL_COUNT {
+                Ok(Some(DownloadModel::Presync(hashes)))
+            } else {
+                Err(super::PeerError::HeadersSync(
+                    crate::headerssync::HeadersSyncError::WorkTooLow,
+                ))
+            }
+        }
+
+        /// The second download takes the batch on its last header, which `buffer` ends with. When
+        /// the work reaches the minimum, the chain takes each header of the download, and then the
+        /// sync goes on from the tip after a full batch, or ends. Else a full batch makes the next
+        /// one due, and a batch that is not full fails.
+        fn receive_redownload(
+            &mut self,
+            presync: Vec<bitcoin_hashes::sha256d::Hash>,
+            mut buffer: Vec<bitcoin_hashes::sha256d::Hash>,
+            headers: &[crate::block::BlockHeader],
+        ) -> Result<Option<DownloadModel>, super::PeerError> {
+            assert_eq!(self.height, 0);
+            let last = buffer.last().copied().unwrap_or(self.tip);
+            for hash in script_hashes(self.network, last, headers).map_err(sync_error)? {
+                buffer.push(hash);
+                if self.work_at(buffer.len()) < self.work_min {
+                    // A script writes one header on each header, so the second download gets the
+                    // headers of the first, and each commitment matches. A new script byte that
+                    // writes another chain fails here, and must model the commitments.
+                    assert_eq!(presync.get(buffer.len() - 1), Some(&hash));
+                }
+            }
+            if self.work_at(buffer.len()) >= self.work_min {
+                self.extend(&buffer);
+                Ok((headers.len() == HEADERS_FULL_COUNT).then_some(DownloadModel::Chain))
+            } else if headers.len() == HEADERS_FULL_COUNT {
+                // `SCRIPT_HEADERS_COUNT_MAX` says why the batch releases no header.
+                assert!(buffer.len() <= self.network.redownload_buffer_size());
+                Ok(Some(DownloadModel::Redownload { presync, buffer }))
+            } else {
+                Err(super::PeerError::HeadersSync(
+                    crate::headerssync::HeadersSyncError::WorkTooLow,
+                ))
+            }
+        }
+
+        /// The chain takes the headers with `hashes`, in order, on its tip.
+        fn extend(&mut self, hashes: &[bitcoin_hashes::sha256d::Hash]) {
+            if let Some(last) = hashes.last() {
+                self.tip = *last;
+            }
+            self.height += hashes.len();
+        }
+
+        /// The work of the chain.
         fn work(&self) -> u128 {
+            self.work_at(self.height)
+        }
+
+        /// The work of a chain of script headers to `height`. A person wrote the work of each
+        /// genesis. Each script header has the regtest limit, whose work is 2, and off regtest no
+        /// script header passes. A height has at most 64 bits, so the work fits a `u128` with no
+        /// overflow.
+        fn work_at(&self, height: usize) -> u128 {
             let genesis_work: u128 = match self.network {
                 crate::chainparams::Network::Mainnet | crate::chainparams::Network::Testnet4 => {
                     0x1_0001_0001
@@ -1692,19 +1888,63 @@ pub(crate) mod fuzz {
                 crate::chainparams::Network::Regtest => 2,
             };
             const { assert!(usize::BITS <= 64) };
-            genesis_work + self.height as u128 * 2
+            genesis_work + height as u128 * 2
         }
     }
 
-    /// The lowest work of a chain at the end of a sync. A person wrote each minimum. Each one but
-    /// regtest is above the work of its genesis, and off regtest no script header passes. So off
-    /// regtest each sync that a script ends fails.
-    fn chain_work_min(network: crate::chainparams::Network) -> u128 {
+    /// The hash of each of `headers`, each on the header below it, the first on `last`. A header
+    /// fails at its `prev` first, then at its proof of work. A script mines each header for
+    /// regtest, and `SCRIPT_HEADER_BITS` are above each other limit. So only regtest takes what a
+    /// script writes. A new script byte that writes other headers fails here, and must change this
+    /// model.
+    fn script_hashes(
+        network: crate::chainparams::Network,
+        last: bitcoin_hashes::sha256d::Hash,
+        headers: &[crate::block::BlockHeader],
+    ) -> Result<Vec<bitcoin_hashes::sha256d::Hash>, HeaderFault> {
+        let mut hashes: Vec<bitcoin_hashes::sha256d::Hash> = Vec::with_capacity(headers.len());
+        for header in headers {
+            let below = hashes.last().copied().unwrap_or(last);
+            if header.prev != below {
+                return Err(if hashes.is_empty() {
+                    HeaderFault::FirstPrev
+                } else {
+                    HeaderFault::Prev
+                });
+            }
+            assert_eq!(header.bits, SCRIPT_HEADER_BITS);
+            assert_eq!(header.version, SCRIPT_HEADER_VERSION);
+            assert!(header.hash().as_byte_array()[31] < 0x7f);
+            if network != crate::chainparams::Network::Regtest {
+                return Err(HeaderFault::ProofOfWork);
+            }
+            hashes.push(header.hash());
+        }
+        Ok(hashes)
+    }
+
+    /// The error of a download of a low-work sync that refuses a header. It has no `NotOnTip`: the
+    /// first header goes on the last header of the download.
+    fn sync_error(fault: HeaderFault) -> super::PeerError {
+        super::PeerError::HeadersSync(match fault {
+            HeaderFault::FirstPrev | HeaderFault::Prev => {
+                crate::headerssync::HeadersSyncError::NotContinuous
+            }
+            HeaderFault::ProofOfWork => crate::headerssync::HeadersSyncError::ProofOfWork,
+        })
+    }
+
+    /// The lowest work of a chain at the end of a sync, as `script_work_min` says. A person wrote
+    /// each minimum of a network. Each one is above the work of its genesis, and off regtest no
+    /// script header passes. So off regtest each sync that a script ends fails. On regtest, genesis
+    /// and each script header have a work of 2.
+    fn work_min_model(network: crate::chainparams::Network, step_count: u8) -> u128 {
+        let headers_count = u128::from(step_count) * SCRIPT_WORK_MIN_STEP as u128;
         match network {
             crate::chainparams::Network::Mainnet => 0x1_1287_50f8_2f4c_3661_53a3_a030,
             crate::chainparams::Network::Testnet4 => 0x9a0_fe15_d017_7d08_6304,
             crate::chainparams::Network::Signet => 0xb46_3ea0_a4b8,
-            crate::chainparams::Network::Regtest => 0,
+            crate::chainparams::Network::Regtest => 2 + headers_count * 2,
         }
     }
 
