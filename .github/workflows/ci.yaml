@@ -135,12 +135,14 @@ jobs:
           # Height 0, the regtest genesis and its work.
           genesis=0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206
           tip="tip 0 $genesis $(printf '%064x' 2)"
+          # The wait and the check after it read the same line.
+          has_tip() { docker logs elo | grep --fixed-strings --line-regexp --quiet "$tip"; }
           for _ in $(seq 60); do
-            docker logs elo | grep --fixed-strings --line-regexp --quiet "$tip" && break
+            has_tip && break
             sleep 1
           done
           docker logs elo
-          docker logs elo | grep --fixed-strings --line-regexp --quiet "$tip"
+          has_tip
           docker stop --timeout 10 elo
           test "$(docker inspect elo --format '{{.State.ExitCode}}')" = 143
 
