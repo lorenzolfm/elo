@@ -36,7 +36,7 @@ fn main() -> std::process::ExitCode {
     // The loop has no count bound, because elo keeps its one peer for as long as it runs. Only
     // an end that a new connection cannot fix gets out.
     loop {
-        let end = runtime.block_on(connection(network, peer));
+        let end = runtime.block_on(dial(network, peer));
         eprintln!("elo: {end}");
         if !end.retries() {
             return std::process::ExitCode::FAILURE;
@@ -97,7 +97,7 @@ impl std::fmt::Display for End {
 
 /// Dials `peer`, does the handshake and prints the `version` of the peer. Then syncs, prints
 /// the tip, and runs until the connection ends. Each connection has its own chain, from genesis.
-async fn connection(network: elo::chainparams::Network, peer: std::net::SocketAddr) -> End {
+async fn dial(network: elo::chainparams::Network, peer: std::net::SocketAddr) -> End {
     let (connection, version) = match elo::net::handshake(network, peer).await {
         Ok(handshake) => handshake,
         Err(error) => return End::Handshake(error),
