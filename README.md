@@ -18,10 +18,9 @@ as it wants, so elo gets the chain twice. The first time, it keeps no header,
 only a salted bit of one header in each run of about 600. The second time, each
 of those headers must match its bit, and a header goes on the chain when about
 15,000 headers are above it, or when the chain reaches the minimum. After the
-sync, elo stays connected and answers each `ping`
-with a `pong`. From the handshake on, it pings the peer every 2 min. It drops a
-peer that does not answer a `ping` within 20 min, or a `getheaders`
-within 2 min.
+sync, elo stays connected and answers each `ping` with a `pong`. From the
+handshake on, it pings the peer every 2 min. It drops a peer that does not
+answer a `ping` within 20 min, or a `getheaders` within 2 min.
 
 ```sh
 elo <mainnet|testnet4|signet|regtest> <ip>[:port]    # IPv6 as [::1]:8333

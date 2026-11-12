@@ -816,7 +816,7 @@ pub(crate) mod fuzz {
 
     /// The headers above genesis in one step of the regtest minimum of a script. 16 steps are a full
     /// batch, so the minimum can be inside a batch or at its end. A short batch has at most 252
-    /// headers or 1,999, so a short batch on genesis can end at 1 or 2 steps.
+    /// headers or 1,999, so a short batch on genesis reaches a minimum of at most 2 steps or 15.
     const SCRIPT_WORK_MIN_STEP: usize = HEADERS_FULL_COUNT / 16;
     const _: () = assert!(SCRIPT_WORK_MIN_STEP * 16 == HEADERS_FULL_COUNT);
 
@@ -1096,7 +1096,7 @@ pub(crate) mod fuzz {
                 (crate::pow::chain_work_min(network), 0xb46_3ea0_a4b8)
             }
             crate::chainparams::Network::Regtest => {
-                // A byte over 4, so the loop below has at most 63 steps of headers.
+                // The byte divided by 4, so the loop below has at most 63 steps of headers.
                 let step_count = byte / 4;
                 // Regtest genesis has the `bits` of each script header.
                 let Some(header_work) = crate::pow::work(SCRIPT_HEADER_BITS, network) else {

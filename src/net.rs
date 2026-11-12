@@ -1297,4 +1297,20 @@ mod tests {
             "{result:?}"
         );
     }
+
+    #[test]
+    fn each_salt_word_is_new() {
+        // A fixed salt, or one that reads a word twice, passes each other test, and a peer that
+        // knows the salt can make a chain that matches each bit. 6 random words are all different,
+        // but once in about 2^60 runs.
+        let mut words = Vec::new();
+        for salt in [super::salt().unwrap(), super::salt().unwrap()] {
+            words.extend(salt.keys);
+            words.push(u64::try_from(salt.offset).unwrap());
+        }
+        let mut distinct = words.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), words.len(), "{words:x?}");
+    }
 }
