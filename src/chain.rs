@@ -7,7 +7,7 @@ const MEDIAN_TIME_HEADERS_COUNT_MAX: usize = 11;
 const _: () = assert!(!MEDIAN_TIME_HEADERS_COUNT_MAX.is_multiple_of(2));
 
 /// The most seconds that the time of a header may be after the local clock.
-const TIME_AHEAD_SECONDS_MAX: u64 = 2 * 60 * 60;
+pub(crate) const TIME_AHEAD_SECONDS_MAX: u64 = 2 * 60 * 60;
 
 /// One linear chain of headers, from genesis to the tip. It is never empty, each header has proof
 /// of work, and each header above genesis has the `bits` that the headers below it require and a
@@ -214,6 +214,33 @@ impl Chain {
         }
     }
 
+    /// The network of the chain.
+    // The peer starts a low-work sync in the next pull request.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn network(&self) -> crate::chainparams::Network {
+        self.network
+    }
+
+    /// The `bits` of the tip.
+    // The peer starts a low-work sync in the next pull request.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn tip_bits(&self) -> u32 {
+        self.tip.bits
+    }
+
+    /// The median time of the tip and the 10 headers below it, or of each header if there are
+    /// fewer. A header on the tip needs a time above it.
+    // The peer starts a low-work sync in the next pull request.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn median_time_past(&self) -> u32 {
+        let ancestors = Ancestors {
+            below_tip: &self.below_tip,
+            tip: &self.tip,
+            batch: &[],
+        };
+        ancestors.median_time_past()
+    }
+
     /// The work of the chain is at least the minimum of its network.
     pub(crate) fn reaches_work_min(&self) -> bool {
         crate::pow::reaches_chain_work_min(self.work, self.network)
@@ -298,6 +325,20 @@ impl Tip {
     /// The hash of the last header, in wire order.
     pub(crate) fn hash(&self) -> bitcoin_hashes::sha256d::Hash {
         self.hash
+    }
+
+    /// The height of the last header.
+    // The peer starts a low-work sync in the next pull request.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn height(&self) -> usize {
+        self.height
+    }
+
+    /// The work of the chain.
+    // The peer starts a low-work sync in the next pull request.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(crate) fn work(&self) -> crate::pow::Work {
+        self.work
     }
 }
 
@@ -434,7 +475,7 @@ mod tests {
             Ok(())
         );
 
-        assert_eq!(chain.tip().height, 3);
+        assert_eq!(chain.tip().height(), 3);
         assert_eq!(chain.tip().hash, headers[2].hash());
     }
 

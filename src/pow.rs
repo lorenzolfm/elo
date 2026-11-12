@@ -409,6 +409,55 @@ pub(crate) fn timewarp_time_min(
     }
 }
 
+/// `bits` may follow `bits_below` at `height` on `network`. This reads no time, so a check that
+/// keeps no headers can run it. Inside a period the `bits` stay the same. At the first header of a
+/// period, the target is at most 4 times above or below the target below it, and at most the
+/// limit. A late header of testnet4 has the limit, so on testnet4 and on regtest each `bits` may
+/// follow. `bits_below` must be a target up to the limit.
+///
+/// A peer with little hash power gets more work from a few hard headers than from many easy ones.
+/// So with no bound on each change, a cheap chain can show the minimum work in few headers.
+// The peer starts a low-work sync in the next pull request.
+#[cfg_attr(not(test), expect(dead_code))]
+#[must_use = "a dropped answer lets each `bits` pass"]
+pub(crate) fn permits_bits_change(
+    network: crate::chainparams::Network,
+    height: usize,
+    bits_below: u32,
+    bits: u32,
+) -> bool {
+    match network {
+        crate::chainparams::Network::Testnet4 | crate::chainparams::Network::Regtest => true,
+        crate::chainparams::Network::Mainnet | crate::chainparams::Network::Signet => {
+            if !height.is_multiple_of(PERIOD_HEADERS_COUNT) {
+                return bits == bits_below;
+            }
+            let limit = network.pow_limit();
+            assert!(Target::from_bits(bits_below, limit).is_some());
+            let Some(target) = Target::from_bits(bits, limit) else {
+                return false;
+            };
+            // The longest timespan gives the highest target, and the shortest gives the lowest.
+            // Each one goes through the compact form, as the change of a target does.
+            let bound = |last_time| {
+                retargeted_bits(bits_below, 0, last_time, limit)
+                    .and_then(|bits| Target::from_bits(bits, limit))
+            };
+            let highest = bound(u32::MAX);
+            // The highest change is at most the limit and never zero, so each target up to the
+            // limit has one.
+            assert!(highest.is_some());
+            if highest.is_some_and(|highest| target.0 <= highest.0) {
+                // Only a target below 4 has a lowest change of zero, and then no target is below
+                // it.
+                bound(0).is_none_or(|lowest| lowest.0 <= target.0)
+            } else {
+                false
+            }
+        }
+    }
+}
+
 /// The hash and the work of `header`, if its `bits` are a target in the range of `network` and the
 /// hash is at most that target.
 #[must_use = "a dropped answer lets each header pass"]
@@ -1189,6 +1238,171 @@ mod tests {
                 super::proven(&genesis, network).map(|(hash, _)| hash),
                 Some(genesis.hash()),
                 "{network:?}"
+            );
+        }
+    }
+
+    /// A person wrote each answer from the rule: the bounds of a change are a target over 4 and
+    /// times 4, at most the limit, each one rounded down to its compact form. A script that ran
+    /// the same rule with big numbers gave the same answers.
+    #[test]
+    fn permits_bits_change_bounds_each_change_of_the_target() {
+        let cases = [
+            // Inside a period the `bits` stay the same.
+            (
+                crate::chainparams::Network::Mainnet,
+                32_255,
+                0x1d00_ffff,
+                0x1d00_ffff,
+                true,
+            ),
+            (
+                crate::chainparams::Network::Mainnet,
+                32_255,
+                0x1d00_ffff,
+                0x1d00_d86a,
+                false,
+            ),
+            (
+                crate::chainparams::Network::Mainnet,
+                32_257,
+                0x1d00_ffff,
+                0x1d00_d86a,
+                false,
+            ),
+            (
+                crate::chainparams::Network::Signet,
+                1,
+                0x1e03_77ae,
+                0x1e00_ddeb,
+                false,
+            ),
+            // The first change of the target of mainnet, at height 32256.
+            (
+                crate::chainparams::Network::Mainnet,
+                32_256,
+                0x1d00_ffff,
+                0x1d00_d86a,
+                true,
+            ),
+            // The highest change of the limit is the limit, and the bits above it are no target.
+            (
+                crate::chainparams::Network::Mainnet,
+                32_256,
+                0x1d00_ffff,
+                0x1d01_0000,
+                false,
+            ),
+            // The lowest change: the limit over 4, and one below it.
+            (
+                crate::chainparams::Network::Mainnet,
+                32_256,
+                0x1d00_ffff,
+                0x1c3f_ffc0,
+                true,
+            ),
+            (
+                crate::chainparams::Network::Mainnet,
+                32_256,
+                0x1d00_ffff,
+                0x1c3f_ffbf,
+                false,
+            ),
+            // Below the limit, the highest change is 4 times the target. Over 4, the target loses
+            // its low bits in the compact form.
+            (
+                crate::chainparams::Network::Mainnet,
+                4_032,
+                0x1b04_04cb,
+                0x1b10_132c,
+                true,
+            ),
+            (
+                crate::chainparams::Network::Mainnet,
+                4_032,
+                0x1b04_04cb,
+                0x1b10_132d,
+                false,
+            ),
+            (
+                crate::chainparams::Network::Mainnet,
+                4_032,
+                0x1b04_04cb,
+                0x1b01_0132,
+                true,
+            ),
+            (
+                crate::chainparams::Network::Mainnet,
+                4_032,
+                0x1b04_04cb,
+                0x1b01_0131,
+                false,
+            ),
+            // A target of 3 over 4 is zero, so it has no lowest change.
+            (
+                crate::chainparams::Network::Mainnet,
+                2_016,
+                0x0103_0000,
+                0x0101_0000,
+                true,
+            ),
+            (
+                crate::chainparams::Network::Mainnet,
+                2_016,
+                0x0103_0000,
+                0x010c_0000,
+                true,
+            ),
+            (
+                crate::chainparams::Network::Mainnet,
+                2_016,
+                0x0103_0000,
+                0x010d_0000,
+                false,
+            ),
+            // The lowest change of the signet limit.
+            (
+                crate::chainparams::Network::Signet,
+                2_016,
+                0x1e03_77ae,
+                0x1e00_ddeb,
+                true,
+            ),
+            (
+                crate::chainparams::Network::Signet,
+                2_016,
+                0x1e03_77ae,
+                0x1e00_ddea,
+                false,
+            ),
+            // Testnet4 and regtest permit each change.
+            (
+                crate::chainparams::Network::Testnet4,
+                1,
+                0x1d00_ffff,
+                0x1c00_ffff,
+                true,
+            ),
+            (
+                crate::chainparams::Network::Testnet4,
+                2_016,
+                0x1d00_ffff,
+                0x1b00_ffff,
+                true,
+            ),
+            (
+                crate::chainparams::Network::Regtest,
+                1,
+                0x207f_ffff,
+                0x2000_0001,
+                true,
+            ),
+        ];
+        for (network, height, bits_below, bits, expected) in cases {
+            assert_eq!(
+                super::permits_bits_change(network, height, bits_below, bits),
+                expected,
+                "{network:?} {height} {bits_below:#010x} {bits:#010x}"
             );
         }
     }
