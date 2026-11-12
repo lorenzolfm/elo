@@ -370,11 +370,13 @@ mod tests {
     /// The `bits` of the regtest limit, which each header of a test has unless it says another.
     const LIMIT_BITS: u32 = 0x207f_ffff;
 
-    /// `usize::MAX` modulo the regtest period of 275 is 15, so the first download keeps a bit at
-    /// the heights 15, 290, 565, 840, 1115, 1390, 1665, 1940, 2215 and on. A person wrote these.
+    /// The offset modulo the regtest period of 275 is 15, so the first download keeps a bit at the
+    /// heights 15, 290, 565, 840, 1115, 1390, 1665, 1940, 2215 and on. A person wrote these. The
+    /// offset is above the period, so the sync must take it modulo the period. It is not
+    /// `usize::MAX`, because that modulo 275 is 15 only where `usize` has 64 bits.
     const SALT: super::Salt = super::Salt {
         keys: [1, 2],
-        offset: usize::MAX,
+        offset: 275 * 1_000 + 15,
     };
 
     /// `count` regtest headers with `bits`, each on the header before it, the first on `below`.
