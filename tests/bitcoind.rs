@@ -267,10 +267,14 @@ fn closed_connection_gets_a_new_handshake_and_sync() {
     // elo is the only peer of bitcoind, so it is node 0. The test does not check the reason of
     // the end: bitcoind can close with bytes from elo that it has not read, and then elo sees a
     // reset.
+    let close = std::time::Instant::now();
     bitcoind.cli(&["-named", "disconnectnode", "nodeid=0"]);
     elo.line(&elo.stderr, "elo: ", END_TIMEOUT);
     let version = elo.line(&elo.stdout, "version ", RECONNECT_TIMEOUT);
     assert_eq!(version, "70016");
+    // The close comes after `close`, and the wait of 5 s comes after the close.
+    let wait = close.elapsed();
+    assert!(wait >= std::time::Duration::from_secs(5), "{wait:?}");
     assert_eq!(elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT), tip);
 }
 
