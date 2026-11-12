@@ -160,11 +160,15 @@ impl Commitments {
 
     /// The bit at `index`, if the first download kept that many bits.
     fn get(&self, index: usize) -> Option<bool> {
-        if index >= self.count {
-            return None;
+        // The pair of the assert in `push`. Without it, a word that is not there would read as
+        // "no more bits", and the peer would get the error.
+        assert_eq!(self.words.len(), self.count.div_ceil(WORD_BITS));
+        if index < self.count {
+            let word = self.words.get(index / WORD_BITS)?;
+            Some((word >> (index % WORD_BITS)) & 1 == 1)
+        } else {
+            None
         }
-        let word = self.words.get(index / WORD_BITS)?;
-        Some((word >> (index % WORD_BITS)) & 1 == 1)
     }
 }
 
