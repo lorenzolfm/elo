@@ -103,7 +103,7 @@ impl std::fmt::Display for Signal {
 }
 
 /// The handlers of the signals that stop elo. From their creation, these signals no longer end
-/// the process by their default action, and each one waits here until `next` takes it.
+/// the process by their default action, and each one waits here until `unless` takes it.
 struct Signals {
     terminate: tokio::signal::unix::Signal,
     interrupt: tokio::signal::unix::Signal,

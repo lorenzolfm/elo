@@ -33,10 +33,10 @@ elo <mainnet|testnet4|signet|regtest> <ip>[:port]    # IPv6 as [::1]:8333
 ```
 
 SIGTERM and SIGINT (Ctrl-C) stop elo at any step, also in the wait before a
-dial. It prints `elo: SIGTERM; stop` to stderr and exits with 0. elo exits with
-1 only on a fault of this host: its async runtime or its signal handlers do not
-start, a write to stdout fails, or a read of `/dev/urandom` fails. Bad usage
-exits with 2.
+dial. It prints the signal to stderr, for example `elo: SIGTERM; stop`, and
+exits with 0. elo exits with 1 only on a fault of this host: its async runtime
+or its signal handlers do not start, a write to stdout fails, or a read of
+`/dev/urandom` fails. Bad usage exits with 2.
 
 ## Build
 
