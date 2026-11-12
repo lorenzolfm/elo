@@ -324,7 +324,7 @@ fn next_connection_syncs_from_our_tip_and_a_tip_off_the_chain_of_bitcoind_starts
     assert_eq!(ends.len(), 2, "{ends:?}");
     assert_eq!(
         ends[1],
-        "elo: peer: headers do not start at our tip; dial again in 5 s"
+        "elo: peer: our tip is not on their chain, so our chain starts again from genesis; dial again in 5 s"
     );
 }
 

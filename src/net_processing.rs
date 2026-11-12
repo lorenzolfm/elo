@@ -87,6 +87,9 @@ pub enum PeerError {
     /// Our chain refused their batch, or a header that the second download of a low-work sync
     /// released. The error says why.
     Extend(crate::chain::ExtendError),
+    /// Their batch is on genesis, below our tip, and a chain from genesis takes it. So our tip is
+    /// not on the chain of the peer, and our chain started again from genesis.
+    TipNotOnTheirChain,
     /// A low-work sync refused their batch. The error says why.
     HeadersSync(crate::headerssync::HeadersSyncError),
     /// Their `headers` came when no `getheaders` of ours was outstanding.
@@ -109,6 +112,12 @@ impl std::fmt::Display for PeerError {
             }
             PeerError::Headers(error) => write!(f, "{error}"),
             PeerError::Extend(error) => write!(f, "{error}"),
+            PeerError::TipNotOnTheirChain => {
+                write!(
+                    f,
+                    "our tip is not on their chain, so our chain starts again from genesis"
+                )
+            }
             PeerError::HeadersSync(error) => write!(f, "low-work sync: {error}"),
             PeerError::UnsolicitedHeaders => write!(f, "headers without our getheaders"),
             PeerError::HeadersTimeout => {
@@ -739,8 +748,10 @@ fn receive_on_genesis(
 /// Our locator holds only our tip, so a peer whose chain does not hold our tip sends the headers
 /// after genesis: our tip is on another branch. elo cannot choose a branch yet, so the chain starts
 /// again from genesis, and the next connection syncs the branch of the peer. Without this, each
-/// connection to that peer ends with the same error. Each other batch off our tip is only a bad
-/// batch, so it keeps the chain: one header with any `prev` must not cost a sync from genesis.
+/// connection to that peer ends with the same error. A batch on genesis restarts the chain only if
+/// a chain from genesis takes it, because that is the answer of a peer. Each other batch off our
+/// tip is only a bad batch, so it keeps the chain: a header with no proof of work must not cost a
+/// sync from genesis.
 fn receive_on_tip(
     chain: &mut crate::chain::Chain,
     work_min: crate::pow::Work,
@@ -748,15 +759,19 @@ fn receive_on_tip(
     clock: u64,
 ) -> Result<Option<Download>, PeerError> {
     let full = headers.is_full();
-    // The batch goes into `extend`, so its first `prev` is read before.
-    let genesis = chain.network().genesis().hash();
-    let on_genesis = headers.first().is_some_and(|first| first.prev == genesis);
-    if let Err(error) = chain.extend(headers, clock) {
-        if error == crate::chain::ExtendError::NotOnTip && on_genesis {
-            chain.restart();
-        }
-        return Err(PeerError::Extend(error));
+    let network = chain.network();
+    let genesis = network.genesis().hash();
+    // On genesis, a batch is on our tip, so the chain takes it.
+    let below_our_tip = chain.tip().height() > 0;
+    if below_our_tip && headers.first().is_some_and(|first| first.prev == genesis) {
+        let mut from_genesis = crate::chain::Chain::new(network);
+        from_genesis
+            .extend(headers, clock)
+            .map_err(PeerError::Extend)?;
+        chain.restart();
+        return Err(PeerError::TipNotOnTheirChain);
     }
+    chain.extend(headers, clock).map_err(PeerError::Extend)?;
     // Only the handshake on a chain at the minimum and a sync that reached it give
     // `Download::Chain`, and the work of a chain does not go down.
     assert!(chain.tip().work() >= work_min);
@@ -2732,26 +2747,44 @@ mod tests {
     }
 
     #[test]
-    fn batch_off_our_tip_starts_the_chain_again_from_genesis_and_each_other_refusal_keeps_it() {
-        // A peer whose chain does not hold our tip sends the headers after genesis. A batch on
-        // another header below our tip, and a break in a batch on our tip, are refusals that say
-        // nothing about our tip.
+    fn batch_on_genesis_that_a_chain_takes_starts_the_chain_again_and_each_other_refusal_keeps_it()
+    {
+        // A peer whose chain does not hold our tip sends the headers after genesis. A header on
+        // genesis with no proof of work, a batch on another header below our tip, and a break in a
+        // batch on our tip are refusals that say nothing about our tip.
         let headers = crate::fixtures::headers_on_genesis(3);
         let on_tip = crate::fixtures::headers_on(&headers[2], 1);
+        // A top byte of 0x80 or more is above each regtest target. The top byte of a hash is its
+        // last byte in wire order.
+        let mut unproven = headers[0];
+        unproven.nonce = (0..=u32::MAX)
+            .find(|nonce| {
+                let header = crate::block::BlockHeader {
+                    nonce: *nonce,
+                    ..unproven
+                };
+                header.hash().as_byte_array()[31] >= 0x80
+            })
+            .unwrap();
         for (batch, error, tip) in [
             (
                 crate::fixtures::headers_on_genesis(1),
-                crate::chain::ExtendError::NotOnTip,
+                super::PeerError::TipNotOnTheirChain,
                 tip_after(&[]),
             ),
             (
+                vec![unproven],
+                super::PeerError::Extend(crate::chain::ExtendError::ProofOfWork),
+                tip_after(&headers),
+            ),
+            (
                 headers[1..].to_vec(),
-                crate::chain::ExtendError::NotOnTip,
+                super::PeerError::Extend(crate::chain::ExtendError::NotOnTip),
                 tip_after(&headers),
             ),
             (
                 vec![on_tip[0], on_tip[0]],
-                crate::chain::ExtendError::NotContinuous,
+                super::PeerError::Extend(crate::chain::ExtendError::NotContinuous),
                 tip_after(&headers),
             ),
         ] {
@@ -2765,7 +2798,7 @@ mod tests {
             let refused = asked(&mut chain, std::time::Instant::now(), 7)
                 .receive(&headers_message(&batch), crate::fixtures::CLOCK)
                 .err();
-            assert_eq!(refused, Some(super::PeerError::Extend(error)));
+            assert_eq!(refused, Some(error));
             assert_eq!(chain.tip(), tip, "{error:?}");
         }
     }
