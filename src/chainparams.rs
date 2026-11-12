@@ -106,10 +106,10 @@ impl Network {
         }
     }
 
-    /// The headers for each commitment of a low-work sync. Its first download keeps a bit of one
-    /// header in each run of this many headers, so its memory is about the height of the chain
-    /// over this count, in bits. Regtest has no real chain, so its count only makes its tests
-    /// cheap.
+    /// The headers for each commitment of a low-work sync. Its first download keeps the
+    /// commitment, one bit, of one header in each run of this many headers, so its memory is about
+    /// the height of the chain over this count, in bits. Regtest has no real chain, so its count
+    /// only makes its tests cheap.
     pub(crate) const fn commitment_period(self) -> usize {
         match self {
             Network::Mainnet => 641,

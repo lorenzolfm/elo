@@ -1,9 +1,10 @@
 //! The sync of a chain of headers that starts below the minimum work. A peer can make cheap
 //! headers for as long as it wants, so elo does not keep the headers of such a chain until the
-//! chain shows the work. The first download, `Presync`, checks each header, keeps one bit for each
-//! period of headers, and drops the headers. When the work is enough, the second download,
-//! `Redownload`, gets the same chain again and checks each bit. It gives a header to the chain only
-//! when enough bits above that header passed, or when the work is enough again.
+//! chain shows the work. The first download, `Presync`, checks each header, keeps one commitment,
+//! a salted bit of one header, for each period of headers, and drops the headers. When the work is
+//! enough, the second download, `Redownload`, gets the same chain again and checks each
+//! commitment. It gives a header to the chain only when enough commitments above that header
+//! passed, or when the work is enough again.
 
 /// The most headers for each second of the median time. Each header needs a time above the median
 /// time of the 11 headers below it, so at most 6 headers can have the same time.
@@ -13,12 +14,12 @@ const HEADERS_PER_SECOND_MAX: u64 = 6;
 const WORD_BITS: usize = 64;
 
 /// The random numbers of one sync. The peer must not know them. With them, it could make a second
-/// chain that matches the bits of the first.
+/// chain that matches the commitments of the first.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Salt {
-    /// The keys of the hash that gives each bit.
+    /// The keys of the hash that gives each commitment.
     pub(crate) keys: [u64; 2],
-    /// Picks the heights that have a bit. Each value is legal.
+    /// Picks the heights that have a commitment. Each value is legal.
     pub(crate) offset: usize,
 }
 
@@ -37,8 +38,8 @@ pub(crate) enum HeadersSyncError {
     TooLong,
     /// A batch that is not full ended the chain, and the chain has less work than the minimum.
     WorkTooLow,
-    /// A header of the second download does not have the bit that the first download kept for
-    /// its height, or the first download kept no more bits.
+    /// A header of the second download does not match the commitment that the first download
+    /// kept for its height, or the first download kept no more commitments.
     CommitmentMismatch,
 }
 
@@ -50,7 +51,8 @@ struct Link {
     bits: u32,
 }
 
-/// One bit for each header at a height of `offset` modulo `period`, in the order of the heights.
+/// One commitment, one bit, for each header at a height of `offset` modulo `period`, in the order
+/// of the heights.
 #[derive(Debug)]
 struct Commitments {
     keys: [u64; 2],
@@ -62,7 +64,8 @@ struct Commitments {
     count: usize,
 }
 
-/// The first download of a sync. It keeps no header, only one bit for each period of headers.
+/// The first download of a sync. It keeps no header, only one commitment for each period of
+/// headers.
 #[derive(Debug)]
 pub(crate) struct Presync {
     network: crate::chainparams::Network,
@@ -91,13 +94,14 @@ pub(crate) enum PresyncStep {
     Redownload(Redownload),
 }
 
-/// The second download of a sync. It holds the headers that wait for more bits above them.
+/// The second download of a sync. It holds the headers that wait for more commitments above
+/// them.
 #[derive(Debug)]
 pub(crate) struct Redownload {
     network: crate::chainparams::Network,
     work_min: crate::pow::Work,
     commitments: Commitments,
-    /// The bits that this download read, from the first.
+    /// The commitments that this download read, from the first.
     commitments_read_count: usize,
     /// The headers that the chain did not get yet, in order. The first is on the tip of our
     /// chain, or on the last header that the chain got.
@@ -130,25 +134,25 @@ impl Commitments {
         }
     }
 
-    /// A header at `height` has a bit.
+    /// A header at `height` has a commitment.
     fn is_at(&self, height: usize) -> bool {
         height % self.period == self.offset
     }
 
-    /// The bit of the header with `hash`: its salted hash is even.
-    fn bit(&self, hash: bitcoin_hashes::sha256d::Hash) -> bool {
+    /// The commitment of the header with `hash`: its salted hash is even.
+    fn commitment(&self, hash: bitcoin_hashes::sha256d::Hash) -> bool {
         let [key_0, key_1] = self.keys;
         bitcoin_hashes::siphash24::Hash::hash_to_u64_with_keys(key_0, key_1, hash.as_byte_array())
             .is_multiple_of(2)
     }
 
-    /// Keeps the bit of the header with `hash`, after the others.
+    /// Keeps the commitment of the header with `hash`, after the others.
     fn push(&mut self, hash: bitcoin_hashes::sha256d::Hash) {
         let bit_index = self.count % WORD_BITS;
         if bit_index == 0 {
             self.words.push(0);
         }
-        if self.bit(hash)
+        if self.commitment(hash)
             && let [.., word] = self.words.as_mut_slice()
         {
             // The bits go in order, so this bit and each bit above it are still clear.
@@ -159,10 +163,10 @@ impl Commitments {
         assert_eq!(self.words.len(), self.count.div_ceil(WORD_BITS));
     }
 
-    /// The bit at `index`, if the first download kept that many bits.
+    /// The commitment at `index`, if the first download kept that many.
     fn get(&self, index: usize) -> Option<bool> {
         // The pair of the assert in `push`. Without it, a word that is not there would read as
-        // "no more bits", and the peer would get the error.
+        // "no more commitments", and the peer would get the error.
         assert_eq!(self.words.len(), self.count.div_ceil(WORD_BITS));
         if index < self.count {
             let word = self.words.get(index / WORD_BITS)?;
@@ -178,7 +182,7 @@ impl Presync {
     /// `work_min`. The work of `chain` must be below `work_min`. `clock` is the local clock, in
     /// seconds since the Unix epoch. A chain gets at most `HEADERS_PER_SECOND_MAX` headers in each
     /// second from the median time of the tip, until a header can be `TIME_AHEAD_SECONDS_MAX`
-    /// after the clock. So the clock bounds the height, and the height bounds the bits.
+    /// after the clock. So the clock bounds the height, and the height bounds the commitments.
     pub(crate) fn new(
         chain: &crate::chain::Chain,
         work_min: crate::pow::Work,
@@ -229,8 +233,8 @@ impl Presync {
             }
             if self.commitments.is_at(link.height) {
                 self.commitments.push(link.hash);
-                // At most one bit in each period above the start. With the height bound above,
-                // this is the bound on the memory of the bits.
+                // At most one commitment in each period above the start. With the height bound
+                // above, this is the bound on the memory of the commitments.
                 assert!(
                     self.commitments.count
                         <= (link.height - self.start.height) / self.commitments.period + 1
@@ -250,7 +254,7 @@ impl Presync {
 }
 
 impl Redownload {
-    /// The second download, on the tip of the chain, with the bits of the first.
+    /// The second download, on the tip of the chain, with the commitments of the first.
     fn new(presync: Presync) -> Redownload {
         assert!(presync.work >= presync.work_min);
         Redownload {
@@ -265,15 +269,16 @@ impl Redownload {
     }
 
     /// Checks each of `headers`, in order, on the last header, as the first download did. Each
-    /// header at the height of a bit must have that bit, until the work reaches the minimum. From
-    /// there the chain shows the work, so no header needs a bit, and the peer can also have new
-    /// headers above the first chain. Then the chain gets each header and the sync ends. Else the
-    /// chain gets only the headers with more than `redownload_buffer_size` headers above them, and
-    /// a batch that is not full fails, an empty one too.
+    /// header at the height of a commitment must match it, until the work reaches the minimum.
+    /// From there the chain shows the work, so no header needs a commitment, and the peer can also
+    /// have new headers above the first chain. Then the chain gets each header and the sync ends.
+    /// Else the chain gets only the headers with more than `redownload_buffer_size` headers above
+    /// them, and a batch that is not full fails, an empty one too.
     ///
     /// This download has no height bound of its own. Below the minimum, the first height with a
-    /// bit above the last bit of the first download fails, because no bit is kept for it. So the
-    /// chain ends at most one period above that bit, and the bit is at most at `height_max`.
+    /// commitment above the last commitment of the first download fails, because none is kept for
+    /// it. So the chain ends at most one period above that commitment, which is at most at
+    /// `height_max`.
     pub(crate) fn receive(
         mut self,
         headers: crate::protocol::Headers,
@@ -287,7 +292,7 @@ impl Redownload {
                 // download.
                 if self.commitments.is_at(link.height) {
                     let kept = self.commitments.get(self.commitments_read_count);
-                    if kept != Some(self.commitments.bit(link.hash)) {
+                    if kept != Some(self.commitments.commitment(link.hash)) {
                         return Err(HeadersSyncError::CommitmentMismatch);
                     }
                     self.commitments_read_count += 1;
@@ -370,10 +375,10 @@ mod tests {
     /// The `bits` of the regtest limit, which each header of a test has unless it says another.
     const LIMIT_BITS: u32 = 0x207f_ffff;
 
-    /// The offset modulo the regtest period of 275 is 15, so the first download keeps a bit at the
-    /// heights 15, 290, 565, 840, 1115, 1390, 1665, 1940, 2215 and on. A person wrote these. The
-    /// offset is above the period, so the sync must take it modulo the period. It is not
-    /// `usize::MAX`, because that modulo 275 is 15 only where `usize` has 64 bits.
+    /// The offset modulo the regtest period of 275 is 15, so the first download keeps a commitment
+    /// at the heights 15, 290, 565, 840, 1115, 1390, 1665, 1940, 2215 and on. A person wrote
+    /// these. The offset is above the period, so the sync must take it modulo the period. It is
+    /// not `usize::MAX`, because that modulo 275 is 15 only where `usize` has 64 bits.
     const SALT: super::Salt = super::Salt {
         keys: [1, 2],
         offset: 275 * 1_000 + 15,
@@ -728,8 +733,8 @@ mod tests {
         ));
     }
 
-    /// The other chain has another merkle root from height 1, so it has another bit at some
-    /// height with a bit.
+    /// The other chain has another merkle root from height 1, so at some height with a commitment
+    /// it has another one.
     #[test]
     fn redownload_refuses_another_chain() {
         let headers = chain_on_genesis(2_000, 0);
@@ -742,11 +747,12 @@ mod tests {
         );
     }
 
-    /// The chain reaches the minimum at height 1,115, which has a bit. Each second chain is the
-    /// first one up to 1,114, then another header at 1,115 and more on it. About half of the
-    /// headers at 1,115 have another bit, so 8 chains read a bit there with odds of 255 in 256.
+    /// The chain reaches the minimum at height 1,115, which has a commitment. Each second chain is
+    /// the first one up to 1,114, then another header at 1,115 and more on it. About half of the
+    /// headers at 1,115 have another commitment, so 8 chains read a commitment there with odds of
+    /// 255 in 256.
     #[test]
-    fn redownload_reads_no_bit_from_the_header_that_reaches_the_minimum() {
+    fn redownload_reads_no_commitment_from_the_header_that_reaches_the_minimum() {
         let headers = chain_on_genesis(2_000, 0);
         let work_min = work_on_genesis(&headers[..1_115]);
         for seed in 1..=8 {
@@ -764,12 +770,12 @@ mod tests {
         }
     }
 
-    /// The first chain has harder headers above height 1,940, its last bit. Each has 15 times the
-    /// work of the limit, so the chain reaches the minimum at height 2,000. The second chain is the
-    /// first up to 1,940, then headers at the limit. So at height 2,215 it is still below the
-    /// minimum, and the first download kept no bit for that height.
+    /// The first chain has harder headers above height 1,940, its last commitment. Each has 15
+    /// times the work of the limit, so the chain reaches the minimum at height 2,000. The second
+    /// chain is the first up to 1,940, then headers at the limit. So at height 2,215 it is still
+    /// below the minimum, and the first download kept no commitment for that height.
     #[test]
-    fn redownload_refuses_a_chain_after_the_last_bit() {
+    fn redownload_refuses_a_chain_after_the_last_commitment() {
         let bits_hard = 0x2010_0000;
         let first = chain_on_genesis(1_940, 0);
         let first_hard = mined_on(&first[1_939], 60, bits_hard, 0);
