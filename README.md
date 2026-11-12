@@ -21,9 +21,9 @@ of those headers must match its bit, and a header goes on the chain when about
 sync, elo stays connected and answers each `ping` with a `pong`. From the
 handshake on, it pings the peer every 2 min. It drops a peer that does not
 answer a `ping` within 20 min, or a `getheaders` within 2 min. When a
-connection ends, elo prints the reason to stderr, waits 5 s and dials the peer
-again. Each connection prints the `version` and the `tip` again, and syncs from
-genesis again.
+connection ends, elo prints `elo: <reason>; dial again in 5 s` to stderr, waits
+5 s and dials the peer again. Each connection prints the `version` and the `tip`
+again, and syncs from genesis again.
 
 ```sh
 elo <mainnet|testnet4|signet|regtest> <ip>[:port]    # IPv6 as [::1]:8333

@@ -193,6 +193,8 @@ fn stdout_error_after_the_handshake_exits_with_1() {
     // An end that the peer causes dials again, so the exit comes from stdout.
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.starts_with("elo: stdout: "), "{stderr}");
+    // The line of an end that exits does not say that elo dials again.
+    assert!(!stderr.contains("dial again"), "{stderr}");
 }
 
 #[test]
@@ -255,7 +257,7 @@ fn our_ping_gets_a_pong_from_bitcoind() {
     // and so does a second `pong` for a stray `ping`.
     bitcoind.cli(&["-named", "disconnectnode", "nodeid=0"]);
     let end = elo.line(&elo.stderr, "elo: ", END_TIMEOUT);
-    assert_eq!(end, "the peer closed the connection");
+    assert_eq!(end, "the peer closed the connection; dial again in 5 s");
 }
 
 #[test]

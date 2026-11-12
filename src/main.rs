@@ -37,10 +37,13 @@ fn main() -> std::process::ExitCode {
     // an end that a new connection cannot fix gets out.
     loop {
         let end = runtime.block_on(dial(network, peer));
-        eprintln!("elo: {end}");
+        // The line says if elo dials again, so a reader of stderr does not need the list of
+        // ends that exit.
         if !end.retries() {
+            eprintln!("elo: {end}");
             return std::process::ExitCode::FAILURE;
         }
+        eprintln!("elo: {end}; dial again in {} s", RECONNECT_WAIT.as_secs());
         // No task runs between two connections, so the wait needs no timer of the runtime.
         std::thread::sleep(RECONNECT_WAIT);
     }
