@@ -33,6 +33,8 @@ pub enum HandshakeError {
     Transport(crate::transport::Error),
     /// elo refused the peer: a bad `version`, our own `version`, or too many messages.
     NetProcessing(crate::net_processing::HandshakeError),
+    /// The read of `RANDOM_SOURCE` for the salt of the peer failed.
+    Salt(std::io::Error),
 }
 
 impl std::fmt::Display for HandshakeError {
@@ -57,6 +59,7 @@ impl std::fmt::Display for HandshakeError {
             HandshakeError::Closed => write!(f, "the peer closed the connection"),
             HandshakeError::Transport(error) => write!(f, "frame: {error}"),
             HandshakeError::NetProcessing(error) => write!(f, "peer: {error}"),
+            HandshakeError::Salt(error) => write!(f, "salt: {RANDOM_SOURCE}: {error}"),
         }
     }
 }
@@ -87,8 +90,6 @@ pub enum RunError {
     /// elo refused the peer: a bad `ping`, `pong` or `headers`, or no `pong` or `headers` in
     /// time.
     NetProcessing(crate::net_processing::PeerError),
-    /// The read of `RANDOM_SOURCE` for a salt failed.
-    Random(std::io::Error),
 }
 
 impl std::fmt::Display for RunError {
@@ -101,7 +102,6 @@ impl std::fmt::Display for RunError {
             RunError::Closed => write!(f, "the peer closed the connection"),
             RunError::Transport(error) => write!(f, "frame: {error}"),
             RunError::NetProcessing(error) => write!(f, "peer: {error}"),
-            RunError::Random(error) => write!(f, "{RANDOM_SOURCE}: {error}"),
         }
     }
 }
@@ -210,8 +210,15 @@ async fn handshake_stream_exchange(
 ) -> Result<(Connection, crate::protocol::Version), HandshakeError> {
     let mut socket = Socket::new(stream, network);
     let work_min = crate::pow::chain_work_min(network);
-    let (mut handshake, outbound) =
-        crate::net_processing::Handshake::start(network, peer, timestamp(), nonce(), work_min);
+    let salt = salt().map_err(HandshakeError::Salt)?;
+    let (mut handshake, outbound) = crate::net_processing::Handshake::start(
+        network,
+        peer,
+        timestamp(),
+        nonce(),
+        work_min,
+        salt,
+    );
     socket
         .send_handshake_outbound(&outbound)
         .await
@@ -331,9 +338,8 @@ async fn run_exchange(
     message: &crate::transport::Message,
 ) -> Result<(crate::net_processing::Peer, Option<crate::chain::Tip>), RunError> {
     // The clock is read when the message is there, so a long wait for it does not age the clock.
-    let salt = salt().map_err(RunError::Random)?;
     let (peer, received) = peer
-        .receive(message, clock(), salt)
+        .receive(message, clock())
         .map_err(RunError::NetProcessing)?;
     match received {
         crate::net_processing::Received::NoReply => {

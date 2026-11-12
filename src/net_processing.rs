@@ -158,6 +158,8 @@ pub(crate) struct Handshake {
     network: crate::chainparams::Network,
     /// The work that our chain must reach in the sync.
     work_min: crate::pow::Work,
+    /// The salt of a low-work sync. It must be secret.
+    salt: crate::headerssync::Salt,
     /// The nonce in our `version`.
     nonce: u64,
     /// The messages that came, fewer than `MESSAGE_COUNT_MAX`.
@@ -230,13 +232,16 @@ pub(crate) enum Step {
 
 impl Handshake {
     /// Returns our `version` to `peer` on `network`, to send first. The sync after the handshake
-    /// must end on a chain with at least `work_min`.
+    /// must end on a chain with at least `work_min`. A low-work sync in it reads `salt`, which
+    /// must be new and secret. A connection has at most one low-work sync, because it ends at the
+    /// minimum and the work of a chain does not go down.
     pub(crate) fn start(
         network: crate::chainparams::Network,
         peer: std::net::SocketAddr,
         timestamp: i64,
         nonce: u64,
         work_min: crate::pow::Work,
+        salt: crate::headerssync::Salt,
     ) -> (Handshake, HandshakeOutbound) {
         let ours = our_version(peer, timestamp, nonce);
         let mut payload = Vec::new();
@@ -251,6 +256,7 @@ impl Handshake {
                 state: State::AwaitingVersion,
                 network,
                 work_min,
+                salt,
                 nonce,
                 message_count: 0,
             },
@@ -277,6 +283,7 @@ impl Handshake {
                         state,
                         self.network,
                         self.work_min,
+                        self.salt,
                         self.nonce,
                         message_count,
                     )?;
@@ -287,6 +294,7 @@ impl Handshake {
                         state,
                         self.network,
                         self.work_min,
+                        self.salt,
                         self.nonce,
                         message_count,
                     )?;
@@ -303,6 +311,7 @@ impl Handshake {
                         sync: SyncState::Due(Download::Chain),
                         chain: crate::chain::Chain::new(self.network),
                         work_min: self.work_min,
+                        salt: self.salt,
                     };
                     Ok(Step::Done(peer, theirs))
                 } else {
@@ -311,6 +320,7 @@ impl Handshake {
                         state,
                         self.network,
                         self.work_min,
+                        self.salt,
                         self.nonce,
                         message_count,
                     )?;
@@ -326,6 +336,7 @@ fn next(
     state: State,
     network: crate::chainparams::Network,
     work_min: crate::pow::Work,
+    salt: crate::headerssync::Salt,
     nonce: u64,
     message_count: u32,
 ) -> Result<Handshake, HandshakeError> {
@@ -334,6 +345,7 @@ fn next(
             state,
             network,
             work_min,
+            salt,
             nonce,
             message_count,
         })
@@ -363,8 +375,8 @@ fn receive_version(
 
 /// The peer after the handshake. Only `Handshake` makes one, so no message reaches it before
 /// the handshake is complete. It does no I/O, reads no clock and draws no random number: the
-/// driver gives it each message with the local clock and a salt, and the instant of each tick
-/// with a nonce, and sends what it returns.
+/// driver gives the handshake a salt, each message with the local clock, and the instant of each
+/// tick with a nonce, and sends what it returns.
 #[derive(Debug)]
 pub(crate) struct Peer {
     ping: PingState,
@@ -373,6 +385,8 @@ pub(crate) struct Peer {
     chain: crate::chain::Chain,
     /// The work that `chain` must reach in the sync.
     work_min: crate::pow::Work,
+    /// The salt of a low-work sync, from the handshake.
+    salt: crate::headerssync::Salt,
 }
 
 /// Where our `ping` is. At most one is outstanding.
@@ -424,13 +438,11 @@ impl Peer {
     /// A `ping` gets a `pong` with its nonce. A `pong` must answer our outstanding `ping`, and a
     /// `headers` our outstanding `getheaders`. Each other message is skipped. Each result but an
     /// error returns the peer, because an error ends the connection. `clock` is the local
-    /// clock, in seconds since the Unix epoch. `salt` must be new and secret, and only a low-work
-    /// sync that this message starts reads it. Only a `headers` reads `clock` and `salt`.
+    /// clock, in seconds since the Unix epoch, and only a `headers` reads it.
     pub(crate) fn receive(
         self,
         message: &crate::transport::Message,
         clock: u64,
-        salt: crate::headerssync::Salt,
     ) -> Result<(Peer, Received), PeerError> {
         let msg_type = message.msg_type();
         if msg_type == crate::protocol::PING {
@@ -442,7 +454,7 @@ impl Peer {
             let peer = self.receive_pong(message)?;
             Ok((peer, Received::NoReply))
         } else if msg_type == crate::protocol::HEADERS {
-            self.receive_headers(message, clock, salt)
+            self.receive_headers(message, clock)
         } else {
             Ok((self, Received::NoReply))
         }
@@ -475,8 +487,8 @@ impl Peer {
     /// payload is checked first, also when no `getheaders` is outstanding. The bytes after the
     /// last transaction count are ignored.
     ///
-    /// A full batch on the tip of a chain below the minimum work starts a low-work sync with
-    /// `salt`, and the batch goes to its first download. Else our chain takes a batch on its tip,
+    /// A full batch on the tip of a chain below the minimum work starts a low-work sync with the
+    /// salt, and the batch goes to its first download. Else our chain takes a batch on its tip,
     /// and then a full batch makes the next one due. A batch that is not full ends the sync, an
     /// empty one too, and the sync must end on a chain with at least the minimum work.
     ///
@@ -487,7 +499,6 @@ impl Peer {
         mut self,
         message: &crate::transport::Message,
         clock: u64,
-        salt: crate::headerssync::Salt,
     ) -> Result<(Peer, Received), PeerError> {
         assert_eq!(message.msg_type(), crate::protocol::HEADERS);
 
@@ -499,7 +510,7 @@ impl Peer {
         let full = headers.is_full();
         let next = match download {
             Download::Chain => {
-                receive_on_tip(&mut self.chain, self.work_min, headers, clock, salt)?
+                receive_on_tip(&mut self.chain, self.work_min, headers, clock, self.salt)?
             }
             Download::Presync(presync) => {
                 let step = presync.receive(headers).map_err(PeerError::HeadersSync)?;
@@ -555,6 +566,7 @@ impl Peer {
             sync,
             chain,
             work_min,
+            salt,
         } = self;
         let (ping, ping_nonce, ping_wake) = ping.tick(now, nonce)?;
         let (sync, get_headers, headers_wake) = sync.tick(now, &chain, work_min)?;
@@ -573,6 +585,7 @@ impl Peer {
             sync,
             chain,
             work_min,
+            salt,
         };
         Ok((peer, outbound, wake))
     }
@@ -985,8 +998,14 @@ pub(crate) mod fuzz {
         // The layout has no byte for it. A value from the script still shows a fixed timestamp.
         let timestamp = nonce.cast_signed();
         let work_min = crate::pow::chain_work_min(network);
-        let (handshake, outbound) =
-            super::Handshake::start(network, PEER_ADDRESS, timestamp, nonce, work_min);
+        let (handshake, outbound) = super::Handshake::start(
+            network,
+            PEER_ADDRESS,
+            timestamp,
+            nonce,
+            work_min,
+            SCRIPT_SALT,
+        );
         machines_start_check(&outbound, timestamp, nonce);
         match handshake_run(&mut script, handshake, nonce) {
             Ok(peer) => peer_run(&mut script, peer, network),
@@ -1190,10 +1209,7 @@ pub(crate) mod fuzz {
         message: &crate::transport::Message,
         clock: u64,
     ) -> Result<super::Peer, super::PeerError> {
-        match (
-            peer.receive(message, clock, SCRIPT_SALT),
-            model.receive(message),
-        ) {
+        match (peer.receive(message, clock), model.receive(message)) {
             (Ok((peer, super::Received::NoReply)), Ok(ReceivedExpected::NoReply)) => Ok(peer),
             (Ok((peer, super::Received::Pong(nonce))), Ok(ReceivedExpected::Pong(expected))) => {
                 assert_eq!(nonce, expected);
@@ -1840,7 +1856,7 @@ mod tests {
         work_min: crate::pow::Work,
     ) -> super::Handshake {
         let peer = std::net::SocketAddr::from(([127, 0, 0, 1], 18444));
-        super::Handshake::start(network, peer, 0, 0, work_min).0
+        super::Handshake::start(network, peer, 0, 0, work_min, SALT).0
     }
 
     fn wait(step: Result<super::Step, super::HandshakeError>) -> super::Handshake {
@@ -1912,7 +1928,7 @@ mod tests {
     /// The peer after `asked`, and after an empty `headers` that ended the sync. So only our
     /// `ping` with `nonce` is outstanding.
     fn pinged(now: std::time::Instant, nonce: u64) -> super::Peer {
-        match asked(now, nonce).receive(&headers_message(&[]), crate::fixtures::CLOCK, SALT) {
+        match asked(now, nonce).receive(&headers_message(&[]), crate::fixtures::CLOCK) {
             Ok((peer, super::Received::Synced(_))) => peer,
             other => panic!("{other:?}"),
         }
@@ -1935,7 +1951,7 @@ mod tests {
 
     /// A message that the peer accepts with no reply.
     fn accept(peer: super::Peer, message: &crate::transport::Message) -> super::Peer {
-        match peer.receive(message, crate::fixtures::CLOCK, SALT) {
+        match peer.receive(message, crate::fixtures::CLOCK) {
             Ok((peer, super::Received::NoReply)) => peer,
             other => panic!("{other:?}"),
         }
@@ -2031,6 +2047,7 @@ mod tests {
             0,
             0x0123_4567_89ab_cdef,
             crate::pow::chain_work_min(crate::chainparams::Network::Regtest),
+            SALT,
         );
         let super::HandshakeOutbound::Version(payload) = outbound else {
             panic!("{outbound:?}");
@@ -2067,7 +2084,6 @@ mod tests {
         let outbound = peer().receive(
             &core_message(crate::fixtures::PING_FRAME),
             crate::fixtures::CLOCK,
-            SALT,
         );
         assert!(
             matches!(
@@ -2082,14 +2098,14 @@ mod tests {
     fn their_ping_needs_a_nonce_and_may_have_bytes_after_it() {
         let short = ping_message(|payload| payload.truncate(size_of::<u64>() - 1));
         assert_eq!(
-            peer().receive(&short, crate::fixtures::CLOCK, SALT).err(),
+            peer().receive(&short, crate::fixtures::CLOCK).err(),
             Some(super::PeerError::Ping(
                 crate::serialize::Error::UnexpectedEnd
             ))
         );
 
         let longer = ping_message(|payload| payload.push(0xaa));
-        let outbound = peer().receive(&longer, crate::fixtures::CLOCK, SALT);
+        let outbound = peer().receive(&longer, crate::fixtures::CLOCK);
         assert!(
             matches!(
                 outbound,
@@ -2106,7 +2122,6 @@ mod tests {
         let outbound = pinged(start, 7).receive(
             &core_message(crate::fixtures::PING_FRAME),
             crate::fixtures::CLOCK,
-            SALT,
         );
         let Ok((peer, super::Received::Pong(0x34e9_3229_8920_45d8))) = outbound else {
             panic!("{outbound:?}");
@@ -2207,7 +2222,7 @@ mod tests {
         let short = pong_message(&7_u64.to_le_bytes()[..size_of::<u64>() - 1]);
         for peer in [peer(), pinged(start, 7)] {
             assert_eq!(
-                peer.receive(&short, crate::fixtures::CLOCK, SALT).err(),
+                peer.receive(&short, crate::fixtures::CLOCK).err(),
                 Some(super::PeerError::Pong(
                     crate::serialize::Error::UnexpectedEnd
                 ))
@@ -2226,7 +2241,7 @@ mod tests {
         let answered = accept(pinged(start, 7), &pong(7));
         for peer in [peer(), answered] {
             assert_eq!(
-                peer.receive(&pong(7), crate::fixtures::CLOCK, SALT).err(),
+                peer.receive(&pong(7), crate::fixtures::CLOCK).err(),
                 Some(super::PeerError::UnsolicitedPong)
             );
         }
@@ -2237,7 +2252,7 @@ mod tests {
         let start = std::time::Instant::now();
         assert_eq!(
             pinged(start, 7)
-                .receive(&pong(8), crate::fixtures::CLOCK, SALT)
+                .receive(&pong(8), crate::fixtures::CLOCK)
                 .err(),
             Some(super::PeerError::PongNonce)
         );
@@ -2258,7 +2273,7 @@ mod tests {
             core_message(crate::fixtures::WTXIDRELAY_FRAME),
             core_message(crate::fixtures::SENDADDRV2_FRAME),
         ] {
-            let outbound = peer().receive(&message, crate::fixtures::CLOCK, SALT);
+            let outbound = peer().receive(&message, crate::fixtures::CLOCK);
             assert!(
                 matches!(outbound, Ok((_, super::Received::NoReply))),
                 "{:?}: {outbound:?}",
@@ -2298,8 +2313,7 @@ mod tests {
     fn short_batch_ends_the_sync_at_its_last_header() {
         let start = std::time::Instant::now();
         let headers = crate::fixtures::headers_on_genesis(2);
-        let received =
-            asked(start, 7).receive(&headers_message(&headers), crate::fixtures::CLOCK, SALT);
+        let received = asked(start, 7).receive(&headers_message(&headers), crate::fixtures::CLOCK);
         let Ok((_, super::Received::Synced(tip))) = received else {
             panic!("{received:?}");
         };
@@ -2317,7 +2331,7 @@ mod tests {
             panic!("{ticked:?}");
         };
 
-        let received = peer.receive(&headers_message(&[]), crate::fixtures::CLOCK, SALT);
+        let received = peer.receive(&headers_message(&[]), crate::fixtures::CLOCK);
         let Ok((_, super::Received::Synced(tip))) = received else {
             panic!("{received:?}");
         };
@@ -2335,11 +2349,8 @@ mod tests {
             (crate::chainparams::Network::Signet, false),
             (crate::chainparams::Network::Regtest, true),
         ] {
-            let received = asked_on(network, start, 7).receive(
-                &headers_message(&[]),
-                crate::fixtures::CLOCK,
-                SALT,
-            );
+            let received =
+                asked_on(network, start, 7).receive(&headers_message(&[]), crate::fixtures::CLOCK);
             match received {
                 Ok((_, super::Received::Synced(_))) => assert!(expected, "{network:?}"),
                 Err(super::PeerError::ChainWorkTooLow) => assert!(!expected, "{network:?}"),
@@ -2354,11 +2365,8 @@ mod tests {
         let start = std::time::Instant::now();
         let headers = crate::fixtures::headers_on_genesis(2);
         let work_min = tip_after(&headers).work();
-        let received = asked_with(work_min, start).receive(
-            &headers_message(&headers),
-            crate::fixtures::CLOCK,
-            SALT,
-        );
+        let received =
+            asked_with(work_min, start).receive(&headers_message(&headers), crate::fixtures::CLOCK);
         let Ok((_, super::Received::Synced(tip))) = received else {
             panic!("{received:?}");
         };
@@ -2375,11 +2383,7 @@ mod tests {
         let (peer, get_headers) =
             batch_then_tick(asked_with(work_min, start), &headers[..2_000], start);
         assert_eq!(get_headers, get_headers_after(&headers[1_999]));
-        let received = peer.receive(
-            &headers_message(&headers[2_000..]),
-            crate::fixtures::CLOCK,
-            SALT,
-        );
+        let received = peer.receive(&headers_message(&headers[2_000..]), crate::fixtures::CLOCK);
         let Ok((_, super::Received::Synced(tip))) = received else {
             panic!("{received:?}");
         };
@@ -2416,11 +2420,7 @@ mod tests {
                 "second download, batch {index}"
             );
         }
-        let received = peer.receive(
-            &headers_message(&headers[12_000..]),
-            crate::fixtures::CLOCK,
-            SALT,
-        );
+        let received = peer.receive(&headers_message(&headers[12_000..]), crate::fixtures::CLOCK);
         let Ok((_, super::Received::Synced(tip))) = received else {
             panic!("{received:?}");
         };
@@ -2436,11 +2436,7 @@ mod tests {
         let (peer, _) = batch_then_tick(asked_with(work_min, start), &headers[..2_000], start);
         let (peer, _) = batch_then_tick(peer, &headers[2_000..], start);
         let (peer, _) = batch_then_tick(peer, &headers[..2_000], start);
-        let received = peer.receive(
-            &headers_message(&headers[2_000..]),
-            crate::fixtures::CLOCK,
-            SALT,
-        );
+        let received = peer.receive(&headers_message(&headers[2_000..]), crate::fixtures::CLOCK);
         let Ok((_, super::Received::Synced(tip))) = received else {
             panic!("{received:?}");
         };
@@ -2458,7 +2454,7 @@ mod tests {
             .saturating_add(tip_after(&[]).work());
         let (peer, _) = batch_then_tick(asked_with(work_min, start), &headers, start);
         assert_eq!(
-            peer.receive(&headers_message(&headers), crate::fixtures::CLOCK, SALT)
+            peer.receive(&headers_message(&headers), crate::fixtures::CLOCK)
                 .err(),
             Some(super::PeerError::HeadersSync(
                 crate::headerssync::HeadersSyncError::NotContinuous
@@ -2489,7 +2485,7 @@ mod tests {
         let (peer, _) = batch_then_tick(peer, &second, start);
         let (peer, _) = batch_then_tick(peer, &first, start);
         assert_eq!(
-            peer.receive(&headers_message(&second), crate::fixtures::CLOCK, SALT)
+            peer.receive(&headers_message(&second), crate::fixtures::CLOCK)
                 .err(),
             Some(super::PeerError::Extend(
                 crate::chain::ExtendError::VersionTooLow
@@ -2512,7 +2508,7 @@ mod tests {
         let start = std::time::Instant::now();
         for peer in [peer(), pinged(start, 7)] {
             assert_eq!(
-                peer.receive(&headers_message(&[]), crate::fixtures::CLOCK, SALT)
+                peer.receive(&headers_message(&[]), crate::fixtures::CLOCK)
                     .err(),
                 Some(super::PeerError::UnsolicitedHeaders)
             );
@@ -2525,7 +2521,7 @@ mod tests {
         let start = std::time::Instant::now();
         for peer in [peer(), asked(start, 7)] {
             assert_eq!(
-                peer.receive(&headers_payload_message(&[]), crate::fixtures::CLOCK, SALT)
+                peer.receive(&headers_payload_message(&[]), crate::fixtures::CLOCK)
                     .err(),
                 Some(super::PeerError::Headers(
                     crate::protocol::HeadersError::Payload(crate::serialize::Error::UnexpectedEnd)
@@ -2541,11 +2537,7 @@ mod tests {
         let headers = crate::fixtures::headers_on_genesis(2);
         assert_eq!(
             asked(start, 7)
-                .receive(
-                    &headers_message(&headers[1..]),
-                    crate::fixtures::CLOCK,
-                    SALT
-                )
+                .receive(&headers_message(&headers[1..]), crate::fixtures::CLOCK)
                 .err(),
             Some(super::PeerError::Extend(
                 crate::chain::ExtendError::NotOnTip
@@ -2562,7 +2554,7 @@ mod tests {
         let clock = u64::from(headers[1].time) - 2 * 60 * 60 - 1;
         assert_eq!(
             asked(start, 7)
-                .receive(&headers_message(&headers), clock, SALT)
+                .receive(&headers_message(&headers), clock)
                 .err(),
             Some(super::PeerError::Extend(
                 crate::chain::ExtendError::TimeTooNew
