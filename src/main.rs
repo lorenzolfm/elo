@@ -1,7 +1,7 @@
 //! `elo <network> <ip>[:port]`: dials one peer, does the handshake, and prints the peer's
 //! `version`. Then it syncs the header chain from the peer and prints the tip. It pings the
 //! peer and answers its `ping` messages until the connection ends. Then it waits and dials the
-//! peer again, and the next connection syncs from genesis again.
+//! peer again. The chain stays in memory, so the next connection syncs from its tip.
 
 use std::io::Write;
 
@@ -33,10 +33,13 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    // One chain for each connection, so a connection ends with the headers of the last one, and
+    // a sync gets only the headers after its tip.
+    let mut chain = elo::chain::Chain::new(network);
     // The loop has no count bound, because elo keeps its one peer for as long as it runs. Only
     // an end that a new connection cannot fix gets out.
     loop {
-        let end = runtime.block_on(dial(network, peer));
+        let end = runtime.block_on(dial(peer, &mut chain));
         // The line says if elo dials again, so a reader of stderr does not need the list of
         // ends that exit.
         if !end.retries() {
@@ -98,10 +101,10 @@ impl std::fmt::Display for End {
     }
 }
 
-/// Dials `peer`, does the handshake and prints the `version` of the peer. Then syncs, prints
-/// the tip, and runs until the connection ends. Each connection has its own chain, from genesis.
-async fn dial(network: elo::chainparams::Network, peer: std::net::SocketAddr) -> End {
-    let (connection, version) = match elo::net::handshake(network, peer).await {
+/// Dials `peer`, does the handshake and prints the `version` of the peer. Then syncs `chain`,
+/// prints its tip, and runs until the connection ends.
+async fn dial(peer: std::net::SocketAddr, chain: &mut elo::chain::Chain) -> End {
+    let (connection, version) = match elo::net::handshake(peer, chain).await {
         Ok(handshake) => handshake,
         Err(error) => return End::Handshake(error),
     };
@@ -179,8 +182,8 @@ mod tests {
     }
 
     // The L3 tests also hold a closed connection, which retries, and a stdout fault, which
-    // exits. The stdout row is here too: a retry on that fault does not end the L3 test, so
-    // only its deadline fails it, and this row gives the reason.
+    // exits. The stdout row is here too: a retry on that fault fails the L3 test on its
+    // `dial again` line, but slower, and through a process. This row gives the reason at L0.
     #[test]
     fn a_fault_of_this_host_ends_elo_and_a_failed_connect_retries() {
         for (end, retries) in [

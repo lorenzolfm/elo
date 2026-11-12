@@ -350,6 +350,11 @@ impl Headers {
         self.0.len() == HEADERS_COUNT_MAX
     }
 
+    /// The first header of the payload, if there is one.
+    pub(crate) fn first(&self) -> Option<&crate::block::BlockHeader> {
+        self.0.first()
+    }
+
     /// The headers, in the order of the payload.
     pub(crate) fn into_vec(self) -> Vec<crate::block::BlockHeader> {
         // `decode` refuses a longer batch. `Chain::extend` takes its loop bound from this `Vec`.

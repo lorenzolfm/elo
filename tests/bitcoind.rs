@@ -161,11 +161,9 @@ fn handshake_with_bitcoind_returns_its_version() {
         .enable_time()
         .build()
         .unwrap();
+    let mut chain = elo::chain::Chain::new(elo::chainparams::Network::Regtest);
     let (_connection, version) = runtime
-        .block_on(elo::net::handshake(
-            elo::chainparams::Network::Regtest,
-            bitcoind.peer,
-        ))
+        .block_on(elo::net::handshake(bitcoind.peer, &mut chain))
         .unwrap();
 
     assert_eq!(version.version(), 70016);
@@ -288,6 +286,46 @@ fn closed_connection_gets_a_new_handshake_and_sync() {
     let wait = close.elapsed();
     assert!(wait >= std::time::Duration::from_secs(5), "{wait:?}");
     assert_eq!(elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT), tip);
+}
+
+#[test]
+fn next_connection_syncs_from_our_tip_and_a_tip_off_the_chain_of_bitcoind_starts_again() {
+    let bitcoind = Bitcoind::start();
+    bitcoind.cli(&["generatetodescriptor", "1", "raw(51)"]);
+    let elo = Elo::start(&bitcoind);
+    let first = bitcoind.cli(&["getbestblockhash"]);
+    let tip = elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT);
+    assert!(
+        tip.starts_with(&format!("1 {} ", first.trim_end())),
+        "{tip}"
+    );
+
+    // bitcoind leaves our tip for a branch of 2 blocks. The branch pays another script, because
+    // the same script in the same second makes the block that bitcoind marked invalid. elo is the
+    // only peer of bitcoind, so it is node 0.
+    bitcoind.cli(&["invalidateblock", first.trim_end()]);
+    bitcoind.cli(&["generatetodescriptor", "2", "raw(52)"]);
+    let best = bitcoind.cli(&["getbestblockhash"]);
+    bitcoind.cli(&["-named", "disconnectnode", "nodeid=0"]);
+
+    // The next connection asks for the headers after our tip. bitcoind does not have it on its
+    // chain, so it sends its headers after genesis, and elo refuses them. The connection after it
+    // syncs from genesis, and gets the branch. A connection that synced from genesis at once would
+    // take the branch with no refusal.
+    let tip = elo.line(&elo.stdout, "tip ", RECONNECT_TIMEOUT);
+    let chain_work = bitcoind.cli(&["getblockheader", best.trim_end()]);
+    let chain_work = string_field(&chain_work, "chainwork");
+    assert_eq!(tip, format!("2 {} {chain_work}", best.trim_end()));
+    // The refusal came 5 s before the tip, so its line is there. The test does not check the
+    // reason of the first end: bitcoind can close with bytes from elo that it has not read, and
+    // then elo sees a reset.
+    let ends = elo.stderr_so_far();
+    let ends: Vec<&str> = ends.lines().collect();
+    assert_eq!(ends.len(), 2, "{ends:?}");
+    assert_eq!(
+        ends[1],
+        "elo: peer: our tip is not on their chain, so our chain starts again from genesis; dial again in 5 s"
+    );
 }
 
 #[test]

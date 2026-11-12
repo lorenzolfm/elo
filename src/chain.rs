@@ -16,7 +16,7 @@ pub(crate) const TIME_AHEAD_SECONDS_MAX: u64 = 2 * 60 * 60;
 /// at most `TIME_AHEAD_SECONDS_MAX` after the local clock. Each header has at least the lowest
 /// `version` of its height on the network.
 #[derive(Debug)]
-pub(crate) struct Chain {
+pub struct Chain {
     /// The network of the chain. Its rules bound the target of each header and, on testnet4, the
     /// time of each first header of a period.
     network: crate::chainparams::Network,
@@ -72,7 +72,7 @@ pub(crate) struct Ancestors<'a> {
 
 impl Chain {
     /// A chain with only the genesis header of `network`.
-    pub(crate) fn new(network: crate::chainparams::Network) -> Chain {
+    pub fn new(network: crate::chainparams::Network) -> Chain {
         let genesis = network.genesis();
         // A test holds that each genesis has proof of work, so peer bytes cannot reach this.
         let Some((_, work)) = crate::pow::proven(&genesis, network) else {
@@ -84,6 +84,11 @@ impl Chain {
             tip: genesis,
             work,
         }
+    }
+
+    /// Drops each header above genesis. The network stays, so a chain never changes its network.
+    pub(crate) fn restart(&mut self) {
+        *self = Chain::new(self.network);
     }
 
     /// Puts all of `headers` on the tip, in order, or none of them. An empty batch changes

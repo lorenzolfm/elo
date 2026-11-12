@@ -1,5 +1,6 @@
-//! The driver: it dials one peer and runs the handshake on the socket. Then it syncs the
-//! header chain from the peer, pings the peer, and answers the messages after the handshake.
+//! The driver: it dials one peer and runs the handshake on the socket. Then it syncs our header
+//! chain from the peer, pings the peer, and answers the messages after the handshake. The chain
+//! is not part of the connection, so it outlives each connection.
 
 use crate::serialize::Encode;
 use std::hash::{BuildHasher, Hasher};
@@ -130,20 +131,20 @@ enum ReceiveError {
     Transport(crate::transport::Error),
 }
 
-/// One peer after the handshake: the socket and the machine for its messages. Only
-/// `handshake` makes one, so `sync` cannot start before the handshake is complete.
+/// One peer after the handshake: the socket and the machine for its messages, which borrows our
+/// chain. Only `handshake` makes one, so `sync` cannot start before the handshake is complete.
 #[derive(Debug)]
-pub struct Connection {
+pub struct Connection<'a> {
     socket: Socket,
-    peer: crate::net_processing::Peer,
+    peer: crate::net_processing::Peer<'a>,
 }
 
 /// One peer after the header sync. Only `Connection::sync` makes one, so `run` cannot start
 /// before the sync ends.
 #[derive(Debug)]
-pub struct Synced {
+pub struct Synced<'a> {
     socket: Socket,
-    peer: crate::net_processing::Peer,
+    peer: crate::net_processing::Peer<'a>,
 }
 
 /// The stream to one peer, its network, and the bytes of the frame that is not complete yet.
@@ -173,28 +174,31 @@ enum PartialFrame {
     },
 }
 
-/// Dials `peer` and runs the handshake. Returns the connection for the messages after it, and
-/// their `version`.
+/// Dials `peer` on the network of `chain` and runs the handshake. Returns the connection for the
+/// messages after it, and their `version`. The sync of the connection extends `chain` from its
+/// tip, so the next connection with the same chain does not get those headers again. A chain
+/// below the minimum work starts again from genesis, and so does a chain whose tip the peer does
+/// not have.
 pub async fn handshake(
-    network: crate::chainparams::Network,
     peer: std::net::SocketAddr,
-) -> Result<(Connection, crate::protocol::Version), HandshakeError> {
+    chain: &mut crate::chain::Chain,
+) -> Result<(Connection<'_>, crate::protocol::Version), HandshakeError> {
     let connect = tokio::net::TcpStream::connect(peer);
     let stream = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) => return Err(HandshakeError::Connect(error)),
         Err(_elapsed) => return Err(HandshakeError::ConnectTimeout),
     };
-    handshake_stream(network, peer, stream).await
+    handshake_stream(peer, stream, chain).await
 }
 
 /// The handshake on a connected `stream`, within `HANDSHAKE_TIMEOUT`.
 async fn handshake_stream(
-    network: crate::chainparams::Network,
     peer: std::net::SocketAddr,
     stream: tokio::net::TcpStream,
-) -> Result<(Connection, crate::protocol::Version), HandshakeError> {
-    let exchange = handshake_stream_exchange(network, peer, stream);
+    chain: &mut crate::chain::Chain,
+) -> Result<(Connection<'_>, crate::protocol::Version), HandshakeError> {
+    let exchange = handshake_stream_exchange(peer, stream, chain);
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, exchange).await {
         Ok(result) => result,
         Err(_elapsed) => Err(HandshakeError::HandshakeTimeout),
@@ -204,21 +208,16 @@ async fn handshake_stream(
 /// Sends our `version`, then reads messages until the handshake is done. The handshake
 /// bounds the loop: it refuses a peer that sends too many messages without its `verack`.
 async fn handshake_stream_exchange(
-    network: crate::chainparams::Network,
     peer: std::net::SocketAddr,
     stream: tokio::net::TcpStream,
-) -> Result<(Connection, crate::protocol::Version), HandshakeError> {
+    chain: &mut crate::chain::Chain,
+) -> Result<(Connection<'_>, crate::protocol::Version), HandshakeError> {
+    let network = chain.network();
     let mut socket = Socket::new(stream, network);
     let work_min = crate::pow::chain_work_min(network);
     let salt = salt().map_err(HandshakeError::Salt)?;
-    let (mut handshake, outbound) = crate::net_processing::Handshake::start(
-        network,
-        peer,
-        timestamp(),
-        nonce(),
-        work_min,
-        salt,
-    );
+    let (mut handshake, outbound) =
+        crate::net_processing::Handshake::start(peer, timestamp(), nonce(), chain, work_min, salt);
     socket
         .send_handshake_outbound(&outbound)
         .await
@@ -248,7 +247,7 @@ async fn handshake_stream_exchange(
     }
 }
 
-impl Connection {
+impl<'a> Connection<'a> {
     /// Runs one turn after the other until a batch that is not full ends the sync. Returns the peer
     /// for `Synced::run`, and the tip of our chain. The loop has no count bound, because only the
     /// chain of the peer bounds the sync. A low-work sync gets the chain twice, and the clock
@@ -261,7 +260,7 @@ impl Connection {
     /// then a `pong`, and each write can take up to `SEND_TIMEOUT`. So the connection can end up to
     /// three times `SEND_TIMEOUT` after the tick that sent our `getheaders`, with `SendTimeout`,
     /// `PingTimeout` or `HeadersTimeout`.
-    pub async fn sync(self) -> Result<(Synced, crate::chain::Tip), RunError> {
+    pub async fn sync(self) -> Result<(Synced<'a>, crate::chain::Tip), RunError> {
         let Connection {
             mut socket,
             mut peer,
@@ -275,7 +274,7 @@ impl Connection {
     }
 }
 
-impl Synced {
+impl Synced<'_> {
     /// Runs one turn after the other. The loop has no count bound, because a peer sends
     /// messages for as long as it is connected. It ends only on an error: the peer closes, a
     /// read or a write fails, a write takes longer than `SEND_TIMEOUT`, our `ping` gets no
@@ -310,10 +309,10 @@ impl Synced {
 /// ticks again, and the tip if the message ended the sync. So each wait has a wake from a tick
 /// after the last message: a `pong` moves the wake to the next `ping`, and after a full batch
 /// the next `getheaders` goes at once.
-async fn run_turn(
+async fn run_turn<'a>(
     socket: &mut Socket,
-    peer: crate::net_processing::Peer,
-) -> Result<(crate::net_processing::Peer, Option<crate::chain::Tip>), RunError> {
+    peer: crate::net_processing::Peer<'a>,
+) -> Result<(crate::net_processing::Peer<'a>, Option<crate::chain::Tip>), RunError> {
     // The wake goes to a tokio timer, so `now` comes from the same clock. Then a paused clock
     // in a test also moves the time of the peer.
     let now = tokio::time::Instant::now().into_std();
@@ -332,11 +331,11 @@ async fn run_turn(
 
 /// Gives `message` to `peer`, and sends the `pong` if there is one. Returns the peer for the
 /// next turn, and the tip if the message ended the sync.
-async fn run_exchange(
+async fn run_exchange<'a>(
     socket: &mut Socket,
-    peer: crate::net_processing::Peer,
+    peer: crate::net_processing::Peer<'a>,
     message: &crate::transport::Message,
-) -> Result<(crate::net_processing::Peer, Option<crate::chain::Tip>), RunError> {
+) -> Result<(crate::net_processing::Peer<'a>, Option<crate::chain::Tip>), RunError> {
     // The clock is read when the message is there, so a long wait for it does not age the clock.
     let (peer, received) = peer
         .receive(message, clock())
@@ -781,6 +780,7 @@ mod tests {
 
     #[test]
     fn their_version_gets_our_verack() {
+        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
         // The peer sends Core's frames and keeps what the driver sends after their `version`.
         // A peer may send its `verack` before ours comes, so the bitcoind test cannot see this.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -802,7 +802,7 @@ mod tests {
             verack
         });
 
-        let result = block_on(super::handshake(crate::chainparams::Network::Regtest, peer));
+        let result = block_on(super::handshake(peer, &mut chain));
         let verack = peer_thread.join().unwrap();
         assert_eq!(verack, crate::fixtures::hex(crate::fixtures::VERACK_FRAME));
         assert!(result.is_ok(), "{result:?}");
@@ -810,6 +810,7 @@ mod tests {
 
     #[test]
     fn our_version_has_the_local_clock_in_seconds() {
+        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
         // A peer reads this time only for its offset from its own clock, so the bitcoind test
         // passes with each value. Only this test reads it.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -830,7 +831,7 @@ mod tests {
             i64::try_from(elapsed.as_secs()).unwrap()
         };
         let before = seconds();
-        let _closed = block_on(super::handshake(crate::chainparams::Network::Regtest, peer));
+        let _closed = block_on(super::handshake(peer, &mut chain));
         let after = seconds();
         let message = peer_thread.join().unwrap();
         assert_eq!(message.msg_type(), crate::protocol::VERSION);
@@ -844,6 +845,7 @@ mod tests {
 
     #[test]
     fn silent_peer_is_handshake_timeout() {
+        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
         // The listener never accepts, so no `version` comes. The clock is paused after the
         // connect. When no task can run, tokio moves the clock to the next timer.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -852,8 +854,7 @@ mod tests {
             let stream = tokio::net::TcpStream::connect(peer).await.unwrap();
             tokio::time::pause();
             let start = tokio::time::Instant::now();
-            let result =
-                super::handshake_stream(crate::chainparams::Network::Regtest, peer, stream).await;
+            let result = super::handshake_stream(peer, stream, &mut chain).await;
             (result, start.elapsed())
         });
         assert!(
@@ -866,6 +867,7 @@ mod tests {
 
     #[test]
     fn silent_peer_after_our_getheaders_is_headers_timeout() {
+        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
         // The peer completes the handshake, reads our `ping` and our `getheaders`, and then
         // sends nothing. The clock is paused only after the handshake: while the peer thread
         // answers, the runtime has no task to run, so a paused clock would jump to
@@ -883,10 +885,7 @@ mod tests {
         });
 
         let (result, elapsed) = block_on(async {
-            let (connection, _theirs) =
-                super::handshake(crate::chainparams::Network::Regtest, peer)
-                    .await
-                    .unwrap();
+            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
             tokio::time::pause();
             let start = tokio::time::Instant::now();
             let result = connection.sync().await;
@@ -914,6 +913,7 @@ mod tests {
 
     #[test]
     fn header_far_after_the_local_clock_ends_the_connection() {
+        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
         // The header has the last time of a `u32`. Until the year 2106, that is more than 2 h
         // after the local clock in seconds, so only the driver decides here. A clock in
         // milliseconds would take this header.
@@ -942,10 +942,7 @@ mod tests {
         });
 
         let result = block_on(async {
-            let (connection, _theirs) =
-                super::handshake(crate::chainparams::Network::Regtest, peer)
-                    .await
-                    .unwrap();
+            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
             connection.sync().await
         });
         peer_thread.join().unwrap();
@@ -966,6 +963,7 @@ mod tests {
         // gives the peer the minimum of its network. The empty batch ends the sync on genesis,
         // which has less work than the signet minimum.
         let network = crate::chainparams::Network::Signet;
+        let mut chain = crate::chain::Chain::new(network);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || {
@@ -1003,7 +1001,7 @@ mod tests {
         });
 
         let result = block_on(async {
-            let (connection, _theirs) = super::handshake(network, peer).await.unwrap();
+            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
             connection.sync().await
         });
         let expected = [
@@ -1027,6 +1025,7 @@ mod tests {
 
     #[test]
     fn silent_peer_after_the_sync_is_ping_timeout() {
+        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
         // The peer completes the handshake, ends the sync with an empty `headers`, and then
         // sends nothing. The clock is paused only after the sync: while the peer thread
         // answers, the runtime has no task to run, so a paused clock would jump to the headers
@@ -1045,10 +1044,7 @@ mod tests {
         });
 
         let (error, elapsed) = block_on(async {
-            let (connection, _theirs) =
-                super::handshake(crate::chainparams::Network::Regtest, peer)
-                    .await
-                    .unwrap();
+            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
             let start = tokio::time::Instant::now();
             let (synced, _tip) = connection.sync().await.unwrap();
             tokio::time::pause();
@@ -1076,6 +1072,7 @@ mod tests {
 
     #[test]
     fn pong_moves_the_next_ping_to_ping_interval_after_the_last() {
+        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
         // The peer answers our first `ping` and not the second. So the connection ends at the
         // ping timeout of the second `ping`, which goes at the ping interval after the first.
         // A wake that stays at the timeout of the first `ping` sends the second one late. The
@@ -1102,10 +1099,7 @@ mod tests {
         });
 
         let (error, elapsed) = block_on(async {
-            let (connection, _theirs) =
-                super::handshake(crate::chainparams::Network::Regtest, peer)
-                    .await
-                    .unwrap();
+            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
             let start = tokio::time::Instant::now();
             let (synced, _tip) = connection.sync().await.unwrap();
             tokio::time::pause();
@@ -1134,6 +1128,7 @@ mod tests {
 
     #[test]
     fn peer_that_stops_reading_is_send_timeout() {
+        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
         // The peer completes the handshake and then reads nothing. The test fills the kernel
         // buffers before `run`, so the write of our first `ping` blocks.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1141,10 +1136,7 @@ mod tests {
         let peer_thread = std::thread::spawn(move || accept_handshake(&listener));
 
         let (result, elapsed) = block_on(async {
-            let (connection, _theirs) =
-                super::handshake(crate::chainparams::Network::Regtest, peer)
-                    .await
-                    .unwrap();
+            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
             // The peer thread ends when it has sent its `verack`, so this wait blocks nothing.
             // The stream stays open, and nothing reads it.
             let _stream = peer_thread.join().unwrap();
@@ -1174,6 +1166,7 @@ mod tests {
 
     #[test]
     fn peer_that_closes_inside_a_frame_is_closed() {
+        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
         // The peer reads our `version`, sends all of Core's `version` but its last byte, and
         // closes. A short read must not reach `check_payload`, which panics on it.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1185,7 +1178,7 @@ mod tests {
             stream.write_all(&frame[..frame.len() - 1]).unwrap();
         });
 
-        let result = block_on(super::handshake(crate::chainparams::Network::Regtest, peer));
+        let result = block_on(super::handshake(peer, &mut chain));
         peer_thread.join().unwrap();
         assert!(
             matches!(result, Err(super::HandshakeError::Closed)),
@@ -1236,6 +1229,7 @@ mod tests {
 
     #[test]
     fn ping_in_one_write_with_their_verack_gets_a_pong() {
+        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
         // The peer sends Core's `verack` and `ping` in one write, so both can be in the stream
         // when the handshake ends. `sync` must still read the `ping` and answer it, after our
         // own `ping` and `getheaders`. Then the peer closes.
@@ -1263,10 +1257,7 @@ mod tests {
         });
 
         let result = block_on(async {
-            let (connection, _theirs) =
-                super::handshake(crate::chainparams::Network::Regtest, peer)
-                    .await
-                    .unwrap();
+            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
             connection.sync().await
         });
         let pong = peer_thread.join().unwrap();
@@ -1282,12 +1273,13 @@ mod tests {
 
     #[test]
     fn refused_connect_is_connect_error() {
+        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
         // Nothing listens on a port that was bound and then freed.
         let peer = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap();
-        let result = block_on(super::handshake(crate::chainparams::Network::Regtest, peer));
+        let result = block_on(super::handshake(peer, &mut chain));
         assert!(
             matches!(
                 result,
