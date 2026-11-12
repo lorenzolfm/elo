@@ -1064,7 +1064,7 @@ pub(crate) mod fuzz {
         machines_start_check(&outbound, timestamp, nonce);
         match handshake_run(&mut script, handshake, nonce) {
             Ok(peer) => {
-                let work_min = work_min_model(network, work_min_step_count);
+                let work_min = script_work_min_model(network, work_min_step_count);
                 peer_run(&mut script, peer, network, work_min)
             }
             Err(end) => end,
@@ -1144,7 +1144,7 @@ pub(crate) mod fuzz {
         let base = MessageBase {
             our_nonce: nonce,
             ping_nonce: 0,
-            last: bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]),
+            last_hash: bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]),
             last_height: 0,
         };
         let mut model = HandshakeModel {
@@ -1201,11 +1201,11 @@ pub(crate) mod fuzz {
             };
             peer = ticked;
             // The peer skips each `version`, so its base does not matter.
-            let (last, last_height) = model.download_last();
+            let (last_hash, last_height) = model.download_last();
             let base = MessageBase {
                 our_nonce: 0,
                 ping_nonce: model.ping_nonce,
-                last,
+                last_hash,
                 last_height,
             };
             // The wait of the driver can end with no message.
@@ -1266,11 +1266,11 @@ pub(crate) mod fuzz {
         }
     }
 
-    /// Checks that `get_headers` asks for the headers after `last`, and for as many as a `headers`
-    /// can carry.
+    /// Checks that `get_headers` asks for the headers after `last_hash`, and for as many as a
+    /// `headers` can carry.
     fn peer_get_headers_check(
         get_headers: crate::protocol::GetHeaders,
-        last: bitcoin_hashes::sha256d::Hash,
+        last_hash: bitcoin_hashes::sha256d::Hash,
     ) {
         let mut encoded = Vec::new();
         get_headers.encode(&mut encoded);
@@ -1278,7 +1278,7 @@ pub(crate) mod fuzz {
         let mut expected = Vec::new();
         expected.extend_from_slice(&crate::protocol::PROTOCOL_VERSION.to_le_bytes());
         expected.push(1);
-        expected.extend_from_slice(last.as_byte_array());
+        expected.extend_from_slice(last_hash.as_byte_array());
         expected.extend_from_slice(&[0; 32]);
         assert_eq!(encoded, expected);
     }
@@ -1381,7 +1381,7 @@ pub(crate) mod fuzz {
                 4 => (crate::protocol::PONG, self.pong_payload(base.ping_nonce)),
                 5 => (
                     crate::protocol::HEADERS,
-                    self.headers_payload(base.last, base.last_height),
+                    self.headers_payload(base.last_hash, base.last_height),
                 ),
                 _ => (OTHER, Vec::new()),
             };
@@ -1412,11 +1412,11 @@ pub(crate) mod fuzz {
             theirs.to_le_bytes().to_vec()
         }
 
-        /// A batch on `last`, at `last_height`. Random bytes never match the hash of the last header,
-        /// so this builds each `prev`. Without this, each batch stops at `NotOnTip`.
+        /// A batch on `last_hash`, at `last_height`. Random bytes never match the hash of the last
+        /// header, so this builds each `prev`. Without this, each batch stops at `NotOnTip`.
         fn headers_payload(
             &mut self,
-            last: bitcoin_hashes::sha256d::Hash,
+            last_hash: bitcoin_hashes::sha256d::Hash,
             last_height: usize,
         ) -> Vec<u8> {
             // The last header is one that the script wrote, or genesis. So the heights of the
@@ -1440,7 +1440,7 @@ pub(crate) mod fuzz {
 
             let mut payload = Vec::new();
             crate::serialize::write_compact_size(&mut payload, count);
-            let mut prev = last;
+            let mut prev = last_hash;
             for index in 0..count {
                 self.headers_written_count += 1;
                 let height = last_height + index + 1;
@@ -1471,7 +1471,7 @@ pub(crate) mod fuzz {
         /// The nonce of our last `ping`. A `pong` starts from it, so a `pong` can repeat.
         ping_nonce: u64,
         /// The hash and the height of the last header of the download. A batch starts from it.
-        last: bitcoin_hashes::sha256d::Hash,
+        last_hash: bitcoin_hashes::sha256d::Hash,
         last_height: usize,
     }
 
@@ -1813,8 +1813,8 @@ pub(crate) mod fuzz {
             headers: &[crate::block::BlockHeader],
         ) -> Result<Option<DownloadModel>, super::PeerError> {
             assert_eq!(self.height, 0);
-            let last = hashes.last().copied().unwrap_or(self.tip);
-            hashes.extend(script_hashes(self.network, last, headers).map_err(sync_error)?);
+            let last_hash = hashes.last().copied().unwrap_or(self.tip);
+            hashes.extend(script_hashes(self.network, last_hash, headers).map_err(sync_error)?);
             if self.work_at(hashes.len()) >= self.work_min {
                 Ok(Some(DownloadModel::Redownload {
                     presync: hashes,
@@ -1840,8 +1840,8 @@ pub(crate) mod fuzz {
             headers: &[crate::block::BlockHeader],
         ) -> Result<Option<DownloadModel>, super::PeerError> {
             assert_eq!(self.height, 0);
-            let last = buffer.last().copied().unwrap_or(self.tip);
-            for hash in script_hashes(self.network, last, headers).map_err(sync_error)? {
+            let last_hash = buffer.last().copied().unwrap_or(self.tip);
+            for hash in script_hashes(self.network, last_hash, headers).map_err(sync_error)? {
                 buffer.push(hash);
                 if self.work_at(buffer.len()) < self.work_min {
                     // A script writes one header on each header, so the second download gets the
@@ -1866,10 +1866,10 @@ pub(crate) mod fuzz {
 
         /// The chain takes the headers with `hashes`, in order, on its tip.
         fn extend(&mut self, hashes: &[bitcoin_hashes::sha256d::Hash]) {
-            if let Some(last) = hashes.last() {
+            if let Some(last_hash) = hashes.last() {
                 // Only an empty batch keeps the tip.
-                assert_ne!(*last, self.tip);
-                self.tip = *last;
+                assert_ne!(*last_hash, self.tip);
+                self.tip = *last_hash;
             }
             self.height += hashes.len();
         }
@@ -1896,19 +1896,19 @@ pub(crate) mod fuzz {
         }
     }
 
-    /// The hash of each of `headers`, each on the header below it, the first on `last`. A header
-    /// fails at its `prev` first, then at its proof of work. A script mines each header for
+    /// The hash of each of `headers`, each on the header below it, the first on `last_hash`. A
+    /// header fails at its `prev` first, then at its proof of work. A script mines each header for
     /// regtest, and `SCRIPT_HEADER_BITS` are above each other limit. So only regtest takes what a
     /// script writes. A new script byte that writes other headers fails here, and must change this
     /// model.
     fn script_hashes(
         network: crate::chainparams::Network,
-        last: bitcoin_hashes::sha256d::Hash,
+        last_hash: bitcoin_hashes::sha256d::Hash,
         headers: &[crate::block::BlockHeader],
     ) -> Result<Vec<bitcoin_hashes::sha256d::Hash>, HeaderFault> {
         let mut hashes: Vec<bitcoin_hashes::sha256d::Hash> = Vec::with_capacity(headers.len());
         for header in headers {
-            let below = hashes.last().copied().unwrap_or(last);
+            let below = hashes.last().copied().unwrap_or(last_hash);
             if header.prev != below {
                 return Err(if hashes.is_empty() {
                     HeaderFault::FirstPrev
@@ -1942,17 +1942,20 @@ pub(crate) mod fuzz {
     /// each minimum of a network. Each one is above the work of its genesis, and off regtest no
     /// script header passes. So off regtest each sync that a script ends fails. On regtest, genesis
     /// and each script header have a work of 2.
-    fn work_min_model(network: crate::chainparams::Network, step_count: u8) -> u128 {
+    fn script_work_min_model(network: crate::chainparams::Network, step_count: u8) -> u128 {
         assert!(step_count <= u8::MAX / 4);
         if network != crate::chainparams::Network::Regtest {
             assert_eq!(step_count, 0);
         }
-        let headers_count = u128::from(step_count) * SCRIPT_WORK_MIN_STEP as u128;
         match network {
             crate::chainparams::Network::Mainnet => 0x1_1287_50f8_2f4c_3661_53a3_a030,
             crate::chainparams::Network::Testnet4 => 0x9a0_fe15_d017_7d08_6304,
             crate::chainparams::Network::Signet => 0xb46_3ea0_a4b8,
-            crate::chainparams::Network::Regtest => 2 + headers_count * 2,
+            crate::chainparams::Network::Regtest => {
+                const { assert!(usize::BITS <= 64) };
+                let headers_count = u128::from(step_count) * SCRIPT_WORK_MIN_STEP as u128;
+                2 + headers_count * 2
+            }
         }
     }
 
