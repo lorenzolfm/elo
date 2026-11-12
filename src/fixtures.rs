@@ -22,6 +22,14 @@
 
 use crate::serialize::{Decode, Encode};
 
+/// The real header of mainnet at height 1. Its hash is
+/// `00000000839a8e6886ab5951d76f411475428afc90947ee320161bbf18eb6048`.
+pub(crate) const MAINNET_BLOCK_1: &str = concat!(
+    "010000006fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000",
+    "982051fd1e4ba744bbbe680e1fee14677ba1a3c3540bf7b1cdb606e857233e0e",
+    "61bc6649ffff001d01e36299",
+);
+
 /// Real headers of mainnet at the first change of its target: the first header of the period, the
 /// last header of the period, and the next header.
 pub(crate) const MAINNET_RETARGET: [&str; 3] = [
