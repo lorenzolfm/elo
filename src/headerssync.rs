@@ -148,11 +148,12 @@ impl Commitments {
         if bit_index == 0 {
             self.words.push(0);
         }
-        if self.bit(hash) {
-            // The bit is clear, so the add is an or.
-            if let [.., word] = self.words.as_mut_slice() {
-                *word += 1 << bit_index;
-            }
+        if self.bit(hash)
+            && let [.., word] = self.words.as_mut_slice()
+        {
+            // The bits go in order, so this bit and each bit above it are still clear.
+            assert_eq!(*word >> bit_index, 0);
+            *word |= 1 << bit_index;
         }
         self.count += 1;
         assert_eq!(self.words.len(), self.count.div_ceil(WORD_BITS));
