@@ -1752,7 +1752,7 @@ pub(crate) mod fuzz {
                 return Err(super::PeerError::UnsolicitedHeaders);
             };
             let full = headers.len() == HEADERS_FULL_COUNT;
-            // An error ends the run, so it leaves the download as it is.
+            // An error ends the run, so the download does not need to come back.
             let download = std::mem::replace(&mut self.download, DownloadModel::Chain);
             let next = match download {
                 DownloadModel::Chain if full && self.work() < self.work_min => {
