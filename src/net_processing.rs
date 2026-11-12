@@ -261,7 +261,9 @@ impl<'a> Handshake<'a> {
         if chain.tip().work() < work_min {
             *chain = crate::chain::Chain::new(chain.network());
         }
-        assert!(chain.tip().height() == 0 || chain.tip().work() >= work_min);
+        if chain.tip().work() < work_min {
+            assert_eq!(chain.tip().height(), 0);
+        }
 
         (
             Handshake {
