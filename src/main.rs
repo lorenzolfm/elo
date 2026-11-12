@@ -1,14 +1,15 @@
 //! `elo <network> <ip>[:port]`: dials one peer, does the handshake, and prints the peer's
 //! `version`. Then it syncs the header chain from the peer and prints the tip. It pings the
 //! peer and answers its `ping` messages until the connection ends. Then it waits and dials the
-//! peer again. The chain stays in memory, so the next connection syncs from its tip.
+//! peer again. The chain stays in memory, so the next connection syncs from its tip. SIGTERM
+//! and SIGINT stop it at any of these steps.
 
 use std::io::Write;
 
 const USAGE: &str = "usage: elo <mainnet|testnet4|signet|regtest> <ip>[:port]";
 
-/// The exit code for bad usage. Every other exit is 1, because only a fault of this host ends
-/// elo. elo has no signal handler, so Ctrl-C ends it with the shell's signal code.
+/// The exit code for bad usage. A stop by a signal exits with 0. Every other exit is 1,
+/// because only a fault of this host ends elo.
 const EXIT_USAGE: u8 = 2;
 
 /// How long elo waits after a connection ends before it dials the peer again. So a peer that is
@@ -22,6 +23,7 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::from(EXIT_USAGE);
     };
 
+    // The I/O driver also gives the signals.
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -33,13 +35,36 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    runtime.block_on(run(network, peer))
+}
+
+/// Dials `peer` again after each end that retries, until a signal or an end that exits.
+async fn run(
+    network: elo::chainparams::Network,
+    peer: std::net::SocketAddr,
+) -> std::process::ExitCode {
+    // Before the first dial, so a signal from here on stops elo. As PID 1 in a container, a
+    // process with no handler never sees a SIGTERM: the kernel drops it, and the stop ends in
+    // SIGKILL after its timeout.
+    let mut signals = match Signals::new() {
+        Ok(signals) => signals,
+        Err(error) => {
+            eprintln!("elo: signals: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     // One chain for each connection, so a connection ends with the headers of the last one, and
     // a sync gets only the headers after its tip.
     let mut chain = elo::chain::Chain::new(network);
     // The loop has no count bound, because elo keeps its one peer for as long as it runs. Only
-    // an end that a new connection cannot fix gets out.
+    // a signal or an end that a new connection cannot fix gets out.
     loop {
-        let end = runtime.block_on(dial(peer, &mut chain));
+        // The drop of the connection closes its socket. elo keeps nothing on disk, so the stop
+        // has nothing else to finish.
+        let end = match signals.unless(dial(peer, &mut chain)).await {
+            Ok(end) => end,
+            Err(signal) => return stopped(signal),
+        };
         // The line says if elo dials again, so a reader of stderr does not need the list of
         // ends that exit.
         if !end.retries() {
@@ -47,8 +72,79 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
         eprintln!("elo: {end}; dial again in {} s", RECONNECT_WAIT.as_secs());
-        // No task runs between two connections, so the wait needs no timer of the runtime.
-        std::thread::sleep(RECONNECT_WAIT);
+        if let Err(signal) = signals.unless(tokio::time::sleep(RECONNECT_WAIT)).await {
+            return stopped(signal);
+        }
+    }
+}
+
+/// Prints the `signal` that stops elo, and gives the exit code of a stop: 0.
+fn stopped(signal: Signal) -> std::process::ExitCode {
+    eprintln!("elo: {signal}; stop");
+    std::process::ExitCode::SUCCESS
+}
+
+/// A signal that stops elo.
+#[derive(Clone, Copy, Debug)]
+enum Signal {
+    /// SIGTERM, from a container stop or a service manager.
+    Terminate,
+    /// SIGINT, from Ctrl-C.
+    Interrupt,
+}
+
+impl std::fmt::Display for Signal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Signal::Terminate => write!(f, "SIGTERM"),
+            Signal::Interrupt => write!(f, "SIGINT"),
+        }
+    }
+}
+
+/// The handlers of the signals that stop elo. From their creation, these signals no longer end
+/// the process by their default action, and each one waits here until `next` takes it.
+struct Signals {
+    terminate: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    fn new() -> Result<Self, std::io::Error> {
+        Ok(Self {
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+        })
+    }
+
+    /// The output of `work`, or the first signal if it comes before. A signal wins over an
+    /// output that is ready at the same time. A signal that came before this call is taken
+    /// first.
+    async fn unless<T>(&mut self, work: impl Future<Output = T>) -> Result<T, Signal> {
+        let mut work = std::pin::pin!(work);
+        std::future::poll_fn(|context| {
+            if let std::task::Poll::Ready(signal) = self.poll_next(context) {
+                return std::task::Poll::Ready(Err(signal));
+            }
+            work.as_mut().poll(context).map(Ok)
+        })
+        .await
+    }
+
+    /// The next signal. When none came, each handler holds the waker of `context`.
+    fn poll_next(&mut self, context: &mut std::task::Context<'_>) -> std::task::Poll<Signal> {
+        for (handler, signal) in [
+            (&mut self.terminate, Signal::Terminate),
+            (&mut self.interrupt, Signal::Interrupt),
+        ] {
+            if let std::task::Poll::Ready(received) = handler.poll_recv(context) {
+                // `None` is a runtime with no signal driver, which cannot be while this runs in
+                // it. As a signal, it would come again at each poll: a stop that no one sent.
+                assert!(received.is_some(), "{signal}: the signal driver ended");
+                return std::task::Poll::Ready(signal);
+            }
+        }
+        std::task::Poll::Pending
     }
 }
 
