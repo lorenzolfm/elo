@@ -82,11 +82,9 @@ pub(crate) struct Branch {
     /// The highest bound on the time of a header that a check of the branch read. The local clock
     /// can go back, so a later batch can have a lower bound.
     time_max: u64,
-    /// The work of the chain that the branch is below. With `work_min`, it sets the margin, so the
-    /// next batch asserts that both are the same.
+    /// The work of the chain that the branch is below. With the minimum work of the sync, it sets
+    /// the margin, so the next batch asserts that it is the same.
     chain_work: crate::pow::Work,
-    /// The minimum work of the sync that the branch is in.
-    work_min: crate::pow::Work,
 }
 
 /// Why `Chain::extend`, `Chain::extend_on_locator` or `Chain::extend_branch` refused a batch.
@@ -197,18 +195,14 @@ impl Chain {
             .find(|height| self.header_at(*height).hash() == first_prev)
             .ok_or(ExtendError::NotOnLocator)?;
         assert!(fork_height < tip_height);
-        self.extend_above(
-            self.branch_on_fork(fork_height, work_min),
-            headers,
-            clock,
-            work_min,
-        )
+        self.extend_above(self.branch_on_fork(fork_height), headers, clock, work_min)
     }
 
     /// Puts `headers`, an answer to a `getheaders` with only the last header of `branch`, on that
     /// header, with `extend_above`. `branch` is what this chain returned for the batch before, and
     /// the chain did not change since. An empty batch ends the branch. The branch has at most the
-    /// work of the chain, so the chain stays. The chain must have at least `work_min`.
+    /// work of the chain, so the chain stays. The chain must have at least `work_min`, the minimum
+    /// of the batch before.
     pub(crate) fn extend_branch(
         &mut self,
         branch: Branch,
@@ -225,11 +219,10 @@ impl Chain {
             Some(first) => assert_eq!(first.prev, fork_hash),
             None => assert_eq!(branch.last_hash, fork_hash),
         }
-        // The chain above the fork did not change either, and the sync has the same minimum. So
-        // the margin is the margin that the batch before passed, and `extend_above` can assert
-        // that a branch with a header of its own passes it again.
+        // The chain above the fork did not change either, and the minimum is the same. So the
+        // margin is the margin that the batch before passed, and `extend_above` can assert that a
+        // branch with a header of its own passes it again.
         assert_eq!(self.work, branch.chain_work);
-        assert_eq!(work_min, branch.work_min);
         if headers.first().is_none() {
             return Ok(Extended::Kept);
         }
@@ -274,9 +267,8 @@ impl Chain {
             // The next batch goes on it, and `check` reads it from the headers.
             last_hash: _,
             time_max: branch_time_max,
-            // `extend_branch` asserts both against the chain and the sync.
+            // `extend_branch` asserts it against the chain.
             chain_work: _,
-            work_min: _,
         } = branch;
         let tip_height = self.below_tip.len();
         // Each caller returns on an empty batch, and a branch is below the tip.
@@ -308,7 +300,7 @@ impl Chain {
             }
             if batch.is_empty() {
                 if full {
-                    let branch = self.branch_on_fork(fork_height, work_min);
+                    let branch = self.branch_on_fork(fork_height);
                     return Ok(Extended::Branch(branch));
                 }
                 return Ok(Extended::Kept);
@@ -338,7 +330,7 @@ impl Chain {
                 }
                 // After headers of the chain, a full batch had less of the branch than that.
                 if full {
-                    let branch = self.branch_on_fork(fork_height, work_min);
+                    let branch = self.branch_on_fork(fork_height);
                     return Ok(Extended::Branch(branch));
                 }
                 return Ok(Extended::Kept);
@@ -358,7 +350,6 @@ impl Chain {
                     last_hash,
                     time_max,
                     chain_work: self.work,
-                    work_min,
                 }));
             }
             return Ok(Extended::Kept);
@@ -409,9 +400,8 @@ impl Chain {
         behind_tip.min(self.work.minus(work_min))
     }
 
-    /// A branch with no header on the fork at `fork_height`, a header of the chain below the tip,
-    /// in a sync with the minimum `work_min`.
-    fn branch_on_fork(&self, fork_height: usize, work_min: crate::pow::Work) -> Branch {
+    /// A branch with no header on the fork at `fork_height`, a header of the chain below the tip.
+    fn branch_on_fork(&self, fork_height: usize) -> Branch {
         assert!(fork_height < self.below_tip.len());
         Branch {
             fork_height,
@@ -420,7 +410,6 @@ impl Chain {
             last_hash: self.header_at(fork_height).hash(),
             time_max: 0,
             chain_work: self.work,
-            work_min,
         }
     }
 
@@ -1836,7 +1825,7 @@ mod tests {
         let headers = crate::fixtures::headers_on_genesis(2_001);
         let mut chain = regtest_with(&headers);
         let branch = branch_of(on_locator(&mut chain, &headers[..2_000]));
-        assert_eq!(branch, chain.branch_on_fork(2_000, crate::pow::Work::ZERO));
+        assert_eq!(branch, chain.branch_on_fork(2_000));
         assert_eq!(
             on_branch(&mut chain, branch, &headers[2_000..]),
             Ok(super::Extended::Taken)
@@ -2002,7 +1991,7 @@ mod tests {
         let mut chain = regtest_with(&headers);
         let batch = [&headers[..1_000], &branch[..1_000]].concat();
         let pending = branch_of(on_locator(&mut chain, &batch));
-        assert_eq!(pending, chain.branch_on_fork(1_000, crate::pow::Work::ZERO));
+        assert_eq!(pending, chain.branch_on_fork(1_000));
         assert_eq!(
             on_branch(&mut chain, pending, &branch),
             Ok(super::Extended::Taken)
