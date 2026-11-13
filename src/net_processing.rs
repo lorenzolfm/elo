@@ -98,6 +98,10 @@ pub enum PeerError {
     HeadersTimeout,
     /// Their sync ended, and our chain has less work than the minimum.
     ChainWorkTooLow,
+    /// Their `wtxidrelay` came after the handshake.
+    LateWtxidRelay,
+    /// Their `sendaddrv2` came after the handshake.
+    LateSendAddrV2,
 }
 
 impl std::fmt::Display for PeerError {
@@ -126,6 +130,8 @@ impl std::fmt::Display for PeerError {
             PeerError::ChainWorkTooLow => {
                 write!(f, "the sync ended on a chain below the minimum work")
             }
+            PeerError::LateWtxidRelay => write!(f, "wtxidrelay after verack"),
+            PeerError::LateSendAddrV2 => write!(f, "sendaddrv2 after verack"),
         }
     }
 }
@@ -467,9 +473,11 @@ enum Download {
 
 impl<'a> Peer<'a> {
     /// A `ping` gets a `pong` with its nonce. A `pong` must answer our outstanding `ping`, and a
-    /// `headers` our outstanding `getheaders`. Each other message is skipped. Each result but an
-    /// error returns the peer, because an error ends the connection. `clock` is the local
-    /// clock, in seconds since the Unix epoch, and only a `headers` reads it.
+    /// `headers` our outstanding `getheaders`. A `wtxidrelay` or a `sendaddrv2` is an error: a
+    /// peer turns these features on only between its `version` and its `verack`. Each other
+    /// message is skipped. Each result but an error returns the peer, because an error ends the
+    /// connection. `clock` is the local clock, in seconds since the Unix epoch, and only a
+    /// `headers` reads it.
     pub(crate) fn receive(
         self,
         message: &crate::transport::Message,
@@ -486,6 +494,10 @@ impl<'a> Peer<'a> {
             Ok((peer, Received::NoReply))
         } else if msg_type == crate::protocol::HEADERS {
             self.receive_headers(message, clock)
+        } else if msg_type == crate::protocol::WTXIDRELAY {
+            Err(PeerError::LateWtxidRelay)
+        } else if msg_type == crate::protocol::SENDADDRV2 {
+            Err(PeerError::LateSendAddrV2)
         } else {
             Ok((self, Received::NoReply))
         }
@@ -992,6 +1004,7 @@ pub(crate) mod fuzz {
         seed!("network-mainnet", "PeerRefused(Extend(ProofOfWork))"),
         seed!("network-signet", "PeerRefused(Extend(ProofOfWork))"),
         seed!("network-testnet4", "PeerRefused(Extend(ProofOfWork))"),
+        seed!("peer-refuses-wtxidrelay", "PeerRefused(LateWtxidRelay)"),
         seed!("peer-skips-version-and-verack", "PeerOpen { height: 0, synced: false }"),
         seed!("ping-bytes-after", "PeerOpen { height: 0, synced: false }"),
         seed!("ping-cut", "PeerRefused(Ping(UnexpectedEnd))"),
@@ -1072,7 +1085,8 @@ pub(crate) mod fuzz {
     ///   last header, and 0 changes none. The script mines each header after it picks the `prev`,
     ///   so proof of work never decides between two ends on regtest. `script_header_time` gives
     ///   each time.
-    /// - 6: another message type, which each machine skips.
+    /// - 6: `wtxidrelay`, which the handshake skips and the peer refuses. No kind is `sendaddrv2`,
+    ///   because the peer refuses it the same way.
     ///
     /// Then an `i8` to add to the length of the payload, so bytes come off its end or go after it.
     /// The committed corpus uses this layout, so a change to the layout must rewrite the corpus.
@@ -1425,10 +1439,6 @@ pub(crate) mod fuzz {
 
         /// The next message, as the driver reads it.
         fn message(&mut self, base: &MessageBase) -> Option<crate::transport::Message> {
-            /// A type that no machine reads.
-            const OTHER: crate::protocol::MessageType =
-                crate::protocol::MessageType::new(*b"wtxidrelay\0\0").expect("a printable name");
-
             let (msg_type, mut payload) = match self.byte() % 7 {
                 0 => return None,
                 1 => (
@@ -1442,7 +1452,7 @@ pub(crate) mod fuzz {
                     crate::protocol::HEADERS,
                     self.headers_payload(base.last_hash, base.last_height),
                 ),
-                _ => (OTHER, Vec::new()),
+                _ => (crate::protocol::WTXIDRELAY, Vec::new()),
             };
             let length = payload
                 .len()
@@ -1794,6 +1804,10 @@ pub(crate) mod fuzz {
                 }
             } else if msg_type == crate::protocol::HEADERS {
                 self.receive_headers(message)
+            } else if msg_type == crate::protocol::WTXIDRELAY {
+                Err(super::PeerError::LateWtxidRelay)
+            } else if msg_type == crate::protocol::SENDADDRV2 {
+                Err(super::PeerError::LateSendAddrV2)
             } else {
                 Ok(ReceivedExpected::NoReply)
             }
@@ -2625,8 +2639,6 @@ mod tests {
             core_message(crate::fixtures::GETHEADERS_FRAME),
             version_message(Vec::clear),
             core_message(crate::fixtures::VERACK_FRAME),
-            core_message(crate::fixtures::WTXIDRELAY_FRAME),
-            core_message(crate::fixtures::SENDADDRV2_FRAME),
         ] {
             let outbound = peer(&mut chain).receive(&message, crate::fixtures::CLOCK);
             assert!(
@@ -2634,6 +2646,27 @@ mod tests {
                 "{:?}: {outbound:?}",
                 message.msg_type()
             );
+        }
+    }
+
+    #[test]
+    fn peer_refuses_wtxidrelay_and_sendaddrv2() {
+        // The handshake skips both. Only after their `verack` is each one an error.
+        let mut chain = regtest();
+        for (frame, error) in [
+            (
+                crate::fixtures::WTXIDRELAY_FRAME,
+                super::PeerError::LateWtxidRelay,
+            ),
+            (
+                crate::fixtures::SENDADDRV2_FRAME,
+                super::PeerError::LateSendAddrV2,
+            ),
+        ] {
+            let refused = peer(&mut chain)
+                .receive(&core_message(frame), crate::fixtures::CLOCK)
+                .err();
+            assert_eq!(refused, Some(error));
         }
     }
 
