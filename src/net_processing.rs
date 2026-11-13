@@ -889,15 +889,17 @@ fn receive_announcement(
     headers: crate::protocol::Headers,
     clock: u64,
 ) -> Result<Option<Download>, PeerError> {
-    if headers
-        .first()
-        .is_some_and(|first| first.prev != chain.tip().hash())
-    {
-        // A sync ends only on a chain with at least the minimum work, so the next batch goes on
-        // our tip.
-        return Ok(Some(Download::Chain));
+    let Some(first) = headers.first() else {
+        // An empty announcement changes nothing.
+        return extend_tip(chain, work_min, headers, clock);
+    };
+    if first.prev == chain.tip().hash() {
+        return extend_tip(chain, work_min, headers, clock);
     }
-    extend_tip(chain, work_min, headers, clock)
+    // A sync ends only on a chain with at least the minimum work, so the next batch goes on our
+    // tip.
+    assert!(chain.tip().work() >= work_min);
+    Ok(Some(Download::Chain))
 }
 
 /// A batch on the tip of `chain`, which has at least `work_min`: an answer of `Download::Chain`, or
