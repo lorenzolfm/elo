@@ -577,9 +577,13 @@ impl<'a> Peer<'a> {
         let headers = crate::protocol::Headers::decode(&mut input).map_err(PeerError::Headers)?;
         let download = match self.sync {
             SyncState::Outstanding { download, .. } => download,
-            // A sync ends only on a chain with at least the minimum work, so the batch goes on our
-            // tip.
-            SyncState::Synced => Download::Chain,
+            SyncState::Synced => {
+                // The end of the sync made our `sendheaders` due. `tick` holds the same.
+                assert!(!matches!(self.send_headers, SendHeadersState::Unsent));
+                // A sync ends only on a chain with at least the minimum work, so the batch goes on
+                // our tip.
+                Download::Chain
+            }
             SyncState::Due(_) => return Err(PeerError::UnsolicitedHeaders),
         };
         let full = headers.is_full();
