@@ -6,6 +6,7 @@ mod block;
 pub mod chain;
 pub mod chainparams;
 mod headerssync;
+pub mod logging;
 pub mod net;
 mod net_processing;
 mod pow;

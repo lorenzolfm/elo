@@ -1484,13 +1484,8 @@ pub(crate) mod fuzz {
             }
             (Ok((peer, super::Received::Synced(tip))), Ok(ReceivedExpected::Synced)) => {
                 assert_eq!(tip.hash(), model.tip);
-                let height = format!("{} ", model.height);
-                assert!(tip.to_string().starts_with(&height), "{tip}, not {height}");
-                let work_text = format!(" {:064x}", model.work());
-                assert!(
-                    tip.to_string().ends_with(&work_text),
-                    "{tip}, not {work_text}"
-                );
+                assert_eq!(tip.height(), model.height);
+                assert_eq!(tip.work().to_string(), format!("{:064x}", model.work()));
                 Ok(peer)
             }
             (Err(error), Err(expected)) => {

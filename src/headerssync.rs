@@ -16,12 +16,19 @@ const WORD_BITS: usize = 64;
 /// The random numbers of one sync. The peer must not know them. With them, it could make a second
 /// chain that matches the commitments of the first. It is not `Copy`, so a sync moves it, and no
 /// other sync can read it.
-#[derive(Debug)]
 pub(crate) struct Salt {
     /// The keys of the hash that gives each commitment.
     pub(crate) keys: [u64; 2],
     /// Picks the heights that have a commitment. Each value is legal.
     pub(crate) offset: usize,
+}
+
+/// Writes no field. The `Debug` of a type that holds the salt, such as `net::Connection`, can go
+/// into a line of the log, and the salt must stay secret.
+impl std::fmt::Debug for Salt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Salt").finish_non_exhaustive()
+    }
 }
 
 /// Why a sync refused a batch. Each one ends the sync.
@@ -54,7 +61,6 @@ struct Link {
 
 /// One commitment, one bit, for each header above `start_height` at a height of `offset` modulo
 /// `period`, in the order of the heights.
-#[derive(Debug)]
 struct Commitments {
     keys: [u64; 2],
     period: usize,
@@ -122,6 +128,18 @@ pub(crate) enum RedownloadStep {
     More(Box<Redownload>, Vec<crate::block::BlockHeader>),
     /// The work reached the minimum, so the chain gets each header that is left. The sync ends.
     Done(Vec<crate::block::BlockHeader>),
+}
+
+/// Writes only the fields that are not secret. The keys and the offset come from the salt, and the
+/// commitments come from the keys.
+impl std::fmt::Debug for Commitments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Commitments")
+            .field("period", &self.period)
+            .field("start_height", &self.start_height)
+            .field("count", &self.count)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Commitments {
@@ -489,6 +507,16 @@ mod tests {
 
     fn batch(headers: &[crate::block::BlockHeader]) -> crate::protocol::Headers {
         crate::fixtures::headers_batch(headers)
+    }
+
+    #[test]
+    fn the_debug_of_the_salt_and_of_its_commitments_writes_no_secret() {
+        assert_eq!(format!("{SALT:?}"), "Salt { .. }");
+        let commitments = super::Commitments::new(crate::chainparams::Network::Regtest, SALT, 7);
+        assert_eq!(
+            format!("{commitments:?}"),
+            "Commitments { period: 275, start_height: 7, count: 0, .. }"
+        );
     }
 
     #[test]

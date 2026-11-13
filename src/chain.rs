@@ -321,6 +321,18 @@ impl Tip {
         self.hash
     }
 
+    /// The hash of the last header in display order, the reverse of the wire order, as 64 hex
+    /// digits.
+    pub(crate) fn hash_display(&self) -> impl std::fmt::Display {
+        let hash = self.hash;
+        std::fmt::from_fn(move |f| {
+            hash.as_byte_array()
+                .iter()
+                .rev()
+                .try_for_each(|byte| write!(f, "{byte:02x}"))
+        })
+    }
+
     /// The height of the last header.
     pub(crate) fn height(&self) -> usize {
         self.height
@@ -329,18 +341,6 @@ impl Tip {
     /// The work of the chain.
     pub(crate) fn work(&self) -> crate::pow::Work {
         self.work
-    }
-}
-
-/// Writes `<height> <hash> <work>`. The hash is in display order: the reverse of the wire order.
-/// The work is 64 hex digits.
-impl std::fmt::Display for Tip {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ", self.height)?;
-        for byte in self.hash.as_byte_array().iter().rev() {
-            write!(f, "{byte:02x}")?;
-        }
-        write!(f, " {}", self.work)
     }
 }
 
@@ -1239,17 +1239,5 @@ mod tests {
             Ok(())
         );
         assert_eq!(chain.tip(), before);
-    }
-
-    #[test]
-    fn tip_writes_the_hash_in_display_order_and_the_work() {
-        let chain = super::Chain::new(crate::chainparams::Network::Regtest);
-        assert_eq!(
-            chain.tip().to_string(),
-            concat!(
-                "0 0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206 ",
-                "0000000000000000000000000000000000000000000000000000000000000002",
-            )
-        );
     }
 }

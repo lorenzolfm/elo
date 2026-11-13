@@ -222,7 +222,7 @@ impl Version {
         self.version
     }
 
-    pub fn services(&self) -> ServiceFlags {
+    pub(crate) fn services(&self) -> ServiceFlags {
         self.services
     }
 
@@ -236,7 +236,7 @@ impl Version {
     }
 
     /// Whether the sender wants to get transactions (BIP37).
-    pub fn relay(&self) -> bool {
+    pub(crate) fn relay(&self) -> bool {
         self.relay
     }
 }

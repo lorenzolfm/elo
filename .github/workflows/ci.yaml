@@ -146,7 +146,8 @@ jobs:
             --security-opt no-new-privileges --network host elo:local regtest 127.0.0.1
           # Height 0, the regtest genesis and its work.
           genesis=0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206
-          tip="tip 0 $genesis $(printf '%064x' 2)"
+          tip="level=info event=tip peer=127.0.0.1:18444 height=0"
+          tip="$tip hash=$genesis work=$(printf '%064x' 2)"
           # The wait and the check after it read the same line.
           has_tip() { docker logs elo | grep --fixed-strings --line-regexp --quiet "$tip"; }
           # A container that stopped cannot print the line later, so the wait ends there too.
