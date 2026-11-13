@@ -38,7 +38,8 @@ const _: () = assert!(LINE_LENGTH_MAX <= 16 * 1024);
 /// dashboards and alerts match on them, so a rename breaks them. `Event::name` and `Event::line`
 /// are the one list of them. Only the fields here go into a line, so no secret, such as the salt
 /// of a peer, can. A `reason` or a `signal` is any `Display`, so its text is what that `Display`
-/// writes: a type that holds a secret has no `Display`, as the salt has none.
+/// writes: a type that holds a secret has no `Display`, as the salt has none, and its `Debug`
+/// writes no secret, so a `{:?}` in a `reason` cannot write it either.
 #[derive(Clone, Copy)]
 pub enum Event<'a> {
     /// The handshake with `peer` is done, and it sent `version`.
