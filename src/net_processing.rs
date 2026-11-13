@@ -519,8 +519,8 @@ enum Download {
 }
 
 /// The first download of a low-work sync of a branch below the margin. It starts on the fork of
-/// the branch, and it must reach the minimum of `Extended::BelowMargin`. Our chain has at least
-/// the minimum work.
+/// the branch, and it must reach the `branch_work_min` of `Extended::BelowMargin`. Our chain has
+/// at least the minimum work.
 #[derive(Debug)]
 struct BranchPresync {
     /// The branch on the fork, with no header, from `Extended::BelowMargin`.
@@ -1006,7 +1006,7 @@ fn chain_next(
         crate::chain::Extended::BelowMargin {
             branch,
             start,
-            work_min: branch_work_min,
+            branch_work_min,
             headers,
         } => {
             // Only a full batch can have more of the branch after it.

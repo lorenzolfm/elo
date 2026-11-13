@@ -70,7 +70,7 @@ pub(crate) enum Extended {
         start: SyncStart,
         /// The work that the sync must reach: the lowest work up to the last header of a branch
         /// that the margin keeps. It is above the work at the fork.
-        work_min: crate::pow::Work,
+        branch_work_min: crate::pow::Work,
         /// The batch, which passed each check of the chain.
         headers: crate::protocol::Headers,
     },
@@ -266,8 +266,8 @@ impl Chain {
     /// `branch`, with `extend_above`, as `extend_branch` puts one batch. `branch` came with
     /// `Extended::BelowMargin`, and the chain did not change since. `full` is true when the last
     /// batch of the sync was full, so the peer can have more of the branch. The chain must have at
-    /// least `work_min`, the minimum of that batch. The sync ends when the headers reach the
-    /// minimum of `Extended::BelowMargin`, so they are not below the margin.
+    /// least `work_min`, as in `extend_branch`. The sync ends when the headers reach the
+    /// `branch_work_min` of `Extended::BelowMargin`, so they are not below the margin.
     pub(crate) fn extend_low_work_branch(
         &mut self,
         branch: Branch,
@@ -435,7 +435,7 @@ impl Chain {
                     (true, 0) => Extended::BelowMargin {
                         branch: self.branch_on_fork(fork_height),
                         start: self.sync_start(fork_height, self.work_at(fork_height)),
-                        work_min: self.branch_work_min(work_min),
+                        branch_work_min: self.branch_work_min(work_min),
                         headers: full_batch(headers),
                     },
                     // After headers of the chain, a full batch had less of the branch than that,
@@ -1883,7 +1883,7 @@ mod tests {
         let Ok(super::Extended::BelowMargin {
             branch,
             start,
-            work_min,
+            branch_work_min,
             headers,
         }) = extended
         else {
@@ -1891,7 +1891,7 @@ mod tests {
         };
         assert_eq!(branch, chain.branch_on_fork(0));
         assert_eq!(headers, crate::fixtures::headers_batch(batch));
-        (start, work_min)
+        (start, branch_work_min)
     }
 
     #[test]
@@ -2189,8 +2189,8 @@ mod tests {
                 "{count}"
             );
             if !goes_on {
-                let (_, sync_work_min) = below_margin_on_genesis(&chain, extended, &branch);
-                assert_eq!(sync_work_min, work_min);
+                let (_, branch_work_min) = below_margin_on_genesis(&chain, extended, &branch);
+                assert_eq!(branch_work_min, work_min);
             }
         }
     }
