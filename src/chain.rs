@@ -54,6 +54,7 @@ pub(crate) enum Extended {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExtendError {
     /// The `prev` of the first header is not the hash of the tip. Only `extend` refuses with this.
+    /// After the sync, an announcement off our tip gets it, and that makes our `getheaders` due.
     NotOnTip,
     /// The `prev` of the first header is not the hash of a header of the locator of the chain. Only
     /// `extend_on_locator` refuses with this. The tip is the first header of the locator.

@@ -909,40 +909,29 @@ fn receive_on_tip(
 /// have, such as our tip again, is off our tip too. Only an announcement makes this `getheaders`,
 /// and no `getheaders` is outstanding at an announcement. So the peer gets at most one message for
 /// each message that it sends.
+///
+/// `Chain::extend` checks the first `prev` before each other check, so its `NotOnTip` is the only
+/// test of "off our tip". An empty announcement changes nothing, and it is not full.
 fn receive_announcement(
     chain: &mut crate::chain::Chain,
     work_min: crate::pow::Work,
     headers: crate::protocol::Headers,
     clock: u64,
 ) -> Result<Option<Download>, PeerError> {
-    let Some(first) = headers.first() else {
-        // An empty announcement changes nothing.
-        return extend_tip(chain, work_min, headers, clock);
-    };
-    if first.prev == chain.tip().hash() {
-        return extend_tip(chain, work_min, headers, clock);
-    }
-    // A sync ends only on a chain with at least the minimum work, so the next batch goes on our
-    // tip.
-    Ok(Some(Download::on_tip(chain, work_min)))
-}
-
-/// An announcement on the tip of `chain` after the sync, and `chain` has at least `work_min`.
-/// Returns where the next batch goes, or `None` if the batch was not full and so ended a sync
-/// again.
-fn extend_tip(
-    chain: &mut crate::chain::Chain,
-    work_min: crate::pow::Work,
-    headers: crate::protocol::Headers,
-    clock: u64,
-) -> Result<Option<Download>, PeerError> {
     let full = headers.is_full();
-    chain.extend(headers, clock).map_err(PeerError::Extend)?;
-    // The chain had the minimum work before the batch, as `SyncState::Synced` holds, and the work
-    // of a chain does not go down. The check goes also when the batch ends the sync, because then
-    // the chain stays at `SyncState::Synced`.
-    let next = Download::on_tip(chain, work_min);
-    Ok(full.then_some(next))
+    match chain.extend(headers, clock) {
+        Ok(()) => {
+            // The chain had the minimum work before the batch, as `SyncState::Synced` holds, and
+            // the work of a chain does not go down. The check goes also when the batch ends the
+            // sync, because then the chain stays at `SyncState::Synced`.
+            let next = Download::on_tip(chain, work_min);
+            Ok(full.then_some(next))
+        }
+        // A sync ends only on a chain with at least the minimum work, so the next batch goes on
+        // our tip.
+        Err(crate::chain::ExtendError::NotOnTip) => Ok(Some(Download::on_tip(chain, work_min))),
+        Err(error) => Err(PeerError::Extend(error)),
+    }
 }
 
 /// Puts each header that the second download of a low-work sync released on `chain`, in order,
