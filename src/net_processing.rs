@@ -525,8 +525,8 @@ enum Download {
 /// at least the minimum work.
 #[derive(Debug)]
 struct BranchPresync {
-    /// The branch on the fork, with no header, from `Extended::BelowMargin`.
-    branch: crate::chain::Branch,
+    /// The fork, from `Extended::BelowMargin`.
+    start: crate::chain::SyncStart,
     presync: crate::headerssync::Presync,
 }
 
@@ -537,8 +537,8 @@ struct BranchPresync {
 /// headers, as it bounds the headers that a sync on genesis puts on our chain.
 #[derive(Debug)]
 struct BranchRedownload {
-    /// The branch on the fork, with no header, from `Extended::BelowMargin`.
-    branch: crate::chain::Branch,
+    /// The fork, from `Extended::BelowMargin`.
+    start: crate::chain::SyncStart,
     redownload: crate::headerssync::Redownload,
     /// The headers that `redownload` released, in order. The first is on the fork.
     released: Vec<crate::block::BlockHeader>,
@@ -865,13 +865,13 @@ fn receive_answer(
             chain_next(chain, work_min, salt, full, extended, clock)
         }
         Download::BranchPresync(sync) => {
-            let BranchPresync { branch, presync } = *sync;
+            let BranchPresync { start, presync } = *sync;
             let step = presync.receive(headers).map_err(PeerError::HeadersSync)?;
-            Ok(Some(branch_presync_next(branch, step)))
+            Ok(Some(branch_presync_next(start, step)))
         }
         Download::BranchRedownload(sync) => {
             let BranchRedownload {
-                branch,
+                start,
                 redownload,
                 mut released,
             } = *sync;
@@ -883,7 +883,7 @@ fn receive_answer(
                     keep_released(chain.network(), &mut released, more);
                     Ok(Some(Download::BranchRedownload(Box::new(
                         BranchRedownload {
-                            branch,
+                            start,
                             redownload: *redownload,
                             released,
                         },
@@ -892,7 +892,7 @@ fn receive_answer(
                 crate::headerssync::RedownloadStep::Done(rest) => {
                     keep_released(chain.network(), &mut released, rest);
                     let extended = chain
-                        .extend_low_work_branch(branch, released, full, clock, work_min)
+                        .extend_low_work_branch(start, released, full, clock, work_min)
                         .map_err(PeerError::Extend)?;
                     chain_next(chain, work_min, salt, full, extended, clock)
                 }
@@ -1012,7 +1012,6 @@ fn chain_next(
             Ok(None)
         }
         crate::chain::Extended::BelowMargin {
-            branch,
             start,
             branch_work_min,
             headers,
@@ -1026,7 +1025,7 @@ fn chain_next(
             // keeps none of them until the branch shows the work of the margin.
             let presync = crate::headerssync::Presync::new(start, branch_work_min, clock, salt);
             let step = presync.receive(headers).map_err(PeerError::HeadersSync)?;
-            Ok(Some(branch_presync_next(branch, step)))
+            Ok(Some(branch_presync_next(start, step)))
         }
     }
 }
@@ -1110,18 +1109,19 @@ fn keep_released(
     released.extend(more);
 }
 
-/// Where the next batch goes after a batch of the first download of a low-work sync of `branch`.
+/// Where the next batch goes after a batch of the first download of a low-work sync of a branch
+/// on `start`.
 fn branch_presync_next(
-    branch: crate::chain::Branch,
+    start: crate::chain::SyncStart,
     step: crate::headerssync::PresyncStep,
 ) -> Download {
     match step {
         crate::headerssync::PresyncStep::More(presync) => {
-            Download::BranchPresync(Box::new(BranchPresync { branch, presync }))
+            Download::BranchPresync(Box::new(BranchPresync { start, presync }))
         }
         crate::headerssync::PresyncStep::Redownload(redownload) => {
             Download::BranchRedownload(Box::new(BranchRedownload {
-                branch,
+                start,
                 redownload,
                 released: Vec::new(),
             }))

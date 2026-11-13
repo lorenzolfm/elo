@@ -64,9 +64,8 @@ pub(crate) enum Extended {
     /// fork can get the branch. Its first download starts with `headers`, and then
     /// `Chain::extend_low_work_branch` takes what it got.
     BelowMargin {
-        /// The branch on the fork, with no header.
-        branch: Branch,
-        /// The fork, where the sync starts.
+        /// The fork, where the sync starts. `Chain::extend_low_work_branch` puts the headers of
+        /// the sync on it.
         start: SyncStart,
         /// The work that the sync must reach: the lowest work up to the last header of a branch
         /// that the margin keeps. It is above the work at the fork.
@@ -89,6 +88,23 @@ pub(crate) struct SyncStart {
     /// The median time of this header and the 10 headers below it. A header on it needs a time
     /// above it.
     median_time_past: u32,
+    /// The work of the chain that made this start. A sync on a fork goes on the chain only if the
+    /// chain did not change, so the chain asserts that its work is the same.
+    chain_work: crate::pow::Work,
+}
+
+/// The headers that `Chain::extend_above` puts on a branch.
+#[derive(Debug)]
+enum Batch {
+    /// An answer to our `getheaders`. A full one gives the peer room for more headers after it.
+    Answer(crate::protocol::Headers),
+    /// The headers that a low-work sync of a branch got, in order. They can be more than one batch.
+    Released {
+        headers: Vec<crate::block::BlockHeader>,
+        /// True when the last batch of the sync was full, so the peer can have more headers after
+        /// them.
+        full: bool,
+    },
 }
 
 /// A branch that a peer sends in more than one batch. It is on a header of the chain below the
@@ -241,9 +257,8 @@ impl Chain {
             .find(|height| self.header_at(*height).hash() == first_prev)
             .ok_or(ExtendError::NotOnLocator)?;
         assert!(fork_height < tip_height);
-        let full = headers.is_full();
         let branch = self.branch_on_fork(fork_height);
-        self.extend_above(branch, headers.into_vec(), full, clock, work_min)
+        self.extend_above(branch, Batch::Answer(headers), clock, work_min)
     }
 
     /// Puts `headers`, an answer to a `getheaders` with only the last header of `branch`, on that
@@ -258,46 +273,49 @@ impl Chain {
         clock: u64,
         work_min: crate::pow::Work,
     ) -> Result<Extended, ExtendError> {
-        let full = headers.is_full();
-        self.extend_on_branch(branch, headers.into_vec(), full, clock, work_min)
+        self.extend_on_branch(branch, Batch::Answer(headers), clock, work_min)
     }
 
-    /// Puts `headers`, each header that a low-work sync of `branch` got, in order, on the fork of
-    /// `branch`, with `extend_above`, as `extend_branch` puts one batch. `branch` came with
-    /// `Extended::BelowMargin`, and the chain did not change since. `full` is true when the last
-    /// batch of the sync was full, so the peer can have more of the branch. The chain must have at
-    /// least `work_min`, as in `extend_branch`. The sync ends when the headers reach the
-    /// `branch_work_min` of `Extended::BelowMargin`, so they are not below the margin.
+    /// Puts `headers`, each header that a low-work sync got, in order, on `start`, the fork that
+    /// came with `Extended::BelowMargin`, with `extend_above`, as `extend_branch` puts one batch.
+    /// The chain did not change since. `full` is true when the last batch of the sync was full, so
+    /// the peer can have more of the branch. The chain must have at least `work_min`, as in
+    /// `extend_branch`. The sync ends when the headers reach the `branch_work_min` of
+    /// `Extended::BelowMargin`, so they are not below the margin.
     pub(crate) fn extend_low_work_branch(
         &mut self,
-        branch: Branch,
+        start: SyncStart,
         headers: Vec<crate::block::BlockHeader>,
         full: bool,
         clock: u64,
         work_min: crate::pow::Work,
     ) -> Result<Extended, ExtendError> {
-        assert!(matches!(branch.above_fork, AboveFork::Empty { .. }));
         // The work at the fork is below the minimum of the sync, so the sync got at least one
         // header.
         assert!(!headers.is_empty());
         // The sync starts on the fork, so a refusal of the first header because it is not on the
         // fork would be our error.
         if let Some(first) = headers.first() {
-            assert_eq!(first.prev, branch.last_hash());
+            assert_eq!(first.prev, start.hash);
         }
-        let extended = self.extend_on_branch(branch, headers, full, clock, work_min);
-        assert!(!matches!(extended, Ok(Extended::BelowMargin { .. })));
-        extended
+        // `extend_on_branch` holds that the fork is below the tip, and that the chain is the chain
+        // that made `start`.
+        let branch = Branch {
+            fork_height: start.height,
+            above_fork: AboveFork::Empty {
+                fork_hash: start.hash,
+            },
+            chain_work: start.chain_work,
+        };
+        self.extend_on_branch(branch, Batch::Released { headers, full }, clock, work_min)
     }
 
-    /// Puts `headers` on the last header of `branch`, which this chain returned, with
-    /// `extend_above`. `full` is true when the peer can have more headers after them. No headers
-    /// end the branch, and the chain stays.
+    /// Puts `batch` on the last header of `branch`, which this chain returned, with
+    /// `extend_above`. No headers end the branch, and the chain stays.
     fn extend_on_branch(
         &mut self,
         branch: Branch,
-        headers: Vec<crate::block::BlockHeader>,
-        full: bool,
+        batch: Batch,
         clock: u64,
         work_min: crate::pow::Work,
     ) -> Result<Extended, ExtendError> {
@@ -316,18 +334,17 @@ impl Chain {
         // margin is the margin that the batch before passed, and `extend_above` can assert that a
         // branch with a header of its own passes it again.
         assert_eq!(self.work, branch.chain_work);
-        if headers.is_empty() {
+        if batch.headers().is_empty() {
             return Ok(Extended::Kept);
         }
-        self.extend_above(branch, headers, full, clock, work_min)
+        self.extend_above(branch, batch, clock, work_min)
     }
 
     /// Goes on with `branch` and `batch`, headers that are not empty, on the last header of the
-    /// branch. `full` is true when the peer can have more headers after the batch. When the branch
-    /// has no header, the batch can start with headers of the chain above the fork. These move the
-    /// fork up, and they do not go into the branch. If they reach the tip, the rest of the batch
-    /// goes on the tip, as in `extend`. Else the rest goes through the checks of `extend`, on the
-    /// chain up to the fork and on the headers of the branch.
+    /// branch. When the branch has no header, the batch can start with headers of the chain above
+    /// the fork. These move the fork up, and they do not go into the branch. If they reach the tip,
+    /// the rest of the batch goes on the tip, as in `extend`. Else the rest goes through the checks
+    /// of `extend`, on the chain up to the fork and on the headers of the branch.
     ///
     /// Then the chain takes the branch if it has more work than the headers above the fork, and
     /// drops those headers. Else a full batch makes the branch go on, but only if the margin keeps
@@ -349,11 +366,11 @@ impl Chain {
     fn extend_above(
         &mut self,
         branch: Branch,
-        mut batch: Vec<crate::block::BlockHeader>,
-        full: bool,
+        batch: Batch,
         clock: u64,
         work_min: crate::pow::Work,
     ) -> Result<Extended, ExtendError> {
+        let full = batch.is_full();
         let Branch {
             mut fork_height,
             above_fork,
@@ -362,7 +379,7 @@ impl Chain {
         } = branch;
         let tip_height = self.below_tip.len();
         // Each caller returns on an empty batch, and a branch is below the tip.
-        assert!(!batch.is_empty());
+        assert!(!batch.headers().is_empty());
         assert!(fork_height < tip_height);
         let time_max = time_max(clock);
 
@@ -383,6 +400,7 @@ impl Chain {
                     .iter()
                     .chain(std::iter::once(&self.tip));
                 let shared_count = batch
+                    .headers()
                     .iter()
                     .zip(ours)
                     .take_while(|(theirs, ours)| theirs == ours)
@@ -390,14 +408,14 @@ impl Chain {
                 // With no headers of the chain at the start, the fork stays below the tip and the
                 // batch is not empty, so this returns only after headers of the chain.
                 fork_height += shared_count;
-                batch.drain(..shared_count);
+                let rest = &batch.headers()[shared_count..];
                 if fork_height == tip_height {
-                    if !batch.is_empty() {
-                        self.extend_tip(batch, time_max)?;
+                    if !rest.is_empty() {
+                        self.extend_tip(rest.to_vec(), time_max)?;
                     }
                     return Ok(Extended::Taken);
                 }
-                if batch.is_empty() {
+                if rest.is_empty() {
                     if full {
                         let branch = self.branch_on_fork(fork_height);
                         return Ok(Extended::Branch(branch));
@@ -411,7 +429,7 @@ impl Chain {
 
         let branch_count = branch_headers.len();
         let mut headers = branch_headers;
-        headers.append(&mut batch);
+        headers.extend_from_slice(&batch.headers()[shared_count..]);
         let (last_hash, work_batch) = self.check(fork_height, &headers, branch_count, time_max)?;
         let work_branch = work_branch_before.saturating_add(work_batch);
         let work_stop = work_branch.saturating_add(self.branch_margin(work_min));
@@ -429,14 +447,19 @@ impl Chain {
                     // The peer has no more of the branch, which is below the margin, so it has
                     // less work than the chain.
                     (false, _) => Extended::Kept,
-                    // A full batch with no headers of the chain had the most of the branch that
-                    // one batch can have. The branch had no header before it, so the batch is
-                    // all of `headers`.
-                    (true, 0) => Extended::BelowMargin {
-                        branch: self.branch_on_fork(fork_height),
-                        start: self.sync_start(fork_height),
-                        branch_work_min: self.branch_work_min(work_min),
-                        headers: full_batch(headers),
+                    // A full answer with no headers of the chain had the most of the branch that
+                    // one batch can have, so it goes to a low-work sync from the fork.
+                    (true, 0) => match batch {
+                        Batch::Answer(answer) => Extended::BelowMargin {
+                            start: self.sync_start(fork_height),
+                            branch_work_min: self.branch_work_min(work_min),
+                            headers: answer,
+                        },
+                        // The headers of a low-work sync reach the `branch_work_min` of its
+                        // `Extended::BelowMargin`, so the margin keeps them.
+                        Batch::Released { .. } => {
+                            panic!("a low-work sync of a branch ended below the margin")
+                        }
                     },
                     // After headers of the chain, a full batch had less of the branch than that,
                     // so the next batch goes on the fork.
@@ -549,6 +572,7 @@ impl Chain {
             bits: header.bits,
             work: self.work_at(height),
             median_time_past: ancestors.median_time_past(),
+            chain_work: self.work,
         }
     }
 
@@ -749,15 +773,6 @@ fn time_max(clock: u64) -> u64 {
     clock.saturating_add(TIME_AHEAD_SECONDS_MAX)
 }
 
-/// `headers`, a full batch, as the batch of a `headers` message.
-fn full_batch(headers: Vec<crate::block::BlockHeader>) -> crate::protocol::Headers {
-    let Ok([batch]) = <[_; 1]>::try_from(crate::protocol::Headers::batches(headers)) else {
-        panic!("the headers are not one batch");
-    };
-    assert!(batch.is_full());
-    batch
-}
-
 /// The heights of the locator of a chain with its tip at `tip_height`, from the tip down. The first
 /// `LOCATOR_DENSE_COUNT` are one height apart. Then each step is twice the step before it. The
 /// last height is 0, genesis. So a locator has about 12 hashes plus the count of bits of the
@@ -911,6 +926,24 @@ impl SyncStart {
     /// fewer. A header on it needs a time above it.
     pub(crate) fn median_time_past(&self) -> u32 {
         self.median_time_past
+    }
+}
+
+impl Batch {
+    /// The headers, in order.
+    fn headers(&self) -> &[crate::block::BlockHeader] {
+        match self {
+            Batch::Answer(answer) => answer.as_slice(),
+            Batch::Released { headers, full: _ } => headers,
+        }
+    }
+
+    /// True when the peer can have more headers after these.
+    fn is_full(&self) -> bool {
+        match self {
+            Batch::Answer(answer) => answer.is_full(),
+            Batch::Released { headers: _, full } => *full,
+        }
     }
 }
 
@@ -1877,7 +1910,6 @@ mod tests {
         batch: &[crate::block::BlockHeader],
     ) -> (super::SyncStart, crate::pow::Work) {
         let Ok(super::Extended::BelowMargin {
-            branch,
             start,
             branch_work_min,
             headers,
@@ -1885,9 +1917,29 @@ mod tests {
         else {
             panic!("{extended:?}");
         };
-        assert_eq!(branch, chain.branch_on_fork(0));
+        assert_eq!(start, chain.sync_start(0));
         assert_eq!(headers, crate::fixtures::headers_batch(batch));
         (start, branch_work_min)
+    }
+
+    /// What a low-work sync reads of the chain at `start`: its height, hash, bits, work and median
+    /// time. The work of the chain that made it is not in it.
+    fn read_start(
+        start: super::SyncStart,
+    ) -> (
+        usize,
+        bitcoin_hashes::sha256d::Hash,
+        u32,
+        crate::pow::Work,
+        u32,
+    ) {
+        (
+            start.height(),
+            start.hash(),
+            start.bits(),
+            start.work(),
+            start.median_time_past(),
+        )
     }
 
     #[test]
@@ -2154,7 +2206,10 @@ mod tests {
                 ),
                 (2_000, _) => {
                     let (start, work_min) = below_margin_on_genesis(&chain, extended, &branch);
-                    assert_eq!(start, regtest_with(&[]).sync_start_on_tip());
+                    assert_eq!(
+                        read_start(start),
+                        read_start(regtest_with(&[]).sync_start_on_tip())
+                    );
                     assert_eq!(work_min, regtest_with(&headers[..2_001]).tip().work());
                 }
                 _ => assert_eq!(extended, Ok(super::Extended::Kept)),
@@ -2226,7 +2281,10 @@ mod tests {
         let Ok(super::Extended::BelowMargin { start, .. }) = extended else {
             panic!("{extended:?}");
         };
-        assert_eq!(start, regtest_with(&headers[..50]).sync_start_on_tip());
+        assert_eq!(
+            read_start(start),
+            read_start(regtest_with(&headers[..50]).sync_start_on_tip())
+        );
     }
 
     #[test]
@@ -2261,13 +2319,13 @@ mod tests {
         ] {
             let branch = crate::fixtures::branch_on(&genesis(), count);
             let mut chain = regtest_with(&headers);
-            let Ok(super::Extended::BelowMargin { branch: below, .. }) =
+            let Ok(super::Extended::BelowMargin { start, .. }) =
                 on_locator(&mut chain, &branch[..2_000])
             else {
                 panic!("no branch below the margin");
             };
             let extended = chain.extend_low_work_branch(
-                below,
+                start,
                 branch.clone(),
                 full,
                 crate::fixtures::CLOCK,

@@ -377,6 +377,13 @@ impl Headers {
     }
 
     /// The headers, in the order of the payload.
+    pub(crate) fn as_slice(&self) -> &[crate::block::BlockHeader] {
+        // As in `into_vec`.
+        assert!(self.0.len() <= HEADERS_COUNT_MAX);
+        &self.0
+    }
+
+    /// The headers, in the order of the payload.
     pub(crate) fn into_vec(self) -> Vec<crate::block::BlockHeader> {
         // `decode` refuses a longer batch. `Chain::extend` takes its loop bound from this `Vec`.
         assert!(self.0.len() <= HEADERS_COUNT_MAX);
