@@ -507,10 +507,11 @@ enum Download {
 impl<'a> Peer<'a> {
     /// A `ping` gets a `pong` with its nonce. A `pong` must answer our outstanding `ping`, and a
     /// `headers` our outstanding `getheaders`, or come after the sync. After the sync, an `inv` of
-    /// a block or a `headers` off our tip makes our `getheaders` due. A `wtxidrelay` or a `sendaddrv2` is an error: a peer
-    /// turns these features on only between its `version` and its `verack`. Each other message is
-    /// skipped. Each result but an error returns the peer, because an error ends the connection.
-    /// `clock` is the local clock, in seconds since the Unix epoch, and only a `headers` reads it.
+    /// a block or a `headers` off our tip makes our `getheaders` due. A `wtxidrelay` or a
+    /// `sendaddrv2` is an error: a peer turns these features on only between its `version` and its
+    /// `verack`. Each other message is skipped. Each result but an error returns the peer, because
+    /// an error ends the connection. `clock` is the local clock, in seconds since the Unix epoch,
+    /// and only a `headers` reads it.
     pub(crate) fn receive(
         self,
         message: &crate::transport::Message,
@@ -589,9 +590,9 @@ impl<'a> Peer<'a> {
     /// sync, a `headers` announces new headers. One on the tip of our chain goes on it. A full one
     /// makes the next batch due, and each other one ends a sync again. One off our tip makes our
     /// `getheaders` due from our tip. An announcement does not answer our locator, so one on
-    /// genesis does not start our chain again. A `headers` is
-    /// unsolicited only while our `getheaders` is due and the tick has not sent it. The payload is
-    /// checked first, also then. The bytes after the last transaction count are ignored.
+    /// genesis does not start our chain again. A `headers` is unsolicited only while our
+    /// `getheaders` is due and the tick has not sent it. The payload is checked first, also then.
+    /// The bytes after the last transaction count are ignored.
     ///
     /// A full batch on a genesis below the minimum work starts a low-work sync with the salt, and
     /// the batch goes to its first download. Else our chain takes a batch on its tip, and then a
@@ -634,12 +635,12 @@ impl<'a> Peer<'a> {
     /// once after the handshake. Then it is due `PING_INTERVAL` after the last `ping` went, if
     /// its `pong` came. A `getheaders` is due at once after the handshake, at once after each
     /// batch that does not end the sync, and at once after an `inv` of a block or a `headers` off
-    /// our tip after the sync. The
-    /// tick fails when our outstanding `ping` is `PING_TIMEOUT` old, or our outstanding
-    /// `getheaders` is `HEADERS_TIMEOUT` old. The `ping` is checked first. Each deadline is due at
-    /// its instant, not after it. The wake is the earliest deadline. The `now` of a tick is not
-    /// before the `now` of an earlier tick, because each deadline counts from an earlier `now`. Our
-    /// `sendheaders` goes in the first tick at `SyncState::Synced`, and has no deadline.
+    /// our tip after the sync. The tick fails when our outstanding `ping` is `PING_TIMEOUT` old, or
+    /// our outstanding `getheaders` is `HEADERS_TIMEOUT` old. The `ping` is checked first. Each
+    /// deadline is due at its instant, not after it. The wake is the earliest deadline. The `now`
+    /// of a tick is not before the `now` of an earlier tick, because each deadline counts from an
+    /// earlier `now`. Our `sendheaders` goes in the first tick at `SyncState::Synced`, and has no
+    /// deadline.
     pub(crate) fn tick(
         self,
         now: std::time::Instant,
@@ -900,8 +901,8 @@ fn receive_announcement(
 }
 
 /// A batch on the tip of `chain`, which has at least `work_min`: an answer of `Download::Chain`, or
-/// an announcement on our tip after the sync. Returns where the next batch goes, or `None` if the batch was
-/// not full and so ended a sync.
+/// an announcement on our tip after the sync. Returns where the next batch goes, or `None` if the
+/// batch was not full and so ended a sync.
 fn extend_tip(
     chain: &mut crate::chain::Chain,
     work_min: crate::pow::Work,
