@@ -22,15 +22,20 @@ sync, elo stays connected and answers each `ping` with a `pong`. It also sends
 `sendheaders`, so the peer announces each new header with a `headers`. elo puts
 those headers on its tip, as a batch of a sync, and logs the `tip` when it
 moves. After a reorg, the headers of an announcement are not on the tip of elo.
-Then elo asks for the headers again. Each `getheaders` of elo has the hashes of
-its tip and of the 11 headers below it, then of headers further down in steps
-that double, then of genesis. The peer sends the headers after the highest of
-them on its chain. When they are on a header below the tip of elo, they are a
-branch, and elo takes it only when it has more work than the headers above that
-header. On the same work, the branch that elo had first stays. elo holds one
-branch, so it drops a peer that sends a full batch of a branch with no more
-work. A peer announces a block with an `inv` when its headers do not connect to
-the last header it sent, so an `inv` of a block makes elo ask too. From the
+Then elo asks for the headers again, with the hashes of its tip and of the 11
+headers below it, then of headers further down in steps that double, then of
+genesis. The peer sends the headers after the highest of them on its chain.
+When they are on a header below the tip of elo, elo skips the headers that it
+has, and the rest is a branch. elo takes it only when it has more work than the
+headers above the header that it is on. On the same work, the branch that elo
+had first stays. After a full batch of a branch with no more work, elo asks for
+the headers after the last header of the branch, and keeps the branch in memory
+until it has more work or ends. elo keeps a branch only while its chain from
+genesis has at least the minimum work, and at least the work of elo less the
+work of 144 headers at the difficulty of the tip. Each `getheaders` of a
+low-work sync or of a branch has only the hash of the last header that elo got.
+A peer announces a block with an `inv` when its headers do not connect to the
+last header it sent, so an `inv` of a block makes elo ask too. From the
 handshake on, it pings the peer every 2 min.
 It drops a peer that does not answer a `ping` within 20 min, or a `getheaders`
 within 2 min. It also drops a peer that sends `wtxidrelay` or `sendaddrv2` after

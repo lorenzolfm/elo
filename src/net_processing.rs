@@ -89,10 +89,6 @@ pub enum PeerError {
     /// Our chain refused their batch, or a header that the second download of a low-work sync
     /// released. The error says why.
     Extend(crate::chain::ExtendError),
-    /// Their answer to our `getheaders` is a full batch on a header below our tip, and its branch
-    /// has at most the work of our chain. The branch can go on with more work after the batch, but
-    /// our chain holds one branch, and the batch is not on it.
-    LowWorkBranch,
     /// A low-work sync refused their batch. The error says why.
     HeadersSync(crate::headerssync::HeadersSyncError),
     /// Their `headers` came while our `getheaders` was due, before the tick that sends it. The
@@ -121,12 +117,6 @@ impl std::fmt::Display for PeerError {
             PeerError::Inv(error) => write!(f, "{error}"),
             PeerError::Headers(error) => write!(f, "{error}"),
             PeerError::Extend(error) => write!(f, "{error}"),
-            PeerError::LowWorkBranch => {
-                write!(
-                    f,
-                    "a full batch off our tip has no more work than our chain"
-                )
-            }
             PeerError::HeadersSync(error) => write!(f, "low-work sync: {error}"),
             PeerError::UnsolicitedHeaders => write!(f, "headers before our due getheaders"),
             PeerError::HeadersTimeout => {
@@ -486,11 +476,13 @@ enum SendHeadersState {
     Sent,
 }
 
-/// Where the next batch of the sync goes. Only `Genesis` and `Chain` put a batch on the tip of our
-/// chain as it comes. In a low-work sync our chain takes only the headers that the second download
+/// Where the next batch of the sync goes. Only `Genesis`, `Chain` and `Branch` change our chain as
+/// a batch comes. In a low-work sync our chain takes only the headers that the second download
 /// releases, and they go on the tip that the first download read. So no other path may extend the
-/// chain before the sync ends. The boxes keep `Genesis` and `Chain` small, because each download
-/// holds its commitments and links. A sync above the minimum moves only `Chain`.
+/// chain before the sync ends. A branch is on the chain as it was at its first batch, so nothing
+/// else may change the chain while it goes on. The boxes keep `Genesis` and `Chain` small, because
+/// each download holds its commitments and links, and a branch holds its headers. A sync above the
+/// minimum moves only `Chain` and `Branch`.
 #[derive(Debug)]
 enum Download {
     /// On genesis, the only header of our chain, which is below the minimum work. A full batch
@@ -503,6 +495,9 @@ enum Download {
     Presync(Box<crate::headerssync::Presync>),
     /// The second download of a low-work sync, on its last header.
     Redownload(Box<crate::headerssync::Redownload>),
+    /// A branch below the tip of our chain, which has at least the minimum work, on its last
+    /// header. It has at most the work of our chain.
+    Branch(Box<crate::chain::Branch>),
 }
 
 impl Download {
@@ -607,8 +602,9 @@ impl<'a> Peer<'a> {
     /// A full batch on a genesis below the minimum work starts a low-work sync with the salt, and
     /// the batch goes to its first download. Else our chain takes a batch on its tip, or a branch
     /// with more work on a header of our locator, and then a full batch makes the next one due. A
-    /// batch that is not full ends the sync, an empty one too, and the sync must end on a chain
-    /// with at least the minimum work.
+    /// full batch of a branch with no more work makes the next one due on its last header. A batch
+    /// that is not full ends the sync, an empty one too, and the sync must end on a chain with at
+    /// least the minimum work.
     ///
     /// In a low-work sync, each download makes the next batch due, until the second download
     /// reaches the minimum. Our chain takes each header that it releases, with the checks of each
@@ -735,8 +731,8 @@ impl PingState {
 impl SyncState {
     /// Returns the next state, our `getheaders` if one is due, and the headers timeout if a
     /// `getheaders` is outstanding. The `getheaders` has the locator of `chain`, or only the last
-    /// header of a download of a low-work sync. The answer of a peer that left that header is
-    /// not on it, and that download refuses it.
+    /// header of a download of a low-work sync or of a branch. The answer of a peer that left that
+    /// header is not on it, and that download refuses it.
     fn tick(
         self,
         now: std::time::Instant,
@@ -756,6 +752,7 @@ impl SyncState {
                     Download::Genesis(_) | Download::Chain => chain.locator(),
                     Download::Presync(presync) => vec![presync.last_hash()],
                     Download::Redownload(redownload) => vec![redownload.last_hash()],
+                    Download::Branch(branch) => vec![branch.last_hash()],
                 };
                 let get_headers = crate::protocol::GetHeaders::new(locator);
                 let sync = SyncState::Outstanding {
@@ -796,7 +793,18 @@ fn receive_answer(
     let full = headers.is_full();
     match download {
         Download::Genesis(salt) => receive_on_genesis(chain, work_min, headers, clock, salt),
-        Download::Chain => receive_on_tip(chain, work_min, headers, clock),
+        Download::Chain => {
+            let extended = chain
+                .extend_on_locator(headers, clock, work_min)
+                .map_err(PeerError::Extend)?;
+            Ok(chain_next(chain, work_min, full, extended))
+        }
+        Download::Branch(branch) => {
+            let extended = chain
+                .extend_branch(*branch, headers, clock, work_min)
+                .map_err(PeerError::Extend)?;
+            Ok(chain_next(chain, work_min, full, extended))
+        }
         Download::Presync(presync) => {
             let step = presync.receive(headers).map_err(PeerError::HeadersSync)?;
             Ok(Some(presync_next(step)))
@@ -848,11 +856,12 @@ fn receive_on_genesis(
     // batch is a branch below our tip, and the chain keeps only an empty batch.
     let empty = headers.first().is_none();
     match chain
-        .extend_on_locator(headers, clock)
+        .extend_on_locator(headers, clock, work_min)
         .map_err(PeerError::Extend)?
     {
         crate::chain::Extended::Taken => assert!(!empty),
         crate::chain::Extended::Kept => assert!(empty),
+        crate::chain::Extended::Branch(_) => panic!("genesis has no header below it"),
     }
     if chain.tip().work() >= work_min {
         Ok(None)
@@ -861,39 +870,39 @@ fn receive_on_genesis(
     }
 }
 
-/// Their answer to our `getheaders` for `Download::Chain`, on the locator of `chain`, which has at
-/// least `work_min`. Returns where the next batch goes, or `None` if the batch was not full and so
-/// ended the sync.
+/// Where the next batch goes after `chain`, which has at least `work_min`, did `extended` with an
+/// answer to our `getheaders` for `Download::Chain` or `Download::Branch`. Returns `None` if the
+/// sync ended.
 ///
 /// A peer whose chain does not hold our tip sends the headers after the highest header of our
 /// locator that is on its chain: our tip is on another branch. The chain takes a branch with more
-/// work, and then a full batch makes the next one due. A branch with at most the work of our chain
-/// does not go on it. If its batch is not full, the peer has no more of it, and the sync ends on
-/// our tip. A full one can go on with more work, but the chain holds one branch, so it ends the
-/// connection. A peer can send our own headers as such a batch, so a batch that passes each check
-/// does not take our tip away.
-fn receive_on_tip(
-    chain: &mut crate::chain::Chain,
+/// work, and then a full batch makes the next one due on our tip. A branch with at most the work of
+/// our chain does not go on it. If its batch is full, the peer can have more of it, so the next one
+/// is due on its last header. Else the peer has no more of it, and the sync ends on our tip. A peer
+/// can send our own headers as such a batch, so a batch that passes each check does not take our
+/// tip away.
+fn chain_next(
+    chain: &crate::chain::Chain,
     work_min: crate::pow::Work,
-    headers: crate::protocol::Headers,
-    clock: u64,
-) -> Result<Option<Download>, PeerError> {
-    let full = headers.is_full();
-    match chain
-        .extend_on_locator(headers, clock)
-        .map_err(PeerError::Extend)?
-    {
+    full: bool,
+    extended: crate::chain::Extended,
+) -> Option<Download> {
+    match extended {
         crate::chain::Extended::Taken => {
-            // The chain had the minimum work before the batch, as each `Download::Chain` holds, and
-            // a batch that the chain takes gives it more work.
+            // The chain had the minimum work before the batch, as `Download::Chain` and
+            // `Download::Branch` hold, and a batch that the chain takes gives it more work.
             let next = Download::on_tip(chain, work_min);
-            Ok(full.then_some(next))
+            full.then_some(next)
         }
-        crate::chain::Extended::Kept if full => Err(PeerError::LowWorkBranch),
-        crate::chain::Extended::Kept => {
-            // The chain stays, so it keeps the minimum work of `Download::Chain`.
+        crate::chain::Extended::Branch(branch) => {
+            // The chain stays, so it keeps the minimum work.
             assert!(chain.tip().work() >= work_min);
-            Ok(None)
+            Some(Download::Branch(Box::new(branch)))
+        }
+        crate::chain::Extended::Kept => {
+            // The chain stays, so it keeps the minimum work.
+            assert!(chain.tip().work() >= work_min);
+            None
         }
     }
 }
@@ -2436,8 +2445,8 @@ mod tests {
         }
     }
 
-    /// The `getheaders` of a download of a low-work sync, which asks for the headers after
-    /// `header` only.
+    /// The `getheaders` of a download of a low-work sync or of a branch, which asks for the headers
+    /// after `header` only.
     fn get_headers_after(header: &crate::block::BlockHeader) -> crate::protocol::GetHeaders {
         crate::protocol::GetHeaders::new(vec![header.hash()])
     }
@@ -3151,19 +3160,41 @@ mod tests {
     }
 
     #[test]
-    fn full_answer_with_a_branch_of_no_more_work_ends_the_connection_and_keeps_our_tip() {
-        // Our tip is block 2,001. A replay of our first 2,000 blocks is on genesis, so the
-        // branch can go on after it with more work. The chain holds one branch.
+    fn full_answer_of_our_headers_below_our_tip_makes_the_next_getheaders_from_its_last_header() {
+        // Our tip is block 2,001. A replay of our first 2,000 blocks is on genesis, so the peer can
+        // have a branch after block 2,000, and the next batch goes on it.
+        let start = std::time::Instant::now();
         let headers = crate::fixtures::headers_on_genesis(2_001);
         let mut chain = regtest();
         for batch in crate::protocol::Headers::batches(headers.clone()) {
             chain.extend(batch, crate::fixtures::CLOCK).unwrap();
         }
-        let refused = asked(&mut chain, std::time::Instant::now(), 7)
-            .receive(&headers_message(&headers[..2_000]), crate::fixtures::CLOCK)
-            .err();
-        assert_eq!(refused, Some(super::PeerError::LowWorkBranch));
+        let (_, get_headers) =
+            batch_then_tick(asked(&mut chain, start, 7), &headers[..2_000], start);
+        assert_eq!(get_headers, get_headers_after(&headers[1_999]));
         assert_eq!(chain.tip(), tip_after(&headers));
+    }
+
+    #[test]
+    fn branch_over_two_batches_with_more_work_takes_the_place_of_our_chain() {
+        // Our tip is block 2,100. A branch of 2,200 on genesis comes as a full batch of 2,000,
+        // which has less work than our chain, then a batch of 200 on its last header.
+        let start = std::time::Instant::now();
+        let headers = crate::fixtures::headers_on_genesis(2_100);
+        let branch =
+            crate::fixtures::branch_on(&crate::chainparams::Network::Regtest.genesis(), 2_200);
+        let mut chain = regtest();
+        for batch in crate::protocol::Headers::batches(headers.clone()) {
+            chain.extend(batch, crate::fixtures::CLOCK).unwrap();
+        }
+        let (peer, get_headers) =
+            batch_then_tick(asked(&mut chain, start, 7), &branch[..2_000], start);
+        assert_eq!(get_headers, get_headers_after(&branch[1_999]));
+        let received = peer.receive(&headers_message(&branch[2_000..]), crate::fixtures::CLOCK);
+        let Ok((_, super::Received::Synced(tip))) = received else {
+            panic!("{received:?}");
+        };
+        assert_eq!(tip, tip_after(&branch));
     }
 
     #[test]
