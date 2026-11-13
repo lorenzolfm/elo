@@ -106,17 +106,7 @@ impl Event<'_> {
             Event::Tip { peer, tip } => {
                 line.field("peer", peer);
                 line.field("height", tip.height());
-                // In display order: the reverse of the wire order.
-                let hash = tip.hash();
-                line.field(
-                    "hash",
-                    std::fmt::from_fn(|f| {
-                        hash.as_byte_array()
-                            .iter()
-                            .rev()
-                            .try_for_each(|byte| write!(f, "{byte:02x}"))
-                    }),
-                );
+                line.field("hash", tip.hash_display());
                 line.field("work", tip.work());
             }
             Event::End { peer, reason, wait } => {
