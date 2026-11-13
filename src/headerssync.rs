@@ -34,8 +34,8 @@ impl std::fmt::Debug for Salt {
 /// Why a sync refused a batch. Each one ends the sync.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadersSyncError {
-    /// The `prev` of a header is not the hash of the header below it: the tip of our chain, or the
-    /// last header that the peer sent in this download.
+    /// The `prev` of a header is not the hash of the header below it: the header of our chain
+    /// that the sync starts on, or the last header that the peer sent in this download.
     NotContinuous,
     /// The `bits` of a header are not a target in the range of the network, or the hash of the
     /// header is above that target.
@@ -66,8 +66,8 @@ struct Commitments {
     period: usize,
     /// Below `period`.
     offset: usize,
-    /// The height of the tip of our chain. The first height with a commitment is above it, by at
-    /// most `period`.
+    /// The height of the header of our chain that the sync starts on. The first height with a
+    /// commitment is above it, by at most `period`.
     start_height: usize,
     /// Bit `index` is bit `index % WORD_BITS` of word `index / WORD_BITS`.
     words: Vec<u64>,
@@ -79,9 +79,9 @@ struct Commitments {
 #[derive(Debug)]
 pub(crate) struct Presync {
     network: crate::chainparams::Network,
-    /// The tip of our chain, which the chain of the peer goes on.
+    /// The header of our chain that the chain of the peer goes on: our tip, or a fork below it.
     start: Link,
-    /// The work of our chain.
+    /// The work of our chain up to `start`.
     start_work: crate::pow::Work,
     /// The work that the chain of the peer must reach. It is above `start_work`.
     work_min: crate::pow::Work,
@@ -100,7 +100,7 @@ pub(crate) enum PresyncStep {
     /// The batch was full and the work is below the minimum. The peer sends more on the last
     /// header.
     More(Presync),
-    /// The work reached the minimum. The peer sends the chain again, on the tip of our chain.
+    /// The work reached the minimum. The peer sends the chain again, on the start of the sync.
     Redownload(Redownload),
 }
 
@@ -111,16 +111,19 @@ pub(crate) struct Redownload {
     network: crate::chainparams::Network,
     work_min: crate::pow::Work,
     commitments: Commitments,
-    /// The headers that the chain did not get yet, in order. The first is on the tip of our
-    /// chain, or on the last header that the chain got.
+    /// The headers that this download did not release yet, in order. The first is on the start
+    /// of the sync, or on the last header that it released.
     buffer: std::collections::VecDeque<crate::block::BlockHeader>,
-    /// The last header of `buffer`, or the tip of our chain.
+    /// The last header of `buffer`, or the last header that this download released, or the start
+    /// of the sync.
     last: Link,
-    /// The work of our chain plus the work of each header of this download.
+    /// The work of our chain up to the start of the sync, plus the work of each header of this
+    /// download.
     work: crate::pow::Work,
 }
 
-/// What a batch of the second download gave. Each header in it goes on the chain, in order.
+/// What a batch of the second download gave. It releases each header in it, in order, for the
+/// chain: on the start of the sync, or on the headers that it released before.
 #[derive(Debug)]
 pub(crate) enum RedownloadStep {
     /// The batch was full and the work is below the minimum. The peer sends more on the last
@@ -212,46 +215,46 @@ impl Commitments {
 }
 
 impl Presync {
-    /// The first download of the chain of the peer, on the tip of `chain`, until the chain has
-    /// `work_min`. The work of `chain` must be below `work_min`. `clock` is the local clock, in
-    /// seconds since the Unix epoch. A chain gets at most `HEADERS_PER_SECOND_MAX` headers in each
-    /// second from the median time of the tip, until a header can be `TIME_AHEAD_SECONDS_MAX`
-    /// after the clock. So the clock bounds the height, and the height bounds the commitments.
+    /// The first download of the chain of the peer, on `start`, a header of our chain, until the
+    /// chain of the peer has `work_min`. The work of our chain up to `start` must be below
+    /// `work_min`. `clock` is the local clock, in seconds since the Unix epoch. A chain gets at
+    /// most `HEADERS_PER_SECOND_MAX` headers in each second from the median time of `start`, until
+    /// a header can be `TIME_AHEAD_SECONDS_MAX` after the clock. So the clock bounds the height,
+    /// and the height bounds the commitments.
     pub(crate) fn new(
-        chain: &crate::chain::Chain,
+        start: crate::chain::SyncStart,
         work_min: crate::pow::Work,
         clock: u64,
         salt: Salt,
     ) -> Presync {
-        let network = chain.network();
-        let tip = chain.tip();
-        assert!(tip.work() < work_min);
-        let start = Link {
-            hash: tip.hash(),
-            height: tip.height(),
-            bits: chain.tip_bits(),
+        let network = start.network();
+        assert!(start.work() < work_min);
+        let link = Link {
+            hash: start.hash(),
+            height: start.height(),
+            bits: start.bits(),
         };
         // A clock far after each real time saturates, and so does the height, so the bound
         // refuses no chain. A clock below the median time gives zero seconds, and then the bound
         // refuses each header.
         let seconds = clock
             .saturating_add(crate::chain::TIME_AHEAD_SECONDS_MAX)
-            .saturating_sub(u64::from(chain.median_time_past()));
+            .saturating_sub(u64::from(start.median_time_past()));
         let headers_count_max =
             usize::try_from(seconds.saturating_mul(HEADERS_PER_SECOND_MAX)).unwrap_or(usize::MAX);
         Presync {
             network,
-            start,
-            start_work: tip.work(),
+            start: link,
+            start_work: start.work(),
             work_min,
-            height_max: start.height.saturating_add(headers_count_max),
-            commitments: Commitments::new(network, salt, start.height),
-            last: start,
-            work: tip.work(),
+            height_max: link.height.saturating_add(headers_count_max),
+            commitments: Commitments::new(network, salt, link.height),
+            last: link,
+            work: start.work(),
         }
     }
 
-    /// The hash of the last header that the peer sent, or of the tip of our chain. The next batch
+    /// The hash of the last header that the peer sent, or of the start of the sync. The next batch
     /// goes on it.
     pub(crate) fn last_hash(&self) -> bitcoin_hashes::sha256d::Hash {
         self.last.hash
@@ -289,7 +292,7 @@ impl Presync {
 }
 
 impl Redownload {
-    /// The second download, on the tip of the chain, with the commitments of the first.
+    /// The second download, on the start of the first, with its commitments.
     fn new(presync: Presync) -> Redownload {
         assert!(presync.work >= presync.work_min);
         Redownload {
@@ -302,7 +305,7 @@ impl Redownload {
         }
     }
 
-    /// The hash of the last header of this download, or of the tip of our chain. The next batch
+    /// The hash of the last header of this download, or of the start of the sync. The next batch
     /// goes on it.
     pub(crate) fn last_hash(&self) -> bitcoin_hashes::sha256d::Hash {
         self.last.hash
@@ -472,7 +475,12 @@ mod tests {
     /// A first download on regtest genesis that ends at `work_min`.
     fn presync(work_min: crate::pow::Work) -> super::Presync {
         let chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
-        super::Presync::new(&chain, work_min, crate::fixtures::CLOCK, SALT)
+        super::Presync::new(
+            chain.sync_start_on_tip(),
+            work_min,
+            crate::fixtures::CLOCK,
+            SALT,
+        )
     }
 
     /// `presync` after it took each batch of `batches` and asked for more.
@@ -629,7 +637,12 @@ mod tests {
         let work_min = genesis_work
             .saturating_add(genesis_work)
             .saturating_add(genesis_work);
-        let presync = super::Presync::new(&chain, work_min, crate::fixtures::CLOCK, SALT);
+        let presync = super::Presync::new(
+            chain.sync_start_on_tip(),
+            work_min,
+            crate::fixtures::CLOCK,
+            SALT,
+        );
 
         // The batch is not full, so a header that passes ends below the minimum.
         assert_eq!(
@@ -651,7 +664,8 @@ mod tests {
         let work_min = work_on_genesis(&headers).saturating_add(work_on_genesis(&[]));
         let genesis_time = u64::from(crate::chainparams::Network::Regtest.genesis().time);
         let clock = genesis_time + 95 - crate::chain::TIME_AHEAD_SECONDS_MAX + 100;
-        let presync_at = |clock| super::Presync::new(&chain, work_min, clock, SALT);
+        let presync_at =
+            |clock| super::Presync::new(chain.sync_start_on_tip(), work_min, clock, SALT);
 
         // The batch is not full, so a chain that is not too high ends below the minimum.
         assert_eq!(
@@ -870,7 +884,7 @@ mod tests {
             .extend(batch(&headers[..15]), crate::fixtures::CLOCK)
             .unwrap();
         let presync = super::Presync::new(
-            &chain,
+            chain.sync_start_on_tip(),
             work_on_genesis(&headers),
             crate::fixtures::CLOCK,
             SALT,
