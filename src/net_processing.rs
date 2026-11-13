@@ -451,10 +451,12 @@ enum SyncState {
         download: Download,
         sent: std::time::Instant,
     },
-    /// A batch that was not full came, so our tip is the tip of the peer. Our chain has at least
-    /// the minimum work. No `getheaders` is outstanding, so each `headers` is an announcement. One
-    /// on our tip goes on it, and a full one makes a `getheaders` due. One off our tip makes a
-    /// `getheaders` due, and so does an `inv` of a block.
+    /// A batch ended the sync. Our chain has at least the minimum work. The peer has no header
+    /// after our tip, or it is on a branch that our chain does not take: one that it ended with at
+    /// most our work, or one below the margin, which can have more (`Extended::BelowMargin`). No
+    /// `getheaders` is outstanding, so each `headers` is an announcement. One on our tip goes on
+    /// it, and a full one makes a `getheaders` due. One off our tip makes a `getheaders` due, and
+    /// so does an `inv` of a block.
     Synced,
 }
 
@@ -861,7 +863,9 @@ fn receive_on_genesis(
     {
         crate::chain::Extended::Taken => assert!(!empty),
         crate::chain::Extended::Kept => assert!(empty),
-        crate::chain::Extended::Branch(_) => panic!("genesis has no header below it"),
+        crate::chain::Extended::Branch(_) | crate::chain::Extended::BelowMargin => {
+            panic!("genesis has no header below it")
+        }
     }
     if chain.tip().work() >= work_min {
         Ok(None)
@@ -878,9 +882,10 @@ fn receive_on_genesis(
 /// locator that is on its chain: our tip is on another branch. The chain takes a branch with more
 /// work, and then a full batch makes the next one due on our tip. A branch with at most the work of
 /// our chain does not go on it. If its batch is full, the peer can have more of it, so the next one
-/// is due on its last header. Else the peer has no more of it, and the sync ends on our tip. A peer
-/// can send our own headers as such a batch, so a batch that passes each check does not take our
-/// tip away.
+/// is due on its last header. Else the peer has no more of it, and the sync ends on our tip. A full
+/// batch of a branch below the margin ends the sync on our tip too, though the peer can have more
+/// of it. A peer can send our own headers as such a batch, so a batch that passes each check does
+/// not take our tip away.
 fn chain_next(
     chain: &crate::chain::Chain,
     work_min: crate::pow::Work,
@@ -903,6 +908,14 @@ fn chain_next(
         }
         crate::chain::Extended::Kept => {
             // The chain stays, so it keeps the minimum work.
+            assert!(chain.tip().work() >= work_min);
+            None
+        }
+        crate::chain::Extended::BelowMargin => {
+            // Only a full batch can have more of the branch after it.
+            assert!(full);
+            // The chain stays, so it keeps the minimum work. The chain does not follow a branch
+            // below the margin, so the sync ends on our tip.
             assert!(chain.tip().work() >= work_min);
             None
         }
@@ -3175,6 +3188,26 @@ mod tests {
             batch_then_tick(asked(&mut chain, start, 7), &headers[..2_000], start);
         assert_eq!(get_headers, get_headers_after(&headers[1_999]));
         assert_eq!(chain.tip(), tip_after(&headers));
+    }
+
+    #[test]
+    fn full_answer_of_a_branch_below_the_margin_ends_the_sync_on_our_tip() {
+        // Our tip is block 2,145. A full batch of a branch of 2,000 on genesis has less work than
+        // our chain by more than 144 of our headers, so our chain drops it. The peer can have more
+        // of the branch, but the sync ends on our tip, and the connection stays.
+        let headers = crate::fixtures::headers_on_genesis(2_145);
+        let branch =
+            crate::fixtures::branch_on(&crate::chainparams::Network::Regtest.genesis(), 2_000);
+        let mut chain = regtest();
+        for batch in crate::protocol::Headers::batches(headers.clone()) {
+            chain.extend(batch, crate::fixtures::CLOCK).unwrap();
+        }
+        let received = asked(&mut chain, std::time::Instant::now(), 7)
+            .receive(&headers_message(&branch), crate::fixtures::CLOCK);
+        let Ok((_, super::Received::Synced(tip))) = received else {
+            panic!("{received:?}");
+        };
+        assert_eq!(tip, tip_after(&headers));
     }
 
     #[test]

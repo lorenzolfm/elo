@@ -52,12 +52,16 @@ pub(crate) enum Extended {
     /// gone.
     Taken,
     /// The batch gives no more work than the chain, so the chain stays and the batch is dropped:
-    /// an empty batch, a branch that the peer ends with at most the work of the chain, or a branch
-    /// below the chain by more than the margin. On the same work, the chain that came first stays.
+    /// an empty batch, or a branch that the peer ends with at most the work of the chain. On the
+    /// same work, the chain that came first stays.
     Kept,
     /// The batch was full, and its branch has at most the work of the chain. The peer can have more
     /// of the branch, and the next batch goes on its last header.
     Branch(Branch),
+    /// The batch was full and had no headers of the chain, and its branch is below the chain by
+    /// more than the margin. The peer can have more of the branch, also with more work than the
+    /// chain, but the chain does not keep it. So the chain stays and the batch is dropped.
+    BelowMargin,
 }
 
 /// A branch that a peer sends in more than one batch. It is on a header of the chain below the
@@ -348,17 +352,17 @@ impl Chain {
                 // A branch with a header of its own passed the margin before, and its work only
                 // rises. So only a branch with no header of its own gets here.
                 assert_eq!(branch_count, 0);
-                // A batch with no headers of the chain had the most of the branch that one batch
-                // can have, and it is below the margin.
-                if shared_count == 0 {
-                    return Ok(Extended::Kept);
-                }
-                // After headers of the chain, a full batch had less of the branch than that.
-                if full {
-                    let branch = self.branch_on_fork(fork_height);
-                    return Ok(Extended::Branch(branch));
-                }
-                return Ok(Extended::Kept);
+                return Ok(match (full, shared_count) {
+                    // The peer has no more of the branch, which is below the margin, so it has
+                    // less work than the chain.
+                    (false, _) => Extended::Kept,
+                    // A full batch with no headers of the chain had the most of the branch that
+                    // one batch can have.
+                    (true, 0) => Extended::BelowMargin,
+                    // After headers of the chain, a full batch had less of the branch than that,
+                    // so the next batch goes on the fork.
+                    (true, _) => Extended::Branch(self.branch_on_fork(fork_height)),
+                });
             }
         }
         // The fork is below the tip, so the loop read at least one header, and each has work.
@@ -1965,21 +1969,26 @@ mod tests {
 
     #[test]
     fn extend_on_locator_goes_on_with_a_full_branch_only_up_to_144_headers_of_the_tip_below() {
-        // A full batch of a branch of 2,000 on genesis. Below our tip at block 2,144, its chain has
+        // A batch of a branch on genesis. Below our tip at block 2,144, a full batch of 2,000 has
         // the work of 144 of our headers less, so it goes on. Below block 2,145, it has less, and
-        // the chain drops it.
-        let branch = crate::fixtures::branch_on(&genesis(), 2_000);
-        for (count, goes_on) in [(2_144, true), (2_145, false)] {
+        // the chain drops it, though the peer can have more of it. A batch of 1,999 is not full,
+        // so the peer ends the branch there, with less work than ours.
+        let rows = [
+            (2_000, 2_144, None),
+            (2_000, 2_145, Some(super::Extended::BelowMargin)),
+            (1_999, 2_145, Some(super::Extended::Kept)),
+        ];
+        for (branch_count, count, dropped) in rows {
+            let branch = crate::fixtures::branch_on(&genesis(), branch_count);
             let headers = crate::fixtures::headers_on_genesis(count);
             let mut chain = regtest_with(&headers);
             let extended = on_locator(&mut chain, &branch);
-            assert_eq!(
-                matches!(extended, Ok(super::Extended::Branch(_))),
-                goes_on,
-                "{count}"
-            );
-            if !goes_on {
-                assert_eq!(extended, Ok(super::Extended::Kept));
+            match dropped {
+                None => assert!(
+                    matches!(extended, Ok(super::Extended::Branch(_))),
+                    "{extended:?}"
+                ),
+                Some(dropped) => assert_eq!(extended, Ok(dropped), "{branch_count} {count}"),
             }
             assert_eq!(chain.tip(), regtest_with(&headers).tip());
         }
@@ -2006,7 +2015,7 @@ mod tests {
                 "{count}"
             );
             if !goes_on {
-                assert_eq!(extended, Ok(super::Extended::Kept));
+                assert_eq!(extended, Ok(super::Extended::BelowMargin));
             }
         }
     }
