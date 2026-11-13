@@ -655,10 +655,10 @@ impl<'a> Peer<'a> {
         let (ping, ping_nonce, ping_wake) = ping.tick(now, nonce)?;
         let (sync, get_headers, headers_wake) = sync.tick(now, chain, work_min)?;
         let wake = headers_wake.map_or(ping_wake, |headers_wake| headers_wake.min(ping_wake));
-        let send_headers_due = matches!(send_headers, SendHeadersState::Due);
-        let send_headers = match send_headers {
-            SendHeadersState::Unsent => SendHeadersState::Unsent,
-            SendHeadersState::Due | SendHeadersState::Sent => SendHeadersState::Sent,
+        let (send_headers, send_headers_due) = match send_headers {
+            SendHeadersState::Unsent => (SendHeadersState::Unsent, false),
+            SendHeadersState::Due => (SendHeadersState::Sent, true),
+            SendHeadersState::Sent => (SendHeadersState::Sent, false),
         };
 
         // Each `getheaders` that is due goes in this tick.
