@@ -464,16 +464,13 @@ enum SyncState {
     Synced,
 }
 
-/// Where our `sendheaders` is. It goes once, in the first tick after the first end of the sync.
-/// Before it, the peer announces a new header with an `inv`, which elo skips. A `headers` that came
-/// while our `getheaders` was outstanding would look like its answer. So it does not go before the
-/// sync ends.
+/// Where our `sendheaders` is. It goes once, in the first tick at `SyncState::Synced`. Before it,
+/// the peer announces a new header with an `inv`, which elo skips. A `headers` that came while our
+/// `getheaders` was outstanding would look like its answer. So it does not go before the sync ends.
 #[derive(Debug)]
 enum SendHeadersState {
-    /// The sync did not end yet.
+    /// It did not go yet.
     Unsent,
-    /// The sync ended, and the next tick sends it.
-    Due,
     /// It went.
     Sent,
 }
@@ -581,8 +578,6 @@ impl<'a> Peer<'a> {
                 receive_answer(self.chain, self.work_min, download, headers, clock)?
             }
             SyncState::Synced => {
-                // The end of the sync made our `sendheaders` due. `tick` holds the same.
-                assert!(!matches!(self.send_headers, SendHeadersState::Unsent));
                 // A sync ends only on a chain with at least the minimum work.
                 extend_tip(self.chain, self.work_min, headers, clock)?
             }
@@ -595,9 +590,6 @@ impl<'a> Peer<'a> {
             }
             None => {
                 self.sync = SyncState::Synced;
-                if let SendHeadersState::Unsent = self.send_headers {
-                    self.send_headers = SendHeadersState::Due;
-                }
                 let tip = self.chain.tip();
                 Ok((self, Received::Synced(tip)))
             }
@@ -611,8 +603,8 @@ impl<'a> Peer<'a> {
     /// `PING_TIMEOUT` old, or our outstanding `getheaders` is `HEADERS_TIMEOUT` old. The `ping` is
     /// checked first. Each deadline is due at its instant, not after it. The wake is the earliest
     /// deadline. The `now` of a tick is not before the `now` of an earlier tick, because each
-    /// deadline counts from an earlier `now`. Our `sendheaders` is due at once after the first end
-    /// of the sync, and has no deadline.
+    /// deadline counts from an earlier `now`. Our `sendheaders` goes in the first tick at
+    /// `SyncState::Synced`, and has no deadline.
     pub(crate) fn tick(
         self,
         now: std::time::Instant,
@@ -628,18 +620,13 @@ impl<'a> Peer<'a> {
         let (ping, ping_nonce, ping_wake) = ping.tick(now, nonce)?;
         let (sync, get_headers, headers_wake) = sync.tick(now, chain, work_min)?;
         let wake = headers_wake.map_or(ping_wake, |headers_wake| headers_wake.min(ping_wake));
-        let (send_headers, send_headers_due) = match send_headers {
-            SendHeadersState::Unsent => (SendHeadersState::Unsent, false),
-            SendHeadersState::Due => (SendHeadersState::Sent, true),
-            SendHeadersState::Sent => (SendHeadersState::Sent, false),
+        let (send_headers, send_headers_due) = match (send_headers, &sync) {
+            (SendHeadersState::Unsent, SyncState::Synced) => (SendHeadersState::Sent, true),
+            (send_headers, _) => (send_headers, false),
         };
 
         // Each `getheaders` that is due goes in this tick.
         assert!(!matches!(sync, SyncState::Due(_)));
-        // Only the end of a sync makes our `sendheaders` due.
-        if let SendHeadersState::Unsent = send_headers {
-            assert!(!matches!(sync, SyncState::Synced));
-        }
         // A wake at or before `now` would make the driver tick again with no wait.
         assert!(wake > now);
         let outbound = TickOutbound {
@@ -1779,10 +1766,8 @@ pub(crate) mod fuzz {
     /// Where our `sendheaders` is.
     #[derive(PartialEq)]
     enum SendHeadersModel {
-        /// The sync did not end yet.
+        /// It did not go yet.
         Unsent,
-        /// The sync ended, and the next tick sends it.
-        Due,
         /// It went.
         Sent,
     }
@@ -1864,7 +1849,9 @@ pub(crate) mod fuzz {
                 GetHeadersModel::Ended => (false, None),
             };
 
-            let send_headers = self.send_headers == SendHeadersModel::Due;
+            // Our `sendheaders` goes in the first tick after the sync ended.
+            let send_headers = self.send_headers == SendHeadersModel::Unsent
+                && matches!(self.get_headers, GetHeadersModel::Ended);
 
             if ping {
                 self.ping_nonce = nonce;
@@ -1958,9 +1945,6 @@ pub(crate) mod fuzz {
                 }
                 None => {
                     self.get_headers = GetHeadersModel::Ended;
-                    if self.send_headers == SendHeadersModel::Unsent {
-                        self.send_headers = SendHeadersModel::Due;
-                    }
                     Ok(ReceivedExpected::Synced)
                 }
             }
