@@ -179,8 +179,9 @@ enum PartialFrame {
 /// Dials `peer` on the network of `chain` and runs the handshake. Returns the connection for the
 /// messages after it, and their `version`. The sync of the connection extends `chain` from its
 /// tip, so the next connection with the same chain does not get those headers again. A chain
-/// below the minimum work starts again from genesis, and so does a chain whose tip the peer does
-/// not have.
+/// below the minimum work starts again from genesis. A peer whose chain does not have our tip
+/// answers from the highest header of our locator on its chain, and a branch with more work takes
+/// the place of ours.
 pub async fn handshake(
     peer: std::net::SocketAddr,
     chain: &mut crate::chain::Chain,
@@ -300,11 +301,9 @@ impl<'a> Synced<'a> {
                 (next, None) => peer = next,
                 (next, Some(tip)) if tip == previous => peer = next,
                 (peer, Some(tip)) => {
-                    // On one connection, our chain only takes headers on its tip. A batch that
-                    // is not on it ends the connection, and so does a restart from genesis.
-                    assert!(tip.height() > previous.height());
-                    // The work of a chain does not go down. It saturates at its maximum, so it can
-                    // stay the same.
+                    // On one connection, our chain takes a batch on its tip, or a branch with more
+                    // work, which can be lower. So only the work goes up. It saturates at its
+                    // maximum, so it can stay the same.
                     assert!(tip.work() >= previous.work());
                     return Ok((Synced { socket, peer, tip }, tip));
                 }

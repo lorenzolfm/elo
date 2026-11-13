@@ -359,6 +359,28 @@ pub(crate) fn headers_on(
         .collect()
 }
 
+/// `headers_on`, with another merkle root in each header. So each header has another hash than the
+/// header of `headers_on` at the same height, and a batch of these is a branch on `below`.
+pub(crate) fn branch_on(
+    below: &crate::block::BlockHeader,
+    count: usize,
+) -> Vec<crate::block::BlockHeader> {
+    let first = crate::pow::mined_for_regtest(crate::block::BlockHeader {
+        merkle_root: [0xbb; 32],
+        ..headers_on(below, 1)[0]
+    });
+    let on = |below: &crate::block::BlockHeader| {
+        crate::pow::mined_for_regtest(crate::block::BlockHeader {
+            prev: below.hash(),
+            time: below.time + 1,
+            ..*below
+        })
+    };
+    std::iter::successors(Some(first), |below| Some(on(below)))
+        .take(count)
+        .collect()
+}
+
 /// A `headers` payload with `headers`, each with a transaction count of 0.
 pub(crate) fn headers_payload_with(headers: &[crate::block::BlockHeader]) -> Vec<u8> {
     let mut payload = Vec::new();

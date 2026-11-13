@@ -8,6 +8,10 @@ pub(crate) const PROTOCOL_VERSION: i32 = 70016;
 /// The most headers a `headers` may carry. A peer that sends fewer has no more to send.
 pub(crate) const HEADERS_COUNT_MAX: usize = 2000;
 
+/// The most hashes in the locator of a `getheaders` that a peer takes. A peer drops a connection
+/// that sends more.
+pub(crate) const LOCATOR_HASHES_COUNT_MAX: usize = 101;
+
 /// The most entries an `inv` may carry.
 pub(crate) const INV_COUNT_MAX: usize = 50_000;
 
@@ -277,28 +281,35 @@ impl Decode for Version {
     }
 }
 
-/// The `getheaders` payload. It asks for the headers after the header with the hash `after`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The `getheaders` payload. It asks for the headers after the first hash of its locator that is
+/// on the chain of the peer.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GetHeaders {
-    /// The only hash in the locator.
-    after: bitcoin_hashes::sha256d::Hash,
+    /// The hashes of the locator, from the highest header down.
+    locator: Vec<bitcoin_hashes::sha256d::Hash>,
 }
 
 impl GetHeaders {
-    /// Asks for the headers after the header with the hash `after`: the tip of our chain, or the
-    /// last header of a download of a low-work sync.
-    pub(crate) fn new(after: bitcoin_hashes::sha256d::Hash) -> GetHeaders {
-        GetHeaders { after }
+    /// Asks for the headers after the first hash of `locator` that is on the chain of the peer: the
+    /// locator of our chain, or only the last header of a download of a low-work sync. `locator`
+    /// has from 1 to `LOCATOR_HASHES_COUNT_MAX` hashes, from the highest header down.
+    pub(crate) fn new(locator: Vec<bitcoin_hashes::sha256d::Hash>) -> GetHeaders {
+        // A peer answers an empty locator with one header, and drops a long one.
+        assert!(!locator.is_empty());
+        assert!(locator.len() <= LOCATOR_HASHES_COUNT_MAX);
+        GetHeaders { locator }
     }
 }
 
-/// The version is `PROTOCOL_VERSION`. The locator holds only `after`. `hash_stop` is all zeros,
-/// so the peer sends as many headers as a `headers` can carry.
+/// The version is `PROTOCOL_VERSION`. `hash_stop` is all zeros, so the peer sends as many headers
+/// as a `headers` can carry.
 impl Encode for GetHeaders {
     fn encode(&self, out: &mut Vec<u8>) {
         PROTOCOL_VERSION.encode(out);
-        crate::serialize::write_compact_size(out, 1);
-        self.after.encode(out);
+        crate::serialize::write_compact_size(out, self.locator.len());
+        for hash in &self.locator {
+            hash.encode(out);
+        }
         let hash_stop = [0_u8; 32];
         hash_stop.encode(out);
     }
@@ -665,7 +676,7 @@ mod tests {
     #[test]
     fn get_headers_encodes_to_core_bytes() {
         let get_headers =
-            super::GetHeaders::new(crate::chainparams::Network::Regtest.genesis().hash());
+            super::GetHeaders::new(vec![crate::chainparams::Network::Regtest.genesis().hash()]);
         let mut payload = Vec::new();
         get_headers.encode(&mut payload);
         assert_eq!(
