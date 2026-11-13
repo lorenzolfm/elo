@@ -832,8 +832,9 @@ fn receive_on_tip(
         return Err(PeerError::TipNotOnTheirChain);
     }
     chain.extend(headers, clock).map_err(PeerError::Extend)?;
-    // Only the handshake on a chain at the minimum and a sync that reached it give
-    // `Download::Chain`, and the work of a chain does not go down.
+    // Only the handshake on a chain at the minimum, a sync that reached it, and an announcement
+    // after a sync give `Download::Chain`. A sync ends only at the minimum, and the work of a
+    // chain does not go down.
     assert!(chain.tip().work() >= work_min);
     Ok(full.then_some(Download::Chain))
 }
