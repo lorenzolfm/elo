@@ -29,6 +29,8 @@ pub(crate) const PING: MessageType = MessageType::from_name("ping");
 pub(crate) const PONG: MessageType = MessageType::from_name("pong");
 pub(crate) const GETHEADERS: MessageType = MessageType::from_name("getheaders");
 pub(crate) const HEADERS: MessageType = MessageType::from_name("headers");
+pub(crate) const WTXIDRELAY: MessageType = MessageType::from_name("wtxidrelay");
+pub(crate) const SENDADDRV2: MessageType = MessageType::from_name("sendaddrv2");
 
 impl MessageType {
     /// Pads `name` with NULs to `MESSAGE_TYPE_SIZE` bytes. Panics if the name
