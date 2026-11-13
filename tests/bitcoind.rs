@@ -374,15 +374,15 @@ fn next_connection_syncs_from_our_tip_and_a_tip_off_the_chain_of_bitcoind_starts
         bitcoind.peer,
         best.trim_end()
     );
-    let deadline = std::time::Instant::now() + 2 * RECONNECT_TIMEOUT;
-    while !elo
-        .event("tip", 2 * RECONNECT_TIMEOUT)
-        .starts_with(&expected)
-    {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "elo did not get the block on genesis"
-        );
+    // The connections log other tips before it. One deadline holds all the waits. Both reconnects
+    // fit in one `RECONNECT_TIMEOUT`, because each waits 5 s, and a longer bound goes past the
+    // limit of a test in nextest, so `event` could not give its message.
+    let deadline = std::time::Instant::now() + RECONNECT_TIMEOUT;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if elo.event("tip", left).starts_with(&expected) {
+            break;
+        }
     }
     // The refusal came at least 5 s before the tip, so its line is there.
     let ends = elo.events("end");
