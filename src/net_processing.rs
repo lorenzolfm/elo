@@ -1445,10 +1445,10 @@ pub(crate) mod fuzz {
             }
             now = now_next(script.byte(), now, wake);
             // The chain holds only headers that the script wrote.
-            assert!(model.height <= script.headers_written_count);
+            assert!(model.height() <= script.headers_written_count);
         }
         ScriptEnd::PeerOpen {
-            height: model.height,
+            height: model.height(),
             synced: model.is_synced(),
         }
     }
@@ -1535,7 +1535,7 @@ pub(crate) mod fuzz {
             }
             (Ok((peer, super::Received::Synced(tip))), Ok(ReceivedExpected::Synced)) => {
                 assert_eq!(tip.hash(), model.tip);
-                assert_eq!(tip.height(), model.height);
+                assert_eq!(tip.height(), model.height());
                 assert_eq!(tip.work().to_string(), format!("{:064x}", model.work()));
                 Ok(peer)
             }
@@ -1812,10 +1812,10 @@ pub(crate) mod fuzz {
         ping_outstanding: bool,
         get_headers: GetHeadersModel,
         send_headers: SendHeadersModel,
-        /// The hash and the height of the last header of the chain.
+        /// The hash of the last header of the chain.
         tip: bitcoin_hashes::sha256d::Hash,
-        height: usize,
-        /// The hash of each header below the tip, from genesis. The index of a hash is its height.
+        /// The hash of each header below the tip, from genesis. The index of a hash is its height,
+        /// so the count of hashes is the height of the tip.
         below_tip: Vec<bitcoin_hashes::sha256d::Hash>,
         network: crate::chainparams::Network,
         /// The work that the chain must reach in the sync.
@@ -1903,7 +1903,6 @@ pub(crate) mod fuzz {
                 get_headers: GetHeadersModel::Due,
                 send_headers: SendHeadersModel::Unsent,
                 tip: network.genesis().hash(),
-                height: 0,
                 below_tip: Vec::new(),
                 network,
                 work_min,
@@ -1915,12 +1914,12 @@ pub(crate) mod fuzz {
         /// it, and the next batch goes on it.
         fn download_last(&self) -> (bitcoin_hashes::sha256d::Hash, usize) {
             let hashes = match &self.download {
-                DownloadModel::Chain => return (self.tip, self.height),
+                DownloadModel::Chain => return (self.tip, self.height()),
                 DownloadModel::Presync(hashes) => hashes,
                 DownloadModel::Redownload { buffer, .. } => buffer,
             };
             // The chain stays on genesis until the low-work sync ends.
-            assert_eq!(self.height, 0);
+            assert_eq!(self.height(), 0);
             (hashes.last().copied().unwrap_or(self.tip), hashes.len())
         }
 
@@ -1933,7 +1932,7 @@ pub(crate) mod fuzz {
             }
             let hash_at = |height: usize| self.below_tip.get(height).copied().unwrap_or(self.tip);
             let mut locator = Vec::new();
-            let mut height = self.height;
+            let mut height = self.height();
             let mut step = 1;
             loop {
                 locator.push(hash_at(height));
@@ -2067,7 +2066,7 @@ pub(crate) mod fuzz {
                 DownloadModel::Chain if full && self.work() < self.work_min => {
                     // Only genesis is below the minimum when a full batch comes: each other chain
                     // got there in a sync that reached it.
-                    assert_eq!(self.height, 0);
+                    assert_eq!(self.height(), 0);
                     self.receive_presync(Vec::new(), &headers)?
                 }
                 DownloadModel::Chain => self.receive_on_tip(&headers)?,
@@ -2121,7 +2120,7 @@ pub(crate) mod fuzz {
             mut hashes: Vec<bitcoin_hashes::sha256d::Hash>,
             headers: &[crate::block::BlockHeader],
         ) -> Result<Option<DownloadModel>, super::PeerError> {
-            assert_eq!(self.height, 0);
+            assert_eq!(self.height(), 0);
             let last_hash = hashes.last().copied().unwrap_or(self.tip);
             hashes.extend(script_hashes(self.network, last_hash, headers).map_err(sync_error)?);
             if self.work_at(hashes.len()) >= self.work_min {
@@ -2148,7 +2147,7 @@ pub(crate) mod fuzz {
             mut buffer: Vec<bitcoin_hashes::sha256d::Hash>,
             headers: &[crate::block::BlockHeader],
         ) -> Result<Option<DownloadModel>, super::PeerError> {
-            assert_eq!(self.height, 0);
+            assert_eq!(self.height(), 0);
             let last_hash = buffer.last().copied().unwrap_or(self.tip);
             for hash in script_hashes(self.network, last_hash, headers).map_err(sync_error)? {
                 buffer.push(hash);
@@ -2178,13 +2177,16 @@ pub(crate) mod fuzz {
             for hash in hashes {
                 self.below_tip.push(std::mem::replace(&mut self.tip, *hash));
             }
-            self.height += hashes.len();
-            assert_eq!(self.below_tip.len(), self.height);
+        }
+
+        /// The height of the tip of the chain.
+        fn height(&self) -> usize {
+            self.below_tip.len()
         }
 
         /// The work of the chain.
         fn work(&self) -> u128 {
-            self.work_at(self.height)
+            self.work_at(self.height())
         }
 
         /// The work of a chain of script headers to `height`. A person wrote the work of each
