@@ -7,8 +7,8 @@
 
 const USAGE: &str = "usage: elo <mainnet|testnet4|signet|regtest> <ip>[:port]";
 
-/// The exit code for bad usage. A stop by a signal exits with 0. Every other exit is 1,
-/// because only a fault of this host ends elo.
+/// The exit code for bad usage. A stop by a signal exits with 0, and a panic with 101. Every
+/// other exit is 1, because only a fault of this host ends elo.
 const EXIT_USAGE: u8 = 2;
 
 /// How long elo waits after a connection ends before it dials the peer again. So a peer that is
@@ -16,6 +16,15 @@ const EXIT_USAGE: u8 = 2;
 const RECONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn main() -> std::process::ExitCode {
+    // First of all, so each panic writes a `panic` line, and not the text of the default hook,
+    // which is not a line of the log. A panic in this hook aborts elo.
+    std::panic::set_hook(Box::new(|info| {
+        let event = elo::logging::Event::Panic { reason: info };
+        if log(&event).is_err() {
+            let _ = event.write(&mut std::io::stderr().lock());
+        }
+    }));
+
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let Some((network, peer)) = parse(&args) else {
         eprintln!("{USAGE}");

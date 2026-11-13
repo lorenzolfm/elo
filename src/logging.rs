@@ -62,6 +62,8 @@ pub enum Event<'a> {
     Exit { reason: &'a dyn std::fmt::Display },
     /// `signal` stops elo, with exit code 0.
     Stop { signal: &'a dyn std::fmt::Display },
+    /// A bug ends elo, with exit code 101. `reason` is the place in the code and the message.
+    Panic { reason: &'a dyn std::fmt::Display },
 }
 
 impl Event<'_> {
@@ -79,6 +81,7 @@ impl Event<'_> {
             Event::End { .. } => "end",
             Event::Exit { .. } => "exit",
             Event::Stop { .. } => "stop",
+            Event::Panic { .. } => "panic",
         }
     }
 
@@ -86,7 +89,7 @@ impl Event<'_> {
         match self {
             Event::Version { .. } | Event::Tip { .. } | Event::Stop { .. } => Level::Info,
             Event::End { .. } => Level::Warn,
-            Event::Exit { .. } => Level::Error,
+            Event::Exit { .. } | Event::Panic { .. } => Level::Error,
         }
     }
 
@@ -114,7 +117,7 @@ impl Event<'_> {
                 line.field("reason", reason);
                 line.field("wait_ms", wait.as_millis());
             }
-            Event::Exit { reason } => line.field("reason", reason),
+            Event::Exit { reason } | Event::Panic { reason } => line.field("reason", reason),
             Event::Stop { signal } => line.field("signal", signal),
         }
         line.end()
@@ -127,7 +130,7 @@ enum Level {
     Info,
     /// A fault that elo gets past, such as a peer that drops.
     Warn,
-    /// A fault that ends elo.
+    /// A fault or a bug that ends elo.
     Error,
 }
 
@@ -315,6 +318,12 @@ mod tests {
             (
                 super::Event::Stop { signal: &"SIGTERM" },
                 "level=info event=stop signal=SIGTERM",
+            ),
+            (
+                super::Event::Panic {
+                    reason: &"panicked at src/main.rs:1:1:\nboom",
+                },
+                r#"level=error event=panic reason="panicked at src/main.rs:1:1:\nboom""#,
             ),
         ] {
             assert_eq!(line(event), format!("{expected}\n"));

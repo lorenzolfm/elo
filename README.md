@@ -39,7 +39,8 @@ elo <mainnet|testnet4|signet|regtest> <ip>[:port]    # IPv6 as [::1]:8333
 SIGTERM and SIGINT (Ctrl-C) stop elo at any step, also in the wait before a
 dial. It logs the signal and exits with 0. elo exits with 1 only on a fault of
 this host: its async runtime or its signal handlers do not start, a write to
-stdout fails, or a read of `/dev/urandom` fails. Bad usage exits with 2.
+stdout fails, or a read of `/dev/urandom` fails. A bug panics: elo logs the
+panic and exits with 101. Bad usage exits with 2.
 
 ## Log
 
@@ -60,6 +61,7 @@ level=info event=stop signal=SIGTERM
 | `end` | `warn` | `peer` `reason` `wait_ms`: elo dials the peer again after `wait_ms` |
 | `exit` | `error` | `reason`: a fault of this host, and elo exits with 1 |
 | `stop` | `info` | `signal`: elo exits with 0 |
+| `panic` | `error` | `reason`: a bug, and elo exits with 101 |
 
 The names of the events and of the fields are an interface, so a rename breaks the dashboards and
 alerts that match on them. `src/logging.rs` holds the one list of them. A value with a space, a `=`,
