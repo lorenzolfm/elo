@@ -61,30 +61,45 @@ pub(crate) enum Extended {
 }
 
 /// A branch that a peer sends in more than one batch. It is on a header of the chain below the
-/// tip, the fork, and its headers passed each check on the chain up to the fork. It has at most the
-/// work of the headers above the fork. A branch with a header is in the margin: its chain from
-/// genesis has at least the minimum work, and at least the work of the chain less the work of
-/// `BRANCH_TIP_HEADERS_BEHIND_MAX` headers with the `bits` of the tip. Only `Chain` makes one, and
-/// only for the chain that it is below. That chain must not change until the next batch, because
-/// the work above the fork is the work of that chain.
+/// tip, the fork, and it has at most the work of the headers above the fork. Only `Chain` makes
+/// one, and only for the chain that it is below. That chain must not change until the next batch,
+/// because the work above the fork is the work of that chain.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Branch {
     /// The height of the fork. It is below the height of the tip.
     fork_height: usize,
-    /// The headers of the branch, in order. None is a header of the chain, so the first is not the
-    /// header of the chain above the fork. It is empty when the peer sent only headers of the chain
-    /// up to the fork.
-    headers: Vec<crate::block::BlockHeader>,
-    /// The sum of the work of `headers`.
-    work: crate::pow::Work,
-    /// The hash of the last of `headers`, or of the fork when there is none.
-    last_hash: bitcoin_hashes::sha256d::Hash,
-    /// The highest bound on the time of a header that a check of the branch read. The local clock
-    /// can go back, so a later batch can have a lower bound.
-    time_max: u64,
+    /// What the branch has above the fork.
+    above_fork: AboveFork,
     /// The work of the chain that the branch is below. With the minimum work of the sync, it sets
     /// the margin, so the next batch asserts that it is the same.
     chain_work: crate::pow::Work,
+}
+
+/// What a `Branch` has above its fork.
+#[derive(Debug, PartialEq, Eq)]
+enum AboveFork {
+    /// No header yet: the peer sent none, or only headers of the chain up to the fork. The next
+    /// batch goes on the fork, and it can start with more headers of the chain.
+    Empty {
+        /// The hash of the fork.
+        fork_hash: bitcoin_hashes::sha256d::Hash,
+    },
+    /// At least one header, and the branch is in the margin: its chain from genesis has at least
+    /// the minimum work, and at least the work of the chain less the work of
+    /// `BRANCH_TIP_HEADERS_BEHIND_MAX` headers with the `bits` of the tip. The headers passed each
+    /// check on the chain up to the fork.
+    Headers {
+        /// The headers of the branch, in order. None is a header of the chain, so the first is not
+        /// the header of the chain above the fork.
+        headers: Vec<crate::block::BlockHeader>,
+        /// The sum of the work of `headers`.
+        work: crate::pow::Work,
+        /// The hash of the last of `headers`.
+        last_hash: bitcoin_hashes::sha256d::Hash,
+        /// The highest bound on the time of a header that a check of the branch read. The local
+        /// clock can go back, so a later batch can have a lower bound.
+        time_max: u64,
+    },
 }
 
 /// Why `Chain::extend`, `Chain::extend_on_locator` or `Chain::extend_branch` refused a batch.
@@ -215,9 +230,11 @@ impl Chain {
         // the branch.
         assert!(branch.fork_height < self.below_tip.len());
         let fork_hash = self.header_at(branch.fork_height).hash();
-        match branch.headers.first() {
-            Some(first) => assert_eq!(first.prev, fork_hash),
-            None => assert_eq!(branch.last_hash, fork_hash),
+        match &branch.above_fork {
+            AboveFork::Empty { fork_hash: hash } => assert_eq!(*hash, fork_hash),
+            AboveFork::Headers { headers, .. } => {
+                assert_eq!(headers.first().map(|first| first.prev), Some(fork_hash));
+            }
         }
         // The chain above the fork did not change either, and the minimum is the same. So the
         // margin is the margin that the batch before passed, and `extend_above` can assert that a
@@ -262,11 +279,7 @@ impl Chain {
         let mut batch = headers.into_vec();
         let Branch {
             mut fork_height,
-            headers: branch_headers,
-            work: work_branch_before,
-            // The next batch goes on it, and `check` reads it from the headers.
-            last_hash: _,
-            time_max: branch_time_max,
+            above_fork,
             // `extend_branch` asserts it against the chain.
             chain_work: _,
         } = branch;
@@ -276,36 +289,48 @@ impl Chain {
         assert!(fork_height < tip_height);
         let time_max = time_max(clock);
 
-        let mut shared_count = 0;
-        if branch_headers.is_empty() {
-            // The headers of the chain from the fork up are below the tip, so they are equal only
-            // to the headers of the chain. The compare needs no hash.
-            let ours = self.below_tip[fork_height + 1..]
-                .iter()
-                .chain(std::iter::once(&self.tip));
-            shared_count = batch
-                .iter()
-                .zip(ours)
-                .take_while(|(theirs, ours)| theirs == ours)
-                .count();
-        }
-        if shared_count > 0 {
-            fork_height += shared_count;
-            batch.drain(..shared_count);
-            if fork_height == tip_height {
-                if !batch.is_empty() {
-                    self.extend_tip(batch, time_max)?;
+        // The headers of the branch before the batch, their work, the highest bound on time that
+        // their checks read, and the count of headers of the chain at the start of the batch.
+        let (branch_headers, work_branch_before, time_max_before, shared_count) = match above_fork {
+            AboveFork::Headers {
+                headers,
+                work,
+                // The next batch goes on it, and `check` reads it from the headers.
+                last_hash: _,
+                time_max: time_max_before,
+            } => (headers, work, time_max_before, 0),
+            AboveFork::Empty { fork_hash: _ } => {
+                // The headers of the chain from the fork up are below the tip, so they are equal
+                // only to the headers of the chain. The compare needs no hash.
+                let ours = self.below_tip[fork_height + 1..]
+                    .iter()
+                    .chain(std::iter::once(&self.tip));
+                let shared_count = batch
+                    .iter()
+                    .zip(ours)
+                    .take_while(|(theirs, ours)| theirs == ours)
+                    .count();
+                if shared_count > 0 {
+                    fork_height += shared_count;
+                    batch.drain(..shared_count);
+                    if fork_height == tip_height {
+                        if !batch.is_empty() {
+                            self.extend_tip(batch, time_max)?;
+                        }
+                        return Ok(Extended::Taken);
+                    }
+                    if batch.is_empty() {
+                        if full {
+                            let branch = self.branch_on_fork(fork_height);
+                            return Ok(Extended::Branch(branch));
+                        }
+                        return Ok(Extended::Kept);
+                    }
                 }
-                return Ok(Extended::Taken);
+                // With no header before the batch, the bound of the batch is the highest.
+                (Vec::new(), crate::pow::Work::ZERO, time_max, shared_count)
             }
-            if batch.is_empty() {
-                if full {
-                    let branch = self.branch_on_fork(fork_height);
-                    return Ok(Extended::Branch(branch));
-                }
-                return Ok(Extended::Kept);
-            }
-        }
+        };
 
         let branch_count = branch_headers.len();
         let mut headers = branch_headers;
@@ -340,15 +365,17 @@ impl Chain {
         assert!(work_above_fork > crate::pow::Work::ZERO);
         // A check can read a lower bound than a check of an earlier batch of the branch, so the
         // store reads the highest.
-        let time_max = time_max.max(branch_time_max);
+        let time_max = time_max.max(time_max_before);
         if work_branch <= work_above_fork {
             if full {
                 return Ok(Extended::Branch(Branch {
                     fork_height,
-                    headers,
-                    work: work_branch,
-                    last_hash,
-                    time_max,
+                    above_fork: AboveFork::Headers {
+                        headers,
+                        work: work_branch,
+                        last_hash,
+                        time_max,
+                    },
                     chain_work: self.work,
                 }));
             }
@@ -405,10 +432,9 @@ impl Chain {
         assert!(fork_height < self.below_tip.len());
         Branch {
             fork_height,
-            headers: Vec::new(),
-            work: crate::pow::Work::ZERO,
-            last_hash: self.header_at(fork_height).hash(),
-            time_max: 0,
+            above_fork: AboveFork::Empty {
+                fork_hash: self.header_at(fork_height).hash(),
+            },
             chain_work: self.work,
         }
     }
@@ -741,7 +767,10 @@ impl Branch {
     /// The hash of the last header of the branch, or of the fork when there is none. The next
     /// batch goes on it.
     pub(crate) fn last_hash(&self) -> bitcoin_hashes::sha256d::Hash {
-        self.last_hash
+        match &self.above_fork {
+            AboveFork::Empty { fork_hash } => *fork_hash,
+            AboveFork::Headers { last_hash, .. } => *last_hash,
+        }
     }
 }
 
@@ -1846,7 +1875,10 @@ mod tests {
             &[&headers[..1], &branch[..]].concat(),
         ));
         assert_eq!(pending.fork_height, 1);
-        assert_eq!(pending.headers, branch);
+        let super::AboveFork::Headers { headers: kept, .. } = &pending.above_fork else {
+            panic!("{pending:?}");
+        };
+        assert_eq!(*kept, branch);
         assert_eq!(pending.last_hash(), branch[1_998].hash());
         assert_eq!(chain.tip(), regtest_with(&headers).tip());
     }
