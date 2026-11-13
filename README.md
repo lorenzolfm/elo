@@ -32,8 +32,13 @@ had first stays. After a full batch of a branch with no more work, elo asks for
 the headers after the last header of the branch, and keeps the branch in memory
 until it has more work or ends. elo keeps a branch only while its chain from
 genesis has at least the minimum work, and at least the work of elo less the
-work of 144 headers at the difficulty of the tip. Each `getheaders` of a
-low-work sync or of a branch has only the hash of the last header that elo got.
+work of 144 headers at the difficulty of the tip. For a full batch of a branch
+below that, elo gets the branch twice in a low-work sync from the header that it
+is on, as from genesis, and the minimum of that sync is the work of elo less the
+144 headers. Then the branch goes on as one that elo kept. A connection has at
+most one low-work sync, so a second one ends it, and the next connection gets a
+new salt. Each `getheaders` of a low-work sync or of a branch has only the hash
+of the last header that elo got.
 A peer announces a block with an `inv` when its headers do not connect to the
 last header it sent, so an `inv` of a block makes elo ask too. From the
 handshake on, it pings the peer every 2 min.
