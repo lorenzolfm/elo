@@ -314,22 +314,22 @@ impl Chain {
                     .zip(ours)
                     .take_while(|(theirs, ours)| theirs == ours)
                     .count();
-                if shared_count > 0 {
-                    fork_height += shared_count;
-                    batch.drain(..shared_count);
-                    if fork_height == tip_height {
-                        if !batch.is_empty() {
-                            self.extend_tip(batch, time_max)?;
-                        }
-                        return Ok(Extended::Taken);
+                // With no headers of the chain at the start, the fork stays below the tip and the
+                // batch is not empty, so this returns only after headers of the chain.
+                fork_height += shared_count;
+                batch.drain(..shared_count);
+                if fork_height == tip_height {
+                    if !batch.is_empty() {
+                        self.extend_tip(batch, time_max)?;
                     }
-                    if batch.is_empty() {
-                        if full {
-                            let branch = self.branch_on_fork(fork_height);
-                            return Ok(Extended::Branch(branch));
-                        }
-                        return Ok(Extended::Kept);
+                    return Ok(Extended::Taken);
+                }
+                if batch.is_empty() {
+                    if full {
+                        let branch = self.branch_on_fork(fork_height);
+                        return Ok(Extended::Branch(branch));
                     }
+                    return Ok(Extended::Kept);
                 }
                 // With no header before the batch, the bound of the batch is the highest.
                 (Vec::new(), crate::pow::Work::ZERO, time_max, shared_count)
