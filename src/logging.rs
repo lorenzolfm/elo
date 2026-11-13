@@ -162,7 +162,8 @@ impl Line {
             self.fields_count < FIELDS_COUNT_MAX,
             "{key}: too many fields"
         );
-        assert!(!key.is_empty() && key.len() <= KEY_LENGTH_MAX, "{key}");
+        assert!(!key.is_empty());
+        assert!(key.len() <= KEY_LENGTH_MAX, "{key}");
         assert!(
             key.bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
@@ -184,10 +185,7 @@ impl Line {
         if cut {
             text.push_str(CUT);
         }
-        let quoted = text.is_empty()
-            || text
-                .chars()
-                .any(|char| char <= ' ' || char == '=' || char == '"' || char.is_control());
+        let quoted = text.is_empty() || text.chars().any(quotes);
         if !quoted {
             self.text.push_str(&text);
             return;
@@ -221,6 +219,15 @@ impl Line {
         self.text.push('\n');
         assert!(self.text.len() <= LINE_LENGTH_MAX, "{}", self.text.len());
         self.text
+    }
+}
+
+/// Whether `char` puts its value in quotes. Each control character has an escape in quotes, and
+/// so do `"` and `\`. A `\` alone does not put a value in quotes.
+fn quotes(char: char) -> bool {
+    match char {
+        ' ' | '=' | '"' => true,
+        char => char.is_control(),
     }
 }
 
