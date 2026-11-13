@@ -89,7 +89,7 @@ pub(crate) struct Work {
 }
 
 impl Work {
-    const ZERO: Work = Work { high: 0, low: 0 };
+    pub(crate) const ZERO: Work = Work { high: 0, low: 0 };
     const ONE: Work = Work { high: 0, low: 1 };
     const MAX: Work = Work {
         high: u128::MAX,
@@ -138,7 +138,7 @@ impl Work {
     }
 
     /// `self` minus `other`, which must be at most `self`.
-    fn minus(self, other: Work) -> Work {
+    pub(crate) fn minus(self, other: Work) -> Work {
         assert!(other <= self);
         let (low, borrow) = self.low.overflowing_sub(other.low);
         Work {
