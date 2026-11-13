@@ -69,7 +69,7 @@ async fn run(
             wait: RECONNECT_WAIT,
         });
         if let Err(error) = logged {
-            return exit(&format_args!("stdout: {error}"));
+            return exit(&End::Stdout(error));
         }
         if let Err(signal) = signals.unless(tokio::time::sleep(RECONNECT_WAIT)).await {
             return stop(signal);
