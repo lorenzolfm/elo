@@ -10,7 +10,7 @@ const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long `getpeerinfo` may take to show what a test waits for.
 const PEER_INFO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How long elo may take to print the end of a connection: after `bitcoind` closes it, or after
+/// How long elo may take to log the end of a connection: after `bitcoind` closes it, or after
 /// the start when the first write to stdout fails.
 const END_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -18,7 +18,7 @@ const END_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// before it dials again.
 const RECONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How long elo may take to sync the headers of `bitcoind` and print its tip.
+/// How long elo may take to sync the headers of `bitcoind` and log its tip.
 const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long elo may take to exit after a signal. Below the wait of 5 s before a dial, so a
@@ -200,11 +200,13 @@ fn stdout_error_after_the_handshake_exits_with_1() {
     // again does not exit, and the drop kills it.
     let end = stderr
         .recv_timeout(END_TIMEOUT)
-        .expect("elo printed no end line");
-    // An end that the peer causes dials again, so the exit comes from stdout.
-    assert!(end.starts_with("elo: stdout: "), "{end}");
-    // The line of an end that exits does not say that elo dials again.
-    assert!(!end.contains("dial again"), "{end}");
+        .expect("elo wrote no exit line");
+    // An end that the peer causes dials again, so the exit comes from stdout. stdout failed, so
+    // the line is on stderr.
+    assert!(
+        end.starts_with("level=error event=exit reason=\"stdout: "),
+        "{end}"
+    );
     assert_eq!(elo.0.wait().unwrap().code(), Some(1));
 }
 
@@ -255,8 +257,8 @@ fn our_ping_gets_a_pong_from_bitcoind() {
         }
         // An early end does not exit elo: it dials again, and then node 0 is gone. So the test
         // fails here, with the reason of elo, and not on `disconnectnode`.
-        let ended = elo.stderr_so_far();
-        assert!(ended.is_empty(), "elo ended the connection: {ended}");
+        let ends = elo.events("end");
+        assert!(ends.is_empty(), "elo ended the connection: {ends:?}");
         assert!(
             start.elapsed() < PEER_INFO_TIMEOUT,
             "bitcoind shows no pong for our ping: {peer_info}"
@@ -268,28 +270,38 @@ fn our_ping_gets_a_pong_from_bitcoind() {
     // close, so elo checks the `pong` first. A `pong` that elo refuses ends with its reason,
     // and so does a second `pong` for a stray `ping`.
     bitcoind.cli(&["-named", "disconnectnode", "nodeid=0"]);
-    let end = elo.line(&elo.stderr, "elo: ", END_TIMEOUT);
-    assert_eq!(end, "the peer closed the connection; dial again in 5 s");
+    let end = elo.event("end", END_TIMEOUT);
+    assert_eq!(
+        end,
+        format!(
+            "level=warn event=end peer={} reason=\"the peer closed the connection\" wait_ms=5000",
+            bitcoind.peer
+        )
+    );
 }
 
 #[test]
 fn closed_connection_gets_a_new_handshake_and_sync() {
     let bitcoind = Bitcoind::start();
     let elo = Elo::start(&bitcoind);
-    let tip = elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT);
+    let tip = elo.event("tip", SYNC_TIMEOUT);
 
     // elo is the only peer of bitcoind, so it is node 0. The test does not check the reason of
     // the end: bitcoind can close with bytes from elo that it has not read, and then elo sees a
     // reset.
     let close = std::time::Instant::now();
     bitcoind.cli(&["-named", "disconnectnode", "nodeid=0"]);
-    elo.line(&elo.stderr, "elo: ", END_TIMEOUT);
-    let version = elo.line(&elo.stdout, "version ", RECONNECT_TIMEOUT);
-    assert_eq!(version, "70016");
+    elo.event("end", END_TIMEOUT);
+    let version = elo.event("version", RECONNECT_TIMEOUT);
+    let expected = format!(
+        "level=info event=version peer={} version=70016 ",
+        bitcoind.peer
+    );
+    assert!(version.starts_with(&expected), "{version}");
     // The close comes after `close`, and the wait of 5 s comes after the close.
     let wait = close.elapsed();
     assert!(wait >= std::time::Duration::from_secs(5), "{wait:?}");
-    assert_eq!(elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT), tip);
+    assert_eq!(elo.event("tip", SYNC_TIMEOUT), tip);
 }
 
 #[test]
@@ -298,12 +310,12 @@ fn signal_in_a_connection_exits_with_0() {
     // elo exits each time, so the next elo is again the only peer of bitcoind.
     for signal in ["TERM", "INT"] {
         let mut elo = Elo::start(&bitcoind);
-        elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT);
+        elo.event("tip", SYNC_TIMEOUT);
         elo.signal(signal);
         assert_eq!(elo.exit_code(), Some(0), "SIG{signal}");
         assert_eq!(
-            elo.line(&elo.stderr, "elo: ", END_TIMEOUT),
-            format!("SIG{signal}; stop")
+            elo.event("stop", END_TIMEOUT),
+            format!("level=info event=stop signal=SIG{signal}")
         );
     }
 }
@@ -312,16 +324,18 @@ fn signal_in_a_connection_exits_with_0() {
 fn signal_in_the_wait_before_a_dial_exits_with_0() {
     let bitcoind = Bitcoind::start();
     let mut elo = Elo::start(&bitcoind);
-    elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT);
+    elo.event("tip", SYNC_TIMEOUT);
 
-    // elo is the only peer of bitcoind, so it is node 0. elo prints the end line, and then it
-    // waits 5 s.
+    // elo is the only peer of bitcoind, so it is node 0. elo logs the end, and then it waits 5 s.
     bitcoind.cli(&["-named", "disconnectnode", "nodeid=0"]);
-    let end = elo.line(&elo.stderr, "elo: ", END_TIMEOUT);
-    assert!(end.ends_with("; dial again in 5 s"), "{end}");
+    let end = elo.event("end", END_TIMEOUT);
+    assert!(end.ends_with(" wait_ms=5000"), "{end}");
     elo.signal("TERM");
     assert_eq!(elo.exit_code(), Some(0));
-    assert_eq!(elo.line(&elo.stderr, "elo: ", END_TIMEOUT), "SIGTERM; stop");
+    assert_eq!(
+        elo.event("stop", END_TIMEOUT),
+        "level=info event=stop signal=SIGTERM"
+    );
 }
 
 #[test]
@@ -330,11 +344,13 @@ fn next_connection_syncs_from_our_tip_and_a_tip_off_the_chain_of_bitcoind_starts
     bitcoind.cli(&["generatetodescriptor", "1", "raw(51)"]);
     let elo = Elo::start(&bitcoind);
     let first = bitcoind.cli(&["getbestblockhash"]);
-    let tip = elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT);
-    assert!(
-        tip.starts_with(&format!("1 {} ", first.trim_end())),
-        "{tip}"
+    let tip = elo.event("tip", SYNC_TIMEOUT);
+    let expected = format!(
+        "level=info event=tip peer={} height=1 hash={} ",
+        bitcoind.peer,
+        first.trim_end()
     );
+    assert!(tip.starts_with(&expected), "{tip}");
 
     // bitcoind announces the branch with a `headers` only after our `sendheaders`. Before it, an
     // `inv` makes elo ask from our tip, and the answer starts the chain again on this connection.
@@ -351,44 +367,65 @@ fn next_connection_syncs_from_our_tip_and_a_tip_off_the_chain_of_bitcoind_starts
     // chain, so it sends its headers after genesis, and elo refuses them. The connection after it
     // syncs from genesis, and gets the branch. A connection that synced from genesis at once would
     // take the branch with no refusal.
-    let tip = elo.line(&elo.stdout, "tip ", 2 * RECONNECT_TIMEOUT);
+    let tip = elo.event("tip", 2 * RECONNECT_TIMEOUT);
     let chain_work = bitcoind.cli(&["getblockheader", best.trim_end()]);
     let chain_work = string_field(&chain_work, "chainwork");
-    assert_eq!(tip, format!("2 {} {chain_work}", best.trim_end()));
+    assert_eq!(
+        tip,
+        format!(
+            "level=info event=tip peer={} height=2 hash={} work={chain_work}",
+            bitcoind.peer,
+            best.trim_end()
+        )
+    );
     // Each refusal came at least 5 s before the tip, so its line is there. elo ends both
     // connections, so no reset from bitcoind changes a reason.
-    let ends = elo.stderr_so_far();
-    let ends: Vec<&str> = ends.lines().collect();
+    let ends = elo.events("end");
     assert_eq!(
         ends,
         [
-            "elo: peer: headers do not start at our tip; dial again in 5 s",
-            "elo: peer: our tip is not on their chain, so our chain starts again from genesis; dial again in 5 s",
+            format!(
+                "level=warn event=end peer={} reason=\"peer: headers do not start at our tip\" \
+                 wait_ms=5000",
+                bitcoind.peer
+            ),
+            format!(
+                "level=warn event=end peer={} reason=\"peer: our tip is not on their chain, so our \
+                 chain starts again from genesis\" wait_ms=5000",
+                bitcoind.peer
+            ),
         ]
     );
 }
 
 #[test]
-fn sync_from_bitcoind_prints_its_tip() {
+fn sync_from_bitcoind_logs_its_tip() {
     let bitcoind = Bitcoind::start();
     // 2001 blocks: a full batch of 2000 headers, our next `getheaders`, and a batch of 1.
     bitcoind.cli(&["generatetodescriptor", "2001", "raw(51)"]);
     let best = bitcoind.cli(&["getbestblockhash"]);
     let elo = Elo::start(&bitcoind);
-    let tip = elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT);
+    let tip = elo.event("tip", SYNC_TIMEOUT);
     let chain_work = bitcoind.cli(&["getblockheader", best.trim_end()]);
     let chain_work = string_field(&chain_work, "chainwork");
-    assert_eq!(tip, format!("2001 {} {chain_work}", best.trim_end()));
+    assert_eq!(
+        tip,
+        format!(
+            "level=info event=tip peer={} height=2001 hash={} work={chain_work}",
+            bitcoind.peer,
+            best.trim_end()
+        )
+    );
 }
 
 #[test]
-fn block_that_bitcoind_mines_after_the_sync_prints_the_next_tip() {
+fn block_that_bitcoind_mines_after_the_sync_logs_the_next_tip() {
     let bitcoind = Bitcoind::start();
     // bitcoind announces no block in its initial block download. On regtest, a block with a recent
     // time ends it.
     bitcoind.cli(&["generatetodescriptor", "1", "raw(51)"]);
     let elo = Elo::start(&bitcoind);
-    elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT);
+    elo.event("tip", SYNC_TIMEOUT);
 
     // Without our `sendheaders`, bitcoind announces the block with an `inv`. So the test waits
     // until bitcoind has it, and then mines.
@@ -397,13 +434,20 @@ fn block_that_bitcoind_mines_after_the_sync_prints_the_next_tip() {
     let best = bitcoind.cli(&["getbestblockhash"]);
 
     // The `headers` of the announcement goes on our tip, as a batch of a sync.
-    let tip = elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT);
+    let tip = elo.event("tip", SYNC_TIMEOUT);
     let chain_work = bitcoind.cli(&["getblockheader", best.trim_end()]);
     let chain_work = string_field(&chain_work, "chainwork");
-    assert_eq!(tip, format!("2 {} {chain_work}", best.trim_end()));
+    assert_eq!(
+        tip,
+        format!(
+            "level=info event=tip peer={} height=2 hash={} work={chain_work}",
+            bitcoind.peer,
+            best.trim_end()
+        )
+    );
     // The same connection took it.
-    let ended = elo.stderr_so_far();
-    assert!(ended.is_empty(), "elo ended the connection: {ended}");
+    let ends = elo.events("end");
+    assert!(ends.is_empty(), "elo ended the connection: {ends:?}");
 }
 
 #[test]
@@ -416,18 +460,21 @@ fn reorg_that_bitcoind_announces_with_an_inv_makes_elo_ask_for_the_headers() {
     let second = bitcoind.cli(&["getblockhash", "2"]);
     bitcoind.cli(&["invalidateblock", second.trim_end()]);
     let elo = Elo::start(&bitcoind);
-    let tip = elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT);
-    assert!(tip.starts_with("1 "), "{tip}");
+    let tip = elo.event("tip", SYNC_TIMEOUT);
+    let expected = format!("level=info event=tip peer={} height=1 ", bitcoind.peer);
+    assert!(tip.starts_with(&expected), "{tip}");
     wait_for_send_headers(&bitcoind, &elo);
 
     // A second branch of 29 blocks on block 1, with another script. elo follows it to height 30.
     bitcoind.cli(&["generatetodescriptor", "29", "raw(52)"]);
     let ours = bitcoind.cli(&["getbestblockhash"]);
+    let expected = format!(
+        "level=info event=tip peer={} height=30 hash={} ",
+        bitcoind.peer,
+        ours.trim_end()
+    );
     let deadline = std::time::Instant::now() + SYNC_TIMEOUT;
-    while !elo
-        .line(&elo.stdout, "tip ", SYNC_TIMEOUT)
-        .starts_with(&format!("30 {}", ours.trim_end()))
-    {
+    while !elo.event("tip", SYNC_TIMEOUT).starts_with(&expected) {
         assert!(
             std::time::Instant::now() < deadline,
             "elo did not reach height 30"
@@ -440,14 +487,25 @@ fn reorg_that_bitcoind_announces_with_an_inv_makes_elo_ask_for_the_headers() {
     // Its answer is on genesis, because our tip is not on the chain of bitcoind, so our chain
     // starts again, and the next connection syncs the first branch from genesis.
     bitcoind.cli(&["reconsiderblock", second.trim_end()]);
-    let tip = elo.line(&elo.stdout, "tip ", 2 * RECONNECT_TIMEOUT);
+    let tip = elo.event("tip", 2 * RECONNECT_TIMEOUT);
     let chain_work = bitcoind.cli(&["getblockheader", best.trim_end()]);
     let chain_work = string_field(&chain_work, "chainwork");
-    assert_eq!(tip, format!("31 {} {chain_work}", best.trim_end()));
-    let ends = elo.stderr_so_far();
+    assert_eq!(
+        tip,
+        format!(
+            "level=info event=tip peer={} height=31 hash={} work={chain_work}",
+            bitcoind.peer,
+            best.trim_end()
+        )
+    );
+    let ends = elo.events("end");
     assert_eq!(
         ends,
-        "elo: peer: our tip is not on their chain, so our chain starts again from genesis; dial again in 5 s"
+        [format!(
+            "level=warn event=end peer={} reason=\"peer: our tip is not on their chain, so our \
+             chain starts again from genesis\" wait_ms=5000",
+            bitcoind.peer
+        )]
     );
 }
 
@@ -460,8 +518,8 @@ fn wait_for_send_headers(bitcoind: &Bitcoind, elo: &Elo) {
         if object_text(&peer_info, "bytesrecv_per_msg").contains("\"sendheaders\"") {
             return;
         }
-        let ended = elo.stderr_so_far();
-        assert!(ended.is_empty(), "elo ended the connection: {ended}");
+        let ends = elo.events("end");
+        assert!(ends.is_empty(), "elo ended the connection: {ends:?}");
         assert!(
             start.elapsed() < PEER_INFO_TIMEOUT,
             "bitcoind shows no sendheaders: {peer_info}"
@@ -470,12 +528,14 @@ fn wait_for_send_headers(bitcoind: &Bitcoind, elo: &Elo) {
     }
 }
 
-/// elo connected to a `bitcoind`, with the lines of its stdout and its stderr. elo does not
-/// exit while it can dial the peer, so the drop kills it.
+/// elo connected to a `bitcoind`, with the log lines of its stdout and the lines of its stderr.
+/// elo does not exit while it can dial the peer, so the drop kills it.
 struct Elo {
     process: Process,
     stdout: std::sync::mpsc::Receiver<String>,
     stderr: std::sync::mpsc::Receiver<String>,
+    /// Each line of stdout that `event` or `events` read, in order.
+    read: std::cell::RefCell<Vec<String>>,
 }
 
 impl Elo {
@@ -493,38 +553,45 @@ impl Elo {
             process: Process(child),
             stdout,
             stderr,
+            read: std::cell::RefCell::default(),
         }
     }
 
-    /// The rest of the next line from `lines` that starts with `prefix`. It skips the lines
-    /// before it, and panics if none comes within `timeout`.
-    fn line(
-        &self,
-        lines: &std::sync::mpsc::Receiver<String>,
-        prefix: &str,
-        timeout: std::time::Duration,
-    ) -> String {
+    /// The next log line of the event `name`. It skips the lines before it, and panics if none
+    /// comes within `timeout`.
+    fn event(&self, name: &str, timeout: std::time::Duration) -> String {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
-            match lines.recv_timeout(left) {
+            match self.stdout.recv_timeout(left) {
                 Ok(line) => {
-                    if let Some(rest) = line.strip_prefix(prefix) {
-                        return rest.to_owned();
+                    self.read.borrow_mut().push(line.clone());
+                    if event_name(&line) == Some(name) {
+                        return line;
                     }
                 }
                 // The thread ends only when the pipe ends, so elo exited, and its stderr ends.
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     let stderr = self.stderr.iter().collect::<Vec<_>>().join("\n");
-                    panic!("elo exited: {stderr}")
+                    panic!("elo exited: {:?} {stderr}", self.read.borrow())
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
-                    "elo printed no {prefix:?} line within {} s: {}",
+                    "elo logged no {name:?} event within {} s: {:?}",
                     timeout.as_secs(),
-                    self.stderr_so_far()
+                    self.read.borrow()
                 ),
             }
         }
+    }
+
+    /// Each log line of the event `name` from the start of elo up to now.
+    fn events(&self, name: &str) -> Vec<String> {
+        let mut read = self.read.borrow_mut();
+        read.extend(self.stdout.try_iter());
+        read.iter()
+            .filter(|line| event_name(line) == Some(name))
+            .cloned()
+            .collect()
     }
 
     /// Sends the signal `name`, for example `TERM`, to elo. The `kill` of coreutils, because
@@ -555,11 +622,11 @@ impl Elo {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
+}
 
-    /// The lines of stderr that no `line` call took yet.
-    fn stderr_so_far(&self) -> String {
-        self.stderr.try_iter().collect::<Vec<_>>().join("\n")
-    }
+/// The name of the event of a log `line`: its second field.
+fn event_name(line: &str) -> Option<&str> {
+    line.split(' ').nth(1)?.strip_prefix("event=")
 }
 
 /// Each line of `pipe`, from a thread. Each test waits for a line with a timeout, and elo does

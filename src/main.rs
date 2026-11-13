@@ -1,11 +1,9 @@
-//! `elo <network> <ip>[:port]`: dials one peer, does the handshake, and prints the peer's
-//! `version`. Then it syncs the header chain from the peer and prints the tip. It asks the peer to
-//! announce each new header, takes it on the tip, and prints the tip when it moves. It pings the
+//! `elo <network> <ip>[:port]`: dials one peer, does the handshake, and logs the peer's
+//! `version`. Then it syncs the header chain from the peer and logs the tip. It asks the peer to
+//! announce each new header, takes it on the tip, and logs the tip when it moves. It pings the
 //! peer and answers its `ping` messages until the connection ends. Then it waits and dials the
 //! peer again. The chain stays in memory, so the next connection syncs from its tip. SIGTERM
-//! and SIGINT stop it at any of these steps.
-
-use std::io::Write;
+//! and SIGINT stop it at any of these steps. Each step writes a line of `elo::logging` to stdout.
 
 const USAGE: &str = "usage: elo <mainnet|testnet4|signet|regtest> <ip>[:port]";
 
@@ -31,10 +29,7 @@ fn main() -> std::process::ExitCode {
         .build()
     {
         Ok(runtime) => runtime,
-        Err(error) => {
-            eprintln!("elo: runtime: {error}");
-            return std::process::ExitCode::FAILURE;
-        }
+        Err(error) => return exit(&format_args!("runtime: {error}")),
     };
     runtime.block_on(run(network, peer))
 }
@@ -49,10 +44,7 @@ async fn run(
     // SIGKILL after its timeout.
     let mut signals = match Signals::new() {
         Ok(signals) => signals,
-        Err(error) => {
-            eprintln!("elo: signals: {error}");
-            return std::process::ExitCode::FAILURE;
-        }
+        Err(error) => return exit(&format_args!("signals: {error}")),
     };
     // One chain for each connection, so a connection ends with the headers of the last one, and
     // a sync gets only the headers after its tip.
@@ -66,23 +58,47 @@ async fn run(
             Ok(end) => end,
             Err(signal) => return stop(signal),
         };
-        // The line says if elo dials again, so a reader of stderr does not need the list of
+        // The event says if elo dials again, so a reader of the log does not need the list of
         // ends that exit.
         if !end.retries() {
-            eprintln!("elo: {end}");
-            return std::process::ExitCode::FAILURE;
+            return exit(&end);
         }
-        eprintln!("elo: {end}; dial again in {} s", RECONNECT_WAIT.as_secs());
+        let logged = log(&elo::logging::Event::End {
+            peer,
+            reason: &end,
+            wait: RECONNECT_WAIT,
+        });
+        if let Err(error) = logged {
+            return exit(&format_args!("stdout: {error}"));
+        }
         if let Err(signal) = signals.unless(tokio::time::sleep(RECONNECT_WAIT)).await {
             return stop(signal);
         }
     }
 }
 
-/// Prints the `signal` that stops elo, and gives the exit code of a stop: 0.
+/// Logs the `signal` that stops elo, and gives the exit code of a stop: 0. A failed write does
+/// not change the exit code, because the signal asked for the stop.
 fn stop(signal: Signal) -> std::process::ExitCode {
-    eprintln!("elo: {signal}; stop");
+    let _ = log(&elo::logging::Event::Stop { signal: &signal });
     std::process::ExitCode::SUCCESS
+}
+
+/// Logs the fault of this host that ends elo, and gives the exit code of a fault: 1. When stdout
+/// fails, the line goes to stderr, so a fault of stdout has a line too. Nothing is left to tell of
+/// a fault of stderr.
+fn exit(reason: &dyn std::fmt::Display) -> std::process::ExitCode {
+    let event = elo::logging::Event::Exit { reason };
+    if log(&event).is_err() {
+        let _ = event.write(&mut std::io::stderr().lock());
+    }
+    std::process::ExitCode::FAILURE
+}
+
+/// Writes the line of `event` to stdout. `println!` panics when stdout fails, for example on a
+/// full disk or a closed pipe.
+fn log(event: &elo::logging::Event<'_>) -> Result<(), std::io::Error> {
+    event.write(&mut std::io::stdout().lock())
 }
 
 /// A signal that stops elo.
@@ -198,8 +214,8 @@ impl std::fmt::Display for End {
     }
 }
 
-/// Dials `peer`, does the handshake and prints the `version` of the peer. Then syncs `chain` and
-/// prints its tip, and prints it again each time an announcement of the peer moves it, until the
+/// Dials `peer`, does the handshake and logs the `version` of the peer. Then syncs `chain` and
+/// logs its tip, and logs it again each time an announcement of the peer moves it, until the
 /// connection ends.
 async fn dial(peer: std::net::SocketAddr, chain: &mut elo::chain::Chain) -> End {
     let (connection, version) = match elo::net::handshake(peer, chain).await {
@@ -207,15 +223,11 @@ async fn dial(peer: std::net::SocketAddr, chain: &mut elo::chain::Chain) -> End 
         Err(error) => return End::Handshake(error),
     };
 
-    let printed = print(format_args!(
-        "version {}\nservices {:016x}\nuser_agent {}\nstart_height {}\nrelay {}",
-        version.version(),
-        version.services(),
-        version.user_agent(),
-        version.start_height(),
-        version.relay(),
-    ));
-    if let Err(error) = printed {
+    let logged = log(&elo::logging::Event::Version {
+        peer,
+        version: &version,
+    });
+    if let Err(error) = logged {
         return End::Stdout(error);
     }
 
@@ -226,7 +238,7 @@ async fn dial(peer: std::net::SocketAddr, chain: &mut elo::chain::Chain) -> End 
     // The loop has no count bound, because the peer announces headers for as long as it is
     // connected. Only the end of the connection or a fault of stdout gets out.
     loop {
-        if let Err(error) = print(format_args!("tip {tip}")) {
+        if let Err(error) = log(&elo::logging::Event::Tip { peer, tip: &tip }) {
             return End::Stdout(error);
         }
         (synced, tip) = match synced.next_tip().await {
@@ -234,15 +246,6 @@ async fn dial(peer: std::net::SocketAddr, chain: &mut elo::chain::Chain) -> End 
             Err(error) => return End::Run(error),
         };
     }
-}
-
-/// Writes `text` and a newline to stdout. `println!` panics when stdout fails, for example on
-/// a full disk or a closed pipe.
-fn print(text: std::fmt::Arguments<'_>) -> Result<(), std::io::Error> {
-    let mut stdout = std::io::stdout().lock();
-    writeln!(stdout, "{text}")?;
-    // stdout is not always line buffered, and the exit ignores a failed flush.
-    stdout.flush()
 }
 
 /// The args after the program name. `None` is bad usage.
