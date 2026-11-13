@@ -176,9 +176,10 @@ impl Line {
         self.text.push('=');
 
         let mut value_text = Capped::default();
-        // `Capped` never fails, so only a `Display` that fails by itself stops here, and then the
-        // line holds what it wrote.
-        let _ = write!(value_text, "{value}");
+        // `Capped` never fails, so only a `Display` that fails by itself can fail here. That is a
+        // bug of the `Display`: `std` asks a `Display` to fail only when its writer fails.
+        let written = write!(value_text, "{value}");
+        assert!(written.is_ok(), "{key}: the value failed to write");
         let Capped { mut text, cut } = value_text;
         if cut {
             text.push_str(CUT);
@@ -201,7 +202,9 @@ impl Line {
                 '\t' => self.text.push_str("\\t"),
                 // Each control character is below U+00A0.
                 char if char.is_control() => {
-                    let _ = write!(self.text, "\\u{:04x}", u32::from(char));
+                    // A write to a `String` never fails.
+                    let written = write!(self.text, "\\u{:04x}", u32::from(char));
+                    assert!(written.is_ok());
                 }
                 char => self.text.push(char),
             }
@@ -210,6 +213,11 @@ impl Line {
     }
 
     fn end(mut self) -> String {
+        // Each line has its level and its event.
+        assert!(self.fields_count >= 2, "{}", self.fields_count);
+        // The escapes keep each newline out of a value, so a value from a peer cannot start a
+        // line of its own. The one newline is the end of the line.
+        assert!(!self.text.contains('\n'), "{}", self.text);
         self.text.push('\n');
         assert!(self.text.len() <= LINE_LENGTH_MAX, "{}", self.text.len());
         self.text
@@ -226,13 +234,18 @@ struct Capped {
 
 impl std::fmt::Write for Capped {
     fn write_str(&mut self, text: &str) -> std::fmt::Result {
-        for char in text.chars() {
-            if self.cut || self.text.len() + char.len_utf8() > VALUE_LENGTH_MAX {
-                self.cut = true;
-                return Ok(());
-            }
-            self.text.push(char);
+        if self.cut {
+            return Ok(());
         }
+        for char in text.chars() {
+            if self.text.len() + char.len_utf8() <= VALUE_LENGTH_MAX {
+                self.text.push(char);
+            } else {
+                self.cut = true;
+                break;
+            }
+        }
+        assert!(self.text.len() <= VALUE_LENGTH_MAX, "{}", self.text.len());
         Ok(())
     }
 }
@@ -339,6 +352,16 @@ mod tests {
         // The last `é` needs 2 bytes, and only 1 is left.
         let first = "a".repeat(super::VALUE_LENGTH_MAX - 1);
         assert_eq!(value(&format!("{first}é")), format!("{first}..."));
+
+        // A `Display` that writes in parts: after the cut, a part that fits is dropped too, so the
+        // value is only the start of the text.
+        let parts = line(super::Event::Exit {
+            reason: &format_args!("{first}{}{}", 'é', 'b'),
+        });
+        assert_eq!(
+            parts,
+            format!("level=error event=exit reason={first}...\n")
+        );
     }
 
     #[test]
