@@ -11,7 +11,7 @@ use std::fmt::Write;
 const VALUE_LENGTH_MAX: usize = 256;
 
 /// What `...` adds to a value that is cut.
-const CUT: &str = "...";
+const CUT_MARK: &str = "...";
 
 /// The most fields of a line, `level` and `event` too. A `version` line has the most.
 const FIELDS_COUNT_MAX: usize = 8;
@@ -25,7 +25,7 @@ const ESCAPE_LENGTH_MAX: usize = 6;
 /// The most bytes of a field: a space, the key, `=`, two quotes, the escaped value and the `...`
 /// of a cut. The `...` needs no escape.
 const FIELD_LENGTH_MAX: usize =
-    1 + KEY_LENGTH_MAX + 1 + 2 + ESCAPE_LENGTH_MAX * VALUE_LENGTH_MAX + CUT.len();
+    1 + KEY_LENGTH_MAX + 1 + 2 + ESCAPE_LENGTH_MAX * VALUE_LENGTH_MAX + CUT_MARK.len();
 
 /// The most bytes of a line. The first field has no space before it, and the line has a newline
 /// after it.
@@ -176,35 +176,38 @@ impl Line {
         self.text.push_str(key);
         self.text.push('=');
 
-        let mut value_text = Capped::default();
+        let mut capped = Capped::default();
         // `Capped` never fails, so only a `Display` that fails by itself can fail here. That is a
         // bug of the `Display`: `std` asks a `Display` to fail only when its writer fails.
-        let written = write!(value_text, "{value}");
+        let written = write!(capped, "{value}");
         assert!(written.is_ok(), "{key}: the value failed to write");
-        let Capped { mut text, cut } = value_text;
+        let Capped {
+            text: mut value_text,
+            cut,
+        } = capped;
         if cut {
-            text.push_str(CUT);
+            value_text.push_str(CUT_MARK);
         }
-        let quoted = text.is_empty() || text.chars().any(quotes);
+        let quoted = value_text.is_empty() || value_text.chars().any(quotes);
         if !quoted {
-            self.text.push_str(&text);
+            self.text.push_str(&value_text);
             return;
         }
         self.text.push('"');
-        for char in text.chars() {
-            match char {
+        for character in value_text.chars() {
+            match character {
                 '"' => self.text.push_str("\\\""),
                 '\\' => self.text.push_str("\\\\"),
                 '\n' => self.text.push_str("\\n"),
                 '\r' => self.text.push_str("\\r"),
                 '\t' => self.text.push_str("\\t"),
                 // Each control character is below U+00A0.
-                char if char.is_control() => {
+                character if character.is_control() => {
                     // A write to a `String` never fails.
-                    let written = write!(self.text, "\\u{:04x}", u32::from(char));
+                    let written = write!(self.text, "\\u{:04x}", u32::from(character));
                     assert!(written.is_ok());
                 }
-                char => self.text.push(char),
+                character => self.text.push(character),
             }
         }
         self.text.push('"');
@@ -222,12 +225,12 @@ impl Line {
     }
 }
 
-/// Whether `char` puts its value in quotes. Each control character has an escape in quotes, and
-/// so do `"` and `\`. A `\` alone does not put a value in quotes.
-fn quotes(char: char) -> bool {
-    match char {
+/// Whether `character` puts its value in quotes. Each control character has an escape in quotes,
+/// and so do `"` and `\`. A `\` alone does not put a value in quotes.
+fn quotes(character: char) -> bool {
+    match character {
         ' ' | '=' | '"' => true,
-        char => char.is_control(),
+        character => character.is_control(),
     }
 }
 
@@ -244,9 +247,9 @@ impl std::fmt::Write for Capped {
         if self.cut {
             return Ok(());
         }
-        for char in text.chars() {
-            if self.text.len() + char.len_utf8() <= VALUE_LENGTH_MAX {
-                self.text.push(char);
+        for character in text.chars() {
+            if self.text.len() + character.len_utf8() <= VALUE_LENGTH_MAX {
+                self.text.push(character);
             } else {
                 self.cut = true;
                 break;
@@ -365,10 +368,7 @@ mod tests {
         let parts = line(super::Event::Exit {
             reason: &format_args!("{first}{}{}", 'é', 'b'),
         });
-        assert_eq!(
-            parts,
-            format!("level=error event=exit reason={first}...\n")
-        );
+        assert_eq!(parts, format!("level=error event=exit reason={first}...\n"));
     }
 
     #[test]
