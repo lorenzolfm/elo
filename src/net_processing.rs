@@ -82,6 +82,8 @@ pub enum PeerError {
     PongNonce,
     /// Our `ping` had no `pong` within `PING_TIMEOUT`.
     PingTimeout,
+    /// Their `inv` payload did not decode, or it has too many entries.
+    Inv(crate::protocol::InvError),
     /// Their `headers` payload did not decode, or it has too many headers or a transaction.
     Headers(crate::protocol::HeadersError),
     /// Our chain refused their batch, or a header that the second download of a low-work sync
@@ -116,6 +118,7 @@ impl std::fmt::Display for PeerError {
             PeerError::PingTimeout => {
                 write!(f, "no pong within {} s", PING_TIMEOUT.as_secs())
             }
+            PeerError::Inv(error) => write!(f, "{error}"),
             PeerError::Headers(error) => write!(f, "{error}"),
             PeerError::Extend(error) => write!(f, "{error}"),
             PeerError::TipNotOnTheirChain => {
@@ -460,15 +463,17 @@ enum SyncState {
     },
     /// A batch that was not full came, so our tip is the tip of the peer. Our chain has at least
     /// the minimum work. No `getheaders` is outstanding, so each `headers` is an announcement, and
-    /// it must go on our tip. A full one makes a `getheaders` due.
+    /// it must go on our tip. A full one makes a `getheaders` due, and so does an `inv` of a block.
     Synced,
 }
 
 /// Where our `sendheaders` is. It goes once, in the first tick at `SyncState::Synced`. Before it,
-/// the peer announces a new header with an `inv`, which elo skips. A `headers` that came while our
-/// `getheaders` was outstanding would look like its answer. So it does not go before the sync ends.
-/// After a full announcement our `getheaders` is outstanding again, and an announcement in that
-/// window looks like its answer. A peer that announces a full batch reaches it.
+/// the peer announces a new header with an `inv`, which makes our `getheaders` due. A `headers`
+/// that came while our `getheaders` was outstanding would look like its answer. So it does not go
+/// before the sync ends. After a full announcement or an `inv` of a block, our `getheaders` is
+/// outstanding again, and an announcement in that window looks like its answer. A peer that
+/// announces a block with an `inv` sends no `headers` announcement before that answer, because the
+/// answer gives it the header that the next announcement connects to.
 #[derive(Debug)]
 enum SendHeadersState {
     /// It did not go yet.
@@ -498,11 +503,11 @@ enum Download {
 
 impl<'a> Peer<'a> {
     /// A `ping` gets a `pong` with its nonce. A `pong` must answer our outstanding `ping`, and a
-    /// `headers` our outstanding `getheaders`, or come after the sync. A `wtxidrelay` or a
-    /// `sendaddrv2` is an error: a peer turns these features on only between its `version` and its
-    /// `verack`. Each other message is skipped. Each result but an error returns the peer, because
-    /// an error ends the connection. `clock` is the local clock, in seconds since the Unix epoch,
-    /// and only a `headers` reads it.
+    /// `headers` our outstanding `getheaders`, or come after the sync. After the sync, an `inv` of
+    /// a block makes our `getheaders` due. A `wtxidrelay` or a `sendaddrv2` is an error: a peer
+    /// turns these features on only between its `version` and its `verack`. Each other message is
+    /// skipped. Each result but an error returns the peer, because an error ends the connection.
+    /// `clock` is the local clock, in seconds since the Unix epoch, and only a `headers` reads it.
     pub(crate) fn receive(
         self,
         message: &crate::transport::Message,
@@ -519,12 +524,38 @@ impl<'a> Peer<'a> {
             Ok((peer, Received::NoReply))
         } else if msg_type == crate::protocol::HEADERS {
             self.receive_headers(message, clock)
+        } else if msg_type == crate::protocol::INV {
+            let peer = self.receive_inv(message)?;
+            Ok((peer, Received::NoReply))
         } else if msg_type == crate::protocol::WTXIDRELAY {
             Err(PeerError::LateWtxidRelay)
         } else if msg_type == crate::protocol::SENDADDRV2 {
             Err(PeerError::LateSendAddrV2)
         } else {
             Ok((self, Received::NoReply))
+        }
+    }
+
+    /// After the sync, an `inv` of a block makes our `getheaders` due, from the tip of our chain.
+    /// The peer announces a block with an `inv` before it has our `sendheaders`, and when the
+    /// headers of the block do not connect to the last header that it sent us. Then each later
+    /// block comes as an `inv` too, until a `headers` answers our `getheaders` again. In a sync,
+    /// the `inv` came before the answer to our `getheaders`, so the answer has the block. The
+    /// payload is checked first, also then. The bytes after the last entry are ignored.
+    fn receive_inv(self, message: &crate::transport::Message) -> Result<Peer<'a>, PeerError> {
+        assert_eq!(message.msg_type(), crate::protocol::INV);
+
+        let mut input = message.payload();
+        let inv = crate::protocol::Inv::decode(&mut input).map_err(PeerError::Inv)?;
+        if inv.has_block() && matches!(self.sync, SyncState::Synced) {
+            // A sync ends only on a chain with at least the minimum work, so the next batch goes
+            // on our tip.
+            Ok(Peer {
+                sync: SyncState::Due(Download::Chain),
+                ..self
+            })
+        } else {
+            Ok(self)
         }
     }
 
@@ -600,13 +631,13 @@ impl<'a> Peer<'a> {
 
     /// Returns the peer, what to send, and when to tick next. A `ping` with `nonce` is due at
     /// once after the handshake. Then it is due `PING_INTERVAL` after the last `ping` went, if
-    /// its `pong` came. A `getheaders` is due at once after the handshake, and at once after each
-    /// batch that does not end the sync. The tick fails when our outstanding `ping` is
-    /// `PING_TIMEOUT` old, or our outstanding `getheaders` is `HEADERS_TIMEOUT` old. The `ping` is
-    /// checked first. Each deadline is due at its instant, not after it. The wake is the earliest
-    /// deadline. The `now` of a tick is not before the `now` of an earlier tick, because each
-    /// deadline counts from an earlier `now`. Our `sendheaders` goes in the first tick at
-    /// `SyncState::Synced`, and has no deadline.
+    /// its `pong` came. A `getheaders` is due at once after the handshake, at once after each
+    /// batch that does not end the sync, and at once after an `inv` of a block after the sync. The
+    /// tick fails when our outstanding `ping` is `PING_TIMEOUT` old, or our outstanding
+    /// `getheaders` is `HEADERS_TIMEOUT` old. The `ping` is checked first. Each deadline is due at
+    /// its instant, not after it. The wake is the earliest deadline. The `now` of a tick is not
+    /// before the `now` of an earlier tick, because each deadline counts from an earlier `now`. Our
+    /// `sendheaders` goes in the first tick at `SyncState::Synced`, and has no deadline.
     pub(crate) fn tick(
         self,
         now: std::time::Instant,
@@ -849,9 +880,9 @@ fn extend_tip(
 ) -> Result<Option<Download>, PeerError> {
     let full = headers.is_full();
     chain.extend(headers, clock).map_err(PeerError::Extend)?;
-    // Only the handshake on a chain at the minimum and a sync that reached it give
-    // `Download::Chain`, and only a sync that reached it ends at `SyncState::Synced`. The work of
-    // a chain does not go down.
+    // Only the handshake on a chain at the minimum, a sync that reached it, and an `inv` at
+    // `SyncState::Synced` give `Download::Chain`. Only a sync that reached it ends at
+    // `SyncState::Synced`. The work of a chain does not go down.
     assert!(chain.tip().work() >= work_min);
     Ok(full.then_some(Download::Chain))
 }
@@ -1069,6 +1100,11 @@ pub(crate) mod fuzz {
         seed!("headers-off-tip-after-full", "PeerRefused(Extend(NotOnTip))"),
         seed!("headers-off-tip-after-sync", "PeerRefused(Extend(NotOnTip))"),
         seed!("headers-wrong-index-past-end", "PeerOpen { height: 2, synced: true }"),
+        seed!("inv-block-after-sync", "PeerOpen { height: 2, synced: false }"),
+        seed!("inv-block-after-sync-then-headers", "PeerOpen { height: 3, synced: true }"),
+        seed!("inv-block-in-sync", "PeerOpen { height: 2, synced: true }"),
+        seed!("inv-other-after-sync", "PeerOpen { height: 2, synced: true }"),
+        seed!("inv-short-payload", "PeerRefused(Inv(Payload(UnexpectedEnd)))"),
         seed!("mix-long", "PeerRefused(PingTimeout)"),
         seed!("network-mainnet", "PeerRefused(Extend(ProofOfWork))"),
         seed!("network-signet", "PeerRefused(Extend(ProofOfWork))"),
@@ -1138,7 +1174,7 @@ pub(crate) mod fuzz {
     /// A script holds a network byte (`script_network_work_min`), a nonce byte for our `version`,
     /// messages until the handshake ends, and then turns. A turn holds a nonce byte for the tick, a
     /// message, and a byte for `now_next`. A read after the end of `data` gives 0. A message is a
-    /// kind byte, modulo 7, then:
+    /// kind byte, modulo 8, then:
     ///
     /// - 0: no message.
     /// - 1: `version`. A byte to add to our nonce in the handshake, so 0 is our nonce, and an `i8`
@@ -1156,6 +1192,7 @@ pub(crate) mod fuzz {
     ///   each time.
     /// - 6: `wtxidrelay`, which the handshake skips and the peer refuses. No kind is `sendaddrv2`,
     ///   because the peer refuses it the same way.
+    /// - 7: `inv` with one entry. A byte: its type, so 2 is a block.
     ///
     /// Then an `i8` to add to the length of the payload, so bytes come off its end or go after it.
     /// The committed corpus uses this layout, so a change to the layout must rewrite the corpus.
@@ -1514,7 +1551,7 @@ pub(crate) mod fuzz {
 
         /// The next message, as the driver reads it.
         fn message(&mut self, base: &MessageBase) -> Option<crate::transport::Message> {
-            let (msg_type, mut payload) = match self.byte() % 7 {
+            let (msg_type, mut payload) = match self.byte() % 8 {
                 0 => return None,
                 1 => (
                     crate::protocol::VERSION,
@@ -1527,7 +1564,8 @@ pub(crate) mod fuzz {
                     crate::protocol::HEADERS,
                     self.headers_payload(base.last_hash, base.last_height),
                 ),
-                _ => (crate::protocol::WTXIDRELAY, Vec::new()),
+                6 => (crate::protocol::WTXIDRELAY, Vec::new()),
+                _ => (crate::protocol::INV, self.inv_payload()),
             };
             let length = payload
                 .len()
@@ -1543,6 +1581,15 @@ pub(crate) mod fuzz {
             theirs.version = super::PROTOCOL_VERSION_MIN + i32::from(self.signed_byte());
             let mut payload = Vec::new();
             theirs.encode(&mut payload);
+            payload
+        }
+
+        /// One entry, with its type from a byte. Its hash is not 0, so a read of the hash as a
+        /// type shows.
+        fn inv_payload(&mut self) -> Vec<u8> {
+            let mut payload = vec![1];
+            payload.extend_from_slice(&u32::from(self.byte()).to_le_bytes());
+            payload.extend_from_slice(&[0xbb; 32]);
             payload
         }
 
@@ -1899,6 +1946,14 @@ pub(crate) mod fuzz {
                 }
             } else if msg_type == crate::protocol::HEADERS {
                 self.receive_headers(message)
+            } else if msg_type == crate::protocol::INV {
+                let has_block = message_inv_has_block(message).map_err(super::PeerError::Inv)?;
+                // After the sync, the next batch goes on the tip of the chain.
+                if has_block && matches!(self.get_headers, GetHeadersModel::Ended) {
+                    assert!(matches!(self.download, DownloadModel::Chain));
+                    self.get_headers = GetHeadersModel::Due;
+                }
+                Ok(ReceivedExpected::NoReply)
             } else if msg_type == crate::protocol::WTXIDRELAY {
                 Err(super::PeerError::LateWtxidRelay)
             } else if msg_type == crate::protocol::SENDADDRV2 {
@@ -2118,6 +2173,28 @@ pub(crate) mod fuzz {
         }
     }
 
+    /// Whether the `inv` in `message` has an entry of a block. The count comes first, so a count
+    /// above the limit fails before the length of the entries does. Each entry is 4 bytes of type
+    /// and 32 of hash.
+    fn message_inv_has_block(
+        message: &crate::transport::Message,
+    ) -> Result<bool, crate::protocol::InvError> {
+        let mut input = message.payload();
+        let count = crate::serialize::read_compact_size(&mut input)
+            .map_err(crate::protocol::InvError::Payload)?;
+        if count > crate::protocol::INV_COUNT_MAX {
+            return Err(crate::protocol::InvError::TooMany(count));
+        }
+        let Some(entries) = input.get(..count * 36) else {
+            return Err(crate::protocol::InvError::Payload(
+                crate::serialize::Error::UnexpectedEnd,
+            ));
+        };
+        Ok(entries
+            .chunks(36)
+            .any(|entry| entry.starts_with(&[2, 0, 0, 0])))
+    }
+
     #[cfg(test)]
     mod tests {
         /// A row with no seed stops the build, so only this sees a new seed. It reads the
@@ -2207,6 +2284,20 @@ mod tests {
         message(&crate::transport::encode(
             crate::chainparams::Network::Regtest,
             crate::protocol::HEADERS,
+            payload,
+        ))
+    }
+
+    /// An `inv` with an entry of each type in `types`.
+    fn inv_message(types: &[u32]) -> crate::transport::Message {
+        inv_payload_message(&crate::fixtures::inv_payload(types))
+    }
+
+    /// An `inv` with `payload`.
+    fn inv_payload_message(payload: &[u8]) -> crate::transport::Message {
+        message(&crate::transport::encode(
+            crate::chainparams::Network::Regtest,
+            crate::protocol::INV,
             payload,
         ))
     }
@@ -3195,6 +3286,86 @@ mod tests {
         let later = start + std::time::Duration::from_mins(10);
         let (_, wake) = idle(peer, later);
         assert_eq!(wake, start + super::PING_TIMEOUT);
+    }
+
+    #[test]
+    fn block_inv_after_the_sync_makes_the_next_tick_send_getheaders_from_our_tip() {
+        let mut chain = regtest();
+        let start = std::time::Instant::now();
+        let headers = crate::fixtures::headers_on_genesis(3);
+        let peer = synced(asked(&mut chain, start, 7), &headers[..2]);
+        let peer = match peer.tick(start, 0) {
+            Ok((
+                peer,
+                super::TickOutbound {
+                    ping: None,
+                    send_headers: true,
+                    get_headers: None,
+                },
+                _,
+            )) => peer,
+            other => panic!("{other:?}"),
+        };
+        // A transaction and a block. The hash of the block is not one that elo reads.
+        let peer = accept(peer, &inv_message(&[1, 2]));
+        let later = start + std::time::Duration::from_mins(1);
+        let peer = match peer.tick(later, 0) {
+            Ok((
+                peer,
+                super::TickOutbound {
+                    ping: None,
+                    send_headers: false,
+                    get_headers: Some(get_headers),
+                },
+                wake,
+            )) => {
+                assert_eq!(get_headers, get_headers_after(&headers[1]));
+                assert_eq!(wake, later + super::HEADERS_TIMEOUT);
+                peer
+            }
+            other => panic!("{other:?}"),
+        };
+        let received = peer.receive(&headers_message(&headers[2..]), crate::fixtures::CLOCK);
+        let Ok((_, super::Received::Synced(tip))) = received else {
+            panic!("{received:?}");
+        };
+        assert_eq!(tip, tip_after(&headers));
+    }
+
+    #[test]
+    fn inv_in_the_sync_or_with_no_block_is_skipped() {
+        let start = std::time::Instant::now();
+        let headers = crate::fixtures::headers_on_genesis(1);
+        // In the sync, the answer to our `getheaders` comes after the `inv`, so the `inv` makes
+        // nothing due, and the answer is not unsolicited.
+        let mut chain = regtest();
+        let peer = accept(asked(&mut chain, start, 7), &inv_message(&[2]));
+        synced(peer, &headers);
+        assert_eq!(chain.tip(), tip_after(&headers));
+
+        // After the sync, an `inv` of transactions makes nothing due.
+        let mut chain = regtest();
+        let peer = accept(pinged(&mut chain, start, 7), &inv_message(&[1, 5]));
+        let later = start + std::time::Duration::from_mins(1);
+        let (_, wake) = idle(peer, later);
+        assert_eq!(wake, start + super::PING_TIMEOUT);
+    }
+
+    #[test]
+    fn inv_that_does_not_decode_ends_the_connection() {
+        // In the sync too. The entry stops one byte before the end of its hash.
+        let mut payload = crate::fixtures::inv_payload(&[2]);
+        payload.pop();
+        let mut chain = regtest();
+        let start = std::time::Instant::now();
+        assert_eq!(
+            asked(&mut chain, start, 7)
+                .receive(&inv_payload_message(&payload), crate::fixtures::CLOCK)
+                .err(),
+            Some(super::PeerError::Inv(crate::protocol::InvError::Payload(
+                crate::serialize::Error::UnexpectedEnd
+            )))
+        );
     }
 
     #[test]

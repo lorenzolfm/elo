@@ -21,10 +21,12 @@ of those headers must match its bit, and a header goes on the chain when about
 sync, elo stays connected and answers each `ping` with a `pong`. It also sends
 `sendheaders`, so the peer announces each new header with a `headers`. elo puts
 those headers on its tip, as a batch of a sync, and prints the `tip` when it
-moves. elo skips an `inv`. From the handshake on, it pings the peer every 2 min.
-It drops a peer that does not answer a `ping` within 20 min, or a `getheaders`
-within 2 min. It also drops a peer that sends `wtxidrelay` or `sendaddrv2` after
-the handshake. When a connection ends, elo prints
+moves. A peer announces a block with an `inv` when its headers do not connect
+to the last header it sent, so an `inv` of a block makes elo ask for the headers
+after its tip. From the handshake on, it pings the peer every 2 min. It drops a
+peer that does not answer a `ping` within 20 min, or a `getheaders` within
+2 min. It also drops a peer that sends `wtxidrelay` or `sendaddrv2` after the
+handshake. When a connection ends, elo prints
 `elo: <reason>; dial again in 5 s` to stderr, waits 5 s and dials the peer
 again. Each connection prints the `version` and the `tip` again. The chain
 stays in memory, so the next connection syncs from its tip. A chain below the

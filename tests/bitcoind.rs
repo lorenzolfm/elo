@@ -406,6 +406,41 @@ fn block_that_bitcoind_mines_after_the_sync_prints_the_next_tip() {
     assert!(ended.is_empty(), "elo ended the connection: {ended}");
 }
 
+#[test]
+fn blocks_that_bitcoind_announces_with_an_inv_move_our_tip() {
+    let bitcoind = Bitcoind::start();
+    // 30 blocks, and then bitcoind leaves 2 to 30, so elo syncs to block 1.
+    bitcoind.cli(&["generatetodescriptor", "30", "raw(51)"]);
+    let best = bitcoind.cli(&["getbestblockhash"]);
+    let second = bitcoind.cli(&["getblockhash", "2"]);
+    bitcoind.cli(&["invalidateblock", second.trim_end()]);
+    let elo = Elo::start(&bitcoind);
+    let tip = elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT);
+    assert!(tip.starts_with("1 "), "{tip}");
+    wait_for_send_headers(&bitcoind, &elo);
+
+    // bitcoind takes blocks 2 to 30 back in one step. It announces more than 8 new blocks with
+    // an `inv` of the last one, and each later block with an `inv` too, until elo asks for the
+    // headers. Their answer moves our tip to 30.
+    bitcoind.cli(&["reconsiderblock", second.trim_end()]);
+    let tip = elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT);
+    let chain_work = bitcoind.cli(&["getblockheader", best.trim_end()]);
+    let chain_work = string_field(&chain_work, "chainwork");
+    assert_eq!(tip, format!("30 {} {chain_work}", best.trim_end()));
+
+    // The answer gave bitcoind the header below the next block, so it announces that block with a
+    // `headers` again.
+    bitcoind.cli(&["generatetodescriptor", "1", "raw(51)"]);
+    let best = bitcoind.cli(&["getbestblockhash"]);
+    let tip = elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT);
+    let chain_work = bitcoind.cli(&["getblockheader", best.trim_end()]);
+    let chain_work = string_field(&chain_work, "chainwork");
+    assert_eq!(tip, format!("31 {} {chain_work}", best.trim_end()));
+    // The same connection took both.
+    let ended = elo.stderr_so_far();
+    assert!(ended.is_empty(), "elo ended the connection: {ended}");
+}
+
 /// Waits until `bitcoind` got our `sendheaders`, which elo sends after the sync. Then bitcoind
 /// announces each new block on our tip with a `headers`. Panics if `elo` ends the connection.
 fn wait_for_send_headers(bitcoind: &Bitcoind, elo: &Elo) {

@@ -8,6 +8,12 @@ pub(crate) const PROTOCOL_VERSION: i32 = 70016;
 /// The most headers a `headers` may carry. A peer that sends fewer has no more to send.
 pub(crate) const HEADERS_COUNT_MAX: usize = 2000;
 
+/// The most entries an `inv` may carry.
+pub(crate) const INV_COUNT_MAX: usize = 50_000;
+
+/// The type of an `inv` entry that announces a block.
+const INV_TYPE_BLOCK: u32 = 2;
+
 /// The longest user agent a `version` may carry.
 const USER_AGENT_LENGTH_MAX: usize = 256;
 
@@ -32,6 +38,7 @@ pub(crate) const HEADERS: MessageType = MessageType::from_name("headers");
 pub(crate) const WTXIDRELAY: MessageType = MessageType::from_name("wtxidrelay");
 pub(crate) const SENDADDRV2: MessageType = MessageType::from_name("sendaddrv2");
 pub(crate) const SENDHEADERS: MessageType = MessageType::from_name("sendheaders");
+pub(crate) const INV: MessageType = MessageType::from_name("inv");
 
 impl MessageType {
     /// Pads `name` with NULs to `MESSAGE_TYPE_SIZE` bytes. Panics if the name
@@ -381,6 +388,57 @@ impl std::fmt::Display for HeadersError {
 }
 
 impl std::error::Error for HeadersError {}
+
+/// The `inv` payload: at most `INV_COUNT_MAX` entries, each a type and a hash. elo keeps only
+/// whether an entry announces a block. It keeps no hash, because it asks for the headers after
+/// its tip, and not for one block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Inv {
+    has_block: bool,
+}
+
+/// Why an `inv` payload was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvError {
+    /// The payload did not decode.
+    Payload(crate::serialize::Error),
+    /// The count is above `INV_COUNT_MAX`.
+    TooMany(usize),
+}
+
+impl Inv {
+    /// Checks the count before it reads an entry. Bytes after the last entry stay in `input`.
+    pub(crate) fn decode(input: &mut &[u8]) -> Result<Self, InvError> {
+        let count = crate::serialize::read_compact_size(input).map_err(InvError::Payload)?;
+        if count > INV_COUNT_MAX {
+            return Err(InvError::TooMany(count));
+        }
+
+        let mut has_block = false;
+        for _ in 0..count {
+            let entry_type = u32::decode(input).map_err(InvError::Payload)?;
+            <[u8; 32]>::decode(input).map_err(InvError::Payload)?;
+            has_block |= entry_type == INV_TYPE_BLOCK;
+        }
+        Ok(Self { has_block })
+    }
+
+    /// True if an entry announces a block.
+    pub(crate) fn has_block(&self) -> bool {
+        self.has_block
+    }
+}
+
+impl std::fmt::Display for InvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InvError::Payload(error) => write!(f, "inv payload: {error}"),
+            InvError::TooMany(count) => write!(f, "{count} inv entries, more than {INV_COUNT_MAX}"),
+        }
+    }
+}
+
+impl std::error::Error for InvError {}
 
 /// The entry points of the `version` and `headers` fuzz targets.
 #[cfg(fuzzing)]
@@ -732,6 +790,69 @@ mod tests {
         let mut input = payload.as_slice();
         let headers = super::Headers::decode(&mut input).unwrap();
         assert_eq!(headers.into_vec().len(), 2);
+        assert_eq!(input, [0xaa]);
+    }
+
+    #[test]
+    fn inv_has_a_block_only_with_an_entry_of_type_2() {
+        // 1 is a transaction, 5 a witness transaction, and 0x4000_0002 a witness block, which a
+        // peer asks for in a `getdata` but does not announce.
+        for (types, has_block) in [
+            (&[][..], false),
+            (&[1, 5, 0x4000_0002][..], false),
+            (&[2][..], true),
+            (&[1, 2, 5][..], true),
+            (&[2, 2][..], true),
+        ] {
+            let payload = crate::fixtures::inv_payload(types);
+            let mut input = payload.as_slice();
+            let inv = super::Inv::decode(&mut input).unwrap();
+            assert_eq!(inv.has_block(), has_block, "{types:?}");
+            assert!(input.is_empty());
+        }
+    }
+
+    #[test]
+    fn inv_count_is_at_most_50000() {
+        let payload = crate::fixtures::inv_payload(&[1; 50_000]);
+        assert!(
+            !super::Inv::decode(&mut payload.as_slice())
+                .unwrap()
+                .has_block()
+        );
+
+        // No entry follows the count. A decode that reads an entry first fails with
+        // `UnexpectedEnd`.
+        let mut payload = Vec::new();
+        crate::serialize::write_compact_size(&mut payload, 50_001);
+        assert_eq!(
+            super::Inv::decode(&mut payload.as_slice()),
+            Err(super::InvError::TooMany(50_001))
+        );
+    }
+
+    #[test]
+    fn inv_requires_each_byte_of_each_entry() {
+        // The bytes stop in the hash of the last entry, and then in its type.
+        let mut payload = crate::fixtures::inv_payload(&[1, 2]);
+        for cut in [1, 32 + 1] {
+            payload.truncate(payload.len() - cut);
+            assert_eq!(
+                super::Inv::decode(&mut payload.as_slice()),
+                Err(super::InvError::Payload(
+                    crate::serialize::Error::UnexpectedEnd
+                )),
+                "{cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn inv_leaves_the_bytes_after_the_last_entry() {
+        let mut payload = crate::fixtures::inv_payload(&[2]);
+        payload.push(0xaa);
+        let mut input = payload.as_slice();
+        assert!(super::Inv::decode(&mut input).unwrap().has_block());
         assert_eq!(input, [0xaa]);
     }
 
