@@ -82,6 +82,11 @@ pub(crate) struct Branch {
     /// The highest bound on the time of a header that a check of the branch read. The local clock
     /// can go back, so a later batch can have a lower bound.
     time_max: u64,
+    /// The work of the chain that the branch is below. With `work_min`, it sets the margin, so the
+    /// next batch asserts that both are the same.
+    chain_work: crate::pow::Work,
+    /// The minimum work of the sync that the branch is in.
+    work_min: crate::pow::Work,
 }
 
 /// Why `Chain::extend`, `Chain::extend_on_locator` or `Chain::extend_branch` refused a batch.
@@ -195,7 +200,7 @@ impl Chain {
             .ok_or(ExtendError::NotOnLocator)?;
         assert!(fork_height < tip_height);
         self.extend_above(
-            Branch::on_fork(fork_height, first_prev),
+            self.branch_on_fork(fork_height, first_prev, work_min),
             headers,
             clock,
             work_min,
@@ -222,6 +227,11 @@ impl Chain {
             Some(first) => assert_eq!(first.prev, fork_hash),
             None => assert_eq!(branch.last_hash, fork_hash),
         }
+        // The chain above the fork did not change either, and the sync has the same minimum. So
+        // the margin is the margin that the batch before passed, and `extend_above` can assert
+        // that a branch with a header of its own passes it again.
+        assert_eq!(self.work, branch.chain_work);
+        assert_eq!(work_min, branch.work_min);
         if headers.first().is_none() {
             return Ok(Extended::Kept);
         }
@@ -248,7 +258,8 @@ impl Chain {
     /// our headers for each header of the branch only when our headers have about the work of the
     /// branch each. A run of our headers with less work each, such as the minimum-difficulty
     /// headers of testnet4, makes it read more. Each header of the branch passed the proof of work
-    /// at its `bits`, so the peer pays for the work that each read stands for, but the margin.
+    /// at its `bits`, so the peer pays for the work that each read stands for, except the reads of
+    /// the margin.
     fn extend_above(
         &mut self,
         branch: Branch,
@@ -261,9 +272,12 @@ impl Chain {
         let Branch {
             mut fork_height,
             headers: branch_headers,
-            work: branch_work,
-            last_hash: mut on_hash,
+            work: work_branch_before,
+            last_hash: mut prev_hash,
             time_max: branch_time_max,
+            // `extend_branch` asserts both against the chain and the sync.
+            chain_work: _,
+            work_min: _,
         } = branch;
         let tip_height = self.below_tip.len();
         // Each caller returns on an empty batch, and a branch is below the tip.
@@ -286,24 +300,29 @@ impl Chain {
         }
         if shared_count > 0 {
             fork_height += shared_count;
-            on_hash = self.header_at(fork_height).hash();
+            prev_hash = self.header_at(fork_height).hash();
             batch.drain(..shared_count);
             if fork_height == tip_height {
                 if !batch.is_empty() {
-                    self.extend_tip(on_hash, batch, time_max)?;
+                    self.extend_tip(prev_hash, batch, time_max)?;
                 }
                 return Ok(Extended::Taken);
             }
             if batch.is_empty() {
-                return Ok(Branch::on_fork_if(full, fork_height, on_hash));
+                if full {
+                    let branch = self.branch_on_fork(fork_height, prev_hash, work_min);
+                    return Ok(Extended::Branch(branch));
+                }
+                return Ok(Extended::Kept);
             }
         }
 
-        let from = branch_headers.len();
+        let branch_count = branch_headers.len();
         let mut headers = branch_headers;
         headers.append(&mut batch);
-        let (last_hash, work_batch) = self.check(fork_height, &headers, from, on_hash, time_max)?;
-        let work_branch = branch_work.saturating_add(work_batch);
+        let (last_hash, work_batch) =
+            self.check(fork_height, &headers, branch_count, prev_hash, time_max)?;
+        let work_branch = work_branch_before.saturating_add(work_batch);
         let work_stop = work_branch.saturating_add(self.branch_margin(work_min));
         // The bound of this loop is the count of headers above the fork, and the work of the
         // branch stops it early. See the doc of this function.
@@ -314,12 +333,18 @@ impl Chain {
             if work_above_fork > work_stop {
                 // A branch with a header of its own passed the margin before, and its work only
                 // rises. So only a branch with no header of its own gets here.
-                assert_eq!(from, 0);
-                return Ok(Branch::on_fork_if(
-                    full && shared_count > 0,
-                    fork_height,
-                    on_hash,
-                ));
+                assert_eq!(branch_count, 0);
+                // A batch with no headers of the chain had the most of the branch that one batch
+                // can have, and it is below the margin.
+                if shared_count == 0 {
+                    return Ok(Extended::Kept);
+                }
+                // After headers of the chain, a full batch had less of the branch than that.
+                if full {
+                    let branch = self.branch_on_fork(fork_height, prev_hash, work_min);
+                    return Ok(Extended::Branch(branch));
+                }
+                return Ok(Extended::Kept);
             }
         }
         // The fork is below the tip, so the loop read at least one header, and each has work.
@@ -328,16 +353,18 @@ impl Chain {
         // store reads the highest.
         let time_max = time_max.max(branch_time_max);
         if work_branch <= work_above_fork {
-            if !full {
-                return Ok(Extended::Kept);
+            if full {
+                return Ok(Extended::Branch(Branch {
+                    fork_height,
+                    headers,
+                    work: work_branch,
+                    last_hash,
+                    time_max,
+                    chain_work: self.work,
+                    work_min,
+                }));
             }
-            return Ok(Extended::Branch(Branch {
-                fork_height,
-                headers,
-                work: work_branch,
-                last_hash,
-                time_max,
-            }));
+            return Ok(Extended::Kept);
         }
 
         // The sum of the chain holds the sum above the fork, so this does not go below zero.
@@ -385,6 +412,26 @@ impl Chain {
                 sum.saturating_add(tip_work)
             });
         behind_tip.min(self.work.minus(work_min))
+    }
+
+    /// A branch with no header on the fork at `fork_height`, a header of the chain below the tip
+    /// whose hash is `fork_hash`, in a sync with the minimum `work_min`.
+    fn branch_on_fork(
+        &self,
+        fork_height: usize,
+        fork_hash: bitcoin_hashes::sha256d::Hash,
+        work_min: crate::pow::Work,
+    ) -> Branch {
+        assert!(fork_height < self.below_tip.len());
+        Branch {
+            fork_height,
+            headers: Vec::new(),
+            work: crate::pow::Work::ZERO,
+            last_hash: fork_hash,
+            time_max: 0,
+            chain_work: self.work,
+            work_min,
+        }
     }
 
     /// The hashes of the locator of the chain, from the tip down: the tip and the 11 headers below
@@ -492,7 +539,7 @@ impl Chain {
         time_max: u64,
         work: crate::pow::Work,
     ) {
-        // `extend` and `extend_on_locator` return before this on an empty batch, so each assert
+        // `extend_tip` and `extend_above` get a batch that is not empty, so each assert
         // reads a new header.
         assert!(!headers.is_empty());
         // Each header has work, so the work of the chain rises. Only a sum above 256 bits can stay
@@ -714,30 +761,6 @@ impl Tip {
 }
 
 impl Branch {
-    /// A branch with no header on the fork at `fork_height`, whose hash is `fork_hash`.
-    fn on_fork(fork_height: usize, fork_hash: bitcoin_hashes::sha256d::Hash) -> Branch {
-        Branch {
-            fork_height,
-            headers: Vec::new(),
-            work: crate::pow::Work::ZERO,
-            last_hash: fork_hash,
-            time_max: 0,
-        }
-    }
-
-    /// A branch with no header on the fork if `goes_on`, else `Extended::Kept`.
-    fn on_fork_if(
-        goes_on: bool,
-        fork_height: usize,
-        fork_hash: bitcoin_hashes::sha256d::Hash,
-    ) -> Extended {
-        if goes_on {
-            Extended::Branch(Branch::on_fork(fork_height, fork_hash))
-        } else {
-            Extended::Kept
-        }
-    }
-
     /// The hash of the last header of the branch, or of the fork when there is none. The next
     /// batch goes on it.
     pub(crate) fn last_hash(&self) -> bitcoin_hashes::sha256d::Hash {
@@ -1825,7 +1848,10 @@ mod tests {
         let headers = crate::fixtures::headers_on_genesis(2_001);
         let mut chain = regtest_with(&headers);
         let branch = branch_of(on_locator(&mut chain, &headers[..2_000]));
-        assert_eq!(branch, super::Branch::on_fork(2_000, headers[1_999].hash()));
+        assert_eq!(
+            branch,
+            chain.branch_on_fork(2_000, headers[1_999].hash(), crate::pow::Work::ZERO)
+        );
         assert_eq!(
             on_branch(&mut chain, branch, &headers[2_000..]),
             Ok(super::Extended::Taken)
@@ -1991,7 +2017,10 @@ mod tests {
         let mut chain = regtest_with(&headers);
         let batch = [&headers[..1_000], &branch[..1_000]].concat();
         let pending = branch_of(on_locator(&mut chain, &batch));
-        assert_eq!(pending, super::Branch::on_fork(1_000, headers[999].hash()));
+        assert_eq!(
+            pending,
+            chain.branch_on_fork(1_000, headers[999].hash(), crate::pow::Work::ZERO)
+        );
         assert_eq!(
             on_branch(&mut chain, pending, &branch),
             Ok(super::Extended::Taken)
