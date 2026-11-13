@@ -433,8 +433,10 @@ pub(crate) struct Peer<'a> {
     chain: &'a mut crate::chain::Chain,
     /// The work that `chain` must reach in the sync.
     work_min: crate::pow::Work,
-    /// The salt of a low-work sync of a branch below the margin, until a sync takes it. A
-    /// connection has at most one low-work sync, so after a sync on genesis there is none.
+    /// The salt of a low-work sync of a branch below the margin, until a sync takes it. While the
+    /// first batch on genesis can start a low-work sync, `Download::Genesis` holds it, and a batch
+    /// that starts none gives it back. A connection has at most one low-work sync, so after one
+    /// there is none.
     salt: Option<crate::headerssync::Salt>,
 }
 
@@ -847,7 +849,9 @@ fn receive_answer(
 ) -> Result<Option<Download>, PeerError> {
     let full = headers.is_full();
     match download {
-        Download::Genesis(salt) => receive_on_genesis(chain, work_min, headers, clock, salt),
+        Download::Genesis(genesis_salt) => {
+            receive_on_genesis(chain, work_min, salt, genesis_salt, headers, clock)
+        }
         Download::Chain => {
             let extended = chain
                 .extend_on_locator(headers, clock, work_min)
@@ -921,14 +925,16 @@ fn receive_answer(
 
 /// The first batch, on genesis, which is below `work_min`. A full batch starts a low-work sync
 /// with `salt`. Our chain takes a batch that is not full, and it ends the sync, which must reach
-/// `work_min`. Returns where the next batch goes, or `None` if the sync ended. A saturated work
-/// means "at least the highest number", so it reaches the minimum.
+/// `work_min`. That batch starts no low-work sync, so `salt` goes to `salt_left`, for a sync of a
+/// branch. Returns where the next batch goes, or `None` if the sync ended. A saturated work means
+/// "at least the highest number", so it reaches the minimum.
 fn receive_on_genesis(
     chain: &mut crate::chain::Chain,
     work_min: crate::pow::Work,
+    salt_left: &mut Option<crate::headerssync::Salt>,
+    salt: crate::headerssync::Salt,
     headers: crate::protocol::Headers,
     clock: u64,
-    salt: crate::headerssync::Salt,
 ) -> Result<Option<Download>, PeerError> {
     // Only the handshake makes `Download::Genesis`, only on a chain below the minimum, and `start`
     // puts such a chain on genesis.
@@ -955,6 +961,8 @@ fn receive_on_genesis(
             panic!("genesis has no header below it")
         }
     }
+    // Only `Download::Genesis` held the salt.
+    assert!(salt_left.replace(salt).is_none());
     if chain.tip().work() >= work_min {
         Ok(None)
     } else {
@@ -3452,6 +3460,33 @@ mod tests {
             .receive(&headers_message(&theirs[50..2_050]), crate::fixtures::CLOCK)
             .err();
         assert_eq!(refused, Some(super::PeerError::SecondLowWorkSync));
+    }
+
+    #[test]
+    fn first_batch_on_genesis_that_starts_no_low_work_sync_keeps_the_salt_for_a_branch() {
+        // The minimum is the work of 2 blocks, and the first batch of 1,000 is not full, so our
+        // chain takes it with no low-work sync. A full announcement takes our chain to block 3,000.
+        // The answer to our locator is a full batch of a branch on genesis, below the margin, so a
+        // low-work sync of the branch starts with the salt.
+        let start = std::time::Instant::now();
+        let mut chain = regtest();
+        let headers = crate::fixtures::headers_on_genesis(3_000);
+        let branch =
+            crate::fixtures::branch_on(&crate::chainparams::Network::Regtest.genesis(), 2_000);
+        let work_min = tip_after(&headers[..2]).work();
+        let peer = synced(asked_with(&mut chain, work_min, start), &headers[..1_000]);
+        let peer = match peer.tick(start, 0) {
+            Ok((peer, outbound, _)) => {
+                assert!(outbound.send_headers, "{outbound:?}");
+                peer
+            }
+            other => panic!("{other:?}"),
+        };
+        let (peer, get_headers) = batch_then_tick(peer, &headers[1_000..], start);
+        assert_eq!(get_headers, get_headers_on(&headers));
+        let (peer, get_headers) = batch_then_tick(peer, &branch, start);
+        assert_eq!(get_headers, get_headers_after(&branch[1_999]));
+        assert_eq!(peer.chain.tip(), tip_after(&headers));
     }
 
     #[test]
