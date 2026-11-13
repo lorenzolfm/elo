@@ -434,7 +434,7 @@ impl Chain {
                     // all of `headers`.
                     (true, 0) => Extended::BelowMargin {
                         branch: self.branch_on_fork(fork_height),
-                        start: self.sync_start(fork_height, self.work_at(fork_height)),
+                        start: self.sync_start(fork_height),
                         branch_work_min: self.branch_work_min(work_min),
                         headers: full_batch(headers),
                     },
@@ -521,11 +521,11 @@ impl Chain {
 
     /// Where a low-work sync on the tip starts.
     pub(crate) fn sync_start_on_tip(&self) -> SyncStart {
-        self.sync_start(self.below_tip.len(), self.work)
+        self.sync_start(self.below_tip.len())
     }
 
     /// The work of the chain from genesis up to the header at `height`, with it. This reads each
-    /// header above that header.
+    /// header above that header, so it reads none for the tip.
     fn work_at(&self, height: usize) -> crate::pow::Work {
         let work_above = (height + 1..=self.below_tip.len())
             .map(|height| self.stored_work(self.header_at(height)))
@@ -534,12 +534,8 @@ impl Chain {
         self.work.minus(work_above)
     }
 
-    /// Where a low-work sync on the header at `height` starts. `work` is the work of the chain up
-    /// to that header.
-    fn sync_start(&self, height: usize, work: crate::pow::Work) -> SyncStart {
-        // Each header has work, so only the tip has the work of the chain.
-        assert!(work <= self.work);
-        assert_eq!(height == self.below_tip.len(), work == self.work);
+    /// Where a low-work sync on the header at `height` starts.
+    fn sync_start(&self, height: usize) -> SyncStart {
         let header = self.header_at(height);
         let ancestors = Ancestors {
             below_tip: &self.below_tip[..height],
@@ -551,7 +547,7 @@ impl Chain {
             height,
             hash: header.hash(),
             bits: header.bits,
-            work,
+            work: self.work_at(height),
             median_time_past: ancestors.median_time_past(),
         }
     }
