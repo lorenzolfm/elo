@@ -37,7 +37,8 @@ const _: () = assert!(LINE_LENGTH_MAX <= 16 * 1024);
 /// An event that elo logs. The name of each event and the key of each field are an interface:
 /// dashboards and alerts match on them, so a rename breaks them. `Event::name` and `Event::line`
 /// are the one list of them. Only the fields here go into a line, so no secret, such as the salt
-/// of a peer, can.
+/// of a peer, can. A `reason` or a `signal` is any `Display`, so its text is what that `Display`
+/// writes: a type that holds a secret has no `Display`, as the salt has none.
 #[derive(Clone, Copy)]
 pub enum Event<'a> {
     /// The handshake with `peer` is done, and it sent `version`.
