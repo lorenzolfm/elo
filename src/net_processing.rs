@@ -876,7 +876,7 @@ fn receive_answer(
                 .map_err(PeerError::HeadersSync)?
             {
                 crate::headerssync::RedownloadStep::More(redownload, more) => {
-                    released.extend(more);
+                    keep_released(chain.network(), &mut released, more);
                     Ok(Some(Download::BranchRedownload(Box::new(
                         BranchRedownload {
                             branch,
@@ -886,7 +886,7 @@ fn receive_answer(
                     ))))
                 }
                 crate::headerssync::RedownloadStep::Done(rest) => {
-                    released.extend(rest);
+                    keep_released(chain.network(), &mut released, rest);
                     let extended = chain
                         .extend_low_work_branch(branch, released, full, clock, work_min)
                         .map_err(PeerError::Extend)?;
@@ -1081,6 +1081,25 @@ fn extend_released(
         chain.extend(batch, clock).map_err(PeerError::Extend)?;
     }
     Ok(())
+}
+
+/// Puts `more`, the headers that one batch of the second download of a low-work sync of a branch
+/// released, after `released`, the headers that it released before, on `network`. They wait for
+/// the last batch.
+fn keep_released(
+    network: crate::chainparams::Network,
+    released: &mut Vec<crate::block::BlockHeader>,
+    more: Vec<crate::block::BlockHeader>,
+) {
+    // As in `extend_released`: the second download keeps at most `redownload_buffer_size` headers
+    // between two batches, and a batch adds at most `HEADERS_COUNT_MAX`.
+    assert!(more.len() <= network.redownload_buffer_size() + crate::protocol::HEADERS_COUNT_MAX);
+    // Each release goes on the release before it. `Chain::extend_low_work_branch` holds that the
+    // first one goes on the fork.
+    if let (Some(last), Some(first)) = (released.last(), more.first()) {
+        assert_eq!(first.prev, last.hash());
+    }
+    released.extend(more);
 }
 
 /// Where the next batch goes after a batch of the first download of a low-work sync of `branch`.

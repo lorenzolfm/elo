@@ -280,6 +280,11 @@ impl Chain {
         // The work at the fork is below the minimum of the sync, so the sync got at least one
         // header.
         assert!(!headers.is_empty());
+        // The sync starts on the fork, so a refusal of the first header because it is not on the
+        // fork would be our error.
+        if let Some(first) = headers.first() {
+            assert_eq!(first.prev, branch.last_hash());
+        }
         let extended = self.extend_on_branch(branch, headers, full, clock, work_min);
         assert!(!matches!(extended, Ok(Extended::BelowMargin { .. })));
         extended
