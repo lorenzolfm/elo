@@ -370,6 +370,18 @@ pub(crate) fn headers_payload_with(headers: &[crate::block::BlockHeader]) -> Vec
     payload
 }
 
+/// An `inv` payload with an entry of each type in `types`. Each hash is 0xbb in each byte, so a
+/// read of a type from a hash does not give 2, the type of a block.
+pub(crate) fn inv_payload(types: &[u32]) -> Vec<u8> {
+    let mut payload = Vec::new();
+    crate::serialize::write_compact_size(&mut payload, types.len());
+    for entry_type in types {
+        payload.extend_from_slice(&entry_type.to_le_bytes());
+        payload.extend_from_slice(&[0xbb; 32]);
+    }
+    payload
+}
+
 /// The local clock in each test that does not test it. It is the last second of a `u32` time, so
 /// the chain takes each time.
 pub(crate) const CLOCK: u64 = u32::MAX as u64;
