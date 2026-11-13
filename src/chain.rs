@@ -537,6 +537,9 @@ impl Chain {
     /// Where a low-work sync on the header at `height` starts. `work` is the work of the chain up
     /// to that header.
     fn sync_start(&self, height: usize, work: crate::pow::Work) -> SyncStart {
+        // Each header has work, so only the tip has the work of the chain.
+        assert!(work <= self.work);
+        assert_eq!(height == self.below_tip.len(), work == self.work);
         let header = self.header_at(height);
         let ancestors = Ancestors {
             below_tip: &self.below_tip[..height],
