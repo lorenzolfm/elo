@@ -352,7 +352,7 @@ impl<'a> Handshake<'a> {
                     let download = if self.chain.tip().work() < self.work_min {
                         Download::Genesis(self.salt)
                     } else {
-                        Download::Chain
+                        Download::on_tip(self.chain, self.work_min)
                     };
                     let peer = Peer {
                         ping: PingState::Unsent,
@@ -504,6 +504,15 @@ enum Download {
     Redownload(Box<crate::headerssync::Redownload>),
 }
 
+impl Download {
+    /// The next batch goes on the tip of `chain`, which has at least `work_min`. Each
+    /// `Download::Chain` comes from here, so each one holds that work.
+    fn on_tip(chain: &crate::chain::Chain, work_min: crate::pow::Work) -> Download {
+        assert!(chain.tip().work() >= work_min);
+        Download::Chain
+    }
+}
+
 impl<'a> Peer<'a> {
     /// A `ping` gets a `pong` with its nonce. A `pong` must answer our outstanding `ping`, and a
     /// `headers` our outstanding `getheaders`, or come after the sync. After the sync, an `inv` of
@@ -555,7 +564,7 @@ impl<'a> Peer<'a> {
             // A sync ends only on a chain with at least the minimum work, so the next batch goes
             // on our tip.
             Ok(Peer {
-                sync: SyncState::Due(Download::Chain),
+                sync: SyncState::Due(Download::on_tip(self.chain, self.work_min)),
                 ..self
             })
         } else {
@@ -802,8 +811,8 @@ fn receive_answer(
                     extend_released(chain, released, clock)?;
                     // The second download gave each header that it checked, and it reached the
                     // minimum with them.
-                    assert!(chain.tip().work() >= work_min);
-                    Ok(full.then_some(Download::Chain))
+                    let next = Download::on_tip(chain, work_min);
+                    Ok(full.then_some(next))
                 }
             }
         }
@@ -898,8 +907,7 @@ fn receive_announcement(
     }
     // A sync ends only on a chain with at least the minimum work, so the next batch goes on our
     // tip.
-    assert!(chain.tip().work() >= work_min);
-    Ok(Some(Download::Chain))
+    Ok(Some(Download::on_tip(chain, work_min)))
 }
 
 /// A batch on the tip of `chain`, which has at least `work_min`: an answer of `Download::Chain`, or
@@ -913,11 +921,11 @@ fn extend_tip(
 ) -> Result<Option<Download>, PeerError> {
     let full = headers.is_full();
     chain.extend(headers, clock).map_err(PeerError::Extend)?;
-    // Only the handshake on a chain at the minimum, a sync that reached it, and an `inv` or an
-    // announcement at `SyncState::Synced` give `Download::Chain`. Only a sync that reached it ends
-    // at `SyncState::Synced`. The work of a chain does not go down.
-    assert!(chain.tip().work() >= work_min);
-    Ok(full.then_some(Download::Chain))
+    // The chain had the minimum work before the batch, as each `Download::Chain` and
+    // `SyncState::Synced` holds, and the work of a chain does not go down. The check goes also
+    // when the batch ends the sync, because then the chain stays at `SyncState::Synced`.
+    let next = Download::on_tip(chain, work_min);
+    Ok(full.then_some(next))
 }
 
 /// Puts each header that the second download of a low-work sync released on `chain`, in order,
