@@ -895,6 +895,8 @@ fn chain_next(
             full.then_some(next)
         }
         crate::chain::Extended::Branch(branch) => {
+            // Only a full batch can have more of the branch after it.
+            assert!(full);
             // The chain stays, so it keeps the minimum work.
             assert!(chain.tip().work() >= work_min);
             Some(Download::Branch(Box::new(branch)))
