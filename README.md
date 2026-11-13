@@ -21,16 +21,17 @@ of those headers must match its bit, and a header goes on the chain when about
 sync, elo stays connected and answers each `ping` with a `pong`. It also sends
 `sendheaders`, so the peer announces each new header with a `headers`. elo puts
 those headers on its tip, as a batch of a sync, and logs the `tip` when it
-moves. A peer announces a block with an `inv` when its headers do not connect
-to the last header it sent, so an `inv` of a block makes elo ask for the headers
-after its tip. From the handshake on, it pings the peer every 2 min. It drops a
-peer that does not answer a `ping` within 20 min, or a `getheaders` within
-2 min. It also drops a peer that sends `wtxidrelay` or `sendaddrv2` after the
-handshake. When a connection ends, elo logs the reason, waits 5 s and dials the
-peer again. Each connection logs the `version` and the `tip` again. The chain
-stays in memory, so the next connection syncs from its tip. A chain below the
-minimum work starts again from genesis, and so does a chain whose tip the peer
-does not have, because elo cannot choose between two branches yet.
+moves. After a reorg, the headers of an announcement are not on the tip of elo.
+Then elo asks for the headers after its tip. A peer announces a block with an
+`inv` when its headers do not connect to the last header it sent, so an `inv` of
+a block makes elo ask too. From the handshake on, it pings the peer every 2 min.
+It drops a peer that does not answer a `ping` within 20 min, or a `getheaders`
+within 2 min. It also drops a peer that sends `wtxidrelay` or `sendaddrv2` after
+the handshake. When a connection ends, elo logs the reason, waits 5 s and dials
+the peer again. Each connection logs the `version` and the `tip` again. The
+chain stays in memory, so the next connection syncs from its tip. A chain below
+the minimum work starts again from genesis, and so does a chain whose tip the
+peer does not have, because elo cannot choose between two branches yet.
 
 ```sh
 elo <mainnet|testnet4|signet|regtest> <ip>[:port]    # IPv6 as [::1]:8333

@@ -352,7 +352,7 @@ impl<'a> Handshake<'a> {
                     let download = if self.chain.tip().work() < self.work_min {
                         Download::Genesis(self.salt)
                     } else {
-                        Download::Chain
+                        Download::on_tip(self.chain, self.work_min)
                     };
                     let peer = Peer {
                         ping: PingState::Unsent,
@@ -462,18 +462,21 @@ enum SyncState {
         sent: std::time::Instant,
     },
     /// A batch that was not full came, so our tip is the tip of the peer. Our chain has at least
-    /// the minimum work. No `getheaders` is outstanding, so each `headers` is an announcement, and
-    /// it must go on our tip. A full one makes a `getheaders` due, and so does an `inv` of a block.
+    /// the minimum work. No `getheaders` is outstanding, so each `headers` is an announcement. One
+    /// on our tip goes on it, and a full one makes a `getheaders` due. One off our tip makes a
+    /// `getheaders` due, and so does an `inv` of a block.
     Synced,
 }
 
 /// Where our `sendheaders` is. It goes once, in the first tick at `SyncState::Synced`. Before it,
 /// the peer announces a new header with an `inv`, which makes our `getheaders` due. A `headers`
 /// that came while our `getheaders` was outstanding would look like its answer. So it does not go
-/// before the sync ends. After a full announcement or an `inv` of a block, our `getheaders` is
-/// outstanding again, and an announcement in that window looks like its answer. A peer that
-/// announces a block with an `inv` sends no `headers` announcement before that answer, because the
-/// answer gives it the header that the next announcement connects to.
+/// before the sync ends. After a full announcement, an announcement off our tip or an `inv` of a
+/// block, our `getheaders` is outstanding again, and an announcement in that window looks like its
+/// answer. A peer that announces a block with an `inv` sends no `headers` announcement before that
+/// answer, because the answer gives it the header that the next announcement connects to. A peer
+/// that announces a block off our tip can announce the next block in that window, on the block
+/// before it. Then the announcement is off our tip, so it ends the connection with `NotOnTip`.
 #[derive(Debug)]
 enum SendHeadersState {
     /// It did not go yet.
@@ -501,13 +504,23 @@ enum Download {
     Redownload(Box<crate::headerssync::Redownload>),
 }
 
+impl Download {
+    /// The next batch goes on the tip of `chain`, which has at least `work_min`. Each
+    /// `Download::Chain` comes from here, so each one holds that work.
+    fn on_tip(chain: &crate::chain::Chain, work_min: crate::pow::Work) -> Download {
+        assert!(chain.tip().work() >= work_min);
+        Download::Chain
+    }
+}
+
 impl<'a> Peer<'a> {
     /// A `ping` gets a `pong` with its nonce. A `pong` must answer our outstanding `ping`, and a
     /// `headers` our outstanding `getheaders`, or come after the sync. After the sync, an `inv` of
-    /// a block makes our `getheaders` due. A `wtxidrelay` or a `sendaddrv2` is an error: a peer
-    /// turns these features on only between its `version` and its `verack`. Each other message is
-    /// skipped. Each result but an error returns the peer, because an error ends the connection.
-    /// `clock` is the local clock, in seconds since the Unix epoch, and only a `headers` reads it.
+    /// a block or a `headers` off our tip makes our `getheaders` due. A `wtxidrelay` or a
+    /// `sendaddrv2` is an error: a peer turns these features on only between its `version` and its
+    /// `verack`. Each other message is skipped. Each result but an error returns the peer, because
+    /// an error ends the connection. `clock` is the local clock, in seconds since the Unix epoch,
+    /// and only a `headers` reads it.
     pub(crate) fn receive(
         self,
         message: &crate::transport::Message,
@@ -551,7 +564,7 @@ impl<'a> Peer<'a> {
             // A sync ends only on a chain with at least the minimum work, so the next batch goes
             // on our tip.
             Ok(Peer {
-                sync: SyncState::Due(Download::Chain),
+                sync: SyncState::Due(Download::on_tip(self.chain, self.work_min)),
                 ..self
             })
         } else {
@@ -583,11 +596,12 @@ impl<'a> Peer<'a> {
 
     /// The `headers` must answer our outstanding `getheaders`, and the download of that
     /// `getheaders` must take the batch at `clock`. Then no `getheaders` is outstanding. After the
-    /// sync, a `headers` announces new headers, and it must go on the tip of our chain. A full one
-    /// makes the next batch due, and each other one ends a sync again. An announcement does not
-    /// answer our locator, so one on genesis does not start our chain again. A `headers` is
-    /// unsolicited only while our `getheaders` is due and the tick has not sent it. The payload is
-    /// checked first, also then. The bytes after the last transaction count are ignored.
+    /// sync, a `headers` announces new headers. One on the tip of our chain goes on it. A full one
+    /// makes the next batch due, and each other one ends a sync again. One off our tip makes our
+    /// `getheaders` due from our tip. An announcement does not answer our locator, so one on
+    /// genesis does not start our chain again. A `headers` is unsolicited only while our
+    /// `getheaders` is due and the tick has not sent it. The payload is checked first, also then.
+    /// The bytes after the last transaction count are ignored.
     ///
     /// A full batch on a genesis below the minimum work starts a low-work sync with the salt, and
     /// the batch goes to its first download. Else our chain takes a batch on its tip, and then a
@@ -610,10 +624,7 @@ impl<'a> Peer<'a> {
             SyncState::Outstanding { download, .. } => {
                 receive_answer(self.chain, self.work_min, download, headers, clock)?
             }
-            SyncState::Synced => {
-                // A sync ends only on a chain with at least the minimum work.
-                extend_tip(self.chain, self.work_min, headers, clock)?
-            }
+            SyncState::Synced => receive_announcement(self.chain, self.work_min, headers, clock)?,
             SyncState::Due(_) => return Err(PeerError::UnsolicitedHeaders),
         };
         match next {
@@ -632,12 +643,13 @@ impl<'a> Peer<'a> {
     /// Returns the peer, what to send, and when to tick next. A `ping` with `nonce` is due at
     /// once after the handshake. Then it is due `PING_INTERVAL` after the last `ping` went, if
     /// its `pong` came. A `getheaders` is due at once after the handshake, at once after each
-    /// batch that does not end the sync, and at once after an `inv` of a block after the sync. The
-    /// tick fails when our outstanding `ping` is `PING_TIMEOUT` old, or our outstanding
-    /// `getheaders` is `HEADERS_TIMEOUT` old. The `ping` is checked first. Each deadline is due at
-    /// its instant, not after it. The wake is the earliest deadline. The `now` of a tick is not
-    /// before the `now` of an earlier tick, because each deadline counts from an earlier `now`. Our
-    /// `sendheaders` goes in the first tick at `SyncState::Synced`, and has no deadline.
+    /// batch that does not end the sync, and at once after an `inv` of a block or a `headers` off
+    /// our tip after the sync. The tick fails when our outstanding `ping` is `PING_TIMEOUT` old, or
+    /// our outstanding `getheaders` is `HEADERS_TIMEOUT` old. The `ping` is checked first. Each
+    /// deadline is due at its instant, not after it. The wake is the earliest deadline. The `now`
+    /// of a tick is not before the `now` of an earlier tick, because each deadline counts from an
+    /// earlier `now`. Our `sendheaders` goes in the first tick at `SyncState::Synced`, and has no
+    /// deadline.
     pub(crate) fn tick(
         self,
         now: std::time::Instant,
@@ -799,8 +811,8 @@ fn receive_answer(
                     extend_released(chain, released, clock)?;
                     // The second download gave each header that it checked, and it reached the
                     // minimum with them.
-                    assert!(chain.tip().work() >= work_min);
-                    Ok(full.then_some(Download::Chain))
+                    let next = Download::on_tip(chain, work_min);
+                    Ok(full.then_some(next))
                 }
             }
         }
@@ -869,9 +881,38 @@ fn receive_on_tip(
     extend_tip(chain, work_min, headers, clock)
 }
 
+/// An announcement after the sync, on `chain`, which has at least `work_min`. One on the tip goes
+/// on it. Returns where the next batch goes, or `None` if the batch was not full and so ended a
+/// sync again.
+///
+/// The peer announces headers on a header that it knows we have. After a reorg of the peer, that
+/// header is below our tip. So one off our tip makes our `getheaders` due from our tip, and its
+/// answer gets the headers after our tip, or the headers after genesis when our tip is not on the
+/// chain of the peer. Our chain does not find a header below its tip by its hash, so an
+/// announcement of headers that we have, such as our tip again, is off our tip too. Only an
+/// announcement makes this `getheaders`, and no `getheaders` is outstanding at an announcement.
+/// So the peer gets at most one message for each message that it sends.
+fn receive_announcement(
+    chain: &mut crate::chain::Chain,
+    work_min: crate::pow::Work,
+    headers: crate::protocol::Headers,
+    clock: u64,
+) -> Result<Option<Download>, PeerError> {
+    let Some(first) = headers.first() else {
+        // An empty announcement changes nothing.
+        return extend_tip(chain, work_min, headers, clock);
+    };
+    if first.prev == chain.tip().hash() {
+        return extend_tip(chain, work_min, headers, clock);
+    }
+    // A sync ends only on a chain with at least the minimum work, so the next batch goes on our
+    // tip.
+    Ok(Some(Download::on_tip(chain, work_min)))
+}
+
 /// A batch on the tip of `chain`, which has at least `work_min`: an answer of `Download::Chain`, or
-/// an announcement after the sync. Returns where the next batch goes, or `None` if the batch was
-/// not full and so ended a sync.
+/// an announcement on our tip after the sync. Returns where the next batch goes, or `None` if the
+/// batch was not full and so ended a sync.
 fn extend_tip(
     chain: &mut crate::chain::Chain,
     work_min: crate::pow::Work,
@@ -880,11 +921,11 @@ fn extend_tip(
 ) -> Result<Option<Download>, PeerError> {
     let full = headers.is_full();
     chain.extend(headers, clock).map_err(PeerError::Extend)?;
-    // Only the handshake on a chain at the minimum, a sync that reached it, and an `inv` at
-    // `SyncState::Synced` give `Download::Chain`. Only a sync that reached it ends at
-    // `SyncState::Synced`. The work of a chain does not go down.
-    assert!(chain.tip().work() >= work_min);
-    Ok(full.then_some(Download::Chain))
+    // The chain had the minimum work before the batch, as each `Download::Chain` and
+    // `SyncState::Synced` holds, and the work of a chain does not go down. The check goes also
+    // when the batch ends the sync, because then the chain stays at `SyncState::Synced`.
+    let next = Download::on_tip(chain, work_min);
+    Ok(full.then_some(next))
 }
 
 /// Puts each header that the second download of a low-work sync released on `chain`, in order,
@@ -1098,7 +1139,9 @@ pub(crate) mod fuzz {
         seed!("headers-empty-payload", "PeerRefused(Headers(Payload(UnexpectedEnd)))"),
         seed!("headers-off-tip", "PeerRefused(Extend(NotOnTip))"),
         seed!("headers-off-tip-after-full", "PeerRefused(Extend(NotOnTip))"),
-        seed!("headers-off-tip-after-sync", "PeerRefused(Extend(NotOnTip))"),
+        seed!("headers-off-tip-after-sync", "PeerOpen { height: 0, synced: false }"),
+        seed!("headers-off-tip-after-sync-then-headers", "PeerOpen { height: 1, synced: true }"),
+        seed!("headers-off-tip-after-sync-twice", "PeerRefused(Extend(NotOnTip))"),
         seed!("headers-wrong-index-past-end", "PeerOpen { height: 2, synced: true }"),
         seed!("inv-block-after-sync", "PeerOpen { height: 2, synced: false }"),
         seed!("inv-block-after-sync-then-headers", "PeerOpen { height: 3, synced: true }"),
@@ -1803,7 +1846,8 @@ pub(crate) mod fuzz {
         Due,
         /// One is outstanding, and it times out at this instant.
         Outstanding(std::time::Instant),
-        /// The sync ended. None goes until a full announcement.
+        /// The sync ended. None goes until a full announcement, an announcement off the tip or an
+        /// `inv` of a block.
         Ended,
     }
 
@@ -1966,11 +2010,17 @@ pub(crate) mod fuzz {
                 .map_err(super::PeerError::Headers)?
                 .into_vec();
             assert!(headers.len() <= HEADERS_FULL_COUNT);
-            // After the sync, each batch is an announcement on the tip of the chain, which has the
-            // minimum work.
+            // After the sync, each batch is an announcement. One off the tip makes our
+            // `getheaders` due from the tip, which has the minimum work. Each other one goes on it.
             match self.get_headers {
                 GetHeadersModel::Outstanding(_) => {}
-                GetHeadersModel::Ended => assert!(matches!(self.download, DownloadModel::Chain)),
+                GetHeadersModel::Ended => {
+                    assert!(matches!(self.download, DownloadModel::Chain));
+                    if headers.first().is_some_and(|first| first.prev != self.tip) {
+                        self.get_headers = GetHeadersModel::Due;
+                        return Ok(ReceivedExpected::NoReply);
+                    }
+                }
                 GetHeadersModel::Due => return Err(super::PeerError::UnsolicitedHeaders),
             }
             let full = headers.len() == HEADERS_FULL_COUNT;
@@ -3046,29 +3096,29 @@ mod tests {
     }
 
     #[test]
-    fn announcement_on_genesis_after_the_sync_keeps_the_chain() {
-        // An announcement does not answer our locator. So our own block 1 again, or another block
-        // on genesis, says nothing about our tip, and only the answer of the next sync can start
-        // the chain again.
+    fn announcement_off_our_tip_after_the_sync_makes_the_next_tick_send_getheaders_from_our_tip() {
+        // Our tip is block 1. The announcements: block 1 again, another block on genesis, and
+        // block 3, on block 2, which our chain does not have. An announcement does not answer our
+        // locator, so one on genesis does not start the chain again. Each one keeps the chain,
+        // and the answer to our `getheaders` puts blocks 2 and 3 on it.
         let start = std::time::Instant::now();
-        let headers = crate::fixtures::headers_on_genesis(2);
+        let headers = crate::fixtures::headers_on_genesis(3);
         let other = crate::pow::mined_for_regtest(crate::block::BlockHeader {
             time: headers[0].time + 1,
             ..headers[0]
         });
         assert_ne!(other.hash(), headers[0].hash());
-        for announced in [headers[0], other] {
+        for announced in [&headers[..1], &[other][..], &headers[2..]] {
             let mut chain = regtest();
-            let refused = synced(asked(&mut chain, start, 7), &headers)
-                .receive(&headers_message(&[announced]), crate::fixtures::CLOCK)
-                .err();
-            assert_eq!(
-                refused,
-                Some(super::PeerError::Extend(
-                    crate::chain::ExtendError::NotOnTip
-                ))
-            );
-            assert_eq!(chain.tip(), tip_after(&headers));
+            let peer = synced(pinged(&mut chain, start, 7), &headers[..1]);
+            let later = start + std::time::Duration::from_mins(1);
+            let (peer, get_headers) = batch_then_tick(peer, announced, later);
+            assert_eq!(get_headers, get_headers_after(&headers[0]));
+            let received = peer.receive(&headers_message(&headers[1..]), crate::fixtures::CLOCK);
+            let Ok((_, super::Received::Synced(tip))) = received else {
+                panic!("{received:?}");
+            };
+            assert_eq!(tip, tip_after(&headers));
         }
     }
 
@@ -3396,16 +3446,17 @@ mod tests {
     }
 
     #[test]
-    fn headers_off_our_tip_end_the_connection() {
-        // The first header is on block 1, which our chain does not have. In the sync, and in an
-        // announcement after it.
+    fn headers_off_our_tip_in_answer_to_our_getheaders_end_the_connection() {
+        // The first header is on block 1, which our chain does not have. In the sync, and in the
+        // answer to the `getheaders` of an announcement off our tip, where the next announcement
+        // of the peer looks like the answer.
         let start = std::time::Instant::now();
         let headers = crate::fixtures::headers_on_genesis(2);
-        let (mut asked_chain, mut pinged_chain) = (regtest(), regtest());
-        for peer in [
-            asked(&mut asked_chain, start, 7),
-            pinged(&mut pinged_chain, start, 7),
-        ] {
+        let (mut asked_chain, mut announced_chain) = (regtest(), regtest());
+        let later = start + std::time::Duration::from_mins(1);
+        let (announced, _) =
+            batch_then_tick(pinged(&mut announced_chain, start, 7), &headers[1..], later);
+        for peer in [asked(&mut asked_chain, start, 7), announced] {
             assert_eq!(
                 peer.receive(&headers_message(&headers[1..]), crate::fixtures::CLOCK)
                     .err(),

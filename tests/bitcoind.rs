@@ -352,49 +352,93 @@ fn next_connection_syncs_from_our_tip_and_a_tip_off_the_chain_of_bitcoind_starts
     );
     assert!(tip.starts_with(&expected), "{tip}");
 
-    // bitcoind announces the branch with a `headers` only after our `sendheaders`. Before it, an
-    // `inv` makes elo ask from our tip, and the answer starts the chain again on this connection.
-    wait_for_send_headers(&bitcoind, &elo);
+    // elo is the only peer of bitcoind, so it is node 0. elo ends no connection of its own here,
+    // so the close does not race elo. The test does not check the reason of this end: bitcoind
+    // can close with bytes from elo that it has not read, and then elo sees a reset.
+    bitcoind.cli(&["-named", "disconnectnode", "nodeid=0"]);
+    elo.event("end", END_TIMEOUT);
 
-    // bitcoind leaves our tip for a branch of 2 blocks. The branch pays another script, because
-    // the same script in the same second makes the block that bitcoind marked invalid.
+    // In the wait before the next dial, bitcoind leaves our tip for a block on genesis. The block
+    // pays another script, because the same script in the same second makes the block that
+    // bitcoind marked invalid.
     bitcoind.cli(&["invalidateblock", first.trim_end()]);
-    bitcoind.cli(&["generatetodescriptor", "2", "raw(52)"]);
+    bitcoind.cli(&["generatetodescriptor", "1", "raw(52)"]);
     let best = bitcoind.cli(&["getbestblockhash"]);
 
-    // The announcement of the branch is on genesis, not on our tip, so elo ends the connection.
     // The next connection asks for the headers after our tip. bitcoind does not have it on its
-    // chain, so it sends its headers after genesis, and elo refuses them. The connection after it
-    // syncs from genesis, and gets the branch. A connection that synced from genesis at once would
-    // take the branch with no refusal.
-    let tip = elo.event("tip", 2 * RECONNECT_TIMEOUT);
+    // chain, so it sends its headers after genesis, and our chain starts again. The connection
+    // after it syncs from genesis, and gets the block. A connection that synced from genesis at
+    // once would take the block with no refusal.
+    let expected = format!(
+        "level=info event=tip peer={} height=1 hash={} ",
+        bitcoind.peer,
+        best.trim_end()
+    );
+    // The connections log other tips before it. One deadline holds all the waits. Both reconnects
+    // fit in one `RECONNECT_TIMEOUT`, because each waits 5 s, and a longer bound goes past the
+    // limit of a test in nextest, so `event` could not give its message.
+    let deadline = std::time::Instant::now() + RECONNECT_TIMEOUT;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if elo.event("tip", left).starts_with(&expected) {
+            break;
+        }
+    }
+    // The refusal came at least 5 s before the tip, so its line is there.
+    let ends = elo.events("end");
+    assert_eq!(ends.len(), 2, "{ends:?}");
+    assert_eq!(
+        ends[1],
+        format!(
+            "level=warn event=end peer={} reason=\"peer: our tip is not on their chain, so our \
+             chain starts again from genesis\" wait_ms=5000",
+            bitcoind.peer
+        )
+    );
+}
+
+#[test]
+fn branch_that_bitcoind_announces_off_our_tip_makes_elo_ask_for_the_headers() {
+    let bitcoind = Bitcoind::start();
+    bitcoind.cli(&["generatetodescriptor", "1", "raw(51)"]);
+    let elo = Elo::start(&bitcoind);
+    let first = bitcoind.cli(&["getbestblockhash"]);
+    elo.event("tip", SYNC_TIMEOUT);
+
+    // bitcoind announces the branch with a `headers` only after our `sendheaders`.
+    wait_for_send_headers(&bitcoind, &elo);
+
+    // bitcoind leaves our tip for one block on genesis, with another script as above. One block,
+    // so bitcoind sends one announcement: a second one could come before the answer to our
+    // `getheaders`, and look like it.
+    bitcoind.cli(&["invalidateblock", first.trim_end()]);
+    bitcoind.cli(&["generatetodescriptor", "1", "raw(52)"]);
+    let best = bitcoind.cli(&["getbestblockhash"]);
+
+    // The announcement is on genesis, not on our tip, so elo asks for the headers after our tip.
+    // bitcoind does not have our tip on its chain, so it sends its headers after genesis, and
+    // our chain starts again on this connection. The next connection syncs from genesis, and
+    // gets the block.
+    let tip = elo.event("tip", RECONNECT_TIMEOUT);
     let chain_work = bitcoind.cli(&["getblockheader", best.trim_end()]);
     let chain_work = string_field(&chain_work, "chainwork");
     assert_eq!(
         tip,
         format!(
-            "level=info event=tip peer={} height=2 hash={} work={chain_work}",
+            "level=info event=tip peer={} height=1 hash={} work={chain_work}",
             bitcoind.peer,
             best.trim_end()
         )
     );
-    // Each refusal came at least 5 s before the tip, so its line is there. elo ends both
-    // connections, so no reset from bitcoind changes a reason.
+    // elo ended the connection, so no reset from bitcoind changes the reason.
     let ends = elo.events("end");
     assert_eq!(
         ends,
-        [
-            format!(
-                "level=warn event=end peer={} reason=\"peer: headers do not start at our tip\" \
-                 wait_ms=5000",
-                bitcoind.peer
-            ),
-            format!(
-                "level=warn event=end peer={} reason=\"peer: our tip is not on their chain, so our \
-                 chain starts again from genesis\" wait_ms=5000",
-                bitcoind.peer
-            ),
-        ]
+        [format!(
+            "level=warn event=end peer={} reason=\"peer: our tip is not on their chain, so our \
+             chain starts again from genesis\" wait_ms=5000",
+            bitcoind.peer
+        )]
     );
 }
 
