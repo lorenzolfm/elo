@@ -328,6 +328,17 @@ mod tests {
         }
     }
 
+    // An L3 test cannot make the runtime, the signal handlers or `/dev/urandom` fail, so this
+    // test holds the exit code of a fault of this host. It writes an `exit` line to stdout.
+    #[test]
+    fn a_fault_of_this_host_exits_with_1() {
+        let code = super::exit(&"a test of the exit code");
+        assert_eq!(
+            format!("{code:?}"),
+            format!("{:?}", std::process::ExitCode::FAILURE)
+        );
+    }
+
     #[test]
     fn each_network_has_a_name_and_a_default_port() {
         for (name, network, port) in [
