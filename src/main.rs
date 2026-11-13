@@ -1,7 +1,7 @@
 //! `elo <network> <ip>[:port]`: dials one peer, does the handshake, and prints the peer's
 //! `version`. Then it syncs the header chain from the peer and prints the tip. It asks the peer to
-//! announce each new header, takes it on the tip, and prints the tip again. It pings the peer and
-//! answers its `ping` messages until the connection ends. Then it waits and dials the
+//! announce each new header, takes it on the tip, and prints the tip when it moves. It pings the
+//! peer and answers its `ping` messages until the connection ends. Then it waits and dials the
 //! peer again. The chain stays in memory, so the next connection syncs from its tip. SIGTERM
 //! and SIGINT stop it at any of these steps.
 

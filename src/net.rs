@@ -145,6 +145,8 @@ pub struct Connection<'a> {
 pub struct Synced<'a> {
     socket: Socket,
     peer: crate::net_processing::Peer<'a>,
+    /// The tip that the last call returned, or the sync if no call did.
+    tip: crate::chain::Tip,
 }
 
 /// The stream to one peer, its network, and the bytes of the frame that is not complete yet.
@@ -269,17 +271,19 @@ impl<'a> Connection<'a> {
         loop {
             match run_turn(&mut socket, peer).await? {
                 (next, None) => peer = next,
-                (peer, Some(tip)) => return Ok((Synced { socket, peer }, tip)),
+                (peer, Some(tip)) => return Ok((Synced { socket, peer, tip }, tip)),
             }
         }
     }
 }
 
 impl<'a> Synced<'a> {
-    /// Runs one turn after the other until a batch that is not full ends a sync again: an
-    /// announcement of the peer, or the last batch of the sync that a full announcement starts.
-    /// Returns the peer for the next call, and the tip of our chain. The loop has no count bound,
-    /// because a peer sends messages for as long as it is connected. It ends on the errors of
+    /// Runs one turn after the other until a batch that is not full ends a sync again on a new
+    /// tip: an announcement of the peer, or the last batch of the sync that a full announcement
+    /// starts. Returns the peer for the next call, and the new tip of our chain. An empty
+    /// announcement ends a sync on the same tip, and the loop goes on. So a peer cannot make the
+    /// caller print the tip again for each `headers`. The loop has no count bound, because a peer
+    /// sends messages for as long as it is connected. It ends on the errors of
     /// `Connection::sync`. Each wait for a message ends at the wake from `tick`, each write ends
     /// within `SEND_TIMEOUT`, and the frame length limit bounds each message. `tick` checks the
     /// ping timeout only at the start of a turn. So a `pong` write that blocks while our `ping` is
@@ -289,11 +293,21 @@ impl<'a> Synced<'a> {
         let Synced {
             mut socket,
             mut peer,
+            tip: previous,
         } = self;
         loop {
             match run_turn(&mut socket, peer).await? {
                 (next, None) => peer = next,
-                (peer, Some(tip)) => return Ok((Synced { socket, peer }, tip)),
+                (next, Some(tip)) if tip == previous => peer = next,
+                (peer, Some(tip)) => {
+                    // On one connection, our chain only takes headers on its tip. A batch that
+                    // is not on it ends the connection, and so does a restart from genesis.
+                    assert!(tip.height() > previous.height());
+                    // The work of a chain does not go down. It saturates at its maximum, so it can
+                    // stay the same.
+                    assert!(tip.work() >= previous.work());
+                    return Ok((Synced { socket, peer, tip }, tip));
+                }
             }
         }
     }
@@ -1074,6 +1088,47 @@ mod tests {
             elapsed.as_secs(),
             std::time::Duration::from_mins(20).as_secs()
         );
+    }
+
+    #[test]
+    fn empty_announcement_after_the_sync_does_not_give_the_tip_again() {
+        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        // The peer ends the sync on genesis, and then announces no header and then one. So the
+        // first call of `next_tip` gives the tip of the second announcement, not genesis again.
+        let headers = crate::fixtures::headers_on_genesis(1);
+        let announcement = crate::transport::encode(
+            crate::chainparams::Network::Regtest,
+            crate::protocol::HEADERS,
+            &crate::fixtures::headers_payload_with(&headers),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+        let peer_thread = std::thread::spawn(move || {
+            let mut stream = accept_handshake(&listener);
+            assert_ping(&read_message(&mut stream));
+            read_first_get_headers(&mut stream);
+            stream.write_all(&empty_headers_frame()).unwrap();
+            read_send_headers(&mut stream);
+            let mut frames = empty_headers_frame();
+            frames.extend(announcement);
+            stream.write_all(&frames).unwrap();
+            // The driver closes the socket after `next_tip`. Nothing more goes before that.
+            let mut rest = Vec::new();
+            stream.read_to_end(&mut rest).unwrap();
+            rest
+        });
+
+        let (synced_tip, next_tip) = block_on(async {
+            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
+            let (synced, synced_tip) = connection.sync().await.unwrap();
+            let (_synced, next_tip) = synced.next_tip().await.unwrap();
+            (synced_tip, next_tip)
+        });
+        let rest = peer_thread.join().unwrap();
+        assert!(rest.is_empty(), "{rest:?}");
+        assert_eq!(synced_tip.height(), 0);
+        assert_eq!(next_tip.height(), 1);
+        assert_eq!(next_tip.hash(), headers[0].hash());
     }
 
     #[test]
