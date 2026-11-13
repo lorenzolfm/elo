@@ -536,6 +536,9 @@ struct Elo {
     stderr: std::sync::mpsc::Receiver<String>,
     /// Each line of stdout that `event` or `events` read, in order.
     read: std::cell::RefCell<Vec<String>>,
+    /// How many lines of `read` the calls of `event` went past. `events` can read lines after
+    /// them, and the next `event` starts at the first of those.
+    passed: std::cell::Cell<usize>,
 }
 
 impl Elo {
@@ -554,22 +557,27 @@ impl Elo {
             stdout,
             stderr,
             read: std::cell::RefCell::default(),
+            passed: std::cell::Cell::default(),
         }
     }
 
-    /// The next log line of the event `name`. It skips the lines before it, and panics if none
-    /// comes within `timeout`.
+    /// The next log line of the event `name`, after the line that the last `event` gave. It skips
+    /// the lines before it, also lines that `events` read, and panics if none comes within
+    /// `timeout`.
     fn event(&self, name: &str, timeout: std::time::Duration) -> String {
         let deadline = std::time::Instant::now() + timeout;
         loop {
+            let passed = self.passed.get();
+            if let Some(line) = self.read.borrow().get(passed) {
+                self.passed.set(passed + 1);
+                if event_name(line) == Some(name) {
+                    return line.clone();
+                }
+                continue;
+            }
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             match self.stdout.recv_timeout(left) {
-                Ok(line) => {
-                    self.read.borrow_mut().push(line.clone());
-                    if event_name(&line) == Some(name) {
-                        return line;
-                    }
-                }
+                Ok(line) => self.read.borrow_mut().push(line),
                 // The thread ends only when the pipe ends, so elo exited, and its stderr ends.
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     let stderr = self.stderr.iter().collect::<Vec<_>>().join("\n");
