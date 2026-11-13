@@ -476,7 +476,8 @@ enum SyncState {
 /// answer. A peer that announces a block with an `inv` sends no `headers` announcement before that
 /// answer, because the answer gives it the header that the next announcement connects to. A peer
 /// that announces a block off our tip can announce the next block in that window, on the block
-/// before it. Then the announcement is off our tip, so it ends the connection with `NotOnTip`.
+/// before it. Then the announcement is not on our locator, so it ends the connection with
+/// `NotOnLocator`.
 #[derive(Debug)]
 enum SendHeadersState {
     /// It did not go yet.
@@ -843,7 +844,16 @@ fn receive_on_genesis(
         let step = presync.receive(headers).map_err(PeerError::HeadersSync)?;
         return Ok(Some(presync_next(step)));
     }
-    chain.extend(headers, clock).map_err(PeerError::Extend)?;
+    // Our `getheaders` had the locator of the chain, which on genesis has only genesis. So no
+    // batch is a branch below our tip, and the chain keeps only an empty batch.
+    let empty = headers.first().is_none();
+    match chain
+        .extend_on_locator(headers, clock)
+        .map_err(PeerError::Extend)?
+    {
+        crate::chain::Extended::Taken => assert!(!empty),
+        crate::chain::Extended::Kept => assert!(empty),
+    }
     if chain.tip().work() >= work_min {
         Ok(None)
     } else {
@@ -896,9 +906,9 @@ fn receive_on_tip(
 /// header is below our tip. So one off our tip makes our `getheaders` due, and its answer gets the
 /// headers after the highest header of our locator on the chain of the peer. Our chain looks for a
 /// header below its tip only in an answer to our locator, so an announcement of headers that we
-/// have, such as our tip again, is off our tip too. Only an
-/// announcement makes this `getheaders`, and no `getheaders` is outstanding at an announcement.
-/// So the peer gets at most one message for each message that it sends.
+/// have, such as our tip again, is off our tip too. Only an announcement makes this `getheaders`,
+/// and no `getheaders` is outstanding at an announcement. So the peer gets at most one message for
+/// each message that it sends.
 fn receive_announcement(
     chain: &mut crate::chain::Chain,
     work_min: crate::pow::Work,
@@ -1144,11 +1154,11 @@ pub(crate) mod fuzz {
         seed!("headers-cut", "PeerRefused(Headers(Payload(UnexpectedEnd)))"),
         seed!("headers-cut-after-sync", "PeerRefused(Headers(Payload(UnexpectedEnd)))"),
         seed!("headers-empty-payload", "PeerRefused(Headers(Payload(UnexpectedEnd)))"),
-        seed!("headers-off-tip", "PeerRefused(Extend(NotOnTip))"),
-        seed!("headers-off-tip-after-full", "PeerRefused(Extend(NotOnTip))"),
+        seed!("headers-off-tip", "PeerRefused(Extend(NotOnLocator))"),
+        seed!("headers-off-tip-after-full", "PeerRefused(Extend(NotOnLocator))"),
         seed!("headers-off-tip-after-sync", "PeerOpen { height: 0, synced: false }"),
         seed!("headers-off-tip-after-sync-then-headers", "PeerOpen { height: 1, synced: true }"),
-        seed!("headers-off-tip-after-sync-twice", "PeerRefused(Extend(NotOnTip))"),
+        seed!("headers-off-tip-after-sync-twice", "PeerRefused(Extend(NotOnLocator))"),
         seed!("headers-wrong-index-past-end", "PeerOpen { height: 2, synced: true }"),
         seed!("inv-block-after-sync", "PeerOpen { height: 2, synced: false }"),
         seed!("inv-block-after-sync-then-headers", "PeerOpen { height: 3, synced: true }"),
@@ -1651,7 +1661,7 @@ pub(crate) mod fuzz {
         }
 
         /// A batch on `last_hash`, at `last_height`. Random bytes never match the hash of the last
-        /// header, so this builds each `prev`. Without this, each batch stops at `NotOnTip`.
+        /// header, so this builds each `prev`. Without this, each batch stops at `NotOnLocator`.
         fn headers_payload(
             &mut self,
             last_hash: bitcoin_hashes::sha256d::Hash,
@@ -1942,7 +1952,9 @@ pub(crate) mod fuzz {
                     break;
                 }
                 height = height.saturating_sub(step);
-                if locator.len() > 10 {
+                // The step doubles after the step down from the 11th hash, so the 12th hash is
+                // still one height below the 11th.
+                if locator.len() >= crate::chain::LOCATOR_DENSE_COUNT - 1 {
                     step *= 2;
                 }
             }
@@ -2096,7 +2108,7 @@ pub(crate) mod fuzz {
         ) -> Result<Option<DownloadModel>, super::PeerError> {
             let hashes = script_hashes(self.network, self.tip, headers).map_err(|fault| {
                 super::PeerError::Extend(match fault {
-                    HeaderFault::FirstPrev => crate::chain::ExtendError::NotOnTip,
+                    HeaderFault::FirstPrev => crate::chain::ExtendError::NotOnLocator,
                     HeaderFault::Prev => crate::chain::ExtendError::NotContinuous,
                     HeaderFault::ProofOfWork => crate::chain::ExtendError::ProofOfWork,
                 })
@@ -2234,8 +2246,8 @@ pub(crate) mod fuzz {
         Ok(hashes)
     }
 
-    /// The error of a download of a low-work sync that refuses a header. It has no `NotOnTip`: the
-    /// first header goes on the last header of the download.
+    /// The error of a download of a low-work sync that refuses a header. It has no `NotOnLocator`:
+    /// the first header goes on the last header of the download.
     fn sync_error(fault: HeaderFault) -> super::PeerError {
         super::PeerError::HeadersSync(match fault {
             HeaderFault::FirstPrev | HeaderFault::Prev => {
@@ -2439,28 +2451,19 @@ mod tests {
         crate::protocol::GetHeaders::new(vec![header.hash()])
     }
 
-    /// The `getheaders` of a regtest chain of `headers` on genesis. Its locator has the tip and
-    /// the 11 headers below it, then a step down that doubles each time, then genesis.
+    /// The `getheaders` of a regtest chain of `headers` on genesis, with the locator of that chain.
+    /// The tests of `chain` hold the heights of a locator.
     fn get_headers_on(headers: &[crate::block::BlockHeader]) -> crate::protocol::GetHeaders {
-        let genesis = crate::chainparams::Network::Regtest.genesis();
-        let hash_at = |height: usize| match height.checked_sub(1) {
-            None => genesis.hash(),
-            Some(index) => headers[index].hash(),
-        };
-        let mut locator = Vec::new();
-        let mut height = headers.len();
-        let mut step = 1;
-        loop {
-            locator.push(hash_at(height));
-            if height == 0 {
-                break;
-            }
-            height = height.saturating_sub(step);
-            if locator.len() > 10 {
-                step *= 2;
-            }
+        let mut chain = regtest();
+        for batch in headers.chunks(crate::protocol::HEADERS_COUNT_MAX) {
+            chain
+                .extend(
+                    crate::fixtures::headers_batch(batch),
+                    crate::fixtures::CLOCK,
+                )
+                .unwrap();
         }
-        crate::protocol::GetHeaders::new(locator)
+        crate::protocol::GetHeaders::new(chain.locator())
     }
 
     /// A chain with only the regtest genesis.
@@ -3194,7 +3197,7 @@ mod tests {
             .unwrap();
         for (batch, error) in [
             (vec![unproven], crate::chain::ExtendError::ProofOfWork),
-            (off_locator, crate::chain::ExtendError::NotOnTip),
+            (off_locator, crate::chain::ExtendError::NotOnLocator),
             (
                 vec![on_tip[0], on_tip[0]],
                 crate::chain::ExtendError::NotContinuous,
@@ -3582,7 +3585,7 @@ mod tests {
                 peer.receive(&headers_message(&headers[1..]), crate::fixtures::CLOCK)
                     .err(),
                 Some(super::PeerError::Extend(
-                    crate::chain::ExtendError::NotOnTip
+                    crate::chain::ExtendError::NotOnLocator
                 ))
             );
         }
