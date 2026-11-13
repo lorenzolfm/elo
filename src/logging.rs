@@ -22,12 +22,14 @@ const KEY_LENGTH_MAX: usize = 16;
 /// The most bytes that one escape writes for one byte of a value: `\u0001`.
 const ESCAPE_LENGTH_MAX: usize = 6;
 
-/// The most bytes of a field: a space, the key, `=`, two quotes and the escaped value.
+/// The most bytes of a field: a space, the key, `=`, two quotes, the escaped value and the `...`
+/// of a cut. The `...` needs no escape.
 const FIELD_LENGTH_MAX: usize =
-    1 + KEY_LENGTH_MAX + 1 + 2 + ESCAPE_LENGTH_MAX * (VALUE_LENGTH_MAX + CUT.len());
+    1 + KEY_LENGTH_MAX + 1 + 2 + ESCAPE_LENGTH_MAX * VALUE_LENGTH_MAX + CUT.len();
 
-/// The most bytes of a line, with its newline.
-const LINE_LENGTH_MAX: usize = FIELDS_COUNT_MAX * FIELD_LENGTH_MAX + 1;
+/// The most bytes of a line. The first field has no space before it, and the line has a newline
+/// after it.
+const LINE_LENGTH_MAX: usize = FIELDS_COUNT_MAX * FIELD_LENGTH_MAX;
 
 // Docker cuts a line of more than 16 KiB into parts, and a collector reads each part as a line.
 const _: () = assert!(LINE_LENGTH_MAX <= 16 * 1024);
@@ -340,16 +342,21 @@ mod tests {
     }
 
     #[test]
-    fn a_line_of_the_longest_values_with_the_longest_escapes_fits() {
-        // Each byte is a control character, which needs the longest escape.
-        let reason = "\u{1}".repeat(super::VALUE_LENGTH_MAX + 1);
-        let line = line(super::Event::Exit { reason: &reason });
-        let escaped = r"\u0001".repeat(super::VALUE_LENGTH_MAX);
-        assert_eq!(
-            line,
-            format!("level=error event=exit reason=\"{escaped}...\"\n")
+    fn the_longest_line_is_the_maximum() {
+        // Each byte is a control character, which needs the longest escape, and the value is cut.
+        let value = "\u{1}".repeat(super::VALUE_LENGTH_MAX + 1);
+        let mut line = super::Line::default();
+        for _ in 0..super::FIELDS_COUNT_MAX {
+            line.field("abcdefghijklmnop", &value);
+        }
+        let line = line.end();
+        let field = format!(
+            "abcdefghijklmnop=\"{}...\"",
+            r"\u0001".repeat(super::VALUE_LENGTH_MAX)
         );
-        assert!(line.len() <= super::LINE_LENGTH_MAX);
+        let fields = vec![field; super::FIELDS_COUNT_MAX];
+        assert_eq!(line, format!("{}\n", fields.join(" ")));
+        assert_eq!(line.len(), super::LINE_LENGTH_MAX);
     }
 
     #[test]
