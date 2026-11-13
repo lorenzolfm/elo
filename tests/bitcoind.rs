@@ -377,6 +377,44 @@ fn sync_from_bitcoind_prints_its_tip() {
     assert_eq!(tip, format!("2001 {} {chain_work}", best.trim_end()));
 }
 
+#[test]
+fn block_that_bitcoind_mines_after_the_sync_prints_the_next_tip() {
+    let bitcoind = Bitcoind::start();
+    // bitcoind announces no block in its initial block download. On regtest, a block with a recent
+    // time ends it.
+    bitcoind.cli(&["generatetodescriptor", "1", "raw(51)"]);
+    let elo = Elo::start(&bitcoind);
+    elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT);
+
+    // Without our `sendheaders`, bitcoind announces the block with an `inv`, which elo skips. So
+    // the test waits until bitcoind has it, and then mines.
+    let start = std::time::Instant::now();
+    loop {
+        let peer_info = bitcoind.cli(&["getpeerinfo"]);
+        if object_text(&peer_info, "bytesrecv_per_msg").contains("\"sendheaders\"") {
+            break;
+        }
+        let ended = elo.stderr_so_far();
+        assert!(ended.is_empty(), "elo ended the connection: {ended}");
+        assert!(
+            start.elapsed() < PEER_INFO_TIMEOUT,
+            "bitcoind shows no sendheaders: {peer_info}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    bitcoind.cli(&["generatetodescriptor", "1", "raw(51)"]);
+    let best = bitcoind.cli(&["getbestblockhash"]);
+
+    // The `headers` of the announcement goes on our tip, as a batch of a sync.
+    let tip = elo.line(&elo.stdout, "tip ", SYNC_TIMEOUT);
+    let chain_work = bitcoind.cli(&["getblockheader", best.trim_end()]);
+    let chain_work = string_field(&chain_work, "chainwork");
+    assert_eq!(tip, format!("2 {} {chain_work}", best.trim_end()));
+    // The same connection took it.
+    let ended = elo.stderr_so_far();
+    assert!(ended.is_empty(), "elo ended the connection: {ended}");
+}
+
 /// elo connected to a `bitcoind`, with the lines of its stdout and its stderr. elo does not
 /// exit while it can dial the peer, so the drop kills it.
 struct Elo {

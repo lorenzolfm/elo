@@ -1,6 +1,7 @@
 //! `elo <network> <ip>[:port]`: dials one peer, does the handshake, and prints the peer's
-//! `version`. Then it syncs the header chain from the peer and prints the tip. It pings the
-//! peer and answers its `ping` messages until the connection ends. Then it waits and dials the
+//! `version`. Then it syncs the header chain from the peer and prints the tip. It asks the peer to
+//! announce each new header, takes it on the tip, and prints the tip again. It pings the peer and
+//! answers its `ping` messages until the connection ends. Then it waits and dials the
 //! peer again. The chain stays in memory, so the next connection syncs from its tip. SIGTERM
 //! and SIGINT stop it at any of these steps.
 
@@ -197,8 +198,9 @@ impl std::fmt::Display for End {
     }
 }
 
-/// Dials `peer`, does the handshake and prints the `version` of the peer. Then syncs `chain`,
-/// prints its tip, and runs until the connection ends.
+/// Dials `peer`, does the handshake and prints the `version` of the peer. Then syncs `chain` and
+/// prints its tip, and prints it again each time an announcement of the peer moves it, until the
+/// connection ends.
 async fn dial(peer: std::net::SocketAddr, chain: &mut elo::chain::Chain) -> End {
     let (connection, version) = match elo::net::handshake(peer, chain).await {
         Ok(handshake) => handshake,
@@ -217,15 +219,21 @@ async fn dial(peer: std::net::SocketAddr, chain: &mut elo::chain::Chain) -> End 
         return End::Stdout(error);
     }
 
-    let (synced, tip) = match connection.sync().await {
+    let (mut synced, mut tip) = match connection.sync().await {
         Ok(sync) => sync,
         Err(error) => return End::Run(error),
     };
-    if let Err(error) = print(format_args!("tip {tip}")) {
-        return End::Stdout(error);
+    // The loop has no count bound, because the peer announces headers for as long as it is
+    // connected. Only the end of the connection or a fault of stdout gets out.
+    loop {
+        if let Err(error) = print(format_args!("tip {tip}")) {
+            return End::Stdout(error);
+        }
+        (synced, tip) = match synced.next_tip().await {
+            Ok(next) => next,
+            Err(error) => return End::Run(error),
+        };
     }
-
-    End::Run(synced.run().await)
 }
 
 /// Writes `text` and a newline to stdout. `println!` panics when stdout fails, for example on
