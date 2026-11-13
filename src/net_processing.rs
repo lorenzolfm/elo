@@ -467,6 +467,8 @@ enum SyncState {
 /// Where our `sendheaders` is. It goes once, in the first tick at `SyncState::Synced`. Before it,
 /// the peer announces a new header with an `inv`, which elo skips. A `headers` that came while our
 /// `getheaders` was outstanding would look like its answer. So it does not go before the sync ends.
+/// After a full announcement our `getheaders` is outstanding again, and an announcement in that
+/// window looks like its answer. A peer that announces a full batch reaches it.
 #[derive(Debug)]
 enum SendHeadersState {
     /// It did not go yet.
