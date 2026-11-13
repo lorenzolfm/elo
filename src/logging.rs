@@ -218,8 +218,9 @@ impl Line {
         // Each line has its level and its event.
         assert!(self.fields_count >= 2, "{}", self.fields_count);
         // The escapes keep each newline out of a value, so a value from a peer cannot start a
-        // line of its own. The one newline is the end of the line.
-        assert!(!self.text.contains('\n'), "{}", self.text);
+        // line of its own. The one newline is the end of the line. `Debug` escapes the text of
+        // the panic too, so a bug of the escapes cannot split a line of stderr either.
+        assert!(!self.text.contains('\n'), "{:?}", self.text);
         self.text.push('\n');
         assert!(self.text.len() <= LINE_LENGTH_MAX, "{}", self.text.len());
         self.text
