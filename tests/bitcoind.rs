@@ -524,6 +524,47 @@ fn reorg_that_bitcoind_announces_with_an_inv_makes_elo_ask_for_the_headers() {
     assert!(ends.is_empty(), "elo ended the connection: {ends:?}");
 }
 
+#[test]
+fn branch_that_bitcoind_sends_in_two_batches_takes_the_place_of_ours() {
+    let bitcoind = Bitcoind::start();
+    // Block 1 and 2,100 blocks on it, then a branch of 2,200 on block 1 with another script, which
+    // bitcoind leaves for the first branch again. So elo syncs to block 2,101, and bitcoind has
+    // the second branch.
+    bitcoind.cli(&["generatetodescriptor", "2101", "raw(51)"]);
+    let second = bitcoind.cli(&["getblockhash", "2"]);
+    bitcoind.cli(&["invalidateblock", second.trim_end()]);
+    bitcoind.cli(&["generatetodescriptor", "2200", "raw(52)"]);
+    let best = bitcoind.cli(&["getbestblockhash"]);
+    let branch = bitcoind.cli(&["getblockhash", "2"]);
+    bitcoind.cli(&["invalidateblock", branch.trim_end()]);
+    bitcoind.cli(&["reconsiderblock", second.trim_end()]);
+    let elo = Elo::start(&bitcoind);
+    let tip = elo.event("tip", SYNC_TIMEOUT);
+    let expected = format!("level=info event=tip peer={} height=2101 ", bitcoind.peer);
+    assert!(tip.starts_with(&expected), "{tip}");
+    wait_for_send_headers(&bitcoind, &elo);
+
+    // bitcoind goes to the second branch, which has more work. elo asks with the locator of our
+    // chain, and no hash of it below our tip is on the second branch but genesis. So the answer
+    // is a full batch on genesis: our block 1, then 1,999 blocks of the branch. These have less
+    // work than our 2,100 blocks above block 1, so elo asks for the headers after the last of
+    // them. The next 201 give the branch more work, and our chain takes it on this connection.
+    bitcoind.cli(&["reconsiderblock", branch.trim_end()]);
+    let tip = elo.event("tip", SYNC_TIMEOUT);
+    let chain_work = bitcoind.cli(&["getblockheader", best.trim_end()]);
+    let chain_work = string_field(&chain_work, "chainwork");
+    assert_eq!(
+        tip,
+        format!(
+            "level=info event=tip peer={} height=2201 hash={} work={chain_work}",
+            bitcoind.peer,
+            best.trim_end()
+        )
+    );
+    let ends = elo.events("end");
+    assert!(ends.is_empty(), "elo ended the connection: {ends:?}");
+}
+
 /// Waits until `bitcoind` got our `sendheaders`, which elo sends after the sync. Then bitcoind
 /// announces each new block on our tip with a `headers`. Panics if `elo` ends the connection.
 fn wait_for_send_headers(bitcoind: &Bitcoind, elo: &Elo) {

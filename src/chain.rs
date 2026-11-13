@@ -39,18 +39,74 @@ pub struct Tip {
 /// is twice the step before it, and the last hash is genesis.
 pub(crate) const LOCATOR_DENSE_COUNT: usize = 12;
 
-/// What `Chain::extend_on_locator` did with a batch that passed each check.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The most headers with the `bits` of the tip whose work a branch may be below the chain and
+/// still go on: about one day of headers.
+pub(crate) const BRANCH_TIP_HEADERS_BEHIND_MAX: usize = 144;
+
+/// What `Chain::extend_on_locator` or `Chain::extend_branch` did with a batch that passed each
+/// check.
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Extended {
-    /// The chain took the batch. If the batch was on a header below the tip, the headers above
-    /// that header are gone.
+    /// The batch ends on the tip. The chain took it, or the batch had only headers of the chain up
+    /// to the tip. If the batch was on a header below the tip, the headers above that header are
+    /// gone.
     Taken,
-    /// The batch gives no more work than the chain, so the chain stays: an empty batch, or a branch
-    /// with at most the work of the chain. On the same work, the chain that came first stays.
+    /// The batch gives no more work than the chain, so the chain stays and the batch is dropped:
+    /// an empty batch, or a branch that the peer ends with at most the work of the chain. On the
+    /// same work, the chain that came first stays.
     Kept,
+    /// The batch was full, and its branch has at most the work of the chain. The peer can have more
+    /// of the branch, and the next batch goes on its last header.
+    Branch(Branch),
+    /// The batch was full and had no headers of the chain, and its branch is below the chain by
+    /// more than the margin. The peer can have more of the branch, also with more work than the
+    /// chain, but the chain does not keep it. So the chain stays and the batch is dropped.
+    BelowMargin,
 }
 
-/// Why `Chain::extend` or `Chain::extend_on_locator` refused a batch.
+/// A branch that a peer sends in more than one batch. It is on a header of the chain below the
+/// tip, the fork, and it has at most the work of the headers above the fork. Only `Chain` makes
+/// one, and only for the chain that it is below. That chain must not change until the next batch,
+/// because the work above the fork is the work of that chain.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Branch {
+    /// The height of the fork. It is below the height of the tip.
+    fork_height: usize,
+    /// What the branch has above the fork.
+    above_fork: AboveFork,
+    /// The work of the chain that the branch is below. With the minimum work of the sync, it sets
+    /// the margin, so the next batch asserts that it is the same.
+    chain_work: crate::pow::Work,
+}
+
+/// What a `Branch` has above its fork.
+#[derive(Debug, PartialEq, Eq)]
+enum AboveFork {
+    /// No header yet: the peer sent none, or only headers of the chain up to the fork. The next
+    /// batch goes on the fork, and it can start with more headers of the chain.
+    Empty {
+        /// The hash of the fork.
+        fork_hash: bitcoin_hashes::sha256d::Hash,
+    },
+    /// At least one header, and the branch is in the margin: its chain from genesis has at least
+    /// the minimum work, and at least the work of the chain less the work of
+    /// `BRANCH_TIP_HEADERS_BEHIND_MAX` headers with the `bits` of the tip. The headers passed each
+    /// check on the chain up to the fork.
+    Headers {
+        /// The headers of the branch, in order. None is a header of the chain, so the first is not
+        /// the header of the chain above the fork.
+        headers: Vec<crate::block::BlockHeader>,
+        /// The sum of the work of `headers`.
+        work: crate::pow::Work,
+        /// The hash of the last of `headers`.
+        last_hash: bitcoin_hashes::sha256d::Hash,
+        /// The highest bound on the time of a header that a check of the branch read. The local
+        /// clock can go back, so a later batch can have a lower bound.
+        time_max: u64,
+    },
+}
+
+/// Why `Chain::extend`, `Chain::extend_on_locator` or `Chain::extend_branch` refused a batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExtendError {
     /// The `prev` of the first header is not the hash of the tip. Only `extend` refuses with this.
@@ -59,7 +115,9 @@ pub enum ExtendError {
     /// The `prev` of the first header is not the hash of a header of the locator of the chain. Only
     /// `extend_on_locator` refuses with this. The tip is the first header of the locator.
     NotOnLocator,
-    /// The `prev` of a header is not the hash of the header before it.
+    /// The `prev` of a header is not the hash of the header before it. For the first header of a
+    /// batch on a branch, that is the last header of the branch. After headers of the chain at the
+    /// start of a batch, it is the last of them.
     NotContinuous,
     /// The `bits` of a header are not a target in the range of the network, or the hash of the
     /// header is above that target.
@@ -127,43 +185,26 @@ impl Chain {
         if first.prev != self.tip.hash() {
             return Err(ExtendError::NotOnTip);
         }
-        let time_max = time_max(clock);
-        let tip_height = self.below_tip.len();
-        let count = headers.len();
-        let (last_hash, work_batch) = self.check(tip_height, &headers, time_max)?;
-        self.extend_store(headers, time_max, self.work.saturating_add(work_batch));
-        // The checks proved the last header of the batch, so this holds that the store took each
-        // one, and the height holds that it took each one once.
-        assert_eq!(self.tip.hash(), last_hash);
-        assert_eq!(self.below_tip.len(), tip_height + count);
-        Ok(())
+        self.extend_tip(headers, time_max(clock))
     }
 
     /// Puts `headers`, an answer to a `getheaders` with the locator of the chain, on the header of
-    /// the locator that the first `prev` names. On the tip, this is `extend`. On a header below the
-    /// tip, the headers above it are a branch, and the batch is another one. The batch goes through
-    /// the checks of `extend` on the chain up to that header. Then the chain takes it only if it
-    /// has more work than the headers above that header, and drops those headers. The chain finds
-    /// only a header of the locator by its hash, so a batch on another header below the tip is
-    /// refused.
-    ///
-    /// A peer can send a batch of our own headers, which passes each check. So the sum of the work
-    /// above that header stops when it reaches the work of the batch. The sum reads at most the
-    /// headers between that header and the tip. It reads about one of our headers for each header
-    /// of the batch only when our headers have about the work of the batch each. A run of our
-    /// headers with less work each, such as the minimum-difficulty headers of testnet4, makes it
-    /// read more. Each header of the batch passed the proof of work at its `bits`, so the peer pays
-    /// for the work that each read stands for.
+    /// the locator that the first `prev` names. On the tip, this is `extend`. A header below the
+    /// tip is a fork, and `extend_above` goes on from it with a branch that has no header yet. The
+    /// chain finds only a header of the locator by its hash, so a batch on another header below the
+    /// tip is refused. For a batch on a header below the tip, the chain must have at least
+    /// `work_min`.
     pub(crate) fn extend_on_locator(
         &mut self,
         headers: crate::protocol::Headers,
         clock: u64,
+        work_min: crate::pow::Work,
     ) -> Result<Extended, ExtendError> {
         let Some(first) = headers.first() else {
             return Ok(Extended::Kept);
         };
         if first.prev == self.tip.hash() {
-            self.extend(headers, clock)?;
+            self.extend_tip(headers.into_vec(), time_max(clock))?;
             return Ok(Extended::Taken);
         }
         let tip_height = self.below_tip.len();
@@ -173,36 +214,233 @@ impl Chain {
             .find(|height| self.header_at(*height).hash() == first_prev)
             .ok_or(ExtendError::NotOnLocator)?;
         assert!(fork_height < tip_height);
+        self.extend_above(self.branch_on_fork(fork_height), headers, clock, work_min)
+    }
 
-        let headers = headers.into_vec();
-        let count = headers.len();
+    /// Puts `headers`, an answer to a `getheaders` with only the last header of `branch`, on that
+    /// header, with `extend_above`. `branch` is what this chain returned for the batch before, and
+    /// the chain did not change since. An empty batch ends the branch. The branch has at most the
+    /// work of the chain, so the chain stays. The chain must have at least `work_min`, the minimum
+    /// of the batch before.
+    pub(crate) fn extend_branch(
+        &mut self,
+        branch: Branch,
+        headers: crate::protocol::Headers,
+        clock: u64,
+        work_min: crate::pow::Work,
+    ) -> Result<Extended, ExtendError> {
+        // The fork is still a header of the chain below the tip, at its height. The hash of a
+        // header holds each header below it, so the chain up to the fork is the chain that checked
+        // the branch.
+        assert!(branch.fork_height < self.below_tip.len());
+        let fork_hash = self.header_at(branch.fork_height).hash();
+        match &branch.above_fork {
+            AboveFork::Empty { fork_hash: hash } => assert_eq!(*hash, fork_hash),
+            AboveFork::Headers { headers, .. } => {
+                assert_eq!(headers.first().map(|first| first.prev), Some(fork_hash));
+            }
+        }
+        // The chain above the fork did not change either, and the minimum is the same. So the
+        // margin is the margin that the batch before passed, and `extend_above` can assert that a
+        // branch with a header of its own passes it again.
+        assert_eq!(self.work, branch.chain_work);
+        if headers.first().is_none() {
+            return Ok(Extended::Kept);
+        }
+        self.extend_above(branch, headers, clock, work_min)
+    }
+
+    /// Goes on with `branch` and `headers`, a batch that is not empty, on the last header of the
+    /// branch. When the branch has no header, the batch can start with headers of the chain above
+    /// the fork. These move the fork up, and they do not go into the branch. If they reach the tip,
+    /// the rest of the batch goes on the tip, as in `extend`. Else the rest goes through the checks
+    /// of `extend`, on the chain up to the fork and on the headers of the branch.
+    ///
+    /// Then the chain takes the branch if it has more work than the headers above the fork, and
+    /// drops those headers. Else a full batch makes the branch go on, but only if the margin keeps
+    /// it: the work up to the last header of the branch is at least the work of the chain less
+    /// `BRANCH_TIP_HEADERS_BEHIND_MAX` headers with the work of the tip, and at least `work_min`.
+    /// So a peer must pay for about the work of the chain above the fork before the chain keeps a
+    /// branch in memory. A branch below the margin is dropped. If its batch started with headers of
+    /// the chain, the peer sent less of the branch than a full batch, so the branch goes on from
+    /// the fork with no header, and the next batch has a full batch of it.
+    ///
+    /// The sum of the work above the fork stops when it passes the work of the branch plus the
+    /// margin. It reads at most the headers between the fork and the tip. It reads about one of
+    /// our headers for each header of the branch only when our headers have about the work of the
+    /// branch each. A run of our headers with less work each, such as the minimum-difficulty
+    /// headers of testnet4, makes it read more. Each header of the branch passed the proof of work
+    /// at its `bits`, so the peer pays for the work that each read stands for, except the reads of
+    /// the margin.
+    fn extend_above(
+        &mut self,
+        branch: Branch,
+        headers: crate::protocol::Headers,
+        clock: u64,
+        work_min: crate::pow::Work,
+    ) -> Result<Extended, ExtendError> {
+        let full = headers.is_full();
+        let mut batch = headers.into_vec();
+        let Branch {
+            mut fork_height,
+            above_fork,
+            // `extend_branch` asserts it against the chain.
+            chain_work: _,
+        } = branch;
+        let tip_height = self.below_tip.len();
+        // Each caller returns on an empty batch, and a branch is below the tip.
+        assert!(!batch.is_empty());
+        assert!(fork_height < tip_height);
         let time_max = time_max(clock);
-        let (last_hash, work_batch) = self.check(fork_height, &headers, time_max)?;
-        // The bound of this loop is the count of headers above the fork, and the work of the batch
-        // stops it early. See the doc of this function.
+
+        // The headers of the branch before the batch, their work, the highest bound on time that
+        // their checks read, and the count of headers of the chain at the start of the batch.
+        let (branch_headers, work_branch_before, time_max_before, shared_count) = match above_fork {
+            AboveFork::Headers {
+                headers,
+                work,
+                // The next batch goes on it, and `check` reads it from the headers.
+                last_hash: _,
+                time_max: time_max_before,
+            } => (headers, work, time_max_before, 0),
+            AboveFork::Empty { fork_hash: _ } => {
+                // The headers of the chain from the fork up are below the tip, so they are equal
+                // only to the headers of the chain. The compare needs no hash.
+                let ours = self.below_tip[fork_height + 1..]
+                    .iter()
+                    .chain(std::iter::once(&self.tip));
+                let shared_count = batch
+                    .iter()
+                    .zip(ours)
+                    .take_while(|(theirs, ours)| theirs == ours)
+                    .count();
+                // With no headers of the chain at the start, the fork stays below the tip and the
+                // batch is not empty, so this returns only after headers of the chain.
+                fork_height += shared_count;
+                batch.drain(..shared_count);
+                if fork_height == tip_height {
+                    if !batch.is_empty() {
+                        self.extend_tip(batch, time_max)?;
+                    }
+                    return Ok(Extended::Taken);
+                }
+                if batch.is_empty() {
+                    if full {
+                        let branch = self.branch_on_fork(fork_height);
+                        return Ok(Extended::Branch(branch));
+                    }
+                    return Ok(Extended::Kept);
+                }
+                // With no header before the batch, the bound of the batch is the highest.
+                (Vec::new(), crate::pow::Work::ZERO, time_max, shared_count)
+            }
+        };
+
+        let branch_count = branch_headers.len();
+        let mut headers = branch_headers;
+        headers.append(&mut batch);
+        let (last_hash, work_batch) = self.check(fork_height, &headers, branch_count, time_max)?;
+        let work_branch = work_branch_before.saturating_add(work_batch);
+        let work_stop = work_branch.saturating_add(self.branch_margin(work_min));
+        // The bound of this loop is the count of headers above the fork, and the work of the
+        // branch stops it early. See the doc of this function.
         let mut work_above_fork = crate::pow::Work::ZERO;
         for height in fork_height + 1..=tip_height {
             let header_work = self.stored_work(self.header_at(height));
             work_above_fork = work_above_fork.saturating_add(header_work);
-            if work_above_fork >= work_batch {
-                return Ok(Extended::Kept);
+            if work_above_fork > work_stop {
+                // A branch with a header of its own passed the margin before, and its work only
+                // rises. So only a branch with no header of its own gets here.
+                assert_eq!(branch_count, 0);
+                return Ok(match (full, shared_count) {
+                    // The peer has no more of the branch, which is below the margin, so it has
+                    // less work than the chain.
+                    (false, _) => Extended::Kept,
+                    // A full batch with no headers of the chain had the most of the branch that
+                    // one batch can have.
+                    (true, 0) => Extended::BelowMargin,
+                    // After headers of the chain, a full batch had less of the branch than that,
+                    // so the next batch goes on the fork.
+                    (true, _) => Extended::Branch(self.branch_on_fork(fork_height)),
+                });
             }
         }
         // The fork is below the tip, so the loop read at least one header, and each has work.
         assert!(work_above_fork > crate::pow::Work::ZERO);
-        assert!(work_batch > work_above_fork);
+        // A check can read a lower bound than a check of an earlier batch of the branch, so the
+        // store reads the highest.
+        let time_max = time_max.max(time_max_before);
+        if work_branch <= work_above_fork {
+            if full {
+                return Ok(Extended::Branch(Branch {
+                    fork_height,
+                    above_fork: AboveFork::Headers {
+                        headers,
+                        work: work_branch,
+                        last_hash,
+                        time_max,
+                    },
+                    chain_work: self.work,
+                }));
+            }
+            return Ok(Extended::Kept);
+        }
 
         // The sum of the chain holds the sum above the fork, so this does not go below zero.
         let work_at_fork = self.work.minus(work_above_fork);
+        let count = headers.len();
         self.tip = self.below_tip[fork_height];
         self.below_tip.truncate(fork_height);
         self.work = work_at_fork;
-        self.extend_store(headers, time_max, work_at_fork.saturating_add(work_batch));
-        // The checks proved the last header of the batch, so this holds that the store took each
+        self.extend_store(headers, time_max, work_at_fork.saturating_add(work_branch));
+        // The checks proved the last header of the branch, so this holds that the store took each
         // one. The height holds that the fork stays once, and that no header above it stays.
         assert_eq!(self.tip.hash(), last_hash);
         assert_eq!(self.below_tip.len(), fork_height + count);
         Ok(Extended::Taken)
+    }
+
+    /// Puts `headers`, a batch that is not empty, on the tip, or none of them.
+    fn extend_tip(
+        &mut self,
+        headers: Vec<crate::block::BlockHeader>,
+        time_max: u64,
+    ) -> Result<(), ExtendError> {
+        let tip_height = self.below_tip.len();
+        let count = headers.len();
+        let (last_hash, work_batch) = self.check(tip_height, &headers, 0, time_max)?;
+        self.extend_store(headers, time_max, self.work.saturating_add(work_batch));
+        // The checks proved the last header of the batch, so this holds that the store took each
+        // one, and the height holds that it took each one once.
+        assert_eq!(self.tip.hash(), last_hash);
+        assert_eq!(self.below_tip.len(), tip_height + count);
+        Ok(())
+    }
+
+    /// How far the work up to the last header of a branch may be below the work of the chain for
+    /// the branch to go on: the work of `BRANCH_TIP_HEADERS_BEHIND_MAX` headers with the `bits` of
+    /// the tip, or the work of the chain above `work_min` if that is less. The chain must have at
+    /// least `work_min`.
+    fn branch_margin(&self, work_min: crate::pow::Work) -> crate::pow::Work {
+        assert!(self.work >= work_min);
+        let tip_work = self.stored_work(&self.tip);
+        let behind_tip = (0..BRANCH_TIP_HEADERS_BEHIND_MAX)
+            .fold(crate::pow::Work::ZERO, |sum, _| {
+                sum.saturating_add(tip_work)
+            });
+        behind_tip.min(self.work.minus(work_min))
+    }
+
+    /// A branch with no header on the fork at `fork_height`, a header of the chain below the tip.
+    fn branch_on_fork(&self, fork_height: usize) -> Branch {
+        assert!(fork_height < self.below_tip.len());
+        Branch {
+            fork_height,
+            above_fork: AboveFork::Empty {
+                fork_hash: self.header_at(fork_height).hash(),
+            },
+            chain_work: self.work,
+        }
     }
 
     /// The hashes of the locator of the chain, from the tip down: the tip and the 11 headers below
@@ -218,30 +456,33 @@ impl Chain {
         locator
     }
 
-    /// Checks `headers` as a batch on the header at `base_height`, with the headers below it: the
-    /// tip for `extend`, or a header of the locator for `extend_on_locator`. Returns the hash of
-    /// the last header, and the sum of the work of the batch. The first `prev` must be the hash of
-    /// the header at `base_height`. For one header, its `prev` is checked first, then its proof of
-    /// work, then its `bits`, then its time against the median time, then its time against the
-    /// timewarp rule, then its time against `time_max`, then its `version`.
+    /// Checks `headers[from..]` as a batch on the header at `base_height`, with the headers below
+    /// it, and on `headers[..from]`, the headers of a branch on that header. The base is the tip
+    /// for `extend`, or a fork below it. The `prev` of the first header of the batch must be the
+    /// hash of the header below it: the last header of the branch, or the base. Returns the hash of
+    /// the last header, and the sum of the work of the batch. For one header, its `prev` is checked
+    /// first, then its proof of work, then its `bits`, then its time against the median time, then
+    /// its time against the timewarp rule, then its time against `time_max`, then its `version`.
     fn check(
         &self,
         base_height: usize,
         headers: &[crate::block::BlockHeader],
+        from: usize,
         time_max: u64,
     ) -> Result<(bitcoin_hashes::sha256d::Hash, crate::pow::Work), ExtendError> {
         let base = self.header_at(base_height);
         let below_base = &self.below_tip[..base_height];
-        // Each caller compares the first `prev` with the hash of the header at `base_height`.
-        let Some(first) = headers.first() else {
-            panic!("an empty batch has nothing to check");
+        // Each caller has a batch that is not empty.
+        assert!(from < headers.len());
+        let below_batch = match from.checked_sub(1) {
+            Some(index) => &headers[index],
+            None => base,
         };
-        assert_eq!(first.prev, base.hash());
         // The hash of a header checks its proof of work and the `prev` of the next header, so one
-        // pass hashes each header once.
-        let mut prev = first.prev;
+        // pass hashes each header of the batch once, after the header below it.
+        let mut prev = below_batch.hash();
         let mut work = crate::pow::Work::ZERO;
-        for (index, header) in headers.iter().enumerate() {
+        for (index, header) in headers.iter().enumerate().skip(from) {
             if header.prev != prev {
                 return Err(ExtendError::NotContinuous);
             }
@@ -297,7 +538,7 @@ impl Chain {
 
     /// Puts each of `headers` on the tip, in order, and `work` as the work of the chain. `check`
     /// checked each header against the batch, and each assert here reads the chain. So with a check
-    /// that skips a header, this panics. `extend` calls this on the tip. `extend_on_locator` calls
+    /// that skips a header, this panics. `extend_tip` calls this on the tip. `extend_above` calls
     /// this on a branch after it drops the headers above the fork, so the tip is then the fork.
     fn extend_store(
         &mut self,
@@ -305,7 +546,7 @@ impl Chain {
         time_max: u64,
         work: crate::pow::Work,
     ) {
-        // `extend` and `extend_on_locator` return before this on an empty batch, so each assert
+        // `extend_tip` and `extend_above` get a batch that is not empty, so each assert
         // reads a new header.
         assert!(!headers.is_empty());
         // Each header has work, so the work of the chain rises. Only a sum above 256 bits can stay
@@ -523,6 +764,17 @@ impl Tip {
     /// The work of the chain.
     pub(crate) fn work(&self) -> crate::pow::Work {
         self.work
+    }
+}
+
+impl Branch {
+    /// The hash of the last header of the branch, or of the fork when there is none. The next
+    /// batch goes on it.
+    pub(crate) fn last_hash(&self) -> bitcoin_hashes::sha256d::Hash {
+        match &self.above_fork {
+            AboveFork::Empty { fork_hash } => *fork_hash,
+            AboveFork::Headers { last_hash, .. } => *last_hash,
+        }
     }
 }
 
@@ -1435,6 +1687,41 @@ mod tests {
         chain
     }
 
+    /// `chain` takes `headers` as an answer to its locator, at the clock of the fixtures, with no
+    /// minimum work.
+    fn on_locator(
+        chain: &mut super::Chain,
+        headers: &[crate::block::BlockHeader],
+    ) -> Result<super::Extended, super::ExtendError> {
+        chain.extend_on_locator(
+            crate::fixtures::headers_batch(headers),
+            crate::fixtures::CLOCK,
+            crate::pow::Work::ZERO,
+        )
+    }
+
+    /// `chain` takes `headers` as an answer on the last header of `branch`, as `on_locator` does.
+    fn on_branch(
+        chain: &mut super::Chain,
+        branch: super::Branch,
+        headers: &[crate::block::BlockHeader],
+    ) -> Result<super::Extended, super::ExtendError> {
+        chain.extend_branch(
+            branch,
+            crate::fixtures::headers_batch(headers),
+            crate::fixtures::CLOCK,
+            crate::pow::Work::ZERO,
+        )
+    }
+
+    /// The branch that `extended` goes on with.
+    fn branch_of(extended: Result<super::Extended, super::ExtendError>) -> super::Branch {
+        match extended {
+            Ok(super::Extended::Branch(branch)) => branch,
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn locator_has_12_heights_one_apart_then_steps_that_double_then_genesis() {
         // A person wrote each list.
@@ -1482,10 +1769,7 @@ mod tests {
         let headers = crate::fixtures::headers_on_genesis(3);
         let mut chain = regtest_with(&headers[..1]);
         assert_eq!(
-            chain.extend_on_locator(
-                crate::fixtures::headers_batch(&headers[1..]),
-                crate::fixtures::CLOCK
-            ),
+            on_locator(&mut chain, &headers[1..]),
             Ok(super::Extended::Taken)
         );
         assert_eq!(chain.tip(), regtest_with(&headers).tip());
@@ -1495,10 +1779,7 @@ mod tests {
     fn extend_on_locator_keeps_the_chain_on_an_empty_batch() {
         let headers = crate::fixtures::headers_on_genesis(3);
         let mut chain = regtest_with(&headers);
-        assert_eq!(
-            chain.extend_on_locator(crate::fixtures::headers_batch(&[]), crate::fixtures::CLOCK),
-            Ok(super::Extended::Kept)
-        );
+        assert_eq!(on_locator(&mut chain, &[]), Ok(super::Extended::Kept));
         assert_eq!(chain.tip(), regtest_with(&headers).tip());
     }
 
@@ -1507,25 +1788,18 @@ mod tests {
         // Our tip is block 3. On block 1, a branch of 1 has less work than blocks 2 and 3, a
         // branch of 2 the same, and a branch of 3 more. Regtest headers have the same work each.
         let headers = crate::fixtures::headers_on_genesis(3);
-        for (count, expected) in [
-            (1, super::Extended::Kept),
-            (2, super::Extended::Kept),
-            (3, super::Extended::Taken),
-        ] {
+        for (count, taken) in [(1, false), (2, false), (3, true)] {
             let branch = crate::fixtures::branch_on(&headers[0], count);
             let mut chain = regtest_with(&headers);
-            assert_eq!(
-                chain.extend_on_locator(
-                    crate::fixtures::headers_batch(&branch),
-                    crate::fixtures::CLOCK
-                ),
-                Ok(expected),
-                "{count}"
-            );
-            let ours = match expected {
-                super::Extended::Kept => headers.to_vec(),
-                super::Extended::Taken => [&headers[..1], &branch[..]].concat(),
+            let (expected, ours) = if taken {
+                (
+                    super::Extended::Taken,
+                    [&headers[..1], &branch[..]].concat(),
+                )
+            } else {
+                (super::Extended::Kept, headers.to_vec())
             };
+            assert_eq!(on_locator(&mut chain, &branch), Ok(expected), "{count}");
             // The tip has the work of its chain from genesis, and the height of its branch.
             assert_eq!(chain.tip(), regtest_with(&ours).tip(), "{count}");
         }
@@ -1540,13 +1814,7 @@ mod tests {
         let branch = crate::fixtures::branch_on(&headers[0], 3);
         let mut chain = regtest_with(&headers);
         assert_eq!(branch[0].time, chain.median_time_past());
-        assert_eq!(
-            chain.extend_on_locator(
-                crate::fixtures::headers_batch(&branch),
-                crate::fixtures::CLOCK
-            ),
-            Ok(super::Extended::Taken)
-        );
+        assert_eq!(on_locator(&mut chain, &branch), Ok(super::Extended::Taken));
     }
 
     #[test]
@@ -1560,13 +1828,7 @@ mod tests {
         ] {
             let branch = crate::fixtures::branch_on(below, 20);
             let mut chain = regtest_with(&headers);
-            assert_eq!(
-                chain.extend_on_locator(
-                    crate::fixtures::headers_batch(&branch),
-                    crate::fixtures::CLOCK
-                ),
-                expected
-            );
+            assert_eq!(on_locator(&mut chain, &branch), expected);
         }
     }
 
@@ -1578,12 +1840,204 @@ mod tests {
         branch.remove(1);
         let mut chain = regtest_with(&headers);
         assert_eq!(
-            chain.extend_on_locator(
-                crate::fixtures::headers_batch(&branch),
-                crate::fixtures::CLOCK
-            ),
+            on_locator(&mut chain, &branch),
             Err(super::ExtendError::NotContinuous)
         );
         assert_eq!(chain.tip(), regtest_with(&headers).tip());
+    }
+
+    /// The regtest genesis.
+    fn genesis() -> crate::block::BlockHeader {
+        crate::chainparams::Network::Regtest.genesis()
+    }
+
+    #[test]
+    fn extend_on_locator_goes_on_after_a_full_batch_of_our_headers_below_the_tip() {
+        // Our tip is block 2,001. The batch on genesis is our first 2,000 blocks, so the peer can
+        // have more after block 2,000, and the next batch goes on it. Our block 2,001 ends there.
+        let headers = crate::fixtures::headers_on_genesis(2_001);
+        let mut chain = regtest_with(&headers);
+        let branch = branch_of(on_locator(&mut chain, &headers[..2_000]));
+        assert_eq!(branch, chain.branch_on_fork(2_000));
+        assert_eq!(
+            on_branch(&mut chain, branch, &headers[2_000..]),
+            Ok(super::Extended::Taken)
+        );
+        assert_eq!(chain.tip(), regtest_with(&headers).tip());
+    }
+
+    #[test]
+    fn extend_on_locator_keeps_none_of_our_headers_in_a_branch() {
+        // Our tip is block 2,100. The full batch on genesis has our block 1, then a branch of 1,999
+        // on it, which has less work than our 2,099 blocks above block 1. So the branch goes on
+        // from block 1.
+        let headers = crate::fixtures::headers_on_genesis(2_100);
+        let branch = crate::fixtures::branch_on(&headers[0], 1_999);
+        let mut chain = regtest_with(&headers);
+        let pending = branch_of(on_locator(
+            &mut chain,
+            &[&headers[..1], &branch[..]].concat(),
+        ));
+        assert_eq!(pending.fork_height, 1);
+        let super::AboveFork::Headers { headers: kept, .. } = &pending.above_fork else {
+            panic!("{pending:?}");
+        };
+        assert_eq!(*kept, branch);
+        assert_eq!(pending.last_hash(), branch[1_998].hash());
+        assert_eq!(chain.tip(), regtest_with(&headers).tip());
+    }
+
+    #[test]
+    fn extend_branch_takes_a_branch_over_two_batches_whose_first_has_less_work_than_ours() {
+        // Our tip is block 2,100. A branch of 2,200 on genesis comes as a full batch of 2,000,
+        // which has less work than our 2,100 blocks, then a batch of 200. The two have more.
+        let headers = crate::fixtures::headers_on_genesis(2_100);
+        let branch = crate::fixtures::branch_on(&genesis(), 2_200);
+        let mut chain = regtest_with(&headers);
+        let pending = branch_of(on_locator(&mut chain, &branch[..2_000]));
+        assert_eq!(chain.tip(), regtest_with(&headers).tip());
+        assert_eq!(
+            on_branch(&mut chain, pending, &branch[2_000..]),
+            Ok(super::Extended::Taken)
+        );
+        assert_eq!(chain.tip(), regtest_with(&branch).tip());
+    }
+
+    #[test]
+    fn extend_branch_keeps_the_chain_when_the_peer_ends_the_branch_with_no_more_work() {
+        // Our tip is block 2,100. After a full batch of 2,000 on genesis, a batch of 100 gives the
+        // branch the work of our chain, and an empty batch gives it less. Our chain came first, so
+        // it stays.
+        let headers = crate::fixtures::headers_on_genesis(2_100);
+        let branch = crate::fixtures::branch_on(&genesis(), 2_100);
+        for rest in [&branch[2_000..], &[]] {
+            let mut chain = regtest_with(&headers);
+            let pending = branch_of(on_locator(&mut chain, &branch[..2_000]));
+            assert_eq!(
+                on_branch(&mut chain, pending, rest),
+                Ok(super::Extended::Kept)
+            );
+            assert_eq!(chain.tip(), regtest_with(&headers).tip());
+        }
+    }
+
+    #[test]
+    fn extend_branch_checks_a_batch_on_the_headers_of_the_branch_and_keeps_the_chain() {
+        // Our tip is block 2,100, and a full batch of a branch of 2,000 on genesis goes on. A batch
+        // after a gap is not on its last header. A header with the time of the median of the last
+        // 11 headers of the branch is too old.
+        let headers = crate::fixtures::headers_on_genesis(2_100);
+        let branch = crate::fixtures::branch_on(&genesis(), 2_200);
+        let median = mined_on(branch[1_999], &[branch[1_994].time]);
+        for (batch, error) in [
+            (&branch[2_001..], super::ExtendError::NotContinuous),
+            (&median[..], super::ExtendError::TimeTooOld),
+        ] {
+            let mut chain = regtest_with(&headers);
+            let pending = branch_of(on_locator(&mut chain, &branch[..2_000]));
+            assert_eq!(on_branch(&mut chain, pending, batch), Err(error));
+            assert_eq!(chain.tip(), regtest_with(&headers).tip(), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn extend_branch_takes_a_branch_whose_first_batch_passed_at_a_later_clock() {
+        // Our tip is block 2,001, and a full batch of a branch of 2,000 on genesis goes on. Then
+        // the clock goes back, and the bound on the time of a header is below the time of the last
+        // header of the branch. Two more headers have times below that bound and above the median,
+        // so the chain takes the branch.
+        let headers = crate::fixtures::headers_on_genesis(2_001);
+        let branch = crate::fixtures::branch_on(&genesis(), 2_000);
+        let more = mined_on(branch[1_999], &[branch[1_996].time, branch[1_997].time]);
+        let clock = u64::from(branch[1_997].time) - super::TIME_AHEAD_SECONDS_MAX;
+        let mut chain = regtest_with(&headers);
+        let pending = branch_of(on_locator(&mut chain, &branch));
+        assert_eq!(
+            chain.extend_branch(
+                pending,
+                crate::fixtures::headers_batch(&more),
+                clock,
+                crate::pow::Work::ZERO
+            ),
+            Ok(super::Extended::Taken)
+        );
+        assert_eq!(
+            chain.tip(),
+            regtest_with(&[&branch[..], &more[..]].concat()).tip()
+        );
+    }
+
+    #[test]
+    fn extend_on_locator_goes_on_with_a_full_branch_only_up_to_144_headers_of_the_tip_below() {
+        // A batch of a branch on genesis. Below our tip at block 2,144, a full batch of 2,000 has
+        // the work of 144 of our headers less, so it goes on. Below block 2,145, it has less, and
+        // the chain drops it, though the peer can have more of it. A batch of 1,999 is not full,
+        // so the peer ends the branch there, with less work than ours.
+        let rows = [
+            (2_000, 2_144, None),
+            (2_000, 2_145, Some(super::Extended::BelowMargin)),
+            (1_999, 2_145, Some(super::Extended::Kept)),
+        ];
+        for (branch_count, count, dropped) in rows {
+            let branch = crate::fixtures::branch_on(&genesis(), branch_count);
+            let headers = crate::fixtures::headers_on_genesis(count);
+            let mut chain = regtest_with(&headers);
+            let extended = on_locator(&mut chain, &branch);
+            match dropped {
+                None => assert!(
+                    matches!(extended, Ok(super::Extended::Branch(_))),
+                    "{extended:?}"
+                ),
+                Some(dropped) => assert_eq!(extended, Ok(dropped), "{branch_count} {count}"),
+            }
+            assert_eq!(chain.tip(), regtest_with(&headers).tip());
+        }
+    }
+
+    #[test]
+    fn extend_on_locator_goes_on_with_a_full_branch_only_at_the_minimum_work() {
+        // Our tip is block 2,100, so a full batch of a branch of 2,000 on genesis is within 144
+        // headers of the tip. Its chain has the work of a chain of 2,000 blocks. So it goes on at
+        // that minimum, and the chain drops it at the minimum of 2,001 blocks.
+        let headers = crate::fixtures::headers_on_genesis(2_100);
+        let branch = crate::fixtures::branch_on(&genesis(), 2_000);
+        for (count, goes_on) in [(2_000, true), (2_001, false)] {
+            let work_min = regtest_with(&headers[..count]).tip().work();
+            let mut chain = regtest_with(&headers);
+            let extended = chain.extend_on_locator(
+                crate::fixtures::headers_batch(&branch),
+                crate::fixtures::CLOCK,
+                work_min,
+            );
+            assert_eq!(
+                matches!(extended, Ok(super::Extended::Branch(_))),
+                goes_on,
+                "{count}"
+            );
+            if !goes_on {
+                assert_eq!(extended, Ok(super::Extended::BelowMargin));
+            }
+        }
+    }
+
+    #[test]
+    fn extend_on_locator_asks_again_from_the_fork_for_a_branch_below_the_margin_after_our_headers()
+    {
+        // Our tip is block 2,300. The full batch on genesis has our first 1,000 blocks, then a
+        // branch of 1,000 on block 1,000. That is more than 144 headers below our 1,300 blocks
+        // above block 1,000, but a full batch of the branch can have more. So the next batch goes
+        // on block 1,000, with no header of the branch. A batch of 2,000 there has more work.
+        let headers = crate::fixtures::headers_on_genesis(2_300);
+        let branch = crate::fixtures::branch_on(&headers[999], 2_000);
+        let mut chain = regtest_with(&headers);
+        let batch = [&headers[..1_000], &branch[..1_000]].concat();
+        let pending = branch_of(on_locator(&mut chain, &batch));
+        assert_eq!(pending, chain.branch_on_fork(1_000));
+        assert_eq!(
+            on_branch(&mut chain, pending, &branch),
+            Ok(super::Extended::Taken)
+        );
+        let ours = [&headers[..1_000], &branch[..]].concat();
+        assert_eq!(chain.tip(), regtest_with(&ours).tip());
     }
 }
