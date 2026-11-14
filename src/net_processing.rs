@@ -492,22 +492,21 @@ impl<'a> Peer<'a> {
 
         let mut input = message.payload();
         let headers = crate::protocol::Headers::decode(&mut input).map_err(PeerError::Headers)?;
+        if let SyncState::Outstanding { download, .. } = &self.sync
+            && !download.is_answered_by(self.chain, &headers)
+        {
+            return Ok((self, Received::NoReply));
+        }
         let next = match self.sync {
-            SyncState::Outstanding { download, sent } => {
-                if !download.is_answered_by(self.chain, &headers) {
-                    self.sync = SyncState::Outstanding { download, sent };
-                    return Ok((self, Received::NoReply));
-                }
-                receive_answer(
-                    self.chain,
-                    self.work_min,
-                    &mut self.salt,
-                    &mut self.branch_tip,
-                    download,
-                    headers,
-                    clock,
-                )?
-            }
+            SyncState::Outstanding { download, .. } => receive_answer(
+                self.chain,
+                self.work_min,
+                &mut self.salt,
+                &mut self.branch_tip,
+                download,
+                headers,
+                clock,
+            )?,
             SyncState::Synced => receive_announcement(
                 self.chain,
                 self.work_min,
