@@ -751,6 +751,7 @@ fn chain_next(
 ) -> Result<Option<Download>, PeerError> {
     match extended {
         crate::chain::Extended::Taken => {
+            *branch_tip = None;
             let next = Download::on_tip(chain, work_min);
             Ok(full.then_some(next))
         }
@@ -2061,7 +2062,10 @@ pub(crate) mod fuzz {
             full: bool,
         ) -> Result<Option<DownloadModel>, super::PeerError> {
             match extended {
-                ExtendedModel::Taken => Ok(full.then_some(DownloadModel::Chain)),
+                ExtendedModel::Taken => {
+                    self.branch_tip = None;
+                    Ok(full.then_some(DownloadModel::Chain))
+                }
                 ExtendedModel::Kept => Ok(None),
                 ExtendedModel::Branch { fork, hashes } if !full => {
                     if let Some(last) = hashes.last() {
@@ -3209,6 +3213,34 @@ mod tests {
             get_headers,
             crate::protocol::GetHeaders::new(peer.chain.locator())
         );
+    }
+
+    #[test]
+    fn branch_that_lost_to_ours_and_then_took_our_chain_is_no_longer_a_branch_tip() {
+        let start = std::time::Instant::now();
+        let mut chain = regtest();
+        let ours = crate::fixtures::headers_on_genesis(100);
+        let work_min = tip_after(&ours[..2]).work();
+        let peer = synced(asked_with(&mut chain, work_min, start), &ours);
+        let peer = sent_send_headers(peer, start);
+        let branch = crate::fixtures::branch_on(&ours[97], 2);
+        let (peer, _) = batch_then_tick(peer, &branch, start);
+        let peer = synced(peer, &branch);
+        let more = crate::fixtures::headers_on(&branch[1], 2);
+        let (peer, _) = batch_then_tick(peer, &[branch[1], more[0]], start);
+        let peer = synced(peer, &[branch[0], branch[1], more[0]]);
+        let theirs = [&ours[..98], &branch[..], &more[..]].concat();
+        assert_eq!(peer.chain.tip(), tip_after(&theirs[..101]));
+        let (peer, get_headers) = batch_then_tick(peer, &more[..1], start);
+        assert_eq!(
+            get_headers,
+            crate::protocol::GetHeaders::new(peer.chain.locator())
+        );
+        let peer = synced(peer, &[]);
+        let (peer, _) = idle(peer, start);
+        let peer = synced(peer, &more[1..]);
+        let (peer, _) = idle(peer, start);
+        assert_eq!(peer.chain.tip(), tip_after(&theirs));
     }
 
     #[test]
