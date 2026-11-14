@@ -289,7 +289,14 @@ impl Chain {
             if work_above_fork > work_stop {
                 assert_eq!(branch_count, 0);
                 return Ok(match (full, shared_count) {
-                    (false, _) => Extended::Kept,
+                    (false, _) => {
+                        let work_at_fork_max = self.work.minus(work_above_fork);
+                        Extended::KeptOver(self.branch_tip(
+                            work_at_fork_max,
+                            work_branch,
+                            last_hash,
+                        ))
+                    }
                     (true, 0) => match batch {
                         Batch::Answer(answer) => Extended::BelowMargin {
                             start: self.sync_start(fork_height),
@@ -1853,7 +1860,13 @@ mod tests {
                     );
                     assert_eq!(work_min, regtest_with(&headers[..2_001]).tip().work());
                 }
-                _ => assert_eq!(extended, Ok(super::Extended::Kept)),
+                _ => assert_eq!(
+                    extended,
+                    Ok(super::Extended::KeptOver(super::BranchTip {
+                        hash: branch[1_998].hash(),
+                        work: regtest_with(&headers[..2_000]).tip().work(),
+                    }))
+                ),
             }
             assert_eq!(chain.tip(), regtest_with(&headers).tip());
         }

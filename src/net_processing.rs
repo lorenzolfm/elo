@@ -1680,6 +1680,10 @@ pub(crate) mod fuzz {
             fork: usize,
             hashes: Vec<bitcoin_hashes::sha256d::Hash>,
         },
+        KeptOver {
+            hash: bitcoin_hashes::sha256d::Hash,
+            work: u128,
+        },
     }
 
     #[derive(Debug)]
@@ -1909,15 +1913,15 @@ pub(crate) mod fuzz {
                 DownloadModel::Branch { fork, hashes } => {
                     let extended = match (headers.first(), hashes.last()) {
                         (None, None) => ExtendedModel::Kept,
-                        (None, Some(last)) => {
-                            self.branch_tip = Some((*last, self.work_at(fork + hashes.len())));
-                            ExtendedModel::Kept
-                        }
+                        (None, Some(last)) => ExtendedModel::KeptOver {
+                            hash: *last,
+                            work: self.work_at(fork + hashes.len()),
+                        },
                         (Some(_), _) => {
                             let last = hashes.last().copied().unwrap_or(self.chain[fork]);
                             let batch = script_hashes(self.network, last, &headers)
                                 .map_err(extend_error)?;
-                            self.extend_above(fork, hashes, batch)
+                            self.extend_above(fork, hashes, batch, full)
                         }
                     };
                     self.chain_next(extended, full)?
@@ -1995,7 +1999,8 @@ pub(crate) mod fuzz {
                 self.chain.extend(batch);
                 return Ok(ExtendedModel::Taken);
             }
-            Ok(self.extend_above(fork, Vec::new(), batch))
+            let full = headers.len() == HEADERS_FULL_COUNT;
+            Ok(self.extend_above(fork, Vec::new(), batch, full))
         }
 
         fn extend_above(
@@ -2003,6 +2008,7 @@ pub(crate) mod fuzz {
             base: usize,
             branch: Vec<bitcoin_hashes::sha256d::Hash>,
             batch: Vec<bitcoin_hashes::sha256d::Hash>,
+            full: bool,
         ) -> ExtendedModel {
             assert!(!batch.is_empty());
             assert!(base < self.height());
@@ -2033,6 +2039,15 @@ pub(crate) mod fuzz {
             let branch_work = self.work_at(fork + hashes.len());
             if branch_work < self.branch_work_min() {
                 assert_eq!(branch_count, 0);
+                if !full {
+                    let Some(last) = hashes.last() else {
+                        panic!("a branch below the margin has no header above the fork");
+                    };
+                    return ExtendedModel::KeptOver {
+                        hash: *last,
+                        work: self.below_margin_work_max(hashes.len()),
+                    };
+                }
                 return if shared == 0 {
                     ExtendedModel::BelowMargin { fork, hashes }
                 } else {
@@ -2043,11 +2058,31 @@ pub(crate) mod fuzz {
                 };
             }
             if branch_work <= self.work() {
+                if !full {
+                    let Some(last) = hashes.last() else {
+                        panic!("a branch with no more work has no header above the fork");
+                    };
+                    return ExtendedModel::KeptOver {
+                        hash: *last,
+                        work: branch_work,
+                    };
+                }
                 return ExtendedModel::Branch { fork, hashes };
             }
             self.chain.truncate(fork + 1);
             self.chain.extend(hashes);
             ExtendedModel::Taken
+        }
+
+        fn below_margin_work_max(&self, count: usize) -> u128 {
+            const { assert!(usize::BITS <= 64) };
+            let work_branch = count as u128 * SCRIPT_HEADER_WORK;
+            let work_stop = work_branch + (self.work() - self.branch_work_min());
+            let work_above_fork = (work_stop / SCRIPT_HEADER_WORK + 1) * SCRIPT_HEADER_WORK;
+            assert!(work_above_fork > work_stop);
+            let work = self.work() - work_above_fork + work_branch;
+            assert!(work < self.branch_work_min());
+            work
         }
 
         fn branch_work_min(&self) -> u128 {
@@ -2067,10 +2102,10 @@ pub(crate) mod fuzz {
                     Ok(full.then_some(DownloadModel::Chain))
                 }
                 ExtendedModel::Kept => Ok(None),
-                ExtendedModel::Branch { fork, hashes } if !full => {
-                    if let Some(last) = hashes.last() {
-                        self.branch_tip = Some((*last, self.work_at(fork + hashes.len())));
-                    }
+                ExtendedModel::KeptOver { hash, work } => {
+                    assert!(!full);
+                    assert!(work <= self.work());
+                    self.branch_tip = Some((hash, work));
                     Ok(None)
                 }
                 _ if !full => Ok(None),
@@ -2155,7 +2190,7 @@ pub(crate) mod fuzz {
                     self.chain.extend(buffer);
                     return Ok(full.then_some(DownloadModel::Chain));
                 }
-                let extended = self.extend_above(start, Vec::new(), buffer);
+                let extended = self.extend_above(start, Vec::new(), buffer, full);
                 assert!(!matches!(extended, ExtendedModel::BelowMargin { .. }));
                 self.chain_next(extended, full)
             } else if full {
