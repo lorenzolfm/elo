@@ -306,7 +306,9 @@ mod tests {
             ),
             (
                 super::Event::End {
-                    peer: &crate::net::Destination::Address(PEER),
+                    peer: &crate::net::Destination::Address(
+                        crate::net::PeerAddress::new(PEER).unwrap(),
+                    ),
                     reason: &"the peer closed the connection",
                     wait: std::time::Duration::from_secs(5),
                 },

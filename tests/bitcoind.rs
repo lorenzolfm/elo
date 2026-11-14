@@ -168,7 +168,7 @@ fn handshake_with_bitcoind_returns_its_version() {
     let mut chain = elo::chain::Chain::new(elo::chainparams::Network::Regtest);
     let (_connection, version) = runtime
         .block_on(elo::net::handshake(
-            &elo::net::Destination::Address(bitcoind.peer),
+            &elo::net::Destination::Address(elo::net::PeerAddress::new(bitcoind.peer).unwrap()),
             &mut chain,
         ))
         .unwrap();

@@ -302,18 +302,13 @@ fn parse(
     let peer = peer.to_str()?;
     let destination = if let Some(address) = address(peer, network.default_port()) {
         // Port 0, `0.0.0.0`, `[::]` and `[::ffff:0.0.0.0]` name no peer.
-        if address.port() == 0 || address.ip().to_canonical().is_unspecified() {
-            return None;
-        }
-        elo::net::Destination::Address(address)
+        elo::net::Destination::Address(elo::net::PeerAddress::new(address)?)
     } else {
+        // The parse of a `NonZeroU16` refuses port 0.
         let (host, port) = match peer.split_once(':') {
             Some((host, port)) => (host, port.parse().ok()?),
             None => (peer, network.default_port()),
         };
-        if port == 0 {
-            return None;
-        }
         elo::net::Destination::Name {
             name: elo::net::Name::new(host)?,
             port,
@@ -323,7 +318,7 @@ fn parse(
 }
 
 /// `peer` as an IP address with an optional port, or `None` if it is no IP address.
-fn address(peer: &str, default_port: u16) -> Option<std::net::SocketAddr> {
+fn address(peer: &str, default_port: std::num::NonZeroU16) -> Option<std::net::SocketAddr> {
     if let Ok(address) = peer.parse() {
         return Some(address);
     }
@@ -331,7 +326,7 @@ fn address(peer: &str, default_port: u16) -> Option<std::net::SocketAddr> {
         Some(ip) => std::net::IpAddr::V6(ip.parse().ok()?),
         None => std::net::IpAddr::V4(peer.parse().ok()?),
     };
-    Some(std::net::SocketAddr::from((ip, default_port)))
+    Some(std::net::SocketAddr::from((ip, default_port.get())))
 }
 
 #[cfg(test)]
@@ -391,7 +386,8 @@ mod tests {
             ("regtest", elo::chainparams::Network::Regtest, 18444),
         ] {
             let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-            let destination = elo::net::Destination::Address(address);
+            let destination =
+                elo::net::Destination::Address(elo::net::PeerAddress::new(address).unwrap());
             assert_eq!(
                 parse(&[name, "127.0.0.1"]),
                 Some((network, destination)),
@@ -399,7 +395,7 @@ mod tests {
             );
             let destination = elo::net::Destination::Name {
                 name: elo::net::Name::new("localhost").unwrap(),
-                port,
+                port: std::num::NonZeroU16::new(port).unwrap(),
             };
             assert_eq!(
                 parse(&[name, "localhost"]),
@@ -412,11 +408,14 @@ mod tests {
     #[test]
     fn peer_is_an_ip_literal_or_a_name_with_an_optional_port() {
         let localhost_v6 = std::net::Ipv6Addr::LOCALHOST;
-        let address = |address| Some(elo::net::Destination::Address(address));
+        let address = |address| {
+            let address = elo::net::PeerAddress::new(address).unwrap();
+            Some(elo::net::Destination::Address(address))
+        };
         let name = |host: &str, port| {
             Some(elo::net::Destination::Name {
                 name: elo::net::Name::new(host).unwrap(),
-                port,
+                port: std::num::NonZeroU16::new(port).unwrap(),
             })
         };
         let label = "a".repeat(63);

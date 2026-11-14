@@ -40,17 +40,37 @@ pub(crate) const DESTINATION_LENGTH_MAX: usize = NAME_LENGTH_MAX + ".".len() + "
 #[derive(Debug, PartialEq, Eq)]
 pub enum Destination {
     /// An IP address, which `handshake` dials with no lookup.
-    Address(std::net::SocketAddr),
+    Address(PeerAddress),
     /// A name, which `handshake` looks up before each dial.
-    Name { name: Name, port: u16 },
+    Name {
+        name: Name,
+        port: std::num::NonZeroU16,
+    },
 }
 
 impl std::fmt::Display for Destination {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Destination::Address(address) => write!(f, "{address}"),
+            Destination::Address(address) => write!(f, "{}", address.0),
             Destination::Name { name, port } => write!(f, "{name}:{port}"),
         }
+    }
+}
+
+/// An address that names a peer: its port is not 0, and its IP is not `0.0.0.0` or `::`. A
+/// connect to those reaches this host. Only `PeerAddress::new` makes one, so each address that
+/// `handshake` dials names a peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PeerAddress(std::net::SocketAddr);
+
+impl PeerAddress {
+    /// `address` as the address of a peer, or `None` if it names no peer. An IPv4 address in
+    /// IPv6, such as `[::ffff:0.0.0.0]`, is checked as the IPv4 address.
+    pub fn new(address: std::net::SocketAddr) -> Option<PeerAddress> {
+        if address.port() == 0 || address.ip().to_canonical().is_unspecified() {
+            return None;
+        }
+        Some(PeerAddress(address))
     }
 }
 
@@ -354,8 +374,8 @@ pub async fn handshake<'a>(
 }
 
 /// The addresses of `name` at `port`, as `dial_order` gives them.
-async fn lookup(name: &Name, port: u16) -> Result<Vec<std::net::SocketAddr>, LookupError> {
-    let answers = tokio::net::lookup_host((name.0.as_str(), port));
+async fn lookup(name: &Name, port: std::num::NonZeroU16) -> Result<Vec<PeerAddress>, LookupError> {
+    let answers = tokio::net::lookup_host((name.0.as_str(), port.get()));
     match tokio::time::timeout(LOOKUP_TIMEOUT, answers).await {
         Ok(Ok(answers)) => dial_order(answers),
         Ok(Err(error)) => Err(LookupError::Failed(error)),
@@ -368,11 +388,10 @@ async fn lookup(name: &Name, port: u16) -> Result<Vec<std::net::SocketAddr>, Loo
 /// needs no secret, so it comes from the keys of `RandomState`.
 fn dial_order(
     answers: impl Iterator<Item = std::net::SocketAddr>,
-) -> Result<Vec<std::net::SocketAddr>, LookupError> {
-    // `0.0.0.0` and `::` name no peer, and the command line refuses them. Some resolvers give
-    // them for a name that they block.
-    let mut addresses: Vec<std::net::SocketAddr> = answers
-        .filter(|address| !address.ip().to_canonical().is_unspecified())
+) -> Result<Vec<PeerAddress>, LookupError> {
+    // Some resolvers give `0.0.0.0` or `::` for a name that they block.
+    let mut addresses: Vec<PeerAddress> = answers
+        .filter_map(PeerAddress::new)
         .take(ADDRESSES_COUNT_MAX)
         .collect();
     if addresses.is_empty() {
@@ -387,7 +406,7 @@ fn dial_order(
 /// `CONNECT_TIMEOUT`, and `ADDRESSES_COUNT_MAX` bounds the tries, so the time of a dial is
 /// bounded. When each try fails, the error has the last address, its error, and the count.
 async fn connect_first(
-    addresses: &[std::net::SocketAddr],
+    addresses: &[PeerAddress],
 ) -> Result<(std::net::SocketAddr, tokio::net::TcpStream), HandshakeError> {
     // `dial_order` keeps at most `ADDRESSES_COUNT_MAX`, and gives no empty list.
     assert!(
@@ -400,13 +419,13 @@ async fn connect_first(
     };
     for &address in before {
         if let Ok(stream) = connect(address).await {
-            return Ok((address, stream));
+            return Ok((address.0, stream));
         }
     }
     match connect(last).await {
-        Ok(stream) => Ok((last, stream)),
+        Ok(stream) => Ok((last.0, stream)),
         Err(error) => Err(HandshakeError::Connect {
-            address: last,
+            address: last.0,
             addresses_count: addresses.len(),
             error,
         }),
@@ -414,8 +433,9 @@ async fn connect_first(
 }
 
 /// The TCP connect to `address`, within `CONNECT_TIMEOUT`.
-async fn connect(address: std::net::SocketAddr) -> Result<tokio::net::TcpStream, ConnectError> {
-    match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(address)).await {
+async fn connect(address: PeerAddress) -> Result<tokio::net::TcpStream, ConnectError> {
+    let connect = tokio::net::TcpStream::connect(address.0);
+    match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
         Ok(Ok(stream)) => Ok(stream),
         Ok(Err(error)) => Err(ConnectError::Io(error)),
         Err(_elapsed) => Err(ConnectError::Timeout),
@@ -962,6 +982,15 @@ mod tests {
             .block_on(future)
     }
 
+    fn destination(peer: std::net::SocketAddr) -> super::Destination {
+        super::Destination::Address(super::PeerAddress::new(peer).unwrap())
+    }
+
+    fn peer_addresses(addresses: &[std::net::SocketAddr]) -> Vec<super::PeerAddress> {
+        let peer_address = |address| super::PeerAddress::new(address).unwrap();
+        addresses.iter().copied().map(peer_address).collect()
+    }
+
     /// Reads one frame on the peer's side of the socket.
     fn read_frame(stream: &mut std::net::TcpStream) -> Vec<u8> {
         read_frame_on(stream, crate::chainparams::Network::Regtest)
@@ -1064,10 +1093,7 @@ mod tests {
             verack
         });
 
-        let result = block_on(super::handshake(
-            &super::Destination::Address(peer),
-            &mut chain,
-        ));
+        let result = block_on(super::handshake(&destination(peer), &mut chain));
         let verack = peer_thread.join().unwrap();
         assert_eq!(verack, crate::fixtures::hex(crate::fixtures::VERACK_FRAME));
         assert!(result.is_ok(), "{result:?}");
@@ -1096,10 +1122,7 @@ mod tests {
             i64::try_from(elapsed.as_secs()).unwrap()
         };
         let before = seconds();
-        let _closed = block_on(super::handshake(
-            &super::Destination::Address(peer),
-            &mut chain,
-        ));
+        let _closed = block_on(super::handshake(&destination(peer), &mut chain));
         let after = seconds();
         let message = peer_thread.join().unwrap();
         assert_eq!(message.msg_type(), crate::protocol::VERSION);
@@ -1153,10 +1176,9 @@ mod tests {
         });
 
         let (result, elapsed) = block_on(async {
-            let (connection, _theirs) =
-                super::handshake(&super::Destination::Address(peer), &mut chain)
-                    .await
-                    .unwrap();
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+                .await
+                .unwrap();
             tokio::time::pause();
             let start = tokio::time::Instant::now();
             let result = connection.sync().await;
@@ -1213,10 +1235,9 @@ mod tests {
         });
 
         let result = block_on(async {
-            let (connection, _theirs) =
-                super::handshake(&super::Destination::Address(peer), &mut chain)
-                    .await
-                    .unwrap();
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+                .await
+                .unwrap();
             connection.sync().await
         });
         peer_thread.join().unwrap();
@@ -1275,10 +1296,9 @@ mod tests {
         });
 
         let result = block_on(async {
-            let (connection, _theirs) =
-                super::handshake(&super::Destination::Address(peer), &mut chain)
-                    .await
-                    .unwrap();
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+                .await
+                .unwrap();
             connection.sync().await
         });
         let expected = [
@@ -1322,10 +1342,9 @@ mod tests {
         });
 
         let (error, elapsed) = block_on(async {
-            let (connection, _theirs) =
-                super::handshake(&super::Destination::Address(peer), &mut chain)
-                    .await
-                    .unwrap();
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+                .await
+                .unwrap();
             let start = tokio::time::Instant::now();
             let (synced, _tip) = connection.sync().await.unwrap();
             tokio::time::pause();
@@ -1380,10 +1399,9 @@ mod tests {
         });
 
         let (synced_tip, next_tip) = block_on(async {
-            let (connection, _theirs) =
-                super::handshake(&super::Destination::Address(peer), &mut chain)
-                    .await
-                    .unwrap();
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+                .await
+                .unwrap();
             let (synced, synced_tip) = connection.sync().await.unwrap();
             let (_synced, next_tip) = synced.next_tip().await.unwrap();
             (synced_tip, next_tip)
@@ -1425,10 +1443,9 @@ mod tests {
         });
 
         let (error, elapsed) = block_on(async {
-            let (connection, _theirs) =
-                super::handshake(&super::Destination::Address(peer), &mut chain)
-                    .await
-                    .unwrap();
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+                .await
+                .unwrap();
             let start = tokio::time::Instant::now();
             let (synced, _tip) = connection.sync().await.unwrap();
             tokio::time::pause();
@@ -1465,10 +1482,9 @@ mod tests {
         let peer_thread = std::thread::spawn(move || accept_handshake(&listener));
 
         let (result, elapsed) = block_on(async {
-            let (connection, _theirs) =
-                super::handshake(&super::Destination::Address(peer), &mut chain)
-                    .await
-                    .unwrap();
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+                .await
+                .unwrap();
             // The peer thread ends when it has sent its `verack`, so this wait blocks nothing.
             // The stream stays open, and nothing reads it.
             let _stream = peer_thread.join().unwrap();
@@ -1510,10 +1526,7 @@ mod tests {
             stream.write_all(&frame[..frame.len() - 1]).unwrap();
         });
 
-        let result = block_on(super::handshake(
-            &super::Destination::Address(peer),
-            &mut chain,
-        ));
+        let result = block_on(super::handshake(&destination(peer), &mut chain));
         peer_thread.join().unwrap();
         assert!(
             matches!(result, Err(super::HandshakeError::Closed)),
@@ -1592,10 +1605,9 @@ mod tests {
         });
 
         let result = block_on(async {
-            let (connection, _theirs) =
-                super::handshake(&super::Destination::Address(peer), &mut chain)
-                    .await
-                    .unwrap();
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+                .await
+                .unwrap();
             connection.sync().await
         });
         let pong = peer_thread.join().unwrap();
@@ -1617,10 +1629,7 @@ mod tests {
             .unwrap()
             .local_addr()
             .unwrap();
-        let result = block_on(super::handshake(
-            &super::Destination::Address(peer),
-            &mut chain,
-        ));
+        let result = block_on(super::handshake(&destination(peer), &mut chain));
         let Err(error) = result else {
             panic!("{result:?}");
         };
@@ -1650,6 +1659,7 @@ mod tests {
             .local_addr()
             .unwrap();
         for addresses in [[refused, listening], [listening, refused]] {
+            let addresses = peer_addresses(&addresses);
             let (address, _stream) = block_on(super::connect_first(&addresses)).unwrap();
             assert_eq!(address, listening, "{addresses:?}");
         }
@@ -1664,7 +1674,7 @@ mod tests {
         let addresses = [first.local_addr().unwrap(), last.local_addr().unwrap()];
         drop((first, last));
 
-        let result = block_on(super::connect_first(&addresses));
+        let result = block_on(super::connect_first(&peer_addresses(&addresses)));
         let Err(error) = result else {
             panic!("{result:?}");
         };
@@ -1689,6 +1699,7 @@ mod tests {
             std::net::SocketAddr::from(([0, 0, 0, 0], 1)),
             std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 1)),
             std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED.to_ipv6_mapped(), 1)),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         ];
         let result = super::dial_order(unspecified.into_iter());
         assert!(
@@ -1703,17 +1714,17 @@ mod tests {
             .collect();
         let mut kept =
             super::dial_order(unspecified.into_iter().chain(answers.iter().copied())).unwrap();
-        kept.sort_unstable();
-        assert_eq!(kept, answers[..super::ADDRESSES_COUNT_MAX]);
+        kept.sort_unstable_by_key(|address| address.0);
+        assert_eq!(kept, peer_addresses(&answers[..super::ADDRESSES_COUNT_MAX]));
     }
 
     // The resolver of the OS reads `localhost` from its hosts file, with no name server.
     #[test]
     fn lookup_gives_the_addresses_of_a_name_with_the_port() {
         let name = super::Name::new("localhost").unwrap();
-        let addresses = block_on(super::lookup(&name, 1)).unwrap();
+        let addresses = block_on(super::lookup(&name, std::num::NonZeroU16::MIN)).unwrap();
         assert!(!addresses.is_empty());
-        for address in addresses {
+        for super::PeerAddress(address) in addresses {
             assert!(address.ip().is_loopback(), "{address}");
             assert_eq!(address.port(), 1, "{address}");
         }
@@ -1726,7 +1737,7 @@ mod tests {
         let longest = format!("{}.", &labels[..super::NAME_LENGTH_MAX]);
         let destination = super::Destination::Name {
             name: super::Name::new(&longest).unwrap(),
-            port: u16::MAX,
+            port: std::num::NonZeroU16::MAX,
         };
         assert_eq!(destination.to_string().len(), super::DESTINATION_LENGTH_MAX);
     }
