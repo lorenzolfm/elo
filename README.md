@@ -45,12 +45,12 @@ handshake on, it pings the peer every 2 min.
 It drops a peer that does not answer a `ping` within 20 min, or a `getheaders`
 within 2 min. It also drops a peer that sends `wtxidrelay` or `sendaddrv2` after
 the handshake. When a connection ends, elo logs the reason, waits 5 s and dials
-the peer again. Each connection logs the `version` and the `tip` again. The
+again. Each connection logs the `version` and the `tip` again. The
 chain stays in memory, so the next connection syncs from its tip. A chain below
 the minimum work starts again from genesis.
 
 ```sh
-elo <mainnet|testnet4|signet|regtest> <ip|name>[:port]    # IPv6 as [::1]:8333
+elo <mainnet|testnet4|signet|regtest> [<ip|name>[:port]]    # IPv6 as [::1]:8333
 ```
 
 The peer is an IP address or a name. Before each dial, elo looks up the name
@@ -59,6 +59,16 @@ addresses, in a random order, and dials them in that order until one takes the
 connect. So a name with many addresses, such as a DNS seed, gives a new peer
 on each dial. A failed lookup is an `end`, and elo looks up the name again
 after 5 s.
+
+With no peer, each dial looks up one DNS seed of the network, at random, as
+`x9.<seed>`: a seed answers that name with nodes that serve each block and its
+witness data. Some seeds have no such names, so when that lookup fails or gives
+no address to dial, elo looks up the seed itself. elo takes at most 32 of its
+addresses that the internet routes to, so not this host, a private network, a
+link or a test range. A seed chose those peers, and elo trusts them as much as
+a peer that you name. A lookup that times out ends the dial at once, because
+the resolver does not answer. Regtest has no seeds, so `elo regtest` needs a
+peer.
 
 SIGTERM and SIGINT (Ctrl-C) stop elo at any step, also in the wait before a
 dial. It logs the signal and exits with 0. elo exits with 1 only on a fault of
@@ -82,14 +92,14 @@ level=info event=stop signal=SIGTERM
 | --- | --- | --- |
 | `version` | `info` | `peer` `version` `services` `user_agent` `start_height` `relay` |
 | `tip` | `info` | `peer` `height` `hash` `work` |
-| `end` | `warn` | `destination` `reason` `wait_ms`: elo dials `destination` again after `wait_ms`. `destination` is the peer of the command line, also a name. `peer` is always the address of a connection |
+| `end` | `warn` | `destination` `reason` `wait_ms`: elo dials again after `wait_ms`. `destination` is what the dial looked up or dialed: the peer of the command line, also a name, or the seed, such as `seed.bitcoin.sipa.be.:8333`. `peer` is always the address of a connection |
 | `exit` | `error` | `reason`: a fault of this host, and elo exits with 1 |
 | `stop` | `info` | `signal`: elo exits with 0 |
 | `panic` | `error` | `reason`: a bug, and elo exits with 101 |
 
 The names of the events and of the fields are an interface, so a rename breaks the dashboards and
 alerts that match on them. `src/logging.rs` holds the one list of them. A value with a space, a `=`,
-a `"` or a control character is in quotes, with escapes. A value is at most 256 bytes, so a line is
+a `"` or a control character is in quotes, with escapes. A value is at most 260 bytes, so a line is
 at most 16 KiB, whatever the peer sends. When a write to stdout fails, elo writes the `exit` line to
 stderr only, because the write that failed can leave part of its line on stdout.
 

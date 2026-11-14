@@ -94,6 +94,9 @@ pub struct ServiceFlags(u64);
 impl ServiceFlags {
     /// No services.
     pub(crate) const NONE: Self = Self(0);
+    /// A node that serves each block, `NODE_NETWORK` (bit 0), with the witness of each
+    /// transaction, `NODE_WITNESS` (bit 3).
+    pub(crate) const NETWORK_WITNESS: Self = Self(0b1001);
 }
 
 impl std::fmt::LowerHex for ServiceFlags {
