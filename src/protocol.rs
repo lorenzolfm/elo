@@ -1,38 +1,25 @@
-//! Message types and payloads.
-
 use crate::serialize::{Decode, Encode};
 
-/// The protocol version elo sends.
 pub(crate) const PROTOCOL_VERSION: i32 = 70016;
 
-/// The most headers a `headers` may carry. A peer that sends fewer has no more to send.
 pub(crate) const HEADERS_COUNT_MAX: usize = 2000;
 
-/// The most hashes in the locator of a `getheaders` that a peer takes. A peer drops a connection
-/// that sends more.
 pub(crate) const LOCATOR_HASHES_COUNT_MAX: usize = 101;
 
-/// The most entries an `inv` may carry.
 pub(crate) const INV_COUNT_MAX: usize = 50_000;
 
-/// The type of an `inv` entry that announces a block.
 const INV_TYPE_BLOCK: u32 = 2;
 
-/// The longest user agent a `version` may carry.
 const USER_AGENT_LENGTH_MAX: usize = 256;
 
-/// The user agent elo sends (BIP14).
 const USER_AGENT_ELO: &str = concat!("/elo:", env!("CARGO_PKG_VERSION"), "/");
 const _: () = assert!(USER_AGENT_ELO.len() <= USER_AGENT_LENGTH_MAX);
 
-/// The size of a message type, with the padding.
 pub(crate) const MESSAGE_TYPE_SIZE: usize = 12;
 
-/// The message type in a header: printable ASCII, then NUL padding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MessageType([u8; MESSAGE_TYPE_SIZE]);
 
-// `from_name` runs at compile time here, so an invalid name does not build.
 pub(crate) const VERSION: MessageType = MessageType::from_name("version");
 pub(crate) const VERACK: MessageType = MessageType::from_name("verack");
 pub(crate) const PING: MessageType = MessageType::from_name("ping");
@@ -45,8 +32,6 @@ pub(crate) const SENDHEADERS: MessageType = MessageType::from_name("sendheaders"
 pub(crate) const INV: MessageType = MessageType::from_name("inv");
 
 impl MessageType {
-    /// Pads `name` with NULs to `MESSAGE_TYPE_SIZE` bytes. Panics if the name
-    /// is longer or `new` rejects the padded bytes.
     const fn from_name(name: &str) -> Self {
         let name = name.as_bytes();
         assert!(name.len() <= MESSAGE_TYPE_SIZE);
@@ -59,7 +44,6 @@ impl MessageType {
         Self::new(bytes).expect("a printable ASCII name")
     }
 
-    /// `None` unless the bytes are printable ASCII followed only by NULs.
     pub(crate) const fn new(bytes: [u8; MESSAGE_TYPE_SIZE]) -> Option<Self> {
         let mut index = 0;
         while index < bytes.len() {
@@ -81,21 +65,16 @@ impl MessageType {
         Some(Self(bytes))
     }
 
-    /// All the bytes, with the padding.
     pub(crate) const fn as_bytes(&self) -> &[u8; MESSAGE_TYPE_SIZE] {
         &self.0
     }
 }
 
-/// The services a node offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ServiceFlags(u64);
 
 impl ServiceFlags {
-    /// No services.
     pub(crate) const NONE: Self = Self(0);
-    /// A node that serves each block, `NODE_NETWORK` (bit 0), with the witness of each
-    /// transaction, `NODE_WITNESS` (bit 3).
     pub(crate) const NETWORK_WITNESS: Self = Self(0b1001);
 }
 
@@ -117,7 +96,6 @@ impl Decode for ServiceFlags {
     }
 }
 
-/// An address as a `version` carries it. An IPv4 address is IPv4-mapped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Address {
     services: ServiceFlags,
@@ -139,7 +117,6 @@ impl Address {
     }
 }
 
-/// The port is big-endian.
 impl Encode for Address {
     fn encode(&self, out: &mut Vec<u8>) {
         self.services.encode(out);
@@ -158,12 +135,10 @@ impl Decode for Address {
     }
 }
 
-/// Raw bytes, which need not be UTF-8. At most `USER_AGENT_LENGTH_MAX`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UserAgent(Vec<u8>);
 
 impl UserAgent {
-    /// The user agent that elo sends: `/elo:<version>/`.
     pub(crate) fn elo() -> Self {
         Self(USER_AGENT_ELO.as_bytes().to_vec())
     }
@@ -173,8 +148,6 @@ impl UserAgent {
     }
 }
 
-/// Escapes each byte that is not printable ASCII, so a peer cannot send control codes to a
-/// terminal.
 impl std::fmt::Display for UserAgent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0.escape_ascii())
@@ -209,7 +182,6 @@ impl Decode for UserAgent {
     }
 }
 
-/// The `version` payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Version {
     pub(crate) version: i32,
@@ -224,7 +196,6 @@ pub struct Version {
 }
 
 impl Version {
-    /// The protocol version.
     pub fn version(&self) -> i32 {
         self.version
     }
@@ -237,12 +208,10 @@ impl Version {
         &self.user_agent
     }
 
-    /// The height of the sender's best chain.
     pub fn start_height(&self) -> i32 {
         self.start_height
     }
 
-    /// Whether the sender wants to get transactions (BIP37).
     pub(crate) fn relay(&self) -> bool {
         self.relay
     }
@@ -262,8 +231,6 @@ impl Encode for Version {
     }
 }
 
-/// Every field up to `start_height` is required. A missing `relay` is true
-/// (BIP37). Bytes after `relay` stay in `input`.
 impl Decode for Version {
     fn decode(input: &mut &[u8]) -> Result<Self, crate::serialize::Error> {
         Ok(Self {
@@ -284,28 +251,19 @@ impl Decode for Version {
     }
 }
 
-/// The `getheaders` payload. It asks for the headers after the first hash of its locator that is
-/// on the chain of the peer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GetHeaders {
-    /// The hashes of the locator, from the highest header down.
     locator: Vec<bitcoin_hashes::sha256d::Hash>,
 }
 
 impl GetHeaders {
-    /// Asks for the headers after the first hash of `locator` that is on the chain of the peer: the
-    /// locator of our chain, or only the last header of a download of a low-work sync. `locator`
-    /// has from 1 to `LOCATOR_HASHES_COUNT_MAX` hashes, from the highest header down.
     pub(crate) fn new(locator: Vec<bitcoin_hashes::sha256d::Hash>) -> GetHeaders {
-        // A peer answers an empty locator with one header, and drops a long one.
         assert!(!locator.is_empty());
         assert!(locator.len() <= LOCATOR_HASHES_COUNT_MAX);
         GetHeaders { locator }
     }
 }
 
-/// The version is `PROTOCOL_VERSION`. `hash_stop` is all zeros, so the peer sends as many headers
-/// as a `headers` can carry.
 impl Encode for GetHeaders {
     fn encode(&self, out: &mut Vec<u8>) {
         PROTOCOL_VERSION.encode(out);
@@ -318,25 +276,17 @@ impl Encode for GetHeaders {
     }
 }
 
-/// The `headers` payload: at most `HEADERS_COUNT_MAX` headers, each with a transaction count
-/// of 0.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Headers(Vec<crate::block::BlockHeader>);
 
-/// Why a `headers` payload was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadersError {
-    /// The payload did not decode.
     Payload(crate::serialize::Error),
-    /// The count is above `HEADERS_COUNT_MAX`.
     TooMany(usize),
-    /// A header has a transaction count that is not 0.
     TxCount(std::num::NonZeroUsize),
 }
 
 impl Headers {
-    /// Checks the count before it reads a header. Bytes after the last transaction count stay
-    /// in `input`.
     pub(crate) fn decode(input: &mut &[u8]) -> Result<Self, HeadersError> {
         let count = crate::serialize::read_compact_size(input).map_err(HeadersError::Payload)?;
         if count > HEADERS_COUNT_MAX {
@@ -356,10 +306,6 @@ impl Headers {
         Ok(Self(headers))
     }
 
-    /// `headers`, in order, in batches of `HEADERS_COUNT_MAX` and a last batch with the rest. No
-    /// headers give no batch. The second download of a low-work sync releases more headers than
-    /// one batch, and the chain takes only a batch. So `is_full` on one of these does not say that
-    /// the peer can have more.
     pub(crate) fn batches(headers: Vec<crate::block::BlockHeader>) -> Vec<Self> {
         let batches: Vec<Self> = headers
             .chunks(HEADERS_COUNT_MAX)
@@ -369,26 +315,20 @@ impl Headers {
         batches
     }
 
-    /// True for `HEADERS_COUNT_MAX` headers. Then the peer can have more.
     pub(crate) fn is_full(&self) -> bool {
         self.0.len() == HEADERS_COUNT_MAX
     }
 
-    /// The first header of the payload, if there is one.
     pub(crate) fn first(&self) -> Option<&crate::block::BlockHeader> {
         self.0.first()
     }
 
-    /// The headers, in the order of the payload.
     pub(crate) fn as_slice(&self) -> &[crate::block::BlockHeader] {
-        // As in `into_vec`.
         assert!(self.0.len() <= HEADERS_COUNT_MAX);
         &self.0
     }
 
-    /// The headers, in the order of the payload.
     pub(crate) fn into_vec(self) -> Vec<crate::block::BlockHeader> {
-        // `decode` refuses a longer batch. `Chain::extend` takes its loop bound from this `Vec`.
         assert!(self.0.len() <= HEADERS_COUNT_MAX);
         self.0
     }
@@ -410,25 +350,18 @@ impl std::fmt::Display for HeadersError {
 
 impl std::error::Error for HeadersError {}
 
-/// The `inv` payload: at most `INV_COUNT_MAX` entries, each a type and a hash. elo keeps only
-/// whether an entry announces a block. It keeps no hash, because it asks for the headers after
-/// its tip, and not for one block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Inv {
     has_block: bool,
 }
 
-/// Why an `inv` payload was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InvError {
-    /// The payload did not decode.
     Payload(crate::serialize::Error),
-    /// The count is above `INV_COUNT_MAX`.
     TooMany(usize),
 }
 
 impl Inv {
-    /// Checks the count before it reads an entry. Bytes after the last entry stay in `input`.
     pub(crate) fn decode(input: &mut &[u8]) -> Result<Self, InvError> {
         let count = crate::serialize::read_compact_size(input).map_err(InvError::Payload)?;
         if count > INV_COUNT_MAX {
@@ -444,7 +377,6 @@ impl Inv {
         Ok(Self { has_block })
     }
 
-    /// True if an entry announces a block.
     pub(crate) fn has_block(&self) -> bool {
         self.has_block
     }
@@ -461,54 +393,35 @@ impl std::fmt::Display for InvError {
 
 impl std::error::Error for InvError {}
 
-/// The entry points of the `version` and `headers` fuzz targets.
 #[cfg(fuzzing)]
-// Only cargo-mutants reads this attribute. Its test runs do not build this module.
 #[cfg_attr(false, mutants::skip)]
 pub(crate) mod fuzz {
     use crate::serialize::{Decode, Encode};
 
-    // The seeds hold these limits as bytes, and each check takes its limit from the same constant.
-    // So a new limit moves the checks and not the seeds, and the replay still passes. A new limit
-    // must rewrite the seeds at the limit.
     const _: () = assert!(super::HEADERS_COUNT_MAX == 2000);
     const _: () = assert!(super::USER_AGENT_LENGTH_MAX == 256);
 
-    /// The size of the `version` fields before the user agent.
     const VERSION_BEFORE_USER_AGENT_SIZE: usize = 80;
 
-    /// The size of the `version` fields after the user agent: `start_height` and `relay`.
     const VERSION_AFTER_USER_AGENT_SIZE: usize = size_of::<i32>() + size_of::<bool>();
 
-    /// The size of the `version` fields other than the user agent.
     const VERSION_FIXED_SIZE: usize =
         VERSION_BEFORE_USER_AGENT_SIZE + VERSION_AFTER_USER_AGENT_SIZE;
 
-    /// The largest batch that `headers` writes: the first count above the limit.
     const HEADERS_WRITTEN_COUNT_MAX: usize = super::HEADERS_COUNT_MAX + 1;
 
-    /// Checks that a `version` from `data` encodes to the bytes that its decode took, and that a
-    /// payload from `data` reads back: with `relay`, without it, and with bytes after it.
-    ///
-    /// The first bytes of `data` fill the fields other than the user agent, with zeros after their
-    /// end. The rest of `data` is the user agent, up to its limit. The committed corpus uses this
-    /// layout, so a change to the layout must rewrite the corpus.
     pub fn version(data: &[u8]) {
         let mut input = data;
         if let Ok(version) = super::Version::decode(&mut input) {
             version_check(&version, &data[..data.len() - input.len()], input);
         }
 
-        // A decoder that refuses each payload passes the check above, so read a payload that is
-        // valid by its layout.
         let written = version_write(data);
         version_read_all(&written, &[]);
         version_read_all(&written[..written.len() - size_of::<bool>()], &[]);
-        // The bytes after `relay` stay in `input`. A later protocol version can add fields there.
         version_read_all(&written, data);
     }
 
-    /// The fields from `data`, in the order of the payload.
     fn version_write(data: &[u8]) -> Vec<u8> {
         let mut fixed = [0; VERSION_FIXED_SIZE];
         for (fixed_byte, byte) in fixed.iter_mut().zip(data) {
@@ -524,8 +437,6 @@ pub(crate) mod fuzz {
         written
     }
 
-    /// Checks that `payload` and then `after` decodes, and that the decode takes each byte of
-    /// `payload` and no byte of `after`.
     fn version_read_all(payload: &[u8], after: &[u8]) {
         let stream = [payload, after].concat();
         let mut input = stream.as_slice();
@@ -536,9 +447,6 @@ pub(crate) mod fuzz {
         assert_eq!(input, after);
     }
 
-    /// Checks that `taken`, the bytes that a decode took, are what `version` encodes to. Only
-    /// `relay` can differ: a decode takes any byte as a bool, or no byte as true. Only the end of
-    /// the input can mean that `relay` is missing, so `rest` must then be empty.
     fn version_check(version: &super::Version, taken: &[u8], rest: &[u8]) {
         let mut encoded = Vec::new();
         version.encode(&mut encoded);
@@ -554,27 +462,17 @@ pub(crate) mod fuzz {
         }
     }
 
-    /// Checks that the headers from `data` encode to the bytes that their decode took, and that a
-    /// batch from `data` reads back, or is refused only if it has too many headers.
-    ///
-    /// The first two bytes of `data`, little-endian, give the count of the batch. So a short input
-    /// reaches the limit and the first count above it. The bytes after them fill the headers, with
-    /// zeros after their end. Bytes that the headers do not use come after the batch. The committed
-    /// corpus uses this layout, so a change to the layout must rewrite the corpus.
     pub fn headers(data: &[u8]) {
         let mut input = data;
         if let Ok(headers) = super::Headers::decode(&mut input) {
             headers_check(headers, &data[..data.len() - input.len()]);
         }
 
-        // A decoder that refuses each payload passes the check above, so read a batch that is
-        // valid by its layout.
         let [count_low, count_high, bytes @ ..] = data else {
             return;
         };
         let count = usize::from(u16::from_le_bytes([*count_low, *count_high]))
             % (HEADERS_WRITTEN_COUNT_MAX + 1);
-        // The bytes that the headers do not use come after the batch, and stay in `input`.
         let header_bytes_size = bytes.len().min(count * crate::block::BLOCK_HEADER_SIZE);
         let (header_bytes, after) = bytes.split_at(header_bytes_size);
         let mut written = headers_write(count, header_bytes);
@@ -595,8 +493,6 @@ pub(crate) mod fuzz {
         }
     }
 
-    /// `count` headers from `bytes`, with zeros after their end, each with a transaction count of
-    /// 0.
     fn headers_write(count: usize, bytes: &[u8]) -> Vec<u8> {
         assert!(count <= HEADERS_WRITTEN_COUNT_MAX);
         let mut bytes = bytes.iter().copied().chain(std::iter::repeat(0));
@@ -609,13 +505,6 @@ pub(crate) mod fuzz {
         written
     }
 
-    /// Checks that `taken`, the bytes that a decode took, are what the headers encode to, each
-    /// with a transaction count of 0. A peer picks each `bits`, so each one also goes through the
-    /// proof-of-work check, which must return for any value. Regtest has the highest limit, so the
-    /// most values reach the compare with the hash. The `machines` script mines each header, so
-    /// only this fuzz target reaches a hash above its proof-of-work target. A peer picks each
-    /// `time`, so each one also goes through the rule of `bits` and the timewarp rule, and the
-    /// first ones go through the median time.
     fn headers_check(headers: super::Headers, taken: &[u8]) {
         let headers = headers.into_vec();
         let mut encoded = Vec::new();
@@ -628,9 +517,6 @@ pub(crate) mod fuzz {
             crate::chain::fuzz::timewarp_time_min_check(header);
             let network = crate::chainparams::Network::Regtest;
             if let Some((hash, _)) = crate::pow::proven(header, network) {
-                // The regtest limit starts with 0x7f, so no hash that passes has a higher top byte.
-                // The top byte of a hash is its last byte in wire order. This rule does not call
-                // the check, so a check that takes too many hashes fails here.
                 assert!(hash.as_byte_array()[31] <= 0x7f);
             }
         }
@@ -644,7 +530,6 @@ pub(crate) mod fuzz {
 mod tests {
     use crate::serialize::{Decode, Encode};
 
-    /// The fields of `VERSION_FRAME`, read by hand.
     fn core_version() -> super::Version {
         let zero = super::Address {
             services: super::ServiceFlags(0),
@@ -667,8 +552,6 @@ mod tests {
         }
     }
 
-    /// Core's payload with another user agent. It does not call `Version::encode`,
-    /// so the user agent can be longer than the limit.
     fn payload_with_user_agent(user_agent: &[u8]) -> Vec<u8> {
         let mut payload = crate::fixtures::version_payload();
         let start_height_and_relay =
@@ -701,7 +584,6 @@ mod tests {
 
     #[test]
     fn batches_cut_headers_at_2000_in_order() {
-        // The headers need no proof of work here, so each one is genesis with its own nonce.
         let genesis = crate::chainparams::Network::Regtest.genesis();
         for (count, expected) in [
             (0, &[][..]),
@@ -736,7 +618,6 @@ mod tests {
 
         let mut input = message.payload();
         let headers = super::Headers::decode(&mut input).unwrap();
-        // Core has only blocks 1 and 2, so the batch is not full.
         assert!(!headers.is_full());
         let hashes: Vec<_> = headers
             .into_vec()
@@ -757,7 +638,6 @@ mod tests {
     fn headers_count_is_at_most_2000() {
         let core = crate::fixtures::headers_payload();
         let (_, entries) = core.split_first().unwrap();
-        // The 80 bytes of block 1 and its transaction count.
         let block_1 = &entries[..80 + 1];
         let mut payload = Vec::new();
         crate::serialize::write_compact_size(&mut payload, 2000);
@@ -768,8 +648,6 @@ mod tests {
         assert!(headers.is_full());
         assert_eq!(headers.into_vec().len(), 2000);
 
-        // No header follows the count. A decode that reads a header first fails with
-        // `UnexpectedEnd`.
         let mut payload = Vec::new();
         crate::serialize::write_compact_size(&mut payload, 2001);
         assert_eq!(
@@ -781,7 +659,6 @@ mod tests {
     #[test]
     fn headers_refuses_a_tx_count_that_is_not_0() {
         let mut payload = crate::fixtures::headers_payload();
-        // The transaction count of block 1, after the count and the 80 bytes of the header.
         let tx_count = &mut payload[1 + 80];
         assert_eq!(*tx_count, 0);
         *tx_count = 1;
@@ -794,7 +671,6 @@ mod tests {
     #[test]
     fn headers_requires_each_tx_count() {
         let mut payload = crate::fixtures::headers_payload();
-        // The bytes stop where the transaction count of block 2 starts. A peer can send this.
         payload.pop();
         assert_eq!(
             super::Headers::decode(&mut payload.as_slice()),
@@ -816,8 +692,6 @@ mod tests {
 
     #[test]
     fn inv_has_a_block_only_with_an_entry_of_type_2() {
-        // 1 is a transaction, 5 a witness transaction, and 0x4000_0002 a witness block, which a
-        // peer asks for in a `getdata` but does not announce.
         for (types, has_block) in [
             (&[][..], false),
             (&[1, 5, 0x4000_0002][..], false),
@@ -842,8 +716,6 @@ mod tests {
                 .has_block()
         );
 
-        // No entry follows the count. A decode that reads an entry first fails with
-        // `UnexpectedEnd`.
         let mut payload = Vec::new();
         crate::serialize::write_compact_size(&mut payload, 50_001);
         assert_eq!(
@@ -854,7 +726,6 @@ mod tests {
 
     #[test]
     fn inv_requires_each_byte_of_each_entry() {
-        // The bytes stop in the hash of the last entry, and then in its type.
         let mut payload = crate::fixtures::inv_payload(&[1, 2]);
         for cut in [1, 32 + 1] {
             payload.truncate(payload.len() - cut);
@@ -965,7 +836,6 @@ mod tests {
 
     #[test]
     fn user_agent_display_escapes_control_bytes() {
-        // An ANSI escape that would turn the terminal text red.
         let user_agent = super::UserAgent::try_from(b"/evil:\x1b[31m/".to_vec()).unwrap();
         assert_eq!(user_agent.to_string(), r"/evil:\x1b[31m/");
     }

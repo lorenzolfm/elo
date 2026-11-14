@@ -1,57 +1,28 @@
-//! The sync of a chain of headers that starts below the minimum work. A peer can make cheap
-//! headers for as long as it wants, so elo does not keep the headers of such a chain until the
-//! chain shows the work. The first download, `Presync`, checks each header, keeps one commitment,
-//! a salted bit of one header, for each period of headers, and drops the headers. When the work is
-//! enough, the second download, `Redownload`, gets the same chain again and checks each
-//! commitment. It gives a header to the chain only when enough commitments above that header
-//! passed, or when the work is enough again.
-
-/// The most headers for each second of the median time. Each header needs a time above the median
-/// time of the 11 headers below it, so at most 6 headers can have the same time.
 const HEADERS_PER_SECOND_MAX: u64 = 6;
 
-/// The bits of one `u64` word of `Commitments`.
 const WORD_BITS: usize = 64;
 
-/// The random numbers of one sync. The peer must not know them. With them, it could make a second
-/// chain that matches the commitments of the first. It is not `Copy`, so a sync moves it, and no
-/// other sync can read it.
 pub(crate) struct Salt {
-    /// The keys of the hash that gives each commitment.
     pub(crate) keys: [u64; 2],
-    /// Picks the heights that have a commitment. Each value is legal.
     pub(crate) offset: usize,
 }
 
-/// Writes no field. The `Debug` of a type that holds the salt, such as `net::Connection`, can go
-/// into a line of the log, and the salt must stay secret.
 impl std::fmt::Debug for Salt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Salt").finish_non_exhaustive()
     }
 }
 
-/// Why a sync refused a batch. Each one ends the sync.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeadersSyncError {
-    /// The `prev` of a header is not the hash of the header below it: the header of our chain
-    /// that the sync starts on, or the last header that the peer sent in this download.
     NotContinuous,
-    /// The `bits` of a header are not a target in the range of the network, or the hash of the
-    /// header is above that target.
     ProofOfWork,
-    /// The `bits` of a header are not a change that the network permits from the `bits` below it.
     BitsChange,
-    /// A header is above the highest height that a chain can have at the clock of the sync.
     TooLong,
-    /// A batch that is not full ended the chain, and the chain has less work than the minimum.
     WorkTooLow,
-    /// A header of the second download does not match the commitment that the first download
-    /// kept for its height, or the first download kept no more commitments.
     CommitmentMismatch,
 }
 
-/// A header that the next header of the peer links to: its hash, its height and its `bits`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Link {
     hash: bitcoin_hashes::sha256d::Hash,
@@ -59,82 +30,49 @@ struct Link {
     bits: u32,
 }
 
-/// One commitment, one bit, for each header above `start_height` at a height of `offset` modulo
-/// `period`, in the order of the heights.
 struct Commitments {
     keys: [u64; 2],
     period: usize,
-    /// Below `period`.
     offset: usize,
-    /// The height of the header of our chain that the sync starts on. The first height with a
-    /// commitment is above it, by at most `period`.
     start_height: usize,
-    /// Bit `index` is bit `index % WORD_BITS` of word `index / WORD_BITS`.
     words: Vec<u64>,
     count: usize,
 }
 
-/// The first download of a sync. It keeps no header, only one commitment for each period of
-/// headers.
 #[derive(Debug)]
 pub(crate) struct Presync {
     network: crate::chainparams::Network,
-    /// The header of our chain that the chain of the peer goes on: our tip, or a fork below it.
     start: Link,
-    /// The work of our chain up to `start`.
     start_work: crate::pow::Work,
-    /// The work that the chain of the peer must reach. It is above `start_work`.
     work_min: crate::pow::Work,
-    /// The highest height that a chain can have at the clock of the sync.
     height_max: usize,
     commitments: Commitments,
-    /// The last header that the peer sent, or `start`.
     last: Link,
-    /// `start_work` plus the work of each header that the peer sent.
     work: crate::pow::Work,
 }
 
-/// What a batch of the first download gave.
 #[derive(Debug)]
 pub(crate) enum PresyncStep {
-    /// The batch was full and the work is below the minimum. The peer sends more on the last
-    /// header.
     More(Presync),
-    /// The work reached the minimum. The peer sends the chain again, on the start of the sync.
     Redownload(Redownload),
 }
 
-/// The second download of a sync. It holds the headers that wait for more commitments above
-/// them.
 #[derive(Debug)]
 pub(crate) struct Redownload {
     network: crate::chainparams::Network,
     work_min: crate::pow::Work,
     commitments: Commitments,
-    /// The headers that this download did not release yet, in order. The first is on the start
-    /// of the sync, or on the last header that it released.
     buffer: std::collections::VecDeque<crate::block::BlockHeader>,
-    /// The last header of `buffer`, or the last header that this download released, or the start
-    /// of the sync.
     last: Link,
-    /// The work of our chain up to the start of the sync, plus the work of each header of this
-    /// download.
     work: crate::pow::Work,
 }
 
-/// What a batch of the second download gave. It releases each header in it, in order, for the
-/// chain: on the start of the sync, or on the headers that it released before.
 #[derive(Debug)]
 pub(crate) enum RedownloadStep {
-    /// The batch was full and the work is below the minimum. The peer sends more on the last
-    /// header. The box keeps the step small, because `Done` has only the headers.
     More(Box<Redownload>, Vec<crate::block::BlockHeader>),
-    /// The work reached the minimum, so the chain gets each header that is left. The sync ends.
     Done(Vec<crate::block::BlockHeader>),
 }
 
-/// Writes only the fields that are not secret. The keys and the offset come from the salt, and the
-/// commitments come from the keys.
 impl std::fmt::Debug for Commitments {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Commitments")
@@ -158,31 +96,23 @@ impl Commitments {
         }
     }
 
-    /// A header at `height` has a commitment.
     fn is_at(&self, height: usize) -> bool {
         height % self.period == self.offset
     }
 
-    /// The index of the commitment at `height`, which is above the start and has a commitment.
-    /// The heights with a commitment are `period` apart, and the first is at most `period` above
-    /// the start, so the index is the count of whole periods from the height above the start.
     fn index(&self, height: usize) -> usize {
         assert!(height > self.start_height);
         assert!(self.is_at(height));
         (height - self.start_height - 1) / self.period
     }
 
-    /// The commitment of the header with `hash`: its salted hash is even.
     fn commitment(&self, hash: bitcoin_hashes::sha256d::Hash) -> bool {
         let [key_0, key_1] = self.keys;
         bitcoin_hashes::siphash24::Hash::hash_to_u64_with_keys(key_0, key_1, hash.as_byte_array())
             .is_multiple_of(2)
     }
 
-    /// Keeps the commitment of the header at `height` with `hash`, after the others.
     fn push(&mut self, height: usize, hash: bitcoin_hashes::sha256d::Hash) {
-        // The heights come in order and none is skipped. This also bounds the memory: one
-        // commitment in each period above the start.
         assert_eq!(self.index(height), self.count);
         let bit_index = self.count % WORD_BITS;
         if bit_index == 0 {
@@ -191,7 +121,6 @@ impl Commitments {
         if self.commitment(hash)
             && let [.., word] = self.words.as_mut_slice()
         {
-            // The bits go in order, so this bit and each bit above it are still clear.
             assert_eq!(*word >> bit_index, 0);
             *word |= 1 << bit_index;
         }
@@ -199,10 +128,7 @@ impl Commitments {
         assert_eq!(self.words.len(), self.count.div_ceil(WORD_BITS));
     }
 
-    /// The commitment at `height`, if the first download kept one there.
     fn get(&self, height: usize) -> Option<bool> {
-        // The pair of the assert in `push`. Without it, a word that is not there would read as
-        // "no more commitments", and the peer would get the error.
         assert_eq!(self.words.len(), self.count.div_ceil(WORD_BITS));
         let index = self.index(height);
         if index < self.count {
@@ -215,12 +141,6 @@ impl Commitments {
 }
 
 impl Presync {
-    /// The first download of the chain of the peer, on `start`, a header of our chain, until the
-    /// chain of the peer has `work_min`. The work of our chain up to `start` must be below
-    /// `work_min`. `clock` is the local clock, in seconds since the Unix epoch. A chain gets at
-    /// most `HEADERS_PER_SECOND_MAX` headers in each second from the median time of `start`, until
-    /// a header can be `TIME_AHEAD_SECONDS_MAX` after the clock. So the clock bounds the height,
-    /// and the height bounds the commitments.
     pub(crate) fn new(
         start: crate::chain::SyncStart,
         work_min: crate::pow::Work,
@@ -234,9 +154,6 @@ impl Presync {
             height: start.height(),
             bits: start.bits(),
         };
-        // A clock far after each real time saturates, and so does the height, so the bound
-        // refuses no chain. A clock below the median time gives zero seconds, and then the bound
-        // refuses each header.
         let seconds = clock
             .saturating_add(crate::chain::TIME_AHEAD_SECONDS_MAX)
             .saturating_sub(u64::from(start.median_time_past()));
@@ -254,16 +171,10 @@ impl Presync {
         }
     }
 
-    /// The hash of the last header that the peer sent, or of the start of the sync. The next batch
-    /// goes on it.
     pub(crate) fn last_hash(&self) -> bitcoin_hashes::sha256d::Hash {
         self.last.hash
     }
 
-    /// Checks each of `headers`, in order, on the last header. For one header, its `prev` is
-    /// checked first, then its proof of work, then its `bits`, then its height. When the work
-    /// reaches the minimum, the next download starts after the batch. Else a batch that is not
-    /// full fails, an empty one too.
     pub(crate) fn receive(
         mut self,
         headers: crate::protocol::Headers,
@@ -274,7 +185,6 @@ impl Presync {
             if link.height > self.height_max {
                 return Err(HeadersSyncError::TooLong);
             }
-            // With the height bound above, `push` bounds the memory of the commitments.
             if self.commitments.is_at(link.height) {
                 self.commitments.push(link.height, link.hash);
             }
@@ -292,7 +202,6 @@ impl Presync {
 }
 
 impl Redownload {
-    /// The second download, on the start of the first, with its commitments.
     fn new(presync: Presync) -> Redownload {
         assert!(presync.work >= presync.work_min);
         Redownload {
@@ -305,23 +214,10 @@ impl Redownload {
         }
     }
 
-    /// The hash of the last header of this download, or of the start of the sync. The next batch
-    /// goes on it.
     pub(crate) fn last_hash(&self) -> bitcoin_hashes::sha256d::Hash {
         self.last.hash
     }
 
-    /// Checks each of `headers`, in order, on the last header, as the first download did. Each
-    /// header at the height of a commitment must match it, until the work reaches the minimum.
-    /// From there the chain shows the work, so no header needs a commitment, and the peer can also
-    /// have new headers above the first chain. Then the chain gets each header and the sync ends.
-    /// Else the chain gets only the headers with more than `redownload_buffer_size` headers above
-    /// them, and a batch that is not full fails, an empty one too.
-    ///
-    /// This download has no height bound of its own. Below the minimum, the first height with a
-    /// commitment above the last commitment of the first download fails, because none is kept for
-    /// it. So the chain ends at most one period above that commitment, which is at most at
-    /// `height_max`.
     pub(crate) fn receive(
         mut self,
         headers: crate::protocol::Headers,
@@ -330,21 +226,15 @@ impl Redownload {
         for header in headers.into_vec() {
             let (link, work) = checked(self.network, self.last, &header)?;
             self.work = self.work.saturating_add(work);
-            if self.work < self.work_min {
-                // The chain does not show the work yet, so it must be the chain of the first
-                // download.
-                if self.commitments.is_at(link.height) {
-                    let kept = self.commitments.get(link.height);
-                    if kept != Some(self.commitments.commitment(link.hash)) {
-                        return Err(HeadersSyncError::CommitmentMismatch);
-                    }
+            if self.work < self.work_min && self.commitments.is_at(link.height) {
+                let kept = self.commitments.get(link.height);
+                if kept != Some(self.commitments.commitment(link.hash)) {
+                    return Err(HeadersSyncError::CommitmentMismatch);
                 }
             }
             self.buffer.push_back(header);
             self.last = link;
         }
-        // `last` is the last header of `buffer`, with the height and the `bits` that the buffer
-        // does not keep.
         if let Some(buffer_last) = self.buffer.back() {
             assert_eq!(buffer_last.hash(), self.last.hash);
         }
@@ -356,7 +246,6 @@ impl Redownload {
                 .len()
                 .saturating_sub(self.network.redownload_buffer_size());
             let released = self.buffer.drain(..released_count).collect();
-            // A batch has at most 2,000 headers, so this bounds the buffer between two batches.
             assert!(self.buffer.len() <= self.network.redownload_buffer_size());
             Ok(RedownloadStep::More(Box::new(self), released))
         } else {
@@ -365,8 +254,6 @@ impl Redownload {
     }
 }
 
-/// Checks `header` on `below`: its `prev`, then its proof of work, then its `bits`. Returns the
-/// header as the link of the next one, and its work.
 fn checked(
     network: crate::chainparams::Network,
     below: Link,
@@ -413,20 +300,13 @@ impl std::error::Error for HeadersSyncError {}
 
 #[cfg(test)]
 mod tests {
-    /// The `bits` of the regtest limit, which each header of a test has unless it says another.
     const LIMIT_BITS: u32 = 0x207f_ffff;
 
-    /// The offset modulo the regtest period of 275 is 15, so the first download keeps a commitment
-    /// at the heights 15, 290, 565, 840, 1115, 1390, 1665, 1940, 2215 and on. A person wrote
-    /// these. The offset is above the period, so the sync must take it modulo the period. It is
-    /// not `usize::MAX`, because that modulo 275 is 15 only where `usize` has 64 bits.
     const SALT: super::Salt = super::Salt {
         keys: [1, 2],
         offset: 275 * 1_000 + 15,
     };
 
-    /// `count` regtest headers with `bits`, each on the header before it, the first on `below`.
-    /// `seed` is each byte of the merkle root, so two seeds give two chains.
     fn mined_on(
         below: &crate::block::BlockHeader,
         count: usize,
@@ -455,13 +335,11 @@ mod tests {
         headers
     }
 
-    /// `count` regtest headers at the limit on genesis, with `seed`.
     fn chain_on_genesis(count: usize, seed: u8) -> Vec<crate::block::BlockHeader> {
         let genesis = crate::chainparams::Network::Regtest.genesis();
         mined_on(&genesis, count, LIMIT_BITS, seed)
     }
 
-    /// The work of regtest genesis and `headers` on it.
     fn work_on_genesis(headers: &[crate::block::BlockHeader]) -> crate::pow::Work {
         let genesis = crate::chainparams::Network::Regtest.genesis();
         std::iter::once(&genesis)
@@ -472,7 +350,6 @@ mod tests {
             .unwrap()
     }
 
-    /// A first download on regtest genesis that ends at `work_min`.
     fn presync(work_min: crate::pow::Work) -> super::Presync {
         let chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
         super::Presync::new(
@@ -483,7 +360,6 @@ mod tests {
         )
     }
 
-    /// `presync` after it took each batch of `batches` and asked for more.
     fn more(
         mut presync: super::Presync,
         batches: &[&[crate::block::BlockHeader]],
@@ -498,7 +374,6 @@ mod tests {
         presync
     }
 
-    /// The second download after the first took `batches`, the last of which reaches the minimum.
     fn redownload(
         work_min: crate::pow::Work,
         batches: &[&[crate::block::BlockHeader]],
@@ -532,7 +407,6 @@ mod tests {
         let headers = chain_on_genesis(4_001, 0);
         let work_min = work_on_genesis(&headers).saturating_add(work_on_genesis(&[]));
 
-        // The second batch is on the last header of the first.
         let after_two_batches = more(
             presync(work_min),
             &[&headers[..2_000], &headers[2_000..4_000]],
@@ -555,7 +429,6 @@ mod tests {
         let headers = chain_on_genesis(2_000, 0);
         let work_at = |count| work_on_genesis(&headers[..count]);
 
-        // A full batch exactly at the minimum, and one header below it.
         assert!(matches!(
             presync(work_at(2_000)).receive(batch(&headers)),
             Ok(super::PresyncStep::Redownload(_))
@@ -564,7 +437,6 @@ mod tests {
             presync(work_at(2_000).saturating_add(work_at(0))).receive(batch(&headers)),
             Ok(super::PresyncStep::More(_))
         ));
-        // A batch that is not full still reaches the minimum.
         assert!(matches!(
             presync(work_at(1_000)).receive(batch(&headers[..1_000])),
             Ok(super::PresyncStep::Redownload(_))
@@ -603,7 +475,6 @@ mod tests {
     fn presync_refuses_a_header_without_proof_of_work() {
         let mut headers = chain_on_genesis(3, 0);
         let work_min = work_on_genesis(&headers).saturating_add(work_on_genesis(&[]));
-        // The first nonce after the mined one that gives a hash above the target.
         headers[2] = (headers[2].nonce + 1..)
             .map(|nonce| crate::block::BlockHeader {
                 nonce,
@@ -620,8 +491,6 @@ mod tests {
         );
     }
 
-    /// On mainnet, a header inside a period keeps the `bits` of the header below it. Block 1 is
-    /// on genesis, so it keeps the `bits` of the tip of our chain.
     #[test]
     fn presync_reads_the_bits_of_the_tip_of_our_chain() {
         let block_1 = crate::fixtures::header(crate::fixtures::MAINNET_BLOCK_1);
@@ -632,7 +501,6 @@ mod tests {
             )
         );
         let chain = crate::chain::Chain::new(crate::chainparams::Network::Mainnet);
-        // Block 1 has the work of genesis, so the minimum is one header above the batch.
         let genesis_work = chain.tip().work();
         let work_min = genesis_work
             .saturating_add(genesis_work)
@@ -644,16 +512,12 @@ mod tests {
             SALT,
         );
 
-        // The batch is not full, so a header that passes ends below the minimum.
         assert_eq!(
             presync.receive(batch(&[block_1])).unwrap_err(),
             super::HeadersSyncError::WorkTooLow
         );
     }
 
-    /// Our chain has 100 headers, each one second above the one below it, so its median time is
-    /// the genesis time plus 95. A clock 100 s above that, less the 2 h that a time may be ahead
-    /// of the clock, permits 600 headers above the tip, up to height 700. A person wrote these.
     #[test]
     fn presync_refuses_a_chain_higher_than_the_clock_permits() {
         let headers = chain_on_genesis(701, 0);
@@ -667,7 +531,6 @@ mod tests {
         let presync_at =
             |clock| super::Presync::new(chain.sync_start_on_tip(), work_min, clock, SALT);
 
-        // The batch is not full, so a chain that is not too high ends below the minimum.
         assert_eq!(
             presync_at(clock)
                 .receive(batch(&headers[100..700]))
@@ -680,7 +543,6 @@ mod tests {
                 .unwrap_err(),
             super::HeadersSyncError::TooLong
         );
-        // A clock more than 2 h below the median time permits no header.
         assert_eq!(
             presync_at(0)
                 .receive(batch(&headers[100..101]))
@@ -689,9 +551,6 @@ mod tests {
         );
     }
 
-    /// The chain reaches the minimum at height 9,500, so the first download takes 5 batches. The
-    /// second download holds 7,017 headers, so the fourth batch gives 983 headers to the chain.
-    /// The fifth reaches the minimum, so it gives the rest, also the 500 headers above it.
     #[test]
     fn redownload_gives_each_header_once_enough_headers_are_above_it() {
         let headers = chain_on_genesis(10_000, 0);
@@ -717,8 +576,6 @@ mod tests {
         assert_eq!(released, headers);
     }
 
-    /// The second download, on a chain that reaches the minimum at height 4,000, after it took
-    /// the first full batch of `headers`.
     fn redownload_after_one_batch(headers: &[crate::block::BlockHeader]) -> super::Redownload {
         let redownload = redownload(
             work_on_genesis(headers),
@@ -748,8 +605,6 @@ mod tests {
         let at_start = || redownload(work_min, &[&headers[..2_000], &headers[2_000..]]);
 
         let cases: [(&str, super::Redownload, &[crate::block::BlockHeader], _); 5] = [
-            // The second download starts again on the tip of our chain, not on the last header
-            // of the first download.
             (
                 "on the last header of the first download",
                 at_start(),
@@ -788,15 +643,12 @@ mod tests {
                 "{name}"
             );
         }
-        // The same chain passes.
         assert!(matches!(
             redownload_after_one_batch(&headers).receive(batch(&headers[2_000..])),
             Ok(super::RedownloadStep::Done(_))
         ));
     }
 
-    /// The other chain has another merkle root from height 1, so at some height with a commitment
-    /// it has another one.
     #[test]
     fn redownload_refuses_another_chain() {
         let headers = chain_on_genesis(2_000, 0);
@@ -809,10 +661,6 @@ mod tests {
         );
     }
 
-    /// The chain reaches the minimum at height 1,115, which has a commitment. Each second chain is
-    /// the first one up to 1,114, then another header at 1,115 and more on it. About half of the
-    /// headers at 1,115 have another commitment, so 8 chains read a commitment there with odds of
-    /// 255 in 256.
     #[test]
     fn redownload_reads_no_commitment_from_the_header_that_reaches_the_minimum() {
         let headers = chain_on_genesis(2_000, 0);
@@ -832,10 +680,6 @@ mod tests {
         }
     }
 
-    /// The first chain has harder headers above height 1,940, its last commitment. Each has a work
-    /// of 15, where a header at the limit has 2, so the chain reaches the minimum at height 2,000.
-    /// The second chain is the first up to 1,940, then headers at the limit. So at height 2,215 it
-    /// is still below the minimum, and the first download kept no commitment for that height.
     #[test]
     fn redownload_refuses_a_chain_after_the_last_commitment() {
         let bits_hard = 0x2010_0000;
@@ -845,8 +689,6 @@ mod tests {
         let first = [first.as_slice(), &first_hard].concat();
         let second = [&first[..1_940], &second_easy].concat();
         let work_min = work_on_genesis(&first);
-        // The second chain at 2,215 has 2 + 2,215 * 2 of work, and the first chain has
-        // 2 + 1,940 * 2 + 60 * 15 at 2,000.
         assert!(work_on_genesis(&second) < work_min);
 
         let after_one_batch = || {
@@ -857,7 +699,6 @@ mod tests {
             *redownload
         };
 
-        // Each header up to 2,214 passes, so the batch ends below the minimum.
         assert_eq!(
             after_one_batch()
                 .receive(batch(&second[2_000..2_214]))
@@ -872,10 +713,6 @@ mod tests {
         );
     }
 
-    /// Our chain ends at height 15, which has a commitment. So the first commitment of the sync is
-    /// one whole period above the tip, at 290, and the first download keeps 7, up to 1,940. The
-    /// chain of the peer reaches the minimum at 2,015, so each download takes one batch. A person
-    /// wrote these.
     #[test]
     fn sync_on_a_tip_with_a_commitment_keeps_the_first_commitment_a_period_above() {
         let headers = chain_on_genesis(2_015, 0);

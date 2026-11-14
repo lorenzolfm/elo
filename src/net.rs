@@ -1,57 +1,33 @@
-//! The driver: it dials one peer and runs the handshake on the socket. Then it syncs our header
-//! chain from the peer, pings the peer, and answers the messages after the handshake. The chain
-//! is not part of the connection, so it outlives each connection.
-
 use crate::serialize::Encode;
 use std::hash::{BuildHasher, Hasher};
 use std::io::Read;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// How long the TCP connect may take.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How long the handshake may take, from the connect to their `verack`.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How long each write after the handshake may take, because a write to a peer that does not
-/// read can block forever. The ping timeout covers each read.
 const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(20);
 
-/// How long the lookup of a name may take. The resolver of the OS tries each name server again
-/// after its own timeout, by default 5 s, two times for each of at most 3 servers.
 const LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The most addresses of a name that one dial tries. Each try takes at most `CONNECT_TIMEOUT`, so
-/// this bounds the time of a dial.
 const ADDRESSES_COUNT_MAX: usize = 256;
 
-/// The most addresses of a seed that one dial tries. A seed has many nodes, and the next dial asks
-/// a seed again, so a seed whose answers are down costs at most this many tries.
 const SEED_ADDRESSES_COUNT_MAX: usize = 32;
 
-/// The most bytes of a name, with no `.` at the end.
 const NAME_LENGTH_MAX: usize = 253;
 
-/// The most bytes of one label of a name.
 const LABEL_LENGTH_MAX: usize = 63;
 
-/// The most bytes of the text of a `Destination`: a name of `NAME_LENGTH_MAX` bytes, its `.` at
-/// the end, and the longest port. An IP address with its port is shorter: at most 58 bytes, an
-/// IPv6 address with a scope.
 pub(crate) const DESTINATION_LENGTH_MAX: usize = NAME_LENGTH_MAX + ".".len() + ":65535".len();
 
-/// Where the destination of each dial comes from: the peer that the command line names, or the
-/// seeds of the network when it names none.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Source {
-    /// The same destination for each dial.
     Destination(Destination),
-    /// A seed of the network for each dial, at random.
     Seeds(Seeds),
 }
 
 impl Source {
-    /// The destination of the next dial.
     pub fn destination(&self) -> std::borrow::Cow<'_, Destination> {
         match self {
             Source::Destination(destination) => std::borrow::Cow::Borrowed(destination),
@@ -60,7 +36,6 @@ impl Source {
     }
 }
 
-/// The seeds of a network that has seeds. Only `Seeds::new` makes one, so it has at least one.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Seeds {
     first: &'static str,
@@ -69,7 +44,6 @@ pub struct Seeds {
 }
 
 impl Seeds {
-    /// The seeds of `network`, or `None` if it has none.
     pub fn new(network: crate::chainparams::Network) -> Option<Seeds> {
         let (&first, rest) = network.seeds().split_first()?;
         Some(Seeds {
@@ -79,8 +53,6 @@ impl Seeds {
         })
     }
 
-    /// One of the seeds, at random, at the default port of the network. The choice needs no
-    /// secret, so it comes from the keys of `RandomState`: the seed with the lowest hash.
     fn choose(&self) -> Destination {
         let random = std::hash::RandomState::new();
         let first = (random.hash_one(self.first), self.first);
@@ -96,14 +68,10 @@ impl Seeds {
     }
 }
 
-/// A seed of a network. Only `Seeds::choose` makes one, so it is on the list of its network.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Seed(&'static str);
 
 impl Seed {
-    /// The name of the seed with the services that elo asks for. A seed answers
-    /// `x<services in hex>.<seed>` with only the nodes that offer each one of them. Some seeds have
-    /// no such names, and answer only the seed itself.
     fn services_name(&self) -> String {
         let services = crate::protocol::ServiceFlags::NETWORK_WITNESS;
         format!("x{services:x}.{}", self.0)
@@ -116,19 +84,13 @@ impl std::fmt::Display for Seed {
     }
 }
 
-/// What one dial looks up and connects to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Destination {
-    /// An IP address, which `handshake` dials with no lookup.
     Address(PeerAddress),
-    /// A name, which `handshake` looks up before each dial.
     Name {
         name: Name,
         port: std::num::NonZeroU16,
     },
-    /// A seed, which `handshake` looks up with the services that elo asks for, and then without
-    /// them if that lookup fails or gives no address. Of its answers, it dials only the addresses
-    /// that the internet routes to.
     Seed {
         seed: Seed,
         port: std::num::NonZeroU16,
@@ -145,15 +107,10 @@ impl std::fmt::Display for Destination {
     }
 }
 
-/// An address that names a peer: its port is not 0, and its IP is not `0.0.0.0` or `::`. A
-/// connect to those reaches this host. Only `PeerAddress::new` makes one, so each address that
-/// `handshake` dials names a peer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PeerAddress(std::net::SocketAddr);
 
 impl PeerAddress {
-    /// `address` as the address of a peer, or `None` if it names no peer. An IPv4 address in
-    /// IPv6, such as `[::ffff:0.0.0.0]`, is checked as the IPv4 address.
     pub fn new(address: std::net::SocketAddr) -> Option<PeerAddress> {
         if address.port() == 0 || address.ip().to_canonical().is_unspecified() {
             return None;
@@ -162,15 +119,10 @@ impl PeerAddress {
     }
 }
 
-/// The name of a host. Only `Name::new` makes one, so each name has the form that it checks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Name(String);
 
 impl Name {
-    /// `host` as a name, or `None` if it is no name. A name has labels, split by `.`, of at most
-    /// `NAME_LENGTH_MAX` bytes in all, and can have one more `.` at the end, as a name with all
-    /// its labels. The last label is no number, so the resolver cannot read the name as an IPv4
-    /// address.
     pub fn new(host: &str) -> Option<Name> {
         let labels = host.strip_suffix('.').unwrap_or(host);
         if labels.len() > NAME_LENGTH_MAX {
@@ -193,10 +145,6 @@ impl std::fmt::Display for Name {
     }
 }
 
-/// Whether the internet does not route to `ip`: this host, a private network, a link, or a range
-/// for documentation or tests. A node on the internet cannot have such an address, so a seed that
-/// gives one is wrong, or points elo at a host that is not on the network. An IPv4 address in IPv6
-/// is checked as the IPv4 address. A multicast address is not reserved, and its connect fails.
 fn is_reserved(ip: std::net::IpAddr) -> bool {
     match ip.to_canonical() {
         std::net::IpAddr::V4(ip) => {
@@ -216,7 +164,6 @@ fn is_reserved(ip: std::net::IpAddr) -> bool {
         std::net::IpAddr::V6(ip) => {
             let [first, second, ..] = ip.segments();
             let is_documentation = first == 0x2001 && second == 0x0db8;
-            // ORCHID, `2001:10::/28`, and ORCHIDv2, `2001:20::/28`: names that no route reaches.
             let is_orchid =
                 first == 0x2001 && (second & 0xfff0 == 0x0010 || second & 0xfff0 == 0x0020);
             ip.is_unspecified()
@@ -229,8 +176,6 @@ fn is_reserved(ip: std::net::IpAddr) -> bool {
     }
 }
 
-/// Whether `label` is a label of a name: 1 to `LABEL_LENGTH_MAX` letters, digits and `-`, with no
-/// `-` at the start or the end.
 fn is_label(label: &str) -> bool {
     if label.is_empty() {
         return false;
@@ -246,10 +191,6 @@ fn is_label(label: &str) -> bool {
         .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
-/// Whether the IPv4 parse of the resolver reads `label` as a number: only digits, or `0x` and
-/// only hex digits. That parse also reads the short forms, so `127.1`, `0x7f000001` and `127.0x1`
-/// are each `127.0.0.1`. It needs each part to be a number, so a name whose last label is no
-/// number goes to DNS. Octal, after a `0`, has only digits.
 fn is_number(label: &str) -> bool {
     let (digits, radix) = match label
         .strip_prefix("0x")
@@ -261,15 +202,10 @@ fn is_number(label: &str) -> bool {
     digits.chars().all(|digit| digit.is_digit(radix))
 }
 
-/// Why the lookup of a name gave no address to dial.
 #[derive(Debug)]
 pub enum LookupError {
-    /// The resolver of the OS failed.
     Failed(std::io::Error),
-    /// The lookup of `host` took longer than `LOOKUP_TIMEOUT`. A dial to a seed has two lookups,
-    /// so the error names the one that did not end.
     Timeout { host: String },
-    /// The lookup gave no address that `handshake` may dial.
     Empty,
 }
 
@@ -287,12 +223,9 @@ impl std::fmt::Display for LookupError {
     }
 }
 
-/// Why the TCP connect to one address failed.
 #[derive(Debug)]
 pub enum ConnectError {
-    /// The connect failed.
     Io(std::io::Error),
-    /// The connect took longer than `CONNECT_TIMEOUT`.
     Timeout,
 }
 
@@ -305,29 +238,19 @@ impl std::fmt::Display for ConnectError {
     }
 }
 
-/// Why the lookup, the connect or the handshake failed.
 #[derive(Debug)]
 pub enum HandshakeError {
-    /// The lookup of the name of the destination failed.
     Lookup(LookupError),
-    /// The TCP connect to each address of the destination failed. `address` is the last one,
-    /// `error` is its error, and `addresses_count` is how many addresses `handshake` tried.
     Connect {
         address: std::net::SocketAddr,
         addresses_count: usize,
         error: ConnectError,
     },
-    /// The handshake took longer than `HANDSHAKE_TIMEOUT`.
     HandshakeTimeout,
-    /// A read or a write on the socket failed.
     Io(std::io::Error),
-    /// The peer closed the connection.
     Closed,
-    /// The peer sent a frame that elo refuses.
     Transport(crate::transport::Error),
-    /// elo refused the peer: a bad `version`, our own `version`, or too many messages.
     NetProcessing(crate::net_processing::HandshakeError),
-    /// The read of `RANDOM_SOURCE` for the salt of the peer failed.
     Salt(std::io::Error),
 }
 
@@ -376,19 +299,12 @@ impl From<ReceiveError> for HandshakeError {
     }
 }
 
-/// Why the connection ended after the handshake.
 #[derive(Debug)]
 pub enum RunError {
-    /// A write after the handshake took longer than `SEND_TIMEOUT`.
     SendTimeout,
-    /// A read or a write on the socket failed.
     Io(std::io::Error),
-    /// The peer closed the connection.
     Closed,
-    /// The peer sent a frame that elo refuses.
     Transport(crate::transport::Error),
-    /// elo refused the peer: a bad `ping`, `pong` or `headers`, or no `pong` or `headers` in
-    /// time.
     NetProcessing(crate::net_processing::PeerError),
 }
 
@@ -418,40 +334,27 @@ impl From<ReceiveError> for RunError {
     }
 }
 
-/// Why `Socket::receive` returned no message. Each one ends the connection, in the handshake
-/// or after it.
 #[derive(Debug)]
 enum ReceiveError {
-    /// A read on the socket failed.
     Io(std::io::Error),
-    /// The peer closed the connection, inside a frame or between two frames.
     Closed,
-    /// The peer sent a frame that elo refuses.
     Transport(crate::transport::Error),
 }
 
-/// One peer after the handshake: the socket and the machine for its messages, which borrows our
-/// chain. Only `handshake` makes one, so `sync` cannot start before the handshake is complete.
 #[derive(Debug)]
 pub struct Connection<'a> {
     socket: Socket,
     peer: crate::net_processing::Peer<'a>,
-    /// The address of the peer that took the connect.
     address: std::net::SocketAddr,
 }
 
-/// One peer after the header sync. Only `Connection::sync` makes one, so `next_tip` cannot start
-/// before the sync ends.
 #[derive(Debug)]
 pub struct Synced<'a> {
     socket: Socket,
     peer: crate::net_processing::Peer<'a>,
-    /// The tip that the last call returned, or the sync if no call did.
     tip: crate::chain::Tip,
 }
 
-/// The stream to one peer, its network, and the bytes of the frame that is not complete yet.
-/// Only `receive` reads the stream, so each byte that comes goes into a frame.
 #[derive(Debug)]
 struct Socket {
     stream: tokio::net::TcpStream,
@@ -459,17 +362,12 @@ struct Socket {
     frame: PartialFrame,
 }
 
-/// The bytes of one frame, kept across waits. Each part has room for its exact size, and each
-/// read goes into the bytes that the part still needs. So a read cannot take a byte of the
-/// next frame.
 #[derive(Debug)]
 enum PartialFrame {
-    /// The header has not passed its checks. The bytes so far are `bytes[..filled]`.
     Header {
         bytes: [u8; crate::transport::MESSAGE_HEADER_SIZE],
         filled: usize,
     },
-    /// The header passed its checks. The payload so far is `payload[..filled]`.
     Payload {
         header: crate::transport::MessageHeader,
         payload: Vec<u8>,
@@ -477,13 +375,6 @@ enum PartialFrame {
     },
 }
 
-/// Looks up `destination` if it is a name or a seed. Then dials the first of its addresses that
-/// takes the TCP connect, in a random order, on the network of `chain`, and runs the handshake.
-/// Returns the connection for the messages after it, and their `version`. The sync of the
-/// connection extends `chain` from its tip, so the next connection with the same chain does not
-/// get those headers again. A chain below the minimum work starts again from genesis. A peer
-/// whose chain does not have our tip answers from the highest header of our locator on its chain,
-/// and a branch with more work takes the place of ours.
 pub async fn handshake<'a>(
     destination: &Destination,
     chain: &'a mut crate::chain::Chain,
@@ -495,8 +386,6 @@ pub async fn handshake<'a>(
     handshake_stream(address, stream, chain).await
 }
 
-/// The addresses that a dial to `destination` tries: its address, or the answers of its lookup in
-/// the order of `name_order` or `seed_order`.
 async fn addresses(destination: &Destination) -> Result<Addresses, LookupError> {
     match destination {
         Destination::Address(address) => Ok(Addresses {
@@ -509,11 +398,7 @@ async fn addresses(destination: &Destination) -> Result<Addresses, LookupError> 
             let services = lookup(&services_name, *port).await;
             match services.and_then(seed_order) {
                 Ok(addresses) => Ok(addresses),
-                // The resolver does not answer, so a lookup of the seed itself would only wait
-                // `LOOKUP_TIMEOUT` again.
                 Err(error @ LookupError::Timeout { .. }) => Err(error),
-                // A seed with no such names fails the lookup. The error of the lookup of the seed
-                // itself is the one that the dial gives.
                 Err(LookupError::Failed(_) | LookupError::Empty) => {
                     seed_order(lookup(seed.0, *port).await?)
                 }
@@ -522,16 +407,12 @@ async fn addresses(destination: &Destination) -> Result<Addresses, LookupError> 
     }
 }
 
-/// The addresses that one dial tries, in order: each one of `before`, then `last`. So a dial has
-/// at least one address, with no check.
 #[derive(Debug)]
 struct Addresses {
     before: Vec<PeerAddress>,
     last: PeerAddress,
 }
 
-/// The addresses of `host` at `port`, as the resolver of the OS gives them. The caller takes at
-/// most its count max of them, so it does not copy the others.
 async fn lookup(
     host: &str,
     port: std::num::NonZeroU16,
@@ -546,20 +427,13 @@ async fn lookup(
     }
 }
 
-/// The `answers` of the lookup of a name that name a peer, at most `ADDRESSES_COUNT_MAX`, in the
-/// order of `dial_order`. The person who names the host chose its addresses, so a name can be on
-/// this host or on a private network.
 fn name_order(
     answers: impl IntoIterator<Item = std::net::SocketAddr>,
 ) -> Result<Addresses, LookupError> {
-    // Some resolvers give `0.0.0.0` or `::` for a name that they block.
     let answers = answers.into_iter().filter_map(PeerAddress::new);
     dial_order::<ADDRESSES_COUNT_MAX>(answers)
 }
 
-/// The `answers` of the lookup of a seed that name a peer that the internet routes to, at most
-/// `SEED_ADDRESSES_COUNT_MAX`, in the order of `dial_order`. The seed chose its answers, and not
-/// the person who runs elo.
 fn seed_order(
     answers: impl IntoIterator<Item = std::net::SocketAddr>,
 ) -> Result<Addresses, LookupError> {
@@ -570,17 +444,11 @@ fn seed_order(
     dial_order::<SEED_ADDRESSES_COUNT_MAX>(routable)
 }
 
-/// At most `COUNT_MAX` of `answers`, each one time, in a random order. So each dial can start on
-/// another address of a name that has many, such as a seed. The order needs no secret, so it comes
-/// from the keys of `RandomState`.
 fn dial_order<const COUNT_MAX: usize>(
     answers: impl Iterator<Item = PeerAddress>,
 ) -> Result<Addresses, LookupError> {
-    // `connect_first` takes at most `ADDRESSES_COUNT_MAX`, so each cap fits in it.
     const { assert!(COUNT_MAX <= ADDRESSES_COUNT_MAX) };
     let mut before: Vec<PeerAddress> = answers.take(COUNT_MAX).collect();
-    // A hosts file can have the same name and address on two lines. A second try of an address
-    // costs up to `CONNECT_TIMEOUT` again.
     before.sort_unstable_by_key(|address| address.0);
     before.dedup();
     let random = std::hash::RandomState::new();
@@ -588,19 +456,14 @@ fn dial_order<const COUNT_MAX: usize>(
     let Some(last) = before.pop() else {
         return Err(LookupError::Empty);
     };
-    // `connect_first` checks only `ADDRESSES_COUNT_MAX`, so the cap of a seed is checked here.
     assert!(before.len() < COUNT_MAX, "{} {COUNT_MAX}", before.len());
     Ok(Addresses { before, last })
 }
 
-/// The TCP connect to the first of `addresses` that takes it. Each try takes at most
-/// `CONNECT_TIMEOUT`, and `ADDRESSES_COUNT_MAX` bounds the tries, so the time of a dial is
-/// bounded. When each try fails, the error has the last address, its error, and the count.
 async fn connect_first(
     addresses: &Addresses,
 ) -> Result<(std::net::SocketAddr, tokio::net::TcpStream), HandshakeError> {
     let Addresses { before, last } = addresses;
-    // `dial_order` keeps at most `ADDRESSES_COUNT_MAX`, with `last`.
     assert!(before.len() < ADDRESSES_COUNT_MAX, "{}", before.len());
     for &address in before {
         if let Ok(stream) = connect(address).await {
@@ -617,7 +480,6 @@ async fn connect_first(
     }
 }
 
-/// The TCP connect to `address`, within `CONNECT_TIMEOUT`.
 async fn connect(address: PeerAddress) -> Result<tokio::net::TcpStream, ConnectError> {
     let connect = tokio::net::TcpStream::connect(address.0);
     match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
@@ -627,7 +489,6 @@ async fn connect(address: PeerAddress) -> Result<tokio::net::TcpStream, ConnectE
     }
 }
 
-/// The handshake on a connected `stream`, within `HANDSHAKE_TIMEOUT`.
 async fn handshake_stream(
     address: std::net::SocketAddr,
     stream: tokio::net::TcpStream,
@@ -640,8 +501,6 @@ async fn handshake_stream(
     }
 }
 
-/// Sends our `version`, then reads messages until the handshake is done. The handshake
-/// bounds the loop: it refuses a peer that sends too many messages without its `verack`.
 async fn handshake_stream_exchange(
     address: std::net::SocketAddr,
     stream: tokio::net::TcpStream,
@@ -678,9 +537,6 @@ async fn handshake_stream_exchange(
                 handshake = next;
             }
             crate::net_processing::Step::Done(peer, theirs) => {
-                // The peer can send more frames in the same segment as its `verack`. Each read
-                // stops at the end of a frame, so they are still in the stream, and `sync` reads
-                // them next.
                 let connection = Connection {
                     socket,
                     peer,
@@ -693,25 +549,10 @@ async fn handshake_stream_exchange(
 }
 
 impl<'a> Connection<'a> {
-    /// The address of the peer: of the addresses of the destination, the one that took the
-    /// connect.
     pub fn address(&self) -> std::net::SocketAddr {
         self.address
     }
 
-    /// Runs one turn after the other until a batch that is not full ends the sync. Returns the
-    /// peer for `Synced::next_tip`, and the tip of our chain. The loop has no count bound, because
-    /// only the chain of the peer bounds the sync. A low-work sync gets the chain twice, and the
-    /// clock bounds the height of its first download. But above the minimum work the peer can send
-    /// headers for as long as it has them. It ends on an error: the peer closes, a read or a write
-    /// fails, a write takes longer than `SEND_TIMEOUT`, our `ping` gets no `pong` in time, or elo
-    /// refuses a frame or a message. It also ends when elo refuses a `headers`, none comes within
-    /// the headers timeout, or the sync ends on a chain below the minimum work. Each wait for a
-    /// message ends at the wake from `tick`, but the read takes a message that is already there,
-    /// also after the wake. `tick` checks the headers timeout only at the start of a turn. One turn
-    /// can write our `ping` and our `getheaders`, and then a `pong`, and each write can take up to
-    /// `SEND_TIMEOUT`. So the connection can end up to three times `SEND_TIMEOUT` after the tick
-    /// that sent our `getheaders`, with `SendTimeout`, `PingTimeout` or `HeadersTimeout`.
     pub async fn sync(self) -> Result<(Synced<'a>, crate::chain::Tip), RunError> {
         let Connection {
             mut socket,
@@ -728,17 +569,6 @@ impl<'a> Connection<'a> {
 }
 
 impl<'a> Synced<'a> {
-    /// Runs one turn after the other until a batch that is not full ends a sync again on a new
-    /// tip: an announcement of the peer, or the last batch of the sync that a full announcement
-    /// starts. Returns the peer for the next call, and the new tip of our chain. An empty
-    /// announcement ends a sync on the same tip, and the loop goes on. So a peer cannot make the
-    /// caller print the tip again for each `headers`. The loop has no count bound, because a peer
-    /// sends messages for as long as it is connected. It ends on the errors of
-    /// `Connection::sync`. Each wait for a message ends at the wake from `tick`, each write ends
-    /// within `SEND_TIMEOUT`, and the frame length limit bounds each message. `tick` checks the
-    /// ping timeout only at the start of a turn. So a `pong` write that blocks while our `ping` is
-    /// outstanding can end the connection up to `SEND_TIMEOUT` after the ping timeout, with
-    /// `SendTimeout`.
     pub async fn next_tip(self) -> Result<(Synced<'a>, crate::chain::Tip), RunError> {
         let Synced {
             mut socket,
@@ -750,9 +580,6 @@ impl<'a> Synced<'a> {
                 (next, None) => peer = next,
                 (next, Some(tip)) if tip == previous => peer = next,
                 (peer, Some(tip)) => {
-                    // On one connection, our chain takes a batch on its tip, or a branch with more
-                    // work, which can be lower. So only the work goes up. It saturates at its
-                    // maximum, so it can stay the same.
                     assert!(tip.work() >= previous.work());
                     return Ok((Synced { socket, peer, tip }, tip));
                 }
@@ -761,24 +588,15 @@ impl<'a> Synced<'a> {
     }
 }
 
-/// Ticks `peer` and sends what the tick returns. Then waits for one message until the wake
-/// from the tick, and gives the message to `peer`. Returns the peer for the next turn, which
-/// ticks again, and the tip if the message ended the sync. So each wait has a wake from a tick
-/// after the last message: a `pong` moves the wake to the next `ping`, and after a full batch
-/// the next `getheaders` goes at once.
 async fn run_turn<'a>(
     socket: &mut Socket,
     peer: crate::net_processing::Peer<'a>,
 ) -> Result<(crate::net_processing::Peer<'a>, Option<crate::chain::Tip>), RunError> {
-    // The wake goes to a tokio timer, so `now` comes from the same clock. Then a paused clock
-    // in a test also moves the time of the peer.
     let now = tokio::time::Instant::now().into_std();
     let (peer, tick_outbound, wake) = peer.tick(now, nonce()).map_err(RunError::NetProcessing)?;
     for outbound in tick_outbound.into_outbounds() {
         run_send(socket, &outbound).await?;
     }
-    // The wait covers only the read, which is cancel safe, so the turn keeps the peer when the
-    // wait ends. A wait that ends at the wake loses no bytes: the next turn continues the frame.
     let receive = socket.receive();
     match tokio::time::timeout_at(tokio::time::Instant::from_std(wake), receive).await {
         Ok(message) => run_exchange(socket, peer, &message?).await,
@@ -786,40 +604,32 @@ async fn run_turn<'a>(
     }
 }
 
-/// Gives `message` to `peer`, and sends the `pong` if there is one. Returns the peer for the
-/// next turn, and the tip if the message ended the sync.
 async fn run_exchange<'a>(
     socket: &mut Socket,
     peer: crate::net_processing::Peer<'a>,
     message: &crate::transport::Message,
 ) -> Result<(crate::net_processing::Peer<'a>, Option<crate::chain::Tip>), RunError> {
-    // The clock is read when the message is there, so a long wait for it does not age the clock.
     let (peer, received) = peer
         .receive(message, clock())
         .map_err(RunError::NetProcessing)?;
     match received {
         crate::net_processing::Received::NoReply => {
-            // Each `ping` that the peer accepts gets a `pong`.
             assert_ne!(message.msg_type(), crate::protocol::PING);
             Ok((peer, None))
         }
         crate::net_processing::Received::Pong(nonce) => {
-            // The peer replies only to a `ping`.
             assert_eq!(message.msg_type(), crate::protocol::PING);
             let pong = crate::net_processing::PeerOutbound::Pong(nonce);
             run_send(socket, &pong).await?;
             Ok((peer, None))
         }
         crate::net_processing::Received::Synced(tip) => {
-            // Only a `headers` ends the sync.
             assert_eq!(message.msg_type(), crate::protocol::HEADERS);
             Ok((peer, Some(tip)))
         }
     }
 }
 
-/// Writes `outbound` within `SEND_TIMEOUT`. A write that ends early can leave part of a frame
-/// in the stream, so each error ends the connection.
 async fn run_send(
     socket: &mut Socket,
     outbound: &crate::net_processing::PeerOutbound,
@@ -840,7 +650,6 @@ impl Socket {
         }
     }
 
-    /// Writes a message of the handshake.
     async fn send_handshake_outbound(
         &mut self,
         outbound: &crate::net_processing::HandshakeOutbound,
@@ -855,7 +664,6 @@ impl Socket {
         }
     }
 
-    /// Writes a message after the handshake.
     async fn send_peer_outbound(
         &mut self,
         outbound: &crate::net_processing::PeerOutbound,
@@ -879,7 +687,6 @@ impl Socket {
         self.send(msg_type, &payload).await
     }
 
-    /// Writes one frame with `msg_type` and `payload`.
     async fn send(
         &mut self,
         msg_type: crate::protocol::MessageType,
@@ -889,18 +696,13 @@ impl Socket {
         self.stream.write_all(&frame).await
     }
 
-    /// Reads until one frame is complete, and returns its message. A wait that ends early,
-    /// for example at a timeout, loses no bytes: the next call continues the same frame.
     async fn receive(&mut self) -> Result<crate::transport::Message, ReceiveError> {
-        // Each turn returns or reads at least one byte, and a frame has at most
-        // `MESSAGE_HEADER_SIZE` + `PAYLOAD_LENGTH_MAX` bytes. So the loop ends.
         loop {
             if let Some(message) = self
                 .frame
                 .cut(self.network)
                 .map_err(ReceiveError::Transport)?
             {
-                // The next frame starts empty, so no byte of this frame goes into it.
                 assert!(matches!(self.frame, PartialFrame::Header { filled: 0, .. }));
                 return Ok(message);
             }
@@ -908,17 +710,11 @@ impl Socket {
         }
     }
 
-    /// Reads at least one byte, and at most the bytes that the part still needs. A wait that
-    /// ends early reads nothing, because `read` is cancel safe.
     async fn read(&mut self) -> Result<(), ReceiveError> {
         let (missing, filled) = self.frame.missing();
-        // `cut` takes each complete part, so this part still needs a byte. An empty slice
-        // would read nothing, and the zero would look like the end of the stream.
         assert!(!missing.is_empty());
-        // A read returns at most the length of its slice, so it stops at the end of the part.
         let count = self.stream.read(missing).await.map_err(ReceiveError::Io)?;
         if count == 0 {
-            // The end of the stream, inside a frame or between two frames.
             return Err(ReceiveError::Closed);
         }
         *filled += count;
@@ -934,7 +730,6 @@ impl PartialFrame {
         }
     }
 
-    /// The bytes that the part still needs, and the count of the bytes that it has.
     fn missing(&mut self) -> (&mut [u8], &mut usize) {
         match self {
             PartialFrame::Header { bytes, filled } => (&mut bytes[*filled..], filled),
@@ -944,9 +739,6 @@ impl PartialFrame {
         }
     }
 
-    /// Takes each complete part. A complete header gets its checks and then room for its
-    /// payload. A complete payload gets its checksum and becomes the message, and the next
-    /// frame starts empty.
     fn cut(
         &mut self,
         network: crate::chainparams::Network,
@@ -957,8 +749,6 @@ impl PartialFrame {
         } = self
         {
             let header = crate::transport::decode_header(network, bytes)?;
-            // The room is made only after the header passes its checks, so it is at most the
-            // length limit.
             let payload = vec![0; header.payload_length()];
             *self = PartialFrame::Payload {
                 header,
@@ -982,16 +772,13 @@ impl PartialFrame {
     }
 }
 
-/// The payload of a `ping` or a `pong`.
 fn nonce_payload(nonce: u64) -> Vec<u8> {
     let mut payload = Vec::with_capacity(size_of::<u64>());
     nonce.encode(&mut payload);
-    // The payload is only the nonce, the `u64` that the peer decodes.
     assert_eq!(payload.len(), size_of::<u64>());
     payload
 }
 
-/// Seconds since the Unix epoch, or zero if the clock is before it.
 fn clock() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(elapsed) => elapsed.as_secs(),
@@ -999,23 +786,16 @@ fn clock() -> u64 {
     }
 }
 
-/// `clock` as the `timestamp` of our `version`, which is an `i64` on the wire.
 fn timestamp() -> i64 {
     i64::try_from(clock()).unwrap_or(i64::MAX)
 }
 
-/// A SipHash with keys from the OS. The nonce in our `version` only detects a connection to
-/// self, and the nonce in our `ping` only matches its `pong`. So neither needs to be secret.
 fn nonce() -> u64 {
     std::hash::RandomState::new().build_hasher().finish()
 }
 
-/// The random source of the OS.
 const RANDOM_SOURCE: &str = "/dev/urandom";
 
-/// A salt for a low-work sync, each byte from `RANDOM_SOURCE`. The peer must not know it, and a
-/// peer sees each nonce. `nonce` does not give that: the keys of `RandomState` come from the OS
-/// once, and each later one is the last plus one. So the salt reads the OS for each value.
 fn salt() -> std::io::Result<crate::headerssync::Salt> {
     let mut source = std::fs::File::open(RANDOM_SOURCE)?;
     let mut key_0 = [0; size_of::<u64>()];
@@ -1030,52 +810,34 @@ fn salt() -> std::io::Result<crate::headerssync::Salt> {
     })
 }
 
-/// The entry point of the `frame` fuzz target.
 #[cfg(fuzzing)]
-// Only cargo-mutants reads this attribute. Its test runs do not build this module.
 #[cfg_attr(false, mutants::skip)]
 pub(crate) mod fuzz {
-    /// The network of the seeds.
     const NETWORK: crate::chainparams::Network = crate::chainparams::Network::Regtest;
 
-    /// The longest payload of the frame that `frame` writes. A run can set a larger `-max_len`,
-    /// and `encode` panics above the length limit.
     const WRITTEN_PAYLOAD_LENGTH_MAX: usize = 4096;
 
-    /// What `PartialFrame` takes from one stream.
     #[derive(Debug, PartialEq, Eq)]
     struct FrameRead {
         messages: Vec<crate::transport::Message>,
         end: FrameEnd,
     }
 
-    /// Why the reads of one stream stopped.
     #[derive(Debug, PartialEq, Eq)]
     enum FrameEnd {
-        /// The reads took each byte, and `PartialFrame` needs more.
         BytesEnded,
-        /// `PartialFrame` refused a frame, and no read took the last `unread_count` bytes.
         Refused {
             error: crate::transport::Error,
             unread_count: usize,
         },
     }
 
-    /// Checks that each split of the same bytes gives the same `FrameRead`, that the messages
-    /// are the same bytes as the start of the stream, and that a frame from `encode` reads back
-    /// as its message.
-    ///
-    /// The first byte of `data` is the count of the size bytes after it. A size byte `s` is a
-    /// read of `s + 1` bytes. The rest of `data` is the stream. The committed corpus uses this
-    /// layout, so a change to the layout must rewrite the corpus.
     pub fn frame(data: &[u8]) {
         let Some((sizes_count, rest)) = data.split_first() else {
             return;
         };
         let (sizes, stream) = rest.split_at(rest.len().min(usize::from(*sizes_count)));
 
-        // The largest reads and the smallest reads, so an input with no size bytes still compares
-        // two splits.
         let whole = frame_read(stream, std::iter::empty());
         assert_eq!(
             frame_read(stream, std::iter::repeat(std::num::NonZeroUsize::MIN)),
@@ -1086,7 +848,6 @@ pub(crate) mod fuzz {
             .map(|size_byte| std::num::NonZeroUsize::MIN.saturating_add(usize::from(*size_byte)));
         assert_eq!(frame_read(stream, read_sizes.clone()), whole);
 
-        // All the splits can be wrong in the same way, so compare with the stream too.
         let encoded: Vec<u8> = whole
             .messages
             .iter()
@@ -1096,8 +857,6 @@ pub(crate) mod fuzz {
             .collect();
         assert!(stream.starts_with(&encoded));
 
-        // A reader that refuses each frame passes all the checks above, so read a frame that elo
-        // wrote.
         let payload = &stream[..stream.len().min(WRITTEN_PAYLOAD_LENGTH_MAX)];
         let written = crate::transport::encode(NETWORK, crate::protocol::VERACK, payload);
         let read = frame_read(&written, read_sizes);
@@ -1109,8 +868,6 @@ pub(crate) mod fuzz {
         assert_eq!(message.payload(), payload);
     }
 
-    /// Gives `stream` to a new `PartialFrame` as `Socket::receive` does, one read for each size
-    /// in `read_sizes`. A read takes all that it can when the sizes end.
     fn frame_read(
         stream: &[u8],
         mut read_sizes: impl Iterator<Item = std::num::NonZeroUsize>,
@@ -1118,8 +875,6 @@ pub(crate) mod fuzz {
         let mut frame = super::PartialFrame::new();
         let mut messages = Vec::new();
         let mut unread = stream;
-        // Each turn ends the loop, takes a message, or reads at least one byte. So the length of
-        // the stream bounds the loop.
         let end = loop {
             match frame.cut(NETWORK) {
                 Ok(Some(message)) => {
@@ -1129,7 +884,6 @@ pub(crate) mod fuzz {
                     ));
                     messages.push(message);
                 }
-                // On the socket, a read of zero bytes means the same.
                 Ok(None) if unread.is_empty() => break FrameEnd::BytesEnded,
                 Ok(None) => {
                     let (missing, filled) = frame.missing();
@@ -1176,26 +930,22 @@ mod tests {
         addresses.iter().copied().map(peer_address).collect()
     }
 
-    /// `addresses` in their order, with the last one as `last`.
     fn dial(addresses: &[std::net::SocketAddr]) -> super::Addresses {
         let mut before = peer_addresses(addresses);
         let last = before.pop().unwrap();
         super::Addresses { before, last }
     }
 
-    /// The addresses of a dial, in their order.
     fn dialed(addresses: super::Addresses) -> Vec<super::PeerAddress> {
         let super::Addresses { mut before, last } = addresses;
         before.push(last);
         before
     }
 
-    /// Reads one frame on the peer's side of the socket.
     fn read_frame(stream: &mut std::net::TcpStream) -> Vec<u8> {
         read_frame_on(stream, crate::chainparams::Network::Regtest)
     }
 
-    /// `read_frame`, with the magic of `network`.
     fn read_frame_on(
         stream: &mut std::net::TcpStream,
         network: crate::chainparams::Network,
@@ -1210,7 +960,6 @@ mod tests {
         frame
     }
 
-    /// Reads one frame on the peer's side of the socket, and returns its message.
     fn read_message(stream: &mut std::net::TcpStream) -> crate::transport::Message {
         let frame = read_frame(stream);
         let (header, payload) = frame.split_first_chunk().unwrap();
@@ -1219,8 +968,6 @@ mod tests {
         crate::transport::check_payload(header, payload.to_vec()).unwrap()
     }
 
-    /// Accepts the driver on `listener` and completes the handshake with Core's frames. A
-    /// driver that sends nothing more fails the test fast.
     fn accept_handshake(listener: &std::net::TcpListener) -> std::net::TcpStream {
         let (mut stream, _) = listener.accept().unwrap();
         stream
@@ -1237,14 +984,11 @@ mod tests {
         stream
     }
 
-    /// Our `ping`: its payload is only the nonce.
     fn assert_ping(message: &crate::transport::Message) {
         assert_eq!(message.msg_type(), crate::protocol::PING);
         assert_eq!(message.payload().len(), size_of::<u64>());
     }
 
-    /// Reads our first `getheaders`. It asks for the headers after genesis, so it is
-    /// `GETHEADERS_FRAME`.
     fn read_first_get_headers(stream: &mut std::net::TcpStream) {
         assert_eq!(
             read_frame(stream),
@@ -1252,14 +996,12 @@ mod tests {
         );
     }
 
-    /// Reads our `sendheaders`, which the first tick after the sync sends.
     fn read_send_headers(stream: &mut std::net::TcpStream) {
         let send_headers = read_message(stream);
         assert_eq!(send_headers.msg_type(), crate::protocol::SENDHEADERS);
         assert!(send_headers.payload().is_empty());
     }
 
-    /// A `headers` with no header, which ends the sync at our tip.
     fn empty_headers_frame() -> Vec<u8> {
         crate::transport::encode(
             crate::chainparams::Network::Regtest,
@@ -1271,13 +1013,10 @@ mod tests {
     #[test]
     fn their_version_gets_our_verack() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
-        // The peer sends Core's frames and keeps what the driver sends after their `version`.
-        // A peer may send its `verack` before ours comes, so the bitcoind test cannot see this.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            // A driver that sends no `verack` fails the test fast.
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
@@ -1301,8 +1040,6 @@ mod tests {
     #[test]
     fn our_version_has_the_local_clock_in_seconds() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
-        // A peer reads this time only for its offset from its own clock, so the bitcoind test
-        // passes with each value. Only this test reads it.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || {
@@ -1310,7 +1047,6 @@ mod tests {
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
-            // The stream closes when this returns, so the handshake of the driver ends.
             read_message(&mut stream)
         });
 
@@ -1336,8 +1072,6 @@ mod tests {
     #[test]
     fn silent_peer_is_handshake_timeout() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
-        // The listener never accepts, so no `version` comes. The clock is paused after the
-        // connect. When no task can run, tokio moves the clock to the next timer.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let (result, elapsed) = block_on(async {
@@ -1351,24 +1085,18 @@ mod tests {
             matches!(result, Err(super::HandshakeError::HandshakeTimeout)),
             "{result:?}"
         );
-        // tokio rounds a deadline up to the next millisecond.
         assert_eq!(elapsed.as_secs(), super::HANDSHAKE_TIMEOUT.as_secs());
     }
 
     #[test]
     fn silent_peer_after_our_getheaders_is_headers_timeout() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
-        // The peer completes the handshake, reads our `ping` and our `getheaders`, and then
-        // sends nothing. The clock is paused only after the handshake: while the peer thread
-        // answers, the runtime has no task to run, so a paused clock would jump to
-        // `HANDSHAKE_TIMEOUT`.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || {
             let mut stream = accept_handshake(&listener);
             assert_ping(&read_message(&mut stream));
             read_first_get_headers(&mut stream);
-            // The socket stays open until the driver closes it. A close here would be `Closed`.
             let mut rest = Vec::new();
             stream.read_to_end(&mut rest).unwrap();
             rest
@@ -1384,8 +1112,6 @@ mod tests {
             (result, start.elapsed())
         });
         let rest = peer_thread.join().unwrap();
-        // The driver sends only what `tick` returns, so no second `getheaders` while the first
-        // is outstanding.
         assert!(rest.is_empty(), "{rest:?}");
         assert!(
             matches!(
@@ -1396,7 +1122,6 @@ mod tests {
             ),
             "{result:?}"
         );
-        // 2 min, the headers timeout. tokio rounds a deadline up to the next millisecond.
         assert_eq!(
             elapsed.as_secs(),
             std::time::Duration::from_mins(2).as_secs()
@@ -1406,9 +1131,6 @@ mod tests {
     #[test]
     fn header_far_after_the_local_clock_ends_the_connection() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
-        // The header has the last time of a `u32`. Until the year 2106, that is more than 2 h
-        // after the local clock in seconds, so only the driver decides here. A clock in
-        // milliseconds would take this header.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || {
@@ -1428,7 +1150,6 @@ mod tests {
                 &crate::fixtures::headers_payload_with(&[header]),
             );
             stream.write_all(&frame).unwrap();
-            // The driver closes the socket when it refuses the batch.
             let mut rest = Vec::new();
             stream.read_to_end(&mut rest).unwrap();
         });
@@ -1453,9 +1174,6 @@ mod tests {
 
     #[test]
     fn sync_that_ends_below_the_minimum_of_the_network_ends_the_connection() {
-        // Regtest has a minimum of zero, so only a test on another network shows that the driver
-        // gives the peer the minimum of its network. The empty batch ends the sync on genesis,
-        // which has less work than the signet minimum.
         let network = crate::chainparams::Network::Signet;
         let mut chain = crate::chain::Chain::new(network);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1467,8 +1185,6 @@ mod tests {
                 .unwrap();
             let frame =
                 |msg_type, payload: &[u8]| crate::transport::encode(network, msg_type, payload);
-            // The reply to each frame of the driver. Our `ping` gets no `pong`, because the ping
-            // timeout is far after the end of the test.
             let replies = [
                 Some(frame(
                     crate::protocol::VERSION,
@@ -1488,7 +1204,6 @@ mod tests {
                     stream.write_all(&reply).unwrap();
                 }
             }
-            // The driver closes the socket when the sync fails.
             let mut rest = Vec::new();
             stream.read_to_end(&mut rest).unwrap();
             msg_types
@@ -1522,10 +1237,6 @@ mod tests {
     #[test]
     fn silent_peer_after_the_sync_is_ping_timeout() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
-        // The peer completes the handshake, ends the sync with an empty `headers`, and then
-        // sends nothing. The clock is paused only after the sync: while the peer thread
-        // answers, the runtime has no task to run, so a paused clock would jump to the headers
-        // timeout. The time starts before the sync, so it includes the send of our `ping`.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || {
@@ -1534,7 +1245,6 @@ mod tests {
             read_first_get_headers(&mut stream);
             stream.write_all(&empty_headers_frame()).unwrap();
             read_send_headers(&mut stream);
-            // The socket stays open until the driver closes it. A close here would be `Closed`.
             let mut rest = Vec::new();
             stream.read_to_end(&mut rest).unwrap();
             (ping, rest)
@@ -1552,8 +1262,6 @@ mod tests {
         });
         let (ping, rest) = peer_thread.join().unwrap();
         assert_ping(&ping);
-        // The driver sends only what `tick` returns, so no second `ping` while the first is
-        // outstanding.
         assert!(rest.is_empty(), "{rest:?}");
         assert!(
             matches!(
@@ -1562,7 +1270,6 @@ mod tests {
             ),
             "{error:?}"
         );
-        // 20 min, the ping timeout. tokio rounds a deadline up to the next millisecond.
         assert_eq!(
             elapsed.as_secs(),
             std::time::Duration::from_mins(20).as_secs()
@@ -1572,8 +1279,6 @@ mod tests {
     #[test]
     fn empty_announcement_after_the_sync_does_not_give_the_tip_again() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
-        // The peer ends the sync on genesis, and then announces no header and then one. So the
-        // first call of `next_tip` gives the tip of the second announcement, not genesis again.
         let headers = crate::fixtures::headers_on_genesis(1);
         let announcement = crate::transport::encode(
             crate::chainparams::Network::Regtest,
@@ -1591,7 +1296,6 @@ mod tests {
             let mut frames = empty_headers_frame();
             frames.extend(announcement);
             stream.write_all(&frames).unwrap();
-            // The driver closes the socket after `next_tip`. Nothing more goes before that.
             let mut rest = Vec::new();
             stream.read_to_end(&mut rest).unwrap();
             rest
@@ -1615,11 +1319,6 @@ mod tests {
     #[test]
     fn pong_moves_the_next_ping_to_ping_interval_after_the_last() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
-        // The peer answers our first `ping` and not the second. So the connection ends at the
-        // ping timeout of the second `ping`, which goes at the ping interval after the first.
-        // A wake that stays at the timeout of the first `ping` sends the second one late. The
-        // `pong` comes before the empty `headers`, so the driver has it when the sync ends. The
-        // clock is paused only then, as in `silent_peer_after_the_sync_is_ping_timeout`.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || {
@@ -1635,7 +1334,6 @@ mod tests {
             stream.write_all(&frames).unwrap();
             read_send_headers(&mut stream);
             let second = read_message(&mut stream);
-            // The socket stays open until the driver closes it. A close here would be `Closed`.
             let mut rest = Vec::new();
             stream.read_to_end(&mut rest).unwrap();
             (first, second, rest)
@@ -1663,8 +1361,6 @@ mod tests {
             ),
             "{error:?}"
         );
-        // 2 min to the second `ping`, then 20 min to its timeout. tokio rounds a deadline up to
-        // the next millisecond.
         assert_eq!(
             elapsed.as_secs(),
             std::time::Duration::from_mins(2 + 20).as_secs()
@@ -1674,8 +1370,6 @@ mod tests {
     #[test]
     fn peer_that_stops_reading_is_send_timeout() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
-        // The peer completes the handshake and then reads nothing. The test fills the kernel
-        // buffers before `run`, so the write of our first `ping` blocks.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || accept_handshake(&listener));
@@ -1684,8 +1378,6 @@ mod tests {
             let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
                 .await
                 .unwrap();
-            // The peer thread ends when it has sent its `verack`, so this wait blocks nothing.
-            // The stream stays open, and nothing reads it.
             let _stream = peer_thread.join().unwrap();
             let stream = &connection.socket.stream;
             stream.writable().await.unwrap();
@@ -1698,7 +1390,6 @@ mod tests {
             assert_eq!(full.kind(), std::io::ErrorKind::WouldBlock);
             tokio::time::pause();
             let start = tokio::time::Instant::now();
-            // A send with no timeout blocks forever. This timeout fails the test instead.
             let sync = connection.sync();
             let result = tokio::time::timeout(std::time::Duration::from_mins(30), sync).await;
             (result, start.elapsed())
@@ -1707,15 +1398,12 @@ mod tests {
             matches!(result, Ok(Err(super::RunError::SendTimeout))),
             "{result:?}"
         );
-        // tokio rounds a deadline up to the next millisecond.
         assert_eq!(elapsed.as_secs(), super::SEND_TIMEOUT.as_secs());
     }
 
     #[test]
     fn peer_that_closes_inside_a_frame_is_closed() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
-        // The peer reads our `version`, sends all of Core's `version` but its last byte, and
-        // closes. A short read must not reach `check_payload`, which panics on it.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || {
@@ -1735,11 +1423,6 @@ mod tests {
 
     #[test]
     fn frame_split_by_a_timeout_is_received_whole() {
-        // The peer sends the first half of Core's `version` and blocks. A `receive` under a
-        // timeout reads that half and times out. The peer then sends the rest, and the next
-        // `receive` must return the whole message, so the wait that ended kept the first half.
-        // The peer sends the rest only after the timeout: bytes on their way do not stop a
-        // paused clock, so the clock could jump before they come.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let (first_sent, first_sent_receiver) = std::sync::mpsc::channel();
@@ -1757,8 +1440,6 @@ mod tests {
         let (timeout, message) = block_on(async {
             let stream = tokio::net::TcpStream::connect(peer).await.unwrap();
             let mut socket = super::Socket::new(stream, crate::chainparams::Network::Regtest);
-            // The runtime has no other task, so this wait blocks nothing. The clock is paused
-            // only when the first half is in the stream.
             first_sent_receiver.recv().unwrap();
             tokio::time::pause();
             let receive = socket.receive();
@@ -1777,14 +1458,10 @@ mod tests {
     #[test]
     fn ping_in_one_write_with_their_verack_gets_a_pong() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
-        // The peer sends Core's `verack` and `ping` in one write, so both can be in the stream
-        // when the handshake ends. `sync` must still read the `ping` and answer it, after our
-        // own `ping` and `getheaders`. Then the peer closes.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            // A driver that sends no `pong` fails the test fast.
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
@@ -1796,8 +1473,6 @@ mod tests {
             let mut frames = crate::fixtures::hex(crate::fixtures::VERACK_FRAME);
             frames.extend(crate::fixtures::hex(crate::fixtures::PING_FRAME));
             stream.write_all(&frames).unwrap();
-            // Our `ping` and `getheaders` go at the start of the first turn, before the driver
-            // reads.
             assert_ping(&read_message(&mut stream));
             read_first_get_headers(&mut stream);
             read_frame(&mut stream)
@@ -1810,7 +1485,6 @@ mod tests {
             connection.sync().await
         });
         let pong = peer_thread.join().unwrap();
-        // A `pong` has the payload of the `ping`, so only the message type differs.
         let mut expected = crate::fixtures::hex(crate::fixtures::PING_FRAME);
         let msg_type =
             crate::chainparams::MAGIC_SIZE..crate::chainparams::MAGIC_SIZE + "ping".len();
@@ -1823,7 +1497,6 @@ mod tests {
     #[test]
     fn refused_connect_is_connect_error() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
-        // Nothing listens on a port that was bound and then freed.
         let peer = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -1851,8 +1524,6 @@ mod tests {
     fn connect_takes_the_first_address_that_takes_it() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let listening = listener.local_addr().unwrap();
-        // Nothing listens on a port that was bound and then freed. The listener is open while
-        // the bind picks the port, so the two ports differ.
         let refused = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -1865,8 +1536,6 @@ mod tests {
 
     #[test]
     fn connect_to_no_address_gives_the_last_one_and_the_count() {
-        // Both listeners are open while the binds pick the ports, so the two ports differ.
-        // Nothing listens on them after the drop.
         let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let last = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addresses = [first.local_addr().unwrap(), last.local_addr().unwrap()];
@@ -1905,8 +1574,6 @@ mod tests {
             "{result:?}"
         );
 
-        // One more than the count max, after the unspecified ones. Each port is new, so the
-        // ones that it keeps are the first ones.
         let answers: Vec<std::net::SocketAddr> = (1..=super::ADDRESSES_COUNT_MAX + 1)
             .map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], u16::try_from(port).unwrap())))
             .collect();
@@ -1926,7 +1593,6 @@ mod tests {
         assert_eq!(kept, peer_addresses(&[first, second]));
     }
 
-    // The resolver of the OS reads `localhost` from its hosts file, with no name server.
     #[test]
     fn lookup_gives_the_addresses_of_a_name_with_the_port() {
         let name = super::Name::new("localhost").unwrap();
@@ -1947,8 +1613,6 @@ mod tests {
             "{result:?}"
         );
 
-        // One more than the count max, after one that the internet does not route to. Each port
-        // is new, so the ones that it keeps are the first ones.
         let answers: Vec<std::net::SocketAddr> = (1..=super::SEED_ADDRESSES_COUNT_MAX + 1)
             .map(|port| std::net::SocketAddr::from(([1, 1, 1, 1], u16::try_from(port).unwrap())))
             .collect();
@@ -1965,8 +1629,6 @@ mod tests {
     fn routable_is_each_address_but_this_host_private_networks_links_and_test_ranges() {
         let v4 = |a, b, c, d| std::net::IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d));
         let v6 = |text: &str| std::net::IpAddr::V6(text.parse().unwrap());
-        // The first and the last address of each range that the internet does not route to, and
-        // the addresses next to them.
         for (ip, routable) in [
             (v4(0, 0, 0, 1), false),
             (v4(0, 255, 255, 255), false),
@@ -2069,7 +1731,6 @@ mod tests {
         let network = crate::chainparams::Network::Mainnet;
         let source = super::Source::Seeds(super::Seeds::new(network).unwrap());
         let mut chosen = std::collections::BTreeSet::new();
-        // 8 seeds: a run of 1000 choices misses one of them once in about 2^190 runs.
         for _ in 0..1000 {
             let super::Destination::Seed { seed, port } = source.destination().into_owned() else {
                 panic!();
@@ -2095,9 +1756,6 @@ mod tests {
 
     #[test]
     fn each_salt_word_is_new() {
-        // A fixed salt, or one that reads a word twice, passes each other test, and a peer that
-        // knows the salt can make a chain that matches each bit. 6 random words are all different,
-        // but once in about 2^60 runs.
         let mut words = Vec::new();
         for salt in [super::salt().unwrap(), super::salt().unwrap()] {
             words.extend(salt.keys);

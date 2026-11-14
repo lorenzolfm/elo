@@ -1,43 +1,23 @@
-//! Proof of work.
-
-/// The headers of one period. The first header of a period has a height that is a multiple of this.
 const PERIOD_HEADERS_COUNT: usize = 2016;
 
-/// The seconds that a period of headers should take: two weeks.
 const PERIOD_TIMESPAN_SECONDS: u32 = 14 * 24 * 60 * 60;
 
-/// A period that takes less time counts as this, so a target falls by at most a factor of 4.
 const TIMESPAN_SECONDS_MIN: u32 = PERIOD_TIMESPAN_SECONDS / 4;
 
-/// A period that takes more time counts as this, so a target rises by at most a factor of 4.
 const TIMESPAN_SECONDS_MAX: u32 = PERIOD_TIMESPAN_SECONDS * 4;
 
-// The divide in the smallest time is exact, so the two factors are the same.
 const _: () = assert!(PERIOD_TIMESPAN_SECONDS.is_multiple_of(4));
 
-/// On testnet4, a header more than this many seconds after the header below it has the limit.
 const MIN_DIFFICULTY_GAP_SECONDS: u32 = 20 * 60;
 
-/// On testnet4, the first header of a period may have a time at most this many seconds below the
-/// header below it.
 const TIMEWARP_SECONDS_MAX: u32 = 10 * 60;
 
-// Each time above genesis is above the genesis time, so with this a real chain does not reach a
-// bound of zero. `Chain::extend` asserts the first half.
 const _: () = assert!(crate::chainparams::Network::Testnet4.genesis().time > TIMEWARP_SECONDS_MAX);
 
-/// The highest hash that a header may have. The bytes are big-endian, so the order of two arrays is
-/// the order of their numbers. Only `from_bits` makes one, so it is above zero and at most the
-/// limit that `from_bits` got.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Target([u8; 32]);
 
 impl Target {
-    /// Reads the compact form `bits`. Its first byte is the size of the number in bytes. Its other
-    /// three bytes are the first bytes of the number, so a number of fewer than three bytes uses
-    /// only the first of them. The first bit after the size byte is a sign. Returns nothing for a
-    /// number that is negative, is zero, does not fit in 32 bytes, or is above `limit`. A peer
-    /// picks `bits`, so no value may panic.
     fn from_bits(bits: u32, limit: [u8; 32]) -> Option<Target> {
         let [size, high, middle, low] = bits.to_be_bytes();
         if high & 0x80 != 0 {
@@ -46,14 +26,11 @@ impl Target {
         let mut target = [0; 32];
         for (word_index, byte) in [high, middle, low].into_iter().enumerate() {
             match (target.len() + word_index).checked_sub(usize::from(size)) {
-                // An index past the end is after the last byte of the number, so the number does
-                // not use this byte.
                 Some(target_index) => {
                     if let Some(place) = target.get_mut(target_index) {
                         *place = byte;
                     }
                 }
-                // Before the first byte of the target, only a zero fits.
                 None if byte == 0 => {}
                 None => return None,
             }
@@ -61,7 +38,6 @@ impl Target {
         if target == [0; 32] {
             return None;
         }
-        // A size of 0 or above 34 keeps no byte of the word, so it gives a target of zero.
         assert!(size >= 1);
         assert!(usize::from(size) <= target.len() + 2);
         if target > limit {
@@ -70,7 +46,6 @@ impl Target {
         Some(Target(target))
     }
 
-    /// `hash` is in wire order: the reverse of the order of a target.
     fn is_met_by(self, hash: bitcoin_hashes::sha256d::Hash) -> bool {
         assert_ne!(self.0, [0; 32]);
         let mut hash_big_endian = hash.to_byte_array();
@@ -79,9 +54,6 @@ impl Target {
     }
 }
 
-/// An amount of work: the count of hashes that a header, or a chain of headers, takes on average.
-/// It is a number of 256 bits in two halves. The high half is the first field, so the order of two
-/// amounts is the order of their fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Work {
     high: u128,
@@ -96,15 +68,9 @@ impl Work {
         low: u128::MAX,
     };
 
-    /// The work of one header with `target`: 2^256 over `target + 1`, rounded down. 2^256 does not
-    /// fit in 256 bits. But it is the inverse of `target` plus `target + 1`, so the answer is the
-    /// inverse over `target + 1`, plus one.
     fn of(target: Target) -> Work {
         let target = Work::from_be_bytes(target.0);
-        // `from_bits` gives no target of zero, so the divisor is at least 2.
         assert_ne!(target, Work::ZERO);
-        // `from_bits` keeps at most three bytes of a number, so no target has all bits set, and
-        // the add does not saturate.
         assert_ne!(target, Work::MAX);
         let divisor = target.saturating_add(Work::ONE);
         let inverse = Work {
@@ -112,14 +78,10 @@ impl Work {
             low: !target.low,
         };
         let quotient = inverse.divided_by(divisor);
-        // The divisor is at least 2, so the quotient is below 2^255: its top bit is clear, and the
-        // add does not saturate.
         assert_eq!(quotient.high >> 127, 0);
         quotient.saturating_add(Work::ONE)
     }
 
-    /// `self` plus `other`, or the highest number if the sum does not fit. Each header of a real
-    /// chain has far less work than this, so only peer bytes that no hash can meet reach it.
     pub(crate) fn saturating_add(self, other: Work) -> Work {
         let (low, carry) = self.low.overflowing_add(other.low);
         let sum = match self
@@ -130,14 +92,11 @@ impl Work {
             Some(high) => Work { high, low },
             None => Work::MAX,
         };
-        // A sum, saturated or not, is at least each part. `Chain::extend_store` reads this, when it
-        // asserts that the work of the chain rises.
         assert!(sum >= self);
         assert!(sum >= other);
         sum
     }
 
-    /// `self` minus `other`, which must be at most `self`.
     pub(crate) fn minus(self, other: Work) -> Work {
         assert!(other <= self);
         let (low, borrow) = self.low.overflowing_sub(other.low);
@@ -147,12 +106,8 @@ impl Work {
         }
     }
 
-    /// `self` over `divisor`, rounded down, by long division in base 2. The first step puts the
-    /// highest bit of `divisor` under the highest bit of `self`, and each step gives one bit of the
-    /// answer. So a small answer takes few steps.
     fn divided_by(self, divisor: Work) -> Work {
         assert_ne!(divisor, Work::ZERO);
-        // `divisor` has a higher bit than `self`, so it is above `self`.
         let Some(shift) = divisor.leading_zeros().checked_sub(self.leading_zeros()) else {
             return Work::ZERO;
         };
@@ -168,12 +123,10 @@ impl Work {
             step_divisor = step_divisor.shifted_right_once();
         }
         assert!(remainder < divisor);
-        // The divisor is at least 1.
         assert!(quotient <= self);
         quotient
     }
 
-    /// `self` times 2^`bits`, without the bits that pass 256. `bits` must be below 256.
     fn shifted_left(self, bits: u32) -> Work {
         assert!(bits < 256);
         if bits >= 128 {
@@ -182,9 +135,7 @@ impl Work {
                 low: 0,
             }
         } else {
-            // A shift of 128 does not fit a `u128`, so a shift of zero moves no bit up.
             let low_to_high = self.low.checked_shr(128 - bits).unwrap_or(0);
-            // The parts of each sum here share no bit, so the add is an or.
             Work {
                 high: (self.high << bits) + low_to_high,
                 low: self.low << bits,
@@ -192,16 +143,13 @@ impl Work {
         }
     }
 
-    /// `self` over 2, rounded down.
     fn shifted_right_once(self) -> Work {
-        // The two parts of the sum share no bit, so the add is an or.
         Work {
             high: self.high >> 1,
             low: (self.low >> 1) + (self.high << 127),
         }
     }
 
-    /// The count of zero bits above the highest one bit.
     fn leading_zeros(self) -> u32 {
         if self.high == 0 {
             128 + self.low.leading_zeros()
@@ -210,11 +158,9 @@ impl Work {
         }
     }
 
-    /// The number of 32 big-endian bytes.
     fn from_be_bytes(bytes: [u8; 32]) -> Work {
         bytes.into_iter().fold(Work::ZERO, |number, byte| {
             let shifted = number.shifted_left(8);
-            // The shift leaves the low byte zero, so the add is an or.
             Work {
                 low: shifted.low + u128::from(byte),
                 ..shifted
@@ -223,16 +169,12 @@ impl Work {
     }
 }
 
-/// Writes the number as 64 hex digits, with the zeros at the start.
 impl std::fmt::Display for Work {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:032x}{:032x}", self.high, self.low)
     }
 }
 
-/// The compact form of `number`, as `Target::from_bits` reads it. Only the first three bytes of the
-/// number stay. A first byte with its top bit set would read as the sign, so it moves one byte
-/// down and the size goes up by one. A number of zero gives zero, so `number` is no `Target`.
 fn to_bits(number: [u8; 32]) -> u32 {
     let mut size = 32_u8;
     let mut rest = number.as_slice();
@@ -254,12 +196,7 @@ fn to_bits(number: [u8; 32]) -> u32 {
     }
 }
 
-/// `number` times `timespan_seconds`, over `PERIOD_TIMESPAN_SECONDS`, rounded down, and at most
-/// `limit`. The multiply is first, so the divide sees all of the product. The answer can be zero,
-/// so it is no `Target`.
 fn scaled_up_to(mut number: [u8; 32], timespan_seconds: u32, limit: [u8; 32]) -> [u8; 32] {
-    // `high` holds the bytes of the product above the 32. A byte times a `u32`, plus a `high` of at
-    // most that `u32`, fits in a `u64`. So no number and no time can overflow.
     let mut high = 0_u64;
     for byte in number.iter_mut().rev() {
         let value = u64::from(*byte) * u64::from(timespan_seconds) + high;
@@ -267,16 +204,13 @@ fn scaled_up_to(mut number: [u8; 32], timespan_seconds: u32, limit: [u8; 32]) ->
         high = value >> 8;
     }
     let divisor = u64::from(PERIOD_TIMESPAN_SECONDS);
-    // The answer passes 32 bytes, so it is above each limit.
     if high >= divisor {
         return limit;
     }
-    // A remainder is below a `u32`, so with one more byte it fits in a `u64`.
     let mut remainder = high;
     for byte in &mut number {
         let value = (remainder << 8) + u64::from(*byte);
         let quotient = value / divisor;
-        // A remainder below `divisor` gives a quotient of one byte, so this drops no bit of it.
         assert!(quotient <= u64::from(u8::MAX));
         [.., *byte] = quotient.to_be_bytes();
         remainder = value % divisor;
@@ -284,19 +218,8 @@ fn scaled_up_to(mut number: [u8; 32], timespan_seconds: u32, limit: [u8; 32]) ->
     number.min(limit)
 }
 
-/// The `bits` of the next period. `bits` give the target to change, and `first_time` and
-/// `last_time` are the times of the first and the last header of the period that ends. The target
-/// changes by the time between them over `PERIOD_TIMESPAN_SECONDS`, by at most a factor of 4 in
-/// each direction, and it stays at most `limit`. Returns nothing if `bits` are no target up to
-/// `limit`, or if the answer is zero, which a target below 4 can reach. No header can pass in
-/// either case, and each answer is a target.
-///
-/// This takes `bits`, not a `Target`, and reads them with `limit`. So the limit that bounds the
-/// target and the limit that caps the answer cannot differ.
 fn retargeted_bits(bits: u32, first_time: u32, last_time: u32, limit: [u8; 32]) -> Option<u32> {
     let target = Target::from_bits(bits, limit)?;
-    // A time before `first_time` counts as zero, so it takes the smallest time, as any short time
-    // does.
     let timespan_seconds = last_time
         .saturating_sub(first_time)
         .clamp(TIMESPAN_SECONDS_MIN, TIMESPAN_SECONDS_MAX);
@@ -304,15 +227,10 @@ fn retargeted_bits(bits: u32, first_time: u32, last_time: u32, limit: [u8; 32]) 
     if next == 0 {
         return None;
     }
-    // This reads the answer with `from_bits`, not with the code that wrote it.
     assert!(Target::from_bits(next, limit).is_some());
     Some(next)
 }
 
-/// The `bits` of the last header of this period that does not have the limit. If each one has the
-/// limit, these are the limit. The header above `ancestors` must not start a period. The first
-/// header of a period comes from the change of the target, so this does not read below it. So this
-/// reads fewer than `PERIOD_HEADERS_COUNT` headers.
 fn last_real_bits(ancestors: crate::chain::Ancestors<'_>, limit_bits: u32) -> u32 {
     let height_above = ancestors.height_above();
     assert!(!height_above.is_multiple_of(PERIOD_HEADERS_COUNT));
@@ -324,14 +242,6 @@ fn last_real_bits(ancestors: crate::chain::Ancestors<'_>, limit_bits: u32) -> u3
         .unwrap_or(limit_bits)
 }
 
-/// The `bits` that a header with `time` must have on `ancestors`. Returns nothing if a change of
-/// the target has no answer, so no header can pass: a target below 4 fell to zero, or the `bits`
-/// that change are no target up to the limit, and a chain does not hold such `bits`. Inside a
-/// period this does not read `bits` as a target, so the answer is `bits` from below the header or
-/// the limit.
-///
-/// Regtest has one target. Each header of its chain has the `bits` of the limit, because its
-/// genesis has them and no rule gives other `bits`. So it needs no period and no time.
 #[must_use = "a dropped answer lets each `bits` pass"]
 pub(crate) fn required_bits(
     network: crate::chainparams::Network,
@@ -343,8 +253,6 @@ pub(crate) fn required_bits(
     let last = ancestors.last();
     let period_ends = height_above.is_multiple_of(PERIOD_HEADERS_COUNT);
     match network {
-        // `extend` checks the `bits` of a header before the rule reads that header, so peer bytes
-        // cannot reach this assert.
         crate::chainparams::Network::Regtest => {
             assert_eq!(last.bits, to_bits(limit));
             Some(last.bits)
@@ -357,8 +265,6 @@ pub(crate) fn required_bits(
                 Some(last.bits)
             }
         }
-        // The first header of a period cannot have the limit by a late time, so its `bits` are the
-        // real ones. The last header of a period can.
         crate::chainparams::Network::Testnet4 => {
             if period_ends {
                 let first = ancestors.at(height_above - PERIOD_HEADERS_COUNT);
@@ -372,17 +278,6 @@ pub(crate) fn required_bits(
     }
 }
 
-/// The lowest time that a header may have on `ancestors`, by the timewarp rule. Zero is no bound,
-/// because no time is below it.
-///
-/// A change of the target reads the first and the last time of one period, so it does not see the
-/// step from one period to the next. A chain could write a last time far ahead and then a first
-/// time far back. Each period then looks long, so the target rises while the clock of the chain
-/// stands still. This bounds that step. Only testnet4 has this rule.
-///
-/// A peer picks each time, so no value may panic. A last time of at most `TIMEWARP_SECONDS_MAX`
-/// gives zero, so each time passes. Each time above genesis is above the genesis time, so a real
-/// chain does not reach zero.
 #[must_use = "a dropped answer lets each time pass"]
 pub(crate) fn timewarp_time_min(
     network: crate::chainparams::Network,
@@ -399,7 +294,6 @@ pub(crate) fn timewarp_time_min(
             {
                 let last_time = ancestors.last().time;
                 let time_min = last_time.saturating_sub(TIMEWARP_SECONDS_MAX);
-                // A bound above the last time refuses a header that is not back at all.
                 assert!(time_min <= last_time);
                 time_min
             } else {
@@ -409,14 +303,6 @@ pub(crate) fn timewarp_time_min(
     }
 }
 
-/// `bits` may follow `bits_below` at `height` on `network`. This reads no time, so a check that
-/// keeps no headers can run it. Inside a period the `bits` stay the same. At the first header of a
-/// period, the target is at most 4 times above or below the target below it, and at most the
-/// limit. A late header of testnet4 has the limit, so on testnet4 and on regtest each `bits` may
-/// follow. `bits_below` must be a target up to the limit.
-///
-/// A peer with little hash power gets more work from a few hard headers than from many easy ones.
-/// So with no bound on each change, a cheap chain can show the minimum work in few headers.
 #[must_use = "a dropped answer lets each `bits` pass"]
 pub(crate) fn permits_bits_change(
     network: crate::chainparams::Network,
@@ -435,19 +321,13 @@ pub(crate) fn permits_bits_change(
             let Some(target) = Target::from_bits(bits, limit) else {
                 return false;
             };
-            // The longest timespan gives the highest target, and the shortest gives the lowest.
-            // Each one goes through the compact form, as the change of a target does.
             let bound = |last_time| {
                 retargeted_bits(bits_below, 0, last_time, limit)
                     .and_then(|bits| Target::from_bits(bits, limit))
             };
             let highest = bound(u32::MAX);
-            // The highest change is at most the limit and never zero, so each target up to the
-            // limit has one.
             assert!(highest.is_some());
             if highest.is_some_and(|highest| target.0 <= highest.0) {
-                // Only a target below 4 has a lowest change of zero, and then no target is below
-                // it.
                 bound(0).is_none_or(|lowest| lowest.0 <= target.0)
             } else {
                 false
@@ -456,8 +336,6 @@ pub(crate) fn permits_bits_change(
     }
 }
 
-/// The hash and the work of `header`, if its `bits` are a target in the range of `network` and the
-/// hash is at most that target.
 #[must_use = "a dropped answer lets each header pass"]
 pub(crate) fn proven(
     header: &crate::block::BlockHeader,
@@ -468,23 +346,15 @@ pub(crate) fn proven(
     target.is_met_by(hash).then(|| (hash, Work::of(target)))
 }
 
-/// The work of a header with `bits`, if they are a target in the range of `network`. It reads no
-/// hash, so it does not check proof of work: `proven` does.
 pub(crate) fn work(bits: u32, network: crate::chainparams::Network) -> Option<Work> {
     Target::from_bits(bits, network.pow_limit()).map(Work::of)
 }
 
-/// The lowest work that a chain of `network` must have when its sync ends.
 pub(crate) fn chain_work_min(network: crate::chainparams::Network) -> Work {
     Work::from_be_bytes(network.chain_work_min())
 }
 
-/// `header` with the first `nonce` that gives a hash below the regtest target, whatever its `bits`
-/// are. A top byte below 0x7f is below that target, so about every second nonce passes. The top
-/// byte of a hash is its last byte in wire order. This does not call the check above, so a check
-/// that reads the wrong byte refuses these headers. Only the tests and the fuzz script call this.
 #[cfg(any(test, fuzzing))]
-// Only cargo-mutants reads this attribute.
 #[cfg_attr(false, mutants::skip)]
 pub(crate) fn mined_for_regtest(header: crate::block::BlockHeader) -> crate::block::BlockHeader {
     let mined = (0..=u32::MAX)
@@ -497,13 +367,8 @@ pub(crate) fn mined_for_regtest(header: crate::block::BlockHeader) -> crate::blo
 }
 
 #[cfg(fuzzing)]
-// Only cargo-mutants reads this attribute. Its test runs do not build this module.
 #[cfg_attr(false, mutants::skip)]
 pub(crate) mod fuzz {
-    /// A peer picks each field of `header`, so its `bits` and its times go through the change of a
-    /// target, whose asserts must hold for any value. A header has one time, and `nonce` gives a
-    /// second `u32` that a peer picks, so it is the first time. Regtest has the highest limit, so
-    /// only it reaches a product above 32 bytes.
     pub(crate) fn retarget_check(header: &crate::block::BlockHeader) {
         for network in [
             crate::chainparams::Network::Mainnet,
@@ -514,7 +379,6 @@ pub(crate) mod fuzz {
             let next = super::retargeted_bits(header.bits, header.nonce, header.time, limit);
             match super::Target::from_bits(header.bits, limit) {
                 None => assert_eq!(next, None),
-                // Only a target below 4 can have no answer.
                 Some(super::Target([high @ .., low])) => {
                     assert!(next.is_some() || (high == [0; 31] && low < 4));
                 }
@@ -522,22 +386,12 @@ pub(crate) mod fuzz {
         }
     }
 
-    /// A peer picks `bits`, so each target goes through the work of a header, whose asserts must
-    /// hold for any target. No limit bounds it here, so a small target reaches the longest division
-    /// and a target above half of 2^256 the shortest.
     pub(crate) fn work_check(header: &crate::block::BlockHeader) {
         if let Some(target) = super::Target::from_bits(header.bits, [0xff; 32]) {
             assert!(super::Work::of(target) >= super::Work::ONE);
         }
     }
 
-    /// A peer picks each `bits` and each `time` of `headers`, so each header goes through the rule
-    /// of each network, as the header above the ones before it. The rule must return for any value,
-    /// apart from one case: on regtest it asserts that the header below has the limit, because a
-    /// chain holds no other `bits`. So on regtest this stops at a header with other `bits`. A batch
-    /// has fewer headers than a period, so no period ends here, and a period that ends would fail
-    /// the assert on mainnet. These checks do not repeat the walk of testnet4: its answer must only
-    /// be the limit or `bits` from below the header.
     pub(crate) fn required_bits_check(headers: &[crate::block::BlockHeader]) {
         for network in [
             crate::chainparams::Network::Mainnet,
@@ -575,17 +429,14 @@ pub(crate) mod fuzz {
 
 #[cfg(test)]
 mod tests {
-    /// A target from its 32 bytes in hex.
     fn target(s: &str) -> super::Target {
         super::Target(crate::fixtures::hex(s).try_into().unwrap())
     }
 
     #[test]
     fn from_bits_reads_the_compact_form() {
-        // The limit is above each target, so only the compact form can refuse.
         let limit = [0xff; 32];
         let cases = [
-            // A size of three bytes or fewer. The sign bit is not a bit of the number.
             (
                 0x0112_3456,
                 "0000000000000000000000000000000000000000000000000000000000000012",
@@ -602,7 +453,6 @@ mod tests {
                 0x0312_3456,
                 "0000000000000000000000000000000000000000000000000000000000123456",
             ),
-            // A size above three bytes.
             (
                 0x0412_3456,
                 "0000000000000000000000000000000000000000000000000000000012345600",
@@ -615,7 +465,6 @@ mod tests {
                 0x2012_3456,
                 "1234560000000000000000000000000000000000000000000000000000000000",
             ),
-            // At the top of the target: the size may pass 32 only by the zeros at the word's start.
             (
                 0x2100_ffff,
                 "ffff000000000000000000000000000000000000000000000000000000000000",
@@ -636,30 +485,23 @@ mod tests {
 
     #[test]
     fn from_bits_refuses_zero_and_negative_and_what_does_not_fit() {
-        // The limit is above each target, so only the compact form can refuse.
         let limit = [0xff; 32];
         let cases = [
-            // Zero: the word is zero, or it has no byte that the size keeps.
             0x0000_0000,
             0x0012_3456,
             0x0100_3456,
             0x0200_0056,
             0x0300_0000,
             0x0400_0000,
-            // Zero with the sign bit.
             0x0092_3456,
             0x0180_3456,
             0x0280_0056,
             0x0380_0000,
             0x0480_0000,
-            // Negative, with a number that is not zero.
             0x01fe_dcba,
             0x0492_3456,
-            // At the top of the target: another byte of the word is not zero, so only the fit
-            // refuses it.
             0x2101_0001,
             0x2200_0101,
-            // No byte of the word fits.
             0x2300_0001,
             0xff12_3456,
         ];
@@ -707,7 +549,6 @@ mod tests {
                 0x1d00_ffff,
                 0x1d01_0000,
             ),
-            // These `bits` are exactly the limit.
             (
                 crate::chainparams::Network::Signet,
                 0x1e03_77ae,
@@ -732,7 +573,6 @@ mod tests {
         }
     }
 
-    /// 32 bytes from hex.
     fn number(s: &str) -> [u8; 32] {
         crate::fixtures::hex(s).try_into().unwrap()
     }
@@ -744,7 +584,6 @@ mod tests {
                 "0000000000000000000000000000000000000000000000000000000000000000",
                 0x0000_0000,
             ),
-            // One or two bytes: the bytes after the number are zero.
             (
                 "0000000000000000000000000000000000000000000000000000000000000012",
                 0x0112_0000,
@@ -757,12 +596,10 @@ mod tests {
                 "0000000000000000000000000000000000000000000000000000000000123456",
                 0x0312_3456,
             ),
-            // Only the first three bytes stay.
             (
                 "0000000000000000000000000000000000000000000000000000000012345678",
                 0x0412_3456,
             ),
-            // A first byte with its top bit set moves one byte down.
             (
                 "0000000000000000000000000000000000000000000000000000000000000080",
                 0x0200_8000,
@@ -775,7 +612,6 @@ mod tests {
                 "0000000000000000000000000000000000000000000000000000000092345678",
                 0x0500_9234,
             ),
-            // The whole width.
             (
                 "1234560000000000000000000000000000000000000000000000000000000000",
                 0x2012_3456,
@@ -806,8 +642,6 @@ mod tests {
         }
     }
 
-    /// Each row has a name, `bits`, the first time, the last time and the answer on the mainnet
-    /// limit.
     fn assert_retargets(cases: &[(&str, u32, u32, u32, u32)]) {
         let limit = crate::chainparams::Network::Mainnet.pow_limit();
         for &(name, bits, first_time, last_time, expected) in cases {
@@ -821,8 +655,6 @@ mod tests {
 
     #[test]
     fn retargeted_bits_match_real_retargets() {
-        // These come from `pow_tests.cpp` of Bitcoin Core: real mainnet retargets, but the first
-        // time of the last row is not a real block time.
         assert_retargets(&[
             ("no bound", 0x1d00_ffff, 1261130161, 1262152739, 0x1d00_d86a),
             (
@@ -852,7 +684,6 @@ mod tests {
     #[test]
     fn retargeted_bits_change_with_the_time_of_the_period() {
         assert_retargets(&[
-            // At a bound, a second inside it changes the answer and a second outside it does not.
             (
                 "below a quarter",
                 0x1c7f_ffff,
@@ -884,9 +715,7 @@ mod tests {
                 0x1b7f_fffc,
             ),
             ("the same", 0x1c04_0000, 1_000_000, 2_209_600, 0x1c04_0000),
-            // A time that goes back counts as a short time.
             ("back", 0x1c7f_ffff, 1_302_401, 1_000_000, 0x1c1f_ffff),
-            // The multiply is first: a divide first gives zero.
             ("one", 0x0101_0000, 1_000_000, 2_209_600, 0x0101_0000),
         ]);
     }
@@ -906,7 +735,6 @@ mod tests {
     #[test]
     fn retargeted_bits_refuse_an_answer_of_zero() {
         let limit = crate::chainparams::Network::Mainnet.pow_limit();
-        // The time is the smallest, so the answer is a quarter of the target, rounded down.
         for (bits, expected) in [(0x0103_0000, None), (0x0104_0000, Some(0x0101_0000))] {
             assert_eq!(
                 super::retargeted_bits(bits, 1_000_000, 1_000_000, limit),
@@ -918,8 +746,6 @@ mod tests {
 
     #[test]
     fn the_largest_change_of_a_limit_is_four_times_it() {
-        // These answers are from big integers, not from this code. The cap is above each one, so it
-        // hides no wrong answer.
         let mainnet = "00000003fffffffffffffffffffffffffffffffffffffffffffffffffffffffc";
         for (network, expected) in [
             (crate::chainparams::Network::Mainnet, mainnet),
@@ -939,14 +765,10 @@ mod tests {
 
     #[test]
     fn retargeted_bits_keep_a_product_above_32_bytes() {
-        // These answers are from big integers, not from this code.
         let limit = crate::chainparams::Network::Regtest.pow_limit();
         for (bits, last_time, expected) in [
-            // The product passes 32 bytes, but the answer does not.
             (0x207f_ffff, 1_302_400, 0x201f_ffff),
-            // The answer also passes 32 bytes, so it takes the limit.
             (0x207f_ffff, 5_838_400, 0x207f_ffff),
-            // The answer is exactly 2^256: the smallest number above 32 bytes.
             (0x2040_0000, 5_838_400, 0x207f_ffff),
         ] {
             assert_eq!(
@@ -957,7 +779,6 @@ mod tests {
         }
     }
 
-    /// `count` headers with `bits`, each 600 seconds after the header before it.
     fn headers(count: u32, bits: u32) -> Vec<crate::block::BlockHeader> {
         (0..count)
             .map(|index| crate::block::BlockHeader {
@@ -968,7 +789,6 @@ mod tests {
             .collect()
     }
 
-    /// `chain` as the headers below one header. The rule reads each part the same way.
     fn ancestors(chain: &[crate::block::BlockHeader]) -> crate::chain::Ancestors<'_> {
         let (tip, batch) = chain.split_first().unwrap();
         crate::chain::Ancestors::on_tip(tip, batch)
@@ -986,7 +806,6 @@ mod tests {
             for count in [1, 2015, 2017] {
                 let mut chain = headers(count, REAL_BITS);
                 chain.last_mut().unwrap().bits = LOW_BITS;
-                // A late time changes nothing on these networks.
                 assert_eq!(
                     super::required_bits(network, ancestors(&chain), u32::MAX),
                     Some(LOW_BITS),
@@ -998,9 +817,6 @@ mod tests {
 
     #[test]
     fn required_bits_read_the_end_of_a_period_in_a_batch() {
-        // A sync in full batches ends each batch at an even height, and the last header of a period
-        // has an odd height. So that header is always in the batch, and this reads it there. The
-        // answer is from big integers, not from this code.
         let chain = headers(2016, REAL_BITS);
         for network in [
             crate::chainparams::Network::Mainnet,
@@ -1024,7 +840,6 @@ mod tests {
         for (time, expected) in [
             (last_time + 1201, limit_bits),
             (last_time + 1200, REAL_BITS),
-            // A time that goes back is not late.
             (last_time - 1, REAL_BITS),
         ] {
             assert_eq!(
@@ -1039,7 +854,6 @@ mod tests {
     fn required_bits_on_testnet4_go_back_to_the_last_real_bits() {
         let network = crate::chainparams::Network::Testnet4;
         let limit_bits = network.genesis().bits;
-        // Each case gives the `bits` from height 0. The time is not late, so the rule goes back.
         let last_of_period = {
             let mut bits = vec![limit_bits; 2015];
             bits[2014] = REAL_BITS;
@@ -1074,7 +888,6 @@ mod tests {
                 start_of_period_real,
                 REAL_BITS,
             ),
-            // The real `bits` below the period do not count.
             ("not below the period", start_of_period_at_limit, limit_bits),
         ] {
             let chain: Vec<_> = bits
@@ -1097,7 +910,6 @@ mod tests {
     fn required_bits_on_regtest_are_the_limit_at_each_height() {
         let network = crate::chainparams::Network::Regtest;
         let limit_bits = network.genesis().bits;
-        // A period ends at 2016, and the math that changes a target gives other `bits` there.
         for count in [1, 2015, 2016] {
             assert_eq!(
                 super::required_bits(network, ancestors(&headers(count, limit_bits)), u32::MAX),
@@ -1109,9 +921,6 @@ mod tests {
 
     #[test]
     fn timewarp_bound_stops_at_zero() {
-        // A real chain has no last time below 600, because each time above genesis is above the
-        // genesis time. So the rows of `Chain::extend` do not reach zero. A person wrote each
-        // answer.
         let mut chain = headers(2016, REAL_BITS);
         for (last_time, expected) in [
             (0, 0),
@@ -1132,30 +941,23 @@ mod tests {
 
     #[test]
     fn work_is_two_to_the_256_over_the_target_plus_one() {
-        // These answers are from big integers, not from this code. The limit is above each target.
         let limit = [0xff; 32];
         for (bits, expected) in [
-            // Mainnet and testnet4 genesis, signet genesis and regtest genesis.
             (0x1d00_ffff, "100010001"),
             (0x1e03_77ae, "49d414"),
             (0x207f_ffff, "2"),
-            // A real mainnet `bits` from 2026.
             (0x1703_4219, "4e9235f043634662e0cb"),
-            // A target of 1 gives the highest work: 256 steps of the division.
             (
                 0x0101_0000,
                 "8000000000000000000000000000000000000000000000000000000000000000",
             ),
-            // Each bit of the answer is in use, in both halves.
             (
                 0x0300_8000,
                 "1fffc0007fff0001fffc0007fff0001fffc0007fff0001fffc0007fff0001",
             ),
             (0x107f_ffff, "200000400000800001000002000003ffc"),
-            // At the edge of the two halves.
             (0x1100_8000, "1fffffffffffffffffffffffffffffffc"),
             (0x1101_0000, "ffffffffffffffffffffffffffffffff"),
-            // A target above half of 2^256 has the lowest work.
             (0x2100_ffff, "1"),
         ] {
             let target = super::Target::from_bits(bits, limit).unwrap();
@@ -1172,11 +974,8 @@ mod tests {
         let work = |high, low| super::Work { high, low };
         for (left, right, expected) in [
             (work(0, u128::MAX), work(0, 1), work(1, 0)),
-            // Exactly the highest number fits.
             (work(u128::MAX, 0), work(0, u128::MAX), super::Work::MAX),
-            // Only the carry passes 256 bits.
             (super::Work::MAX, work(0, 1), super::Work::MAX),
-            // Only the high halves pass 256 bits.
             (work(u128::MAX, 0), work(1, 0), super::Work::MAX),
         ] {
             assert_eq!(left.saturating_add(right), expected, "{left} {right}");
@@ -1185,8 +984,6 @@ mod tests {
 
     #[test]
     fn chain_work_min_is_the_minimum_of_its_network() {
-        // A person copied each minimum from the source of the network. Regtest has no real chain,
-        // so its minimum is zero.
         for (network, minimum) in [
             (
                 crate::chainparams::Network::Mainnet,
@@ -1213,8 +1010,6 @@ mod tests {
 
     #[test]
     fn each_genesis_has_proof_of_work() {
-        // Real headers, so this also shows the byte order of the hash: in wire order, each hash
-        // but the regtest one starts with bytes above its target.
         for network in [
             crate::chainparams::Network::Mainnet,
             crate::chainparams::Network::Testnet4,
@@ -1230,13 +1025,9 @@ mod tests {
         }
     }
 
-    /// A person wrote each answer from the rule: the bounds of a change are a target over 4 and
-    /// times 4, at most the limit, each one rounded down to its compact form. A script that ran
-    /// the same rule with big numbers gave the same answers.
     #[test]
     fn permits_bits_change_bounds_each_change_of_the_target() {
         let cases = [
-            // Inside a period the `bits` stay the same.
             (
                 crate::chainparams::Network::Mainnet,
                 32_255,
@@ -1265,7 +1056,6 @@ mod tests {
                 0x1e00_ddeb,
                 false,
             ),
-            // The first change of the target of mainnet, at height 32256.
             (
                 crate::chainparams::Network::Mainnet,
                 32_256,
@@ -1273,7 +1063,6 @@ mod tests {
                 0x1d00_d86a,
                 true,
             ),
-            // The highest change of the limit is the limit, and the bits above it are no target.
             (
                 crate::chainparams::Network::Mainnet,
                 32_256,
@@ -1281,7 +1070,6 @@ mod tests {
                 0x1d01_0000,
                 false,
             ),
-            // The lowest change: the limit over 4, and one below it.
             (
                 crate::chainparams::Network::Mainnet,
                 32_256,
@@ -1296,8 +1084,6 @@ mod tests {
                 0x1c3f_ffbf,
                 false,
             ),
-            // Below the limit, the highest change is 4 times the target. Over 4, the target loses
-            // its low bits in the compact form.
             (
                 crate::chainparams::Network::Mainnet,
                 4_032,
@@ -1326,7 +1112,6 @@ mod tests {
                 0x1b01_0131,
                 false,
             ),
-            // A target of 3 over 4 is zero, so it has no lowest change.
             (
                 crate::chainparams::Network::Mainnet,
                 2_016,
@@ -1348,7 +1133,6 @@ mod tests {
                 0x010d_0000,
                 false,
             ),
-            // The lowest change of the signet limit.
             (
                 crate::chainparams::Network::Signet,
                 2_016,
@@ -1363,7 +1147,6 @@ mod tests {
                 0x1e00_ddea,
                 false,
             ),
-            // Testnet4 and regtest permit each change.
             (
                 crate::chainparams::Network::Testnet4,
                 1,

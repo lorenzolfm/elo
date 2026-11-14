@@ -11,9 +11,6 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  # A new push to a pull request cancels the older run. A push to main does
-  # not, so a run on main that started gets a result. A run that waits is
-  # still dropped when a newer one comes.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -23,50 +20,37 @@ jobs:
     timeout-minutes: 20
     strategy:
       fail-fast: false
-      # One job for each derivation, so the runners work in parallel. A single
-      # `nix flake check` puts every gate behind one log and one runner.
       matrix:
-        gate: [elo, elo-clippy, elo-test, elo-doctest, elo-fmt, elo-fuzz, elo-fuzz-image, elo-image]
+        gate: [elo, elo-clippy, elo-test, elo-doctest, elo-fmt, elo-comments, elo-fuzz, elo-fuzz-image, elo-image]
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
-      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
 
-      # flake.lock pins each tool, and rust-toolchain.toml pins the compiler.
-      # No installer step chooses a different version.
       - run: nix build --print-build-logs ".#${{ matrix.gate }}"
 
-      # Build the package and its dependencies a second time. Nix fails the
-      # step if an output is not the same bytes. `--rebuild` does not rebuild
-      # inputs, so the dependencies are named on their own.
       - if: matrix.gate == 'elo'
         run: nix build --print-build-logs --rebuild .#elo .#elo.cargoArtifacts
 
-  # Runs each mutant on the lines that a pull request changes. A push has no such diff.
   mutants:
     name: mutants
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-          # A pull request checks out its merge commit. Depth 2 also gets the parents of that
-          # commit, so the diff is what the merge adds to `main`.
           fetch-depth: 2
 
-      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
 
-      # git quotes a non-ASCII path by default, and cargo-mutants cannot parse that quoting.
       - run: |
           git -c core.quotePath=false diff HEAD^1 HEAD > "$RUNNER_TEMP/pull-request.diff"
           nix develop --command cargo mutants --in-diff "$RUNNER_TEMP/pull-request.diff" --jobs 2
 
-  # A long fuzz run takes this image. Only a push to main reaches this job, so a pull request
-  # cannot push an image.
   fuzz-image:
     name: fuzz image
     if: github.event_name == 'push'
@@ -77,32 +61,24 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
-      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
 
       - run: nix build --print-build-logs .#elo-fuzz-image
 
-      # No build runs the entry point, so run a short session. A crash in it also stops the push,
-      # so `main` stays on the last image that ran. Each target takes at least 1 s, so 8 s leaves
-      # room for new targets. Not in a gate, because a gate must not depend on a random run.
       - run: |
           docker load --input result
           data="$(mktemp --directory)"
           docker run --rm --read-only --network none --user "$(id -u):$(id -g)" \
             --volume "$data:/data" elo-fuzz:local 8
 
-      # `sha-` first, so `main` never names an image that has no commit tag.
       - env:
           GHCR_TOKEN: ${{ github.token }}
         run: |
           echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          # A re-run of an older run pushes its `sha-` tag again, but must not move `main` back.
-          # The concurrency group runs one push run at a time, so the run of a newer head waits and
-          # moves `main` after this one. No pipe, because the step has no `pipefail`, and a failed
-          # read must fail the step.
           head="$(git ls-remote --exit-code origin refs/heads/main)"
           tags="sha-$GITHUB_SHA"
           if test "${head%%[[:space:]]*}" = "$GITHUB_SHA"; then tags="$tags main"; fi
@@ -111,7 +87,6 @@ jobs:
             docker push "ghcr.io/lorenzolfm/elo-fuzz:$tag"
           done
 
-  # A deployment of elo takes this image. As for `fuzz-image`, only a push to main reaches this job.
   image:
     name: image
     if: github.event_name == 'push'
@@ -122,21 +97,16 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
-      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
 
       - run: nix build --print-build-logs .#elo-image
 
-      # No build runs the entry point, so the image syncs from a regtest bitcoind on the runner,
-      # with the bitcoind of `flake.lock`. Then the job stops the container. Exit 0 is the handler
-      # of elo, as PID 1. With no handler, the stop ends in SIGKILL: 137.
       - run: |
           docker load --input result
-          # The push tags the image `sha-<commit>`, so its label must name the same commit, and
-          # not `dirty`.
           revision='{{index .Config.Labels "org.opencontainers.image.revision"}}'
           test "$(docker inspect elo:local --format "$revision")" = "$GITHUB_SHA"
           datadir="$(mktemp --directory)"
@@ -144,13 +114,10 @@ jobs:
             -datadir="$datadir" -daemonwait
           docker run --detach --name elo --read-only --cap-drop ALL \
             --security-opt no-new-privileges --network host elo:local regtest 127.0.0.1
-          # Height 0, the regtest genesis and its work.
           genesis=0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206
           tip="level=info event=tip peer=127.0.0.1:18444 height=0"
           tip="$tip hash=$genesis work=$(printf '%064x' 2)"
-          # The wait and the check after it read the same line.
           has_tip() { docker logs elo | grep --fixed-strings --line-regexp --quiet "$tip"; }
-          # A container that stopped cannot print the line later, so the wait ends there too.
           for _ in $(seq 60); do
             has_tip && break
             test "$(docker inspect elo --format '{{.State.Running}}')" = true || break
@@ -161,15 +128,10 @@ jobs:
           docker stop --timeout 10 elo
           test "$(docker inspect elo --format '{{.State.ExitCode}}')" = 0
 
-      # `sha-` first, so `main` never names an image that has no commit tag.
       - env:
           GHCR_TOKEN: ${{ github.token }}
         run: |
           echo "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          # A re-run of an older run pushes its `sha-` tag again, but must not move `main` back.
-          # The concurrency group runs one push run at a time, so the run of a newer head waits and
-          # moves `main` after this one. No pipe, because the step has no `pipefail`, and a failed
-          # read must fail the step.
           head="$(git ls-remote --exit-code origin refs/heads/main)"
           tags="sha-$GITHUB_SHA"
           if test "${head%%[[:space:]]*}" = "$GITHUB_SHA"; then tags="$tags main"; fi
