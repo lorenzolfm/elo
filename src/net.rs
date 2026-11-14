@@ -25,6 +25,12 @@ const LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// this bounds the time of a dial.
 const ADDRESSES_COUNT_MAX: usize = 256;
 
+/// The most addresses of a seed that one dial tries. A seed has many nodes, and the next dial asks
+/// a seed again, so a seed whose answers are down costs at most this many tries.
+const SEED_ADDRESSES_COUNT_MAX: usize = 32;
+
+const _: () = assert!(SEED_ADDRESSES_COUNT_MAX <= ADDRESSES_COUNT_MAX);
+
 /// The most bytes of a name, with no `.` at the end.
 const NAME_LENGTH_MAX: usize = 253;
 
@@ -36,14 +42,100 @@ const LABEL_LENGTH_MAX: usize = 63;
 /// IPv6 address with a scope.
 pub(crate) const DESTINATION_LENGTH_MAX: usize = NAME_LENGTH_MAX + ".".len() + ":65535".len();
 
-/// The peer that the command line names.
+/// Where the destination of each dial comes from: the peer that the command line names, or the
+/// seeds of the network when it names none.
 #[derive(Debug, PartialEq, Eq)]
+pub enum Source {
+    /// The same destination for each dial.
+    Destination(Destination),
+    /// A seed of the network for each dial, at random.
+    Seeds(Seeds),
+}
+
+impl Source {
+    /// The destination of the next dial.
+    pub fn destination(&self) -> std::borrow::Cow<'_, Destination> {
+        match self {
+            Source::Destination(destination) => std::borrow::Cow::Borrowed(destination),
+            Source::Seeds(seeds) => std::borrow::Cow::Owned(seeds.choose()),
+        }
+    }
+}
+
+/// The seeds of a network that has seeds. Only `Seeds::new` makes one, so it has at least one.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Seeds {
+    first: &'static str,
+    rest: &'static [&'static str],
+    port: std::num::NonZeroU16,
+}
+
+impl Seeds {
+    /// The seeds of `network`, or `None` if it has none.
+    pub fn new(network: crate::chainparams::Network) -> Option<Seeds> {
+        let (&first, rest) = network.seeds().split_first()?;
+        Some(Seeds {
+            first,
+            rest,
+            port: network.default_port(),
+        })
+    }
+
+    /// One of the seeds, at random, at the default port of the network. The choice needs no
+    /// secret, so it comes from the keys of `RandomState`: the seed with the lowest hash.
+    fn choose(&self) -> Destination {
+        let random = std::hash::RandomState::new();
+        let first = (self.first, random.hash_one(self.first));
+        let (seed, _) = self.rest.iter().fold(first, |chosen, &seed| {
+            let hash = random.hash_one(seed);
+            if hash < chosen.1 {
+                (seed, hash)
+            } else {
+                chosen
+            }
+        });
+        Destination::Seed {
+            seed: Seed(seed),
+            port: self.port,
+        }
+    }
+}
+
+/// A seed of a network. Only `Seeds::choose` makes one, so it is on the list of its network.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Seed(&'static str);
+
+impl Seed {
+    /// The name of the seed with the services that elo asks for. A seed answers
+    /// `x<services in hex>.<seed>` with only the nodes that offer each one of them. Some seeds have
+    /// no such names, and answer only the seed itself.
+    fn services_name(&self) -> String {
+        let services = crate::protocol::ServiceFlags::NETWORK_WITNESS;
+        format!("x{services:x}.{}", self.0)
+    }
+}
+
+impl std::fmt::Display for Seed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// What one dial looks up and connects to.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Destination {
     /// An IP address, which `handshake` dials with no lookup.
     Address(PeerAddress),
     /// A name, which `handshake` looks up before each dial.
     Name {
         name: Name,
+        port: std::num::NonZeroU16,
+    },
+    /// A seed, which `handshake` looks up with the services that elo asks for, and then without
+    /// them if that gives no address. Of its answers, it dials only the addresses that the
+    /// internet routes to.
+    Seed {
+        seed: Seed,
         port: std::num::NonZeroU16,
     },
 }
@@ -53,6 +145,7 @@ impl std::fmt::Display for Destination {
         match self {
             Destination::Address(address) => write!(f, "{}", address.0),
             Destination::Name { name, port } => write!(f, "{name}:{port}"),
+            Destination::Seed { seed, port } => write!(f, "{seed}:{port}"),
         }
     }
 }
@@ -75,7 +168,7 @@ impl PeerAddress {
 }
 
 /// The name of a host. Only `Name::new` makes one, so each name has the form that it checks.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Name(String);
 
 impl Name {
@@ -102,6 +195,42 @@ impl Name {
 impl std::fmt::Display for Name {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+/// Whether the internet routes to `ip`. The others are this host, a private network, a link, or
+/// a range for documentation or tests. A node on the internet cannot have them, so a seed that
+/// gives one is wrong, or points elo at a host that is not on the network. An IPv4 address in IPv6
+/// is checked as the IPv4 address. A multicast address passes, and its connect fails.
+fn is_routable(ip: std::net::IpAddr) -> bool {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(ip) => {
+            let [first, second, _, _] = ip.octets();
+            let is_this_network = first == 0;
+            let is_shared = first == 100 && (64..=127).contains(&second);
+            let is_benchmarking = first == 198 && (second == 18 || second == 19);
+            !(is_this_network
+                || ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || is_shared
+                || is_benchmarking
+                || ip.is_documentation()
+                || ip.is_broadcast())
+        }
+        std::net::IpAddr::V6(ip) => {
+            let [first, second, ..] = ip.segments();
+            let is_documentation = first == 0x2001 && second == 0x0db8;
+            // ORCHID, `2001:10::/28`, and ORCHIDv2, `2001:20::/28`: names that no route reaches.
+            let is_orchid =
+                first == 0x2001 && (second & 0xfff0 == 0x0010 || second & 0xfff0 == 0x0020);
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || is_documentation
+                || is_orchid)
+        }
     }
 }
 
@@ -144,7 +273,7 @@ pub enum LookupError {
     Failed(std::io::Error),
     /// The lookup took longer than `LOOKUP_TIMEOUT`.
     Timeout,
-    /// The name has no address that names a peer.
+    /// The lookup gave no address that `handshake` may dial.
     Empty,
 }
 
@@ -352,8 +481,8 @@ enum PartialFrame {
     },
 }
 
-/// Looks up `destination` if it is a name. Then dials the first of its addresses that takes the
-/// TCP connect, in the order of `dial_order`, on the network of `chain`, and runs the handshake.
+/// Looks up `destination` if it is a name or a seed. Then dials the first of its addresses that
+/// takes the TCP connect, in a random order, on the network of `chain`, and runs the handshake.
 /// Returns the connection for the messages after it, and their `version`. The sync of the
 /// connection extends `chain` from its tip, so the next connection with the same chain does not
 /// get those headers again. A chain below the minimum work starts again from genesis. A peer
@@ -363,17 +492,31 @@ pub async fn handshake<'a>(
     destination: &Destination,
     chain: &'a mut crate::chain::Chain,
 ) -> Result<(Connection<'a>, crate::protocol::Version), HandshakeError> {
-    let addresses = match destination {
-        Destination::Address(address) => Addresses {
-            before: Vec::new(),
-            last: *address,
-        },
-        Destination::Name { name, port } => {
-            lookup(name, *port).await.map_err(HandshakeError::Lookup)?
-        }
-    };
+    let addresses = addresses(destination)
+        .await
+        .map_err(HandshakeError::Lookup)?;
     let (address, stream) = connect_first(&addresses).await?;
     handshake_stream(address, stream, chain).await
+}
+
+/// The addresses that a dial to `destination` tries: its address, or the answers of its lookup in
+/// the order of `name_order` or `seed_order`.
+async fn addresses(destination: &Destination) -> Result<Addresses, LookupError> {
+    match destination {
+        Destination::Address(address) => Ok(Addresses {
+            before: Vec::new(),
+            last: *address,
+        }),
+        Destination::Name { name, port } => name_order(lookup(&name.0, *port).await?),
+        Destination::Seed { seed, port } => {
+            // The error of the second lookup is the one that the dial gives.
+            let services = lookup(&seed.services_name(), *port).await;
+            match services.and_then(seed_order) {
+                Ok(addresses) => Ok(addresses),
+                Err(_) => seed_order(lookup(seed.0, *port).await?),
+            }
+        }
+    }
 }
 
 /// The addresses that one dial tries, in order: each one of `before`, then `last`. So a dial has
@@ -384,27 +527,52 @@ struct Addresses {
     last: PeerAddress,
 }
 
-/// The addresses of `name` at `port`, as `dial_order` gives them.
-async fn lookup(name: &Name, port: std::num::NonZeroU16) -> Result<Addresses, LookupError> {
-    let answers = tokio::net::lookup_host((name.0.as_str(), port.get()));
+/// The addresses of `host` at `port`, as the resolver of the OS gives them.
+async fn lookup(
+    host: &str,
+    port: std::num::NonZeroU16,
+) -> Result<Vec<std::net::SocketAddr>, LookupError> {
+    let answers = tokio::net::lookup_host((host, port.get()));
     match tokio::time::timeout(LOOKUP_TIMEOUT, answers).await {
-        Ok(Ok(answers)) => dial_order(answers),
+        Ok(Ok(answers)) => Ok(answers.collect()),
         Ok(Err(error)) => Err(LookupError::Failed(error)),
         Err(_elapsed) => Err(LookupError::Timeout),
     }
 }
 
-/// The `answers` of a lookup that name a peer, at most `ADDRESSES_COUNT_MAX`, each one time, in a
-/// random order. So each dial can start on another address of a name that has many, such as a
-/// seed. The order needs no secret, so it comes from the keys of `RandomState`.
-fn dial_order(
-    answers: impl Iterator<Item = std::net::SocketAddr>,
+/// The `answers` of the lookup of a name that name a peer, at most `ADDRESSES_COUNT_MAX`, in the
+/// order of `dial_order`. The person who names the host chose its addresses, so a name can be on
+/// this host or on a private network.
+fn name_order(
+    answers: impl IntoIterator<Item = std::net::SocketAddr>,
 ) -> Result<Addresses, LookupError> {
     // Some resolvers give `0.0.0.0` or `::` for a name that they block.
-    let mut before: Vec<PeerAddress> = answers
+    let answers = answers.into_iter().filter_map(PeerAddress::new);
+    dial_order(answers, ADDRESSES_COUNT_MAX)
+}
+
+/// The `answers` of the lookup of a seed that name a peer that the internet routes to, at most
+/// `SEED_ADDRESSES_COUNT_MAX`, in the order of `dial_order`. The seed chose its answers, and not
+/// the person who runs elo.
+fn seed_order(
+    answers: impl IntoIterator<Item = std::net::SocketAddr>,
+) -> Result<Addresses, LookupError> {
+    let routable = answers
+        .into_iter()
         .filter_map(PeerAddress::new)
-        .take(ADDRESSES_COUNT_MAX)
-        .collect();
+        .filter(|address| is_routable(address.0.ip()));
+    dial_order(routable, SEED_ADDRESSES_COUNT_MAX)
+}
+
+/// At most `count_max` of `answers`, each one time, in a random order. So each dial can start on
+/// another address of a name that has many, such as a seed. The order needs no secret, so it comes
+/// from the keys of `RandomState`.
+fn dial_order(
+    answers: impl Iterator<Item = PeerAddress>,
+    count_max: usize,
+) -> Result<Addresses, LookupError> {
+    assert!(count_max <= ADDRESSES_COUNT_MAX, "{count_max}");
+    let mut before: Vec<PeerAddress> = answers.take(count_max).collect();
     // A hosts file can have the same name and address on two lines. A second try of an address
     // costs up to `CONNECT_TIMEOUT` again.
     before.sort_unstable_by_key(|address| address.0);
@@ -1716,14 +1884,14 @@ mod tests {
     }
 
     #[test]
-    fn dial_order_drops_the_answers_that_name_no_peer_and_keeps_at_most_the_count_max() {
+    fn name_order_drops_the_answers_that_name_no_peer_and_keeps_at_most_the_count_max() {
         let unspecified = [
             std::net::SocketAddr::from(([0, 0, 0, 0], 1)),
             std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 1)),
             std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED.to_ipv6_mapped(), 1)),
             std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
         ];
-        let result = super::dial_order(unspecified.into_iter());
+        let result = super::name_order(unspecified);
         assert!(
             matches!(result, Err(super::LookupError::Empty)),
             "{result:?}"
@@ -1734,17 +1902,17 @@ mod tests {
         let answers: Vec<std::net::SocketAddr> = (1..=super::ADDRESSES_COUNT_MAX + 1)
             .map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], u16::try_from(port).unwrap())))
             .collect();
-        let kept = super::dial_order(unspecified.into_iter().chain(answers.iter().copied()));
+        let kept = super::name_order(unspecified.into_iter().chain(answers.iter().copied()));
         let mut kept = dialed(kept.unwrap());
         kept.sort_unstable_by_key(|address| address.0);
         assert_eq!(kept, peer_addresses(&answers[..super::ADDRESSES_COUNT_MAX]));
     }
 
     #[test]
-    fn dial_order_keeps_each_address_one_time() {
+    fn name_order_keeps_each_address_one_time() {
         let first = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
         let second = std::net::SocketAddr::from(([127, 0, 0, 1], 2));
-        let addresses = super::dial_order([first, second, first, first].into_iter()).unwrap();
+        let addresses = super::name_order([first, second, first, first]).unwrap();
         let mut kept = dialed(addresses);
         kept.sort_unstable_by_key(|address| address.0);
         assert_eq!(kept, peer_addresses(&[first, second]));
@@ -1754,11 +1922,155 @@ mod tests {
     #[test]
     fn lookup_gives_the_addresses_of_a_name_with_the_port() {
         let name = super::Name::new("localhost").unwrap();
-        let addresses = block_on(super::lookup(&name, std::num::NonZeroU16::MIN)).unwrap();
+        let answers = block_on(super::lookup(&name.0, std::num::NonZeroU16::MIN)).unwrap();
+        let addresses = super::name_order(answers).unwrap();
         for super::PeerAddress(address) in dialed(addresses) {
             assert!(address.ip().is_loopback(), "{address}");
             assert_eq!(address.port(), 1, "{address}");
         }
+    }
+
+    #[test]
+    fn seed_order_keeps_at_most_the_seed_count_max_of_the_routable_answers() {
+        let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
+        let result = super::seed_order([loopback]);
+        assert!(
+            matches!(result, Err(super::LookupError::Empty)),
+            "{result:?}"
+        );
+
+        // One more than the count max, after one that the internet does not route to. Each port
+        // is new, so the ones that it keeps are the first ones.
+        let answers: Vec<std::net::SocketAddr> = (1..=super::SEED_ADDRESSES_COUNT_MAX + 1)
+            .map(|port| std::net::SocketAddr::from(([1, 1, 1, 1], u16::try_from(port).unwrap())))
+            .collect();
+        let kept = super::seed_order([loopback].into_iter().chain(answers.iter().copied()));
+        let mut kept = dialed(kept.unwrap());
+        kept.sort_unstable_by_key(|address| address.0);
+        assert_eq!(
+            kept,
+            peer_addresses(&answers[..super::SEED_ADDRESSES_COUNT_MAX])
+        );
+    }
+
+    #[test]
+    fn routable_is_each_address_but_this_host_private_networks_links_and_test_ranges() {
+        let v4 = |a, b, c, d| std::net::IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, d));
+        let v6 = |text: &str| std::net::IpAddr::V6(text.parse().unwrap());
+        // The first and the last address of each range that the internet does not route to, and
+        // the addresses next to them.
+        for (ip, routable) in [
+            (v4(0, 0, 0, 1), false),
+            (v4(0, 255, 255, 255), false),
+            (v4(1, 0, 0, 0), true),
+            (v4(9, 255, 255, 255), true),
+            (v4(10, 0, 0, 0), false),
+            (v4(10, 255, 255, 255), false),
+            (v4(11, 0, 0, 0), true),
+            (v4(100, 63, 255, 255), true),
+            (v4(100, 64, 0, 0), false),
+            (v4(100, 127, 255, 255), false),
+            (v4(100, 128, 0, 0), true),
+            (v4(126, 255, 255, 255), true),
+            (v4(127, 0, 0, 0), false),
+            (v4(127, 255, 255, 255), false),
+            (v4(128, 0, 0, 0), true),
+            (v4(169, 253, 255, 255), true),
+            (v4(169, 254, 0, 0), false),
+            (v4(169, 254, 255, 255), false),
+            (v4(169, 255, 0, 0), true),
+            (v4(172, 15, 255, 255), true),
+            (v4(172, 16, 0, 0), false),
+            (v4(172, 31, 255, 255), false),
+            (v4(172, 32, 0, 0), true),
+            (v4(192, 0, 1, 255), true),
+            (v4(192, 0, 2, 0), false),
+            (v4(192, 0, 2, 255), false),
+            (v4(192, 0, 3, 0), true),
+            (v4(192, 167, 255, 255), true),
+            (v4(192, 168, 0, 0), false),
+            (v4(192, 168, 255, 255), false),
+            (v4(192, 169, 0, 0), true),
+            (v4(198, 17, 255, 255), true),
+            (v4(198, 18, 0, 0), false),
+            (v4(198, 19, 255, 255), false),
+            (v4(198, 20, 0, 0), true),
+            (v4(198, 51, 99, 255), true),
+            (v4(198, 51, 100, 0), false),
+            (v4(198, 51, 100, 255), false),
+            (v4(198, 51, 101, 0), true),
+            (v4(203, 0, 112, 255), true),
+            (v4(203, 0, 113, 0), false),
+            (v4(203, 0, 113, 255), false),
+            (v4(203, 0, 114, 0), true),
+            (v4(255, 255, 255, 254), true),
+            (v4(255, 255, 255, 255), false),
+            (v6("::"), false),
+            (v6("::1"), false),
+            (v6("::2"), true),
+            (v6("::ffff:127.0.0.1"), false),
+            (v6("::ffff:10.0.0.1"), false),
+            (v6("::ffff:1.1.1.1"), true),
+            (v6("2001:f::"), true),
+            (v6("2001:10::"), false),
+            (v6("2001:2f:ffff:ffff:ffff:ffff:ffff:ffff"), false),
+            (v6("2001:30::"), true),
+            (v6("2001:db7:ffff:ffff:ffff:ffff:ffff:ffff"), true),
+            (v6("2001:db8::"), false),
+            (v6("2001:db8:ffff:ffff:ffff:ffff:ffff:ffff"), false),
+            (v6("2001:db9::"), true),
+            (v6("2a01::1"), true),
+            (v6("fbff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), true),
+            (v6("fc00::"), false),
+            (v6("fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), false),
+            (v6("fe00::"), true),
+            (v6("fe7f:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), true),
+            (v6("fe80::"), false),
+            (v6("febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), false),
+            (v6("fec0::"), true),
+        ] {
+            assert_eq!(super::is_routable(ip), routable, "{ip}");
+        }
+    }
+
+    #[test]
+    fn each_network_but_regtest_has_seeds_that_are_names_at_its_default_port() {
+        assert_eq!(
+            super::Seeds::new(crate::chainparams::Network::Regtest),
+            None
+        );
+        for network in [
+            crate::chainparams::Network::Mainnet,
+            crate::chainparams::Network::Testnet4,
+            crate::chainparams::Network::Signet,
+        ] {
+            let seeds = super::Seeds::new(network).unwrap();
+            assert_eq!(seeds.port, network.default_port(), "{network:?}");
+            for seed in std::iter::once(seeds.first).chain(seeds.rest.iter().copied()) {
+                let seed = super::Seed(seed);
+                assert_eq!(seed.services_name(), format!("x9.{seed}"));
+                for name in [seed.services_name(), seed.to_string()] {
+                    assert!(super::Name::new(&name).is_some(), "{name}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_seeds_source_chooses_each_seed_of_the_network() {
+        let network = crate::chainparams::Network::Mainnet;
+        let source = super::Source::Seeds(super::Seeds::new(network).unwrap());
+        let mut chosen = std::collections::BTreeSet::new();
+        // 8 seeds: a run of 1000 choices misses one of them once in about 2^190 runs.
+        for _ in 0..1000 {
+            let super::Destination::Seed { seed, port } = source.destination().into_owned() else {
+                panic!();
+            };
+            assert_eq!(port, network.default_port());
+            chosen.insert(seed.0);
+        }
+        let seeds: std::collections::BTreeSet<&str> = network.seeds().iter().copied().collect();
+        assert_eq!(chosen, seeds);
     }
 
     #[test]

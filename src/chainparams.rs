@@ -69,6 +69,25 @@ const PORT_TESTNET4: std::num::NonZeroU16 = std::num::NonZeroU16::new(48333).exp
 const PORT_SIGNET: std::num::NonZeroU16 = std::num::NonZeroU16::new(38333).expect("not 0");
 const PORT_REGTEST: std::num::NonZeroU16 = std::num::NonZeroU16::new(18444).expect("not 0");
 
+const SEEDS_MAINNET: [&str; 8] = [
+    "seed.bitcoin.sipa.be.",
+    "dnsseed.bluematt.me.",
+    "seed.bitcoin.jonasschnelli.ch.",
+    "seed.btc.petertodd.net.",
+    "seed.bitcoin.sprovoost.nl.",
+    "dnsseed.emzy.de.",
+    "seed.bitcoin.wiz.biz.",
+    "seed.mainnet.achownodes.xyz.",
+];
+const SEEDS_TESTNET4: [&str; 2] = [
+    "seed.testnet4.bitcoin.sprovoost.nl.",
+    "seed.testnet4.wiz.biz.",
+];
+const SEEDS_SIGNET: [&str; 2] = [
+    "seed.signet.bitcoin.sprovoost.nl.",
+    "seed.signet.achownodes.xyz.",
+];
+
 impl Network {
     /// The bytes that start every message.
     pub(crate) const fn magic(self) -> [u8; MAGIC_SIZE] {
@@ -87,6 +106,18 @@ impl Network {
             Network::Testnet4 => PORT_TESTNET4,
             Network::Signet => PORT_SIGNET,
             Network::Regtest => PORT_REGTEST,
+        }
+    }
+
+    /// The names of the DNS seeds of the network. A seed answers the lookup of its name with the
+    /// addresses of nodes of the network that it chose. Regtest has no real network, so it has no
+    /// seeds.
+    pub(crate) const fn seeds(self) -> &'static [&'static str] {
+        match self {
+            Network::Mainnet => &SEEDS_MAINNET,
+            Network::Testnet4 => &SEEDS_TESTNET4,
+            Network::Signet => &SEEDS_SIGNET,
+            Network::Regtest => &[],
         }
     }
 

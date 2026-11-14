@@ -55,9 +55,10 @@ pub enum Event<'a> {
         peer: std::net::SocketAddr,
         tip: &'a crate::chain::Tip,
     },
-    /// The connection to `destination` ended for `reason`, and elo dials it again after `wait`.
-    /// `destination` is the peer of the command line: an IP address, or a name that elo looks up
-    /// again. It has its own key, so `peer` is always the address of a connection.
+    /// The connection to `destination` ended for `reason`, and elo dials again after `wait`.
+    /// `destination` is what the dial looked up or dialed: the IP address or the name of the
+    /// command line, or a seed of the network. It has its own key, so `peer` is always the address
+    /// of a connection.
     End {
         destination: &'a crate::net::Destination,
         reason: &'a dyn std::fmt::Display,

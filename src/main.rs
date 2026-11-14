@@ -1,20 +1,22 @@
-//! `elo <network> <host>[:port]`: dials one peer, does the handshake, and logs the peer's
-//! `version`. The host is an IP address or a name. Before each dial, elo looks up the name, and
-//! dials its addresses in a random order until one takes the connect. Then it syncs the header
-//! chain from the peer and logs the tip. It asks the peer to announce each new header, takes it on
-//! the tip, and logs the tip when it moves. It pings the peer and answers its `ping` messages
-//! until the connection ends. Then it waits and dials the peer again. The chain stays in memory,
-//! so the next connection syncs from its tip. SIGTERM and SIGINT stop it at any of these steps.
-//! Each step writes a line of `elo::logging` to stdout.
+//! `elo <network> [<host>[:port]]`: dials one peer, does the handshake, and logs the peer's
+//! `version`. The host is an IP address or a name. With no host, each dial takes a seed of the
+//! network, at random. Before each dial, elo looks up the name or the seed, and dials its addresses
+//! in a random order until one takes the connect. Then it syncs the header chain from the peer and
+//! logs the tip. It asks the peer to announce each new header, takes it on the tip, and logs the
+//! tip when it moves. It pings the peer and answers its `ping` messages until the connection ends.
+//! Then it waits and dials again. The chain stays in memory, so the next connection syncs from its
+//! tip. SIGTERM and SIGINT stop it at any of these steps. Each step writes a line of
+//! `elo::logging` to stdout.
 
-const USAGE: &str = "usage: elo <mainnet|testnet4|signet|regtest> <ip|name>[:port]";
+const USAGE: &str = "usage: elo <mainnet|testnet4|signet|regtest> [<ip|name>[:port]]
+regtest has no seeds, so it needs a peer";
 
 /// The exit code for bad usage. A stop by a signal exits with 0, and a panic with 101. Every
 /// other exit is 1, because only a fault of this host ends elo.
 const EXIT_USAGE: u8 = 2;
 
-/// How long elo waits after a connection ends before it dials the peer again. So a peer that is
-/// down, or that ends each connection at once, gets at most one try in each wait.
+/// How long elo waits after a connection ends before it dials again. So a peer that is down, or
+/// that ends each connection at once, gets at most one try in each wait.
 const RECONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn main() -> std::process::ExitCode {
@@ -28,7 +30,7 @@ fn main() -> std::process::ExitCode {
     }));
 
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    let Some((network, destination)) = parse(&args) else {
+    let Some((network, source)) = parse(&args) else {
         eprintln!("{USAGE}");
         return std::process::ExitCode::from(EXIT_USAGE);
     };
@@ -42,17 +44,18 @@ fn main() -> std::process::ExitCode {
         Ok(runtime) => runtime,
         Err(error) => return exit(&format_args!("runtime: {error}")),
     };
-    let code = runtime.block_on(run(network, destination));
+    let code = runtime.block_on(run(network, source));
     // A lookup runs on a blocking thread of the runtime, and a stop or a lookup timeout does not
     // end it. The drop of the runtime would wait for that thread, so the runtime does not wait.
     runtime.shutdown_background();
     code
 }
 
-/// Dials `destination` again after each end that retries, until a signal or an end that exits.
+/// Dials a destination of `source` again after each end that retries, until a signal or an end
+/// that exits.
 async fn run(
     network: elo::chainparams::Network,
-    destination: elo::net::Destination,
+    source: elo::net::Source,
 ) -> std::process::ExitCode {
     // Before the first dial, so a signal from here on stops elo. As PID 1 in a container, a
     // process with no handler never sees a SIGTERM: the kernel drops it, and the stop ends in
@@ -67,6 +70,7 @@ async fn run(
     // The loop has no count bound, because elo keeps its one peer for as long as it runs. Only
     // a signal or an end that a new connection cannot fix gets out.
     loop {
+        let destination = source.destination();
         // The drop of the connection closes its socket. elo keeps nothing on disk, so the stop
         // has nothing else to finish.
         let end = match signals.unless(dial(&destination, &mut chain)).await {
@@ -79,8 +83,8 @@ async fn run(
         if !end.retries() {
             return exit(&end);
         }
-        // The destination of the command line, and not the address of the connection: the next
-        // dial looks up a name again.
+        // The destination of the dial, and not the address of the connection: the next dial looks
+        // up a name again, and a seed shows which seed gave the peer.
         let logged = log(&elo::logging::Event::End {
             destination: &destination,
             reason: &end,
@@ -281,15 +285,13 @@ async fn dial(
     }
 }
 
-/// The args after the program name. `None` is bad usage.
-///
-/// An IPv6 address needs brackets even without a port, because `::1:8333` is an IPv6 address
-/// and not `::1` with a port.
-fn parse(
-    args: &[std::ffi::OsString],
-) -> Option<(elo::chainparams::Network, elo::net::Destination)> {
-    let [network, peer] = args else {
-        return None;
+/// The args after the program name. `None` is bad usage. With no peer, the source is the seeds
+/// of the network, so a network with no seeds needs a peer.
+fn parse(args: &[std::ffi::OsString]) -> Option<(elo::chainparams::Network, elo::net::Source)> {
+    let (network, peer) = match args {
+        [network] => (network, None),
+        [network, peer] => (network, Some(peer)),
+        _ => return None,
     };
     let network = match network.to_str()? {
         "mainnet" => elo::chainparams::Network::Mainnet,
@@ -298,8 +300,18 @@ fn parse(
         "regtest" => elo::chainparams::Network::Regtest,
         _ => return None,
     };
+    let source = match peer {
+        Some(peer) => elo::net::Source::Destination(destination(peer.to_str()?, network)?),
+        None => elo::net::Source::Seeds(elo::net::Seeds::new(network)?),
+    };
+    Some((network, source))
+}
 
-    let peer = peer.to_str()?;
+/// `peer` as the destination of each dial, or `None` if it is no IP address and no name.
+///
+/// An IPv6 address needs brackets even without a port, because `::1:8333` is an IPv6 address
+/// and not `::1` with a port.
+fn destination(peer: &str, network: elo::chainparams::Network) -> Option<elo::net::Destination> {
     let destination = if let Some(address) = address(peer, network.default_port()) {
         // Port 0, `0.0.0.0`, `[::]` and `[::ffff:0.0.0.0]` name no peer.
         elo::net::Destination::Address(elo::net::PeerAddress::new(address)?)
@@ -314,7 +326,7 @@ fn parse(
             port,
         }
     };
-    Some((network, destination))
+    Some(destination)
 }
 
 /// `peer` as an IP address with an optional port, or `None` if it is no IP address.
@@ -331,7 +343,7 @@ fn address(peer: &str, default_port: std::num::NonZeroU16) -> Option<std::net::S
 
 #[cfg(test)]
 mod tests {
-    fn parse(args: &[&str]) -> Option<(elo::chainparams::Network, elo::net::Destination)> {
+    fn parse(args: &[&str]) -> Option<(elo::chainparams::Network, elo::net::Source)> {
         let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
         super::parse(&args)
     }
@@ -390,7 +402,7 @@ mod tests {
                 elo::net::Destination::Address(elo::net::PeerAddress::new(address).unwrap());
             assert_eq!(
                 parse(&[name, "127.0.0.1"]),
-                Some((network, destination)),
+                Some((network, elo::net::Source::Destination(destination))),
                 "{name}"
             );
             let destination = elo::net::Destination::Name {
@@ -399,7 +411,7 @@ mod tests {
             };
             assert_eq!(
                 parse(&[name, "localhost"]),
-                Some((network, destination)),
+                Some((network, elo::net::Source::Destination(destination))),
                 "{name}"
             );
         }
@@ -472,16 +484,37 @@ mod tests {
             ("0x7f.example", name("0x7f.example", 18444)),
             ("", None),
         ] {
-            let parsed = parse(&["regtest", peer]).map(|(_, destination)| destination);
-            assert_eq!(parsed, expected, "{peer}");
+            let parsed = parse(&["regtest", peer]).map(|(_, source)| source);
+            assert_eq!(
+                parsed,
+                expected.map(elo::net::Source::Destination),
+                "{peer}"
+            );
         }
     }
 
     #[test]
-    fn usage_is_a_network_name_and_a_peer() {
+    fn no_peer_is_the_seeds_of_the_network() {
+        for (name, network) in [
+            ("mainnet", elo::chainparams::Network::Mainnet),
+            ("testnet4", elo::chainparams::Network::Testnet4),
+            ("signet", elo::chainparams::Network::Signet),
+        ] {
+            let seeds = elo::net::Seeds::new(network).unwrap();
+            assert_eq!(
+                parse(&[name]),
+                Some((network, elo::net::Source::Seeds(seeds))),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_is_a_network_name_and_a_peer_and_regtest_needs_the_peer() {
         for args in [
             &[][..],
             &["regtest"],
+            &["testnet3"],
             &["testnet3", "127.0.0.1"],
             &["regtest", "127.0.0.1", "127.0.0.1"],
         ] {
