@@ -900,10 +900,12 @@ pub(crate) mod fuzz {
         root
     }
 
-    const SCRIPT_SALT: crate::headerssync::Salt = crate::headerssync::Salt {
-        keys: [0, 0],
-        offset: 0,
-    };
+    const SCRIPT_KEYS: [u64; 2] = [0, 0];
+
+    const SCRIPT_OFFSET: usize = 0;
+
+    const SCRIPT_SALT: crate::headerssync::Salt =
+        crate::headerssync::Salt::new(SCRIPT_KEYS, SCRIPT_OFFSET);
 
     const NONCE_SPREAD: u64 = 0x0123_4567_89ab_cdef;
     const _: () = assert!(NONCE_SPREAD % 2 == 1);
@@ -2056,7 +2058,7 @@ pub(crate) mod fuzz {
                 buffer.push(hash);
                 let height = start + buffer.len();
                 let below_minimum = self.work_at(height) < work_min;
-                let at_commitment = height % period == SCRIPT_SALT.offset % period;
+                let at_commitment = height % period == SCRIPT_OFFSET % period;
                 if below_minimum && at_commitment {
                     let Some(first) = presync.get(buffer.len() - 1) else {
                         panic!("the first download has no header at {height}");
@@ -2145,7 +2147,7 @@ pub(crate) mod fuzz {
     }
 
     fn script_commitment(hash: bitcoin_hashes::sha256d::Hash) -> bool {
-        let [key_0, key_1] = SCRIPT_SALT.keys;
+        let [key_0, key_1] = SCRIPT_KEYS;
         bitcoin_hashes::siphash24::Hash::hash_to_u64_with_keys(key_0, key_1, hash.as_byte_array())
             .is_multiple_of(2)
     }
@@ -2489,10 +2491,7 @@ mod tests {
 
     const NANOSECOND: std::time::Duration = std::time::Duration::from_nanos(1);
 
-    const SALT: crate::headerssync::Salt = crate::headerssync::Salt {
-        keys: [1, 2],
-        offset: 3,
-    };
+    const SALT: crate::headerssync::Salt = crate::headerssync::Salt::new([1, 2], 3);
 
     #[test]
     fn handshake_skips_until_their_version_and_then_until_their_verack() {

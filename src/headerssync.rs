@@ -3,8 +3,14 @@ const HEADERS_PER_SECOND_MAX: u64 = 6;
 const WORD_BITS: usize = 64;
 
 pub(crate) struct Salt {
-    pub(crate) keys: [u64; 2],
-    pub(crate) offset: usize,
+    keys: [u64; 2],
+    offset: usize,
+}
+
+impl Salt {
+    pub(crate) const fn new(keys: [u64; 2], offset: usize) -> Salt {
+        Salt { keys, offset }
+    }
 }
 
 impl std::fmt::Debug for Salt {
@@ -303,10 +309,7 @@ impl std::error::Error for HeadersSyncError {}
 mod tests {
     const LIMIT_BITS: u32 = 0x207f_ffff;
 
-    const SALT: super::Salt = super::Salt {
-        keys: [1, 2],
-        offset: 275 * 1_000 + 15,
-    };
+    const SALT: super::Salt = super::Salt::new([1, 2], 275 * 1_000 + 15);
 
     fn mined_on(
         below: &crate::block::BlockHeader,

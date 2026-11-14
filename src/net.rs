@@ -797,6 +797,11 @@ fn nonce() -> u64 {
 const RANDOM_SOURCE: &str = "/dev/urandom";
 
 fn salt() -> std::io::Result<crate::headerssync::Salt> {
+    let (keys, offset) = salt_words()?;
+    Ok(crate::headerssync::Salt::new(keys, offset))
+}
+
+fn salt_words() -> std::io::Result<([u64; 2], usize)> {
     let mut source = std::fs::File::open(RANDOM_SOURCE)?;
     let mut key_0 = [0; size_of::<u64>()];
     let mut key_1 = [0; size_of::<u64>()];
@@ -804,10 +809,10 @@ fn salt() -> std::io::Result<crate::headerssync::Salt> {
     source.read_exact(&mut key_0)?;
     source.read_exact(&mut key_1)?;
     source.read_exact(&mut offset)?;
-    Ok(crate::headerssync::Salt {
-        keys: [u64::from_le_bytes(key_0), u64::from_le_bytes(key_1)],
-        offset: usize::from_le_bytes(offset),
-    })
+    Ok((
+        [u64::from_le_bytes(key_0), u64::from_le_bytes(key_1)],
+        usize::from_le_bytes(offset),
+    ))
 }
 
 #[cfg(fuzzing)]
@@ -1757,9 +1762,9 @@ mod tests {
     #[test]
     fn each_salt_word_is_new() {
         let mut words = Vec::new();
-        for salt in [super::salt().unwrap(), super::salt().unwrap()] {
-            words.extend(salt.keys);
-            words.push(u64::try_from(salt.offset).unwrap());
+        for (keys, offset) in [super::salt_words().unwrap(), super::salt_words().unwrap()] {
+            words.extend(keys);
+            words.push(u64::try_from(offset).unwrap());
         }
         let mut distinct = words.clone();
         distinct.sort_unstable();
