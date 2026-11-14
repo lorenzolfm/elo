@@ -539,7 +539,7 @@ async fn handshake_stream_exchange(
             crate::net_processing::Step::Done(peer, theirs) => {
                 let connection = Connection {
                     socket,
-                    peer,
+                    peer: *peer,
                     address,
                 };
                 return Ok((connection, theirs));

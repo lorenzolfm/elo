@@ -95,7 +95,6 @@ enum AboveFork {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExtendError {
     NotOnTip,
-    NotOnLocator,
     NotContinuous,
     ProofOfWork,
     WrongBits,
@@ -150,24 +149,26 @@ impl Chain {
         headers: crate::protocol::Headers,
         clock: u64,
         work_min: crate::pow::Work,
-    ) -> Result<Extended, ExtendError> {
+    ) -> Result<Option<Extended>, ExtendError> {
         let Some(first) = headers.first() else {
-            return Ok(Extended::Kept);
+            return Ok(Some(Extended::Kept));
         };
-        if first.prev == self.tip.hash() {
-            let full = headers.is_full();
-            self.extend_tip(headers.into_vec(), time_max(clock))?;
-            return Ok(Extended::Taken { full });
-        }
         let tip_height = self.below_tip.len();
         let first_prev = first.prev;
-        let fork_height = locator_heights(tip_height)
-            .skip(1)
-            .find(|height| self.header_at(*height).hash() == first_prev)
-            .ok_or(ExtendError::NotOnLocator)?;
+        let Some(fork_height) =
+            locator_heights(tip_height).find(|height| self.header_at(*height).hash() == first_prev)
+        else {
+            return Ok(None);
+        };
+        if fork_height == tip_height {
+            let full = headers.is_full();
+            self.extend_tip(headers.into_vec(), time_max(clock))?;
+            return Ok(Some(Extended::Taken { full }));
+        }
         assert!(fork_height < tip_height);
         let branch = self.branch_on_fork(fork_height);
         self.extend_above(branch, Batch::Answer(headers), clock, work_min)
+            .map(Some)
     }
 
     pub(crate) fn extend_branch(
@@ -779,9 +780,6 @@ impl std::fmt::Display for ExtendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ExtendError::NotOnTip => write!(f, "headers do not start at our tip"),
-            ExtendError::NotOnLocator => {
-                write!(f, "headers do not start at a header of our locator")
-            }
             ExtendError::NotContinuous => write!(f, "headers do not form a chain"),
             ExtendError::ProofOfWork => write!(f, "a header fails proof of work"),
             ExtendError::WrongBits => write!(f, "a header has the wrong bits"),
@@ -1589,11 +1587,14 @@ mod tests {
         chain: &mut super::Chain,
         headers: &[crate::block::BlockHeader],
     ) -> Result<super::Extended, super::ExtendError> {
-        chain.extend_on_locator(
-            crate::fixtures::headers_batch(headers),
-            crate::fixtures::CLOCK,
-            crate::pow::Work::ZERO,
-        )
+        chain
+            .extend_on_locator(
+                crate::fixtures::headers_batch(headers),
+                crate::fixtures::CLOCK,
+                crate::pow::Work::ZERO,
+            )
+            .transpose()
+            .unwrap()
     }
 
     fn on_branch(
@@ -1764,16 +1765,26 @@ mod tests {
     }
 
     #[test]
-    fn extend_on_locator_refuses_a_batch_on_a_header_that_is_not_in_the_locator() {
+    fn extend_on_locator_takes_no_batch_on_a_header_that_is_not_in_the_locator() {
         let headers = crate::fixtures::headers_on_genesis(14);
         for (below, expected) in [
-            (&headers[0], Ok(super::Extended::Taken { full: false })),
-            (&headers[1], Err(super::ExtendError::NotOnLocator)),
-            (&headers[2], Ok(super::Extended::Taken { full: false })),
+            (&headers[0], Some(super::Extended::Taken { full: false })),
+            (&headers[1], None),
+            (&headers[2], Some(super::Extended::Taken { full: false })),
         ] {
             let branch = crate::fixtures::branch_on(below, 20);
             let mut chain = regtest_with(&headers);
-            assert_eq!(on_locator(&mut chain, &branch), expected);
+            let tip = chain.tip();
+            let extended = chain.extend_on_locator(
+                crate::fixtures::headers_batch(&branch),
+                crate::fixtures::CLOCK,
+                crate::pow::Work::ZERO,
+            );
+            let skipped = expected.is_none();
+            assert_eq!(extended, Ok(expected));
+            if skipped {
+                assert_eq!(chain.tip(), tip);
+            }
         }
     }
 
@@ -1934,11 +1945,14 @@ mod tests {
         for (count, goes_on) in [(2_000, true), (2_001, false)] {
             let work_min = regtest_with(&headers[..count]).tip().work();
             let mut chain = regtest_with(&headers);
-            let extended = chain.extend_on_locator(
-                crate::fixtures::headers_batch(&branch),
-                crate::fixtures::CLOCK,
-                work_min,
-            );
+            let extended = chain
+                .extend_on_locator(
+                    crate::fixtures::headers_batch(&branch),
+                    crate::fixtures::CLOCK,
+                    work_min,
+                )
+                .transpose()
+                .unwrap();
             assert_eq!(
                 matches!(extended, Ok(super::Extended::Branch(_))),
                 goes_on,

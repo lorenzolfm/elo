@@ -172,7 +172,7 @@ pub(crate) enum Received {
 pub(crate) enum Step<'a> {
     Wait(Handshake<'a>),
     Reply(Handshake<'a>, HandshakeOutbound),
-    Done(Peer<'a>, crate::protocol::Version),
+    Done(Box<Peer<'a>>, crate::protocol::Version),
 }
 
 impl<'a> Handshake<'a> {
@@ -264,7 +264,7 @@ impl<'a> Handshake<'a> {
                         salt,
                         branch_tip: None,
                     };
-                    Ok(Step::Done(peer, theirs))
+                    Ok(Step::Done(Box::new(peer), theirs))
                 } else {
                     let state = State::AwaitingVerack(theirs);
                     let handshake = next(
@@ -350,8 +350,15 @@ enum SyncState {
     Outstanding {
         download: Download,
         sent: std::time::Instant,
+        tip: bitcoin_hashes::sha256d::Hash,
     },
     Synced,
+}
+
+#[derive(Debug)]
+enum Answer {
+    Next(Option<Download>),
+    Skipped(Download),
 }
 
 #[derive(Debug)]
@@ -388,6 +395,43 @@ impl Download {
     fn on_tip(chain: &crate::chain::Chain, work_min: crate::pow::Work) -> Download {
         assert!(chain.tip().work() >= work_min);
         Download::Chain
+    }
+
+    fn locator(&self, chain: &crate::chain::Chain) -> Vec<bitcoin_hashes::sha256d::Hash> {
+        let last = match self {
+            Download::Genesis(_) | Download::Chain => return chain.locator(),
+            Download::Presync(presync) => presync.last_hash(),
+            Download::Redownload(redownload) => redownload.last_hash(),
+            Download::Branch(branch) => branch.last_hash(),
+            Download::BranchPresync(sync) => sync.presync.last_hash(),
+            Download::BranchRedownload(sync) => sync.redownload.last_hash(),
+        };
+        let genesis = chain.network().genesis().hash();
+        let mut locator = vec![last];
+        if last != genesis {
+            locator.push(genesis);
+        }
+        assert_eq!(locator.first(), Some(&last));
+        assert_eq!(locator.last(), Some(&genesis));
+        locator
+    }
+
+    fn is_answered_by(
+        &self,
+        chain: &crate::chain::Chain,
+        headers: &crate::protocol::Headers,
+    ) -> bool {
+        match self {
+            Download::Chain => true,
+            Download::Genesis(_)
+            | Download::Presync(_)
+            | Download::Redownload(_)
+            | Download::Branch(_)
+            | Download::BranchPresync(_)
+            | Download::BranchRedownload(_) => headers
+                .first()
+                .is_none_or(|first| self.locator(chain).contains(&first.prev)),
+        }
     }
 }
 
@@ -464,15 +508,32 @@ impl<'a> Peer<'a> {
         let mut input = message.payload();
         let headers = crate::protocol::Headers::decode(&mut input).map_err(PeerError::Headers)?;
         let next = match self.sync {
-            SyncState::Outstanding { download, .. } => receive_answer(
-                self.chain,
-                self.work_min,
-                &mut self.salt,
-                &mut self.branch_tip,
+            SyncState::Outstanding {
                 download,
-                headers,
-                clock,
-            )?,
+                sent,
+                tip,
+            } => {
+                assert_eq!(self.chain.tip().hash(), tip);
+                match receive_answer(
+                    self.chain,
+                    self.work_min,
+                    &mut self.salt,
+                    &mut self.branch_tip,
+                    download,
+                    headers,
+                    clock,
+                )? {
+                    Answer::Next(next) => next,
+                    Answer::Skipped(download) => {
+                        self.sync = SyncState::Outstanding {
+                            download,
+                            sent,
+                            tip,
+                        };
+                        return Ok((self, Received::NoReply));
+                    }
+                }
+            }
             SyncState::Synced => receive_announcement(
                 self.chain,
                 self.work_min,
@@ -588,18 +649,11 @@ impl SyncState {
     > {
         match self {
             SyncState::Due(download) => {
-                let locator = match &download {
-                    Download::Genesis(_) | Download::Chain => chain.locator(),
-                    Download::Presync(presync) => vec![presync.last_hash()],
-                    Download::Redownload(redownload) => vec![redownload.last_hash()],
-                    Download::Branch(branch) => vec![branch.last_hash()],
-                    Download::BranchPresync(sync) => vec![sync.presync.last_hash()],
-                    Download::BranchRedownload(sync) => vec![sync.redownload.last_hash()],
-                };
-                let get_headers = crate::protocol::GetHeaders::new(locator);
+                let get_headers = crate::protocol::GetHeaders::new(download.locator(chain));
                 let sync = SyncState::Outstanding {
                     download,
                     sent: now,
+                    tip: chain.tip().hash(),
                 };
                 Ok((sync, Some(get_headers), Some(now + HEADERS_TIMEOUT)))
             }
@@ -628,28 +682,34 @@ fn receive_answer(
     download: Download,
     headers: crate::protocol::Headers,
     clock: u64,
-) -> Result<Option<Download>, PeerError> {
+) -> Result<Answer, PeerError> {
+    if !download.is_answered_by(chain, &headers) {
+        return Ok(Answer::Skipped(download));
+    }
     let full = headers.is_full();
-    match download {
+    let next = match download {
         Download::Genesis(genesis_salt) => {
-            receive_on_genesis(chain, work_min, salt, genesis_salt, headers, clock)
+            receive_on_genesis(chain, work_min, salt, genesis_salt, headers, clock)?
         }
         Download::Chain => {
-            let extended = chain
+            let Some(extended) = chain
                 .extend_on_locator(headers, clock, work_min)
-                .map_err(PeerError::Extend)?;
-            chain_next(chain, work_min, salt, branch_tip, extended, clock)
+                .map_err(PeerError::Extend)?
+            else {
+                return Ok(Answer::Skipped(Download::Chain));
+            };
+            chain_next(chain, work_min, salt, branch_tip, extended, clock)?
         }
         Download::Branch(branch) => {
             let extended = chain
                 .extend_branch(*branch, headers, clock, work_min)
                 .map_err(PeerError::Extend)?;
-            chain_next(chain, work_min, salt, branch_tip, extended, clock)
+            chain_next(chain, work_min, salt, branch_tip, extended, clock)?
         }
         Download::BranchPresync(sync) => {
             let BranchPresync { start, presync } = *sync;
             let step = presync.receive(headers).map_err(PeerError::HeadersSync)?;
-            Ok(Some(branch_presync_next(start, step)))
+            Some(branch_presync_next(start, step))
         }
         Download::BranchRedownload(sync) => {
             let BranchRedownload {
@@ -663,26 +723,24 @@ fn receive_answer(
             {
                 crate::headerssync::RedownloadStep::More(redownload, more) => {
                     keep_released(chain.network(), &mut released, more);
-                    Ok(Some(Download::BranchRedownload(Box::new(
-                        BranchRedownload {
-                            start,
-                            redownload: *redownload,
-                            released,
-                        },
-                    ))))
+                    Some(Download::BranchRedownload(Box::new(BranchRedownload {
+                        start,
+                        redownload: *redownload,
+                        released,
+                    })))
                 }
                 crate::headerssync::RedownloadStep::Done(rest) => {
                     keep_released(chain.network(), &mut released, rest);
                     let extended = chain
                         .extend_low_work_branch(start, released, full, clock, work_min)
                         .map_err(PeerError::Extend)?;
-                    chain_next(chain, work_min, salt, branch_tip, extended, clock)
+                    chain_next(chain, work_min, salt, branch_tip, extended, clock)?
                 }
             }
         }
         Download::Presync(presync) => {
             let step = presync.receive(headers).map_err(PeerError::HeadersSync)?;
-            Ok(Some(presync_next(step)))
+            Some(presync_next(step))
         }
         Download::Redownload(redownload) => {
             match redownload
@@ -691,16 +749,17 @@ fn receive_answer(
             {
                 crate::headerssync::RedownloadStep::More(redownload, released) => {
                     extend_released(chain, released, clock)?;
-                    Ok(Some(Download::Redownload(redownload)))
+                    Some(Download::Redownload(redownload))
                 }
                 crate::headerssync::RedownloadStep::Done(released) => {
                     extend_released(chain, released, clock)?;
                     let next = Download::on_tip(chain, work_min);
-                    Ok(full.then_some(next))
+                    full.then_some(next)
                 }
             }
         }
-    }
+    };
+    Ok(Answer::Next(next))
 }
 
 fn receive_on_genesis(
@@ -719,22 +778,7 @@ fn receive_on_genesis(
         let step = presync.receive(headers).map_err(PeerError::HeadersSync)?;
         return Ok(Some(presync_next(step)));
     }
-    let empty = headers.first().is_none();
-    match chain
-        .extend_on_locator(headers, clock, work_min)
-        .map_err(PeerError::Extend)?
-    {
-        crate::chain::Extended::Taken { full } => {
-            assert!(!full);
-            assert!(!empty);
-        }
-        crate::chain::Extended::Kept => assert!(empty),
-        crate::chain::Extended::KeptOver(_)
-        | crate::chain::Extended::Branch(_)
-        | crate::chain::Extended::BelowMargin { .. } => {
-            panic!("genesis has no header below it")
-        }
-    }
+    chain.extend(headers, clock).map_err(PeerError::Extend)?;
     assert!(salt_left.replace(salt).is_none());
     if chain.tip().work() >= work_min {
         Ok(None)
@@ -1032,11 +1076,12 @@ pub(crate) mod fuzz {
         seed!("headers-cut", "PeerRefused(Headers(Payload(UnexpectedEnd)))"),
         seed!("headers-cut-after-sync", "PeerRefused(Headers(Payload(UnexpectedEnd)))"),
         seed!("headers-empty-payload", "PeerRefused(Headers(Payload(UnexpectedEnd)))"),
-        seed!("headers-off-tip", "PeerRefused(Extend(NotOnLocator))"),
-        seed!("headers-off-tip-after-full", "PeerRefused(Extend(NotOnLocator))"),
+        seed!("headers-off-tip", "PeerOpen { height: 0, synced: false }"),
+        seed!("headers-off-tip-after-full", "PeerOpen { height: 2000, synced: false }"),
         seed!("headers-off-tip-after-sync", "PeerOpen { height: 0, synced: false }"),
         seed!("headers-off-tip-after-sync-then-headers", "PeerOpen { height: 1, synced: true }"),
-        seed!("headers-off-tip-after-sync-twice", "PeerRefused(Extend(NotOnLocator))"),
+        seed!("headers-off-tip-after-sync-twice", "PeerOpen { height: 0, synced: false }"),
+        seed!("headers-off-tip-after-sync-twice-then-answer", "PeerOpen { height: 1, synced: true }"),
         seed!("headers-wrong-index-past-end", "PeerOpen { height: 2, synced: true }"),
         seed!("inv-block-after-sync", "PeerOpen { height: 2, synced: false }"),
         seed!("inv-block-after-sync-then-headers", "PeerOpen { height: 3, synced: true }"),
@@ -1068,13 +1113,15 @@ pub(crate) mod fuzz {
         seed!("sync-full-then-short", "PeerOpen { height: 2002, synced: true }"),
         seed!("sync-longest-short-byte", "PeerOpen { height: 252, synced: true }"),
         seed!("sync-low-work-full-mainnet", "PeerRefused(HeadersSync(ProofOfWork))"),
-        seed!("sync-low-work-full-off-tip-signet", "PeerRefused(HeadersSync(NotContinuous))"),
+        seed!("sync-low-work-full-off-tip-signet", "PeerOpen { height: 0, synced: false }"),
         seed!("sync-low-work-mainnet", "PeerRefused(ChainWorkTooLow)"),
         seed!("sync-low-work-regtest", "PeerOpen { height: 4002, synced: true }"),
         seed!("sync-low-work-regtest-at-batch-end", "PeerOpen { height: 2000, synced: true }"),
+        seed!("sync-low-work-regtest-first-on-genesis", "PeerRefused(HeadersSync(NotContinuous))"),
         seed!("sync-low-work-regtest-first-short", "PeerRefused(HeadersSync(WorkTooLow))"),
         seed!("sync-low-work-regtest-second-above-first", "PeerOpen { height: 4002, synced: true }"),
-        seed!("sync-low-work-regtest-second-off-last", "PeerRefused(HeadersSync(NotContinuous))"),
+        seed!("sync-low-work-regtest-second-break-second", "PeerRefused(HeadersSync(NotContinuous))"),
+        seed!("sync-low-work-regtest-second-off-last", "PeerOpen { height: 0, synced: false }"),
         seed!("sync-low-work-regtest-second-other", "PeerRefused(HeadersSync(CommitmentMismatch))"),
         seed!("sync-low-work-regtest-second-short", "PeerRefused(HeadersSync(WorkTooLow))"),
         seed!("sync-low-work-regtest-short-at-min", "PeerOpen { height: 250, synced: true }"),
@@ -1233,7 +1280,7 @@ pub(crate) mod fuzz {
                 ) => handshake = next,
                 (Ok(super::Step::Done(peer, theirs)), Ok(HandshakeExpected::Done(expected))) => {
                     assert_eq!(theirs, expected);
-                    return Ok(peer);
+                    return Ok(*peer);
                 }
                 (Err(error), Err(expected)) => {
                     assert_eq!(error, expected);
@@ -1788,7 +1835,12 @@ pub(crate) mod fuzz {
 
         fn locator_below(&self) -> Vec<(bitcoin_hashes::sha256d::Hash, usize)> {
             if !matches!(self.download, DownloadModel::Chain) {
-                return Vec::new();
+                let (_, height) = self.download_last();
+                return if height == 0 {
+                    Vec::new()
+                } else {
+                    vec![(self.chain[0], 0)]
+                };
             }
             self.locator_heights()
                 .into_iter()
@@ -1802,6 +1854,13 @@ pub(crate) mod fuzz {
                 .chain(self.locator_below())
                 .map(|(hash, _)| hash)
                 .collect()
+        }
+
+        fn locator_height(&self, prev: bitcoin_hashes::sha256d::Hash) -> Option<usize> {
+            std::iter::once(self.download_last())
+                .chain(self.locator_below())
+                .find(|(hash, _)| *hash == prev)
+                .map(|(_, height)| height)
         }
 
         fn is_synced(&self) -> bool {
@@ -1898,8 +1957,16 @@ pub(crate) mod fuzz {
                 .into_vec();
             assert!(headers.len() <= HEADERS_FULL_COUNT);
             let announced = matches!(self.get_headers, GetHeadersModel::Ended);
+            let mut fork = None;
             match self.get_headers {
-                GetHeadersModel::Outstanding(_) => {}
+                GetHeadersModel::Outstanding(_) => {
+                    if let Some(first) = headers.first() {
+                        let Some(height) = self.locator_height(first.prev) else {
+                            return Ok(ReceivedExpected::NoReply);
+                        };
+                        fork = Some(height);
+                    }
+                }
                 GetHeadersModel::Ended => {
                     assert!(matches!(self.download, DownloadModel::Chain));
                     if let Some(first) = headers.first()
@@ -1927,7 +1994,10 @@ pub(crate) mod fuzz {
                     self.presync_start(0, hashes, full)?
                 }
                 DownloadModel::Chain => {
-                    let extended = self.extend_on_locator(&headers)?;
+                    let extended = match fork {
+                        None => ExtendedModel::Kept,
+                        Some(fork) => self.extend_on_locator(fork, &headers)?,
+                    };
                     self.chain_next(extended, full)?
                 }
                 DownloadModel::Branch { fork, hashes } => {
@@ -2000,24 +2070,13 @@ pub(crate) mod fuzz {
 
         fn extend_on_locator(
             &mut self,
+            fork: usize,
             headers: &[crate::block::BlockHeader],
         ) -> Result<ExtendedModel, super::PeerError> {
-            let Some(first) = headers.first() else {
-                return Ok(ExtendedModel::Kept);
-            };
-            let fork = match self
-                .locator_heights()
-                .into_iter()
-                .find(|height| self.chain[*height] == first.prev)
-            {
-                Some(height) => height,
-                None => {
-                    return Err(super::PeerError::Extend(
-                        crate::chain::ExtendError::NotOnLocator,
-                    ));
-                }
-            };
-            let batch = script_hashes(self.network, first.prev, headers).map_err(extend_error)?;
+            assert!(!headers.is_empty());
+            assert!(fork <= self.height());
+            let batch =
+                script_hashes(self.network, self.chain[fork], headers).map_err(extend_error)?;
             if fork == self.height() {
                 self.chain.extend(batch);
                 return Ok(ExtendedModel::Taken);
@@ -2471,7 +2530,12 @@ mod tests {
     }
 
     fn get_headers_after(header: &crate::block::BlockHeader) -> crate::protocol::GetHeaders {
-        crate::protocol::GetHeaders::new(vec![header.hash()])
+        let genesis = crate::chainparams::Network::Regtest.genesis().hash();
+        let mut locator = vec![header.hash()];
+        if header.hash() != genesis {
+            locator.push(genesis);
+        }
+        crate::protocol::GetHeaders::new(locator)
     }
 
     fn get_headers_on(headers: &[crate::block::BlockHeader]) -> crate::protocol::GetHeaders {
@@ -2528,7 +2592,7 @@ mod tests {
         let (handshake, _) =
             reply(handshake.receive(&core_message(crate::fixtures::VERSION_FRAME)));
         match handshake.receive(&core_message(crate::fixtures::VERACK_FRAME)) {
-            Ok(super::Step::Done(peer, _)) => peer,
+            Ok(super::Step::Done(peer, _)) => *peer,
             other => panic!("{other:?}"),
         }
     }
@@ -3368,7 +3432,6 @@ mod tests {
     fn refused_answer_keeps_the_chain() {
         let headers = crate::fixtures::headers_on_genesis(14);
         let on_tip = crate::fixtures::headers_on(&headers[13], 1);
-        let off_locator = crate::fixtures::branch_on(&headers[1], 20);
         let mut unproven = headers[0];
         unproven.nonce = (0..=u32::MAX)
             .find(|nonce| {
@@ -3381,7 +3444,6 @@ mod tests {
             .unwrap();
         for (batch, error) in [
             (vec![unproven], crate::chain::ExtendError::ProofOfWork),
-            (off_locator, crate::chain::ExtendError::NotOnLocator),
             (
                 vec![on_tip[0], on_tip[0]],
                 crate::chain::ExtendError::NotContinuous,
@@ -3532,6 +3594,28 @@ mod tests {
     }
 
     #[test]
+    fn headers_off_the_locator_of_a_low_work_sync_are_skipped() {
+        let mut chain = regtest();
+        let start = std::time::Instant::now();
+        let headers = crate::fixtures::headers_on_genesis(3_500);
+        let work_min = tip_after(&headers).work();
+        let (peer, _) = batch_then_tick(
+            asked_with(&mut chain, work_min, start),
+            &headers[..2_000],
+            start,
+        );
+        let off_locator = crate::fixtures::branch_on(&headers[1_000], 20);
+        let peer = accept(peer, &headers_message(&off_locator));
+        let (peer, _) = batch_then_tick(peer, &headers[2_000..], start);
+        let (peer, _) = batch_then_tick(peer, &headers[..2_000], start);
+        let received = peer.receive(&headers_message(&headers[2_000..]), crate::fixtures::CLOCK);
+        let Ok((_, super::Received::Synced(tip))) = received else {
+            panic!("{received:?}");
+        };
+        assert_eq!(tip, tip_after(&headers));
+    }
+
+    #[test]
     fn low_work_sync_that_refuses_a_batch_ends_the_connection() {
         let mut chain = regtest();
         let start = std::time::Instant::now();
@@ -3540,11 +3624,57 @@ mod tests {
             .work()
             .saturating_add(tip_after(&[]).work());
         let (peer, _) = batch_then_tick(asked_with(&mut chain, work_min, start), &headers, start);
+        let next = crate::fixtures::headers_on(&headers[1_999], 1);
         assert_eq!(
-            peer.receive(&headers_message(&headers), crate::fixtures::CLOCK)
+            peer.receive(
+                &headers_message(&[next[0], next[0]]),
+                crate::fixtures::CLOCK
+            )
+            .err(),
+            Some(super::PeerError::HeadersSync(
+                crate::headerssync::HeadersSyncError::NotContinuous
+            ))
+        );
+    }
+
+    #[test]
+    fn low_work_sync_ends_the_connection_at_once_on_an_answer_from_genesis() {
+        let mut chain = regtest();
+        let start = std::time::Instant::now();
+        let headers = crate::fixtures::headers_on_genesis(2_000);
+        let work_min = tip_after(&headers)
+            .work()
+            .saturating_add(tip_after(&[]).work());
+        let (peer, get_headers) =
+            batch_then_tick(asked_with(&mut chain, work_min, start), &headers, start);
+        assert_eq!(get_headers, get_headers_after(&headers[1_999]));
+        let other = crate::fixtures::branch_on(&crate::chainparams::Network::Regtest.genesis(), 1);
+        assert_eq!(
+            peer.receive(&headers_message(&other), crate::fixtures::CLOCK)
                 .err(),
             Some(super::PeerError::HeadersSync(
                 crate::headerssync::HeadersSyncError::NotContinuous
+            ))
+        );
+    }
+
+    #[test]
+    fn branch_download_ends_the_connection_at_once_on_an_answer_from_genesis() {
+        let start = std::time::Instant::now();
+        let headers = crate::fixtures::headers_on_genesis(2_001);
+        let mut chain = regtest();
+        for batch in crate::protocol::Headers::batches(headers.clone()) {
+            chain.extend(batch, crate::fixtures::CLOCK).unwrap();
+        }
+        let (peer, get_headers) =
+            batch_then_tick(asked(&mut chain, start, 7), &headers[..2_000], start);
+        assert_eq!(get_headers, get_headers_after(&headers[1_999]));
+        let other = crate::fixtures::branch_on(&crate::chainparams::Network::Regtest.genesis(), 1);
+        assert_eq!(
+            peer.receive(&headers_message(&other), crate::fixtures::CLOCK)
+                .err(),
+            Some(super::PeerError::Extend(
+                crate::chain::ExtendError::NotContinuous
             ))
         );
     }
@@ -3722,7 +3852,7 @@ mod tests {
     }
 
     #[test]
-    fn headers_off_our_tip_in_answer_to_our_getheaders_end_the_connection() {
+    fn headers_off_our_locator_while_our_getheaders_is_outstanding_are_skipped() {
         let start = std::time::Instant::now();
         let headers = crate::fixtures::headers_on_genesis(2);
         let (mut asked_chain, mut announced_chain) = (regtest(), regtest());
@@ -3730,14 +3860,42 @@ mod tests {
         let (announced, _) =
             batch_then_tick(pinged(&mut announced_chain, start, 7), &headers[1..], later);
         for peer in [asked(&mut asked_chain, start, 7), announced] {
-            assert_eq!(
-                peer.receive(&headers_message(&headers[1..]), crate::fixtures::CLOCK)
-                    .err(),
-                Some(super::PeerError::Extend(
-                    crate::chain::ExtendError::NotOnLocator
-                ))
-            );
+            let peer = accept(peer, &headers_message(&headers[1..]));
+            assert_eq!(peer.chain.tip(), tip_after(&[]));
+            synced(peer, &headers);
         }
+        assert_eq!(asked_chain.tip(), tip_after(&headers));
+        assert_eq!(announced_chain.tip(), tip_after(&headers));
+    }
+
+    #[test]
+    fn headers_on_a_header_in_a_gap_of_our_locator_are_skipped() {
+        let mut chain = regtest();
+        let start = std::time::Instant::now();
+        let headers = crate::fixtures::headers_on_genesis(14);
+        chain
+            .extend(
+                crate::fixtures::headers_batch(&headers),
+                crate::fixtures::CLOCK,
+            )
+            .unwrap();
+        let branch = crate::fixtures::branch_on(&headers[1], 20);
+        let peer = accept(asked(&mut chain, start, 7), &headers_message(&branch));
+        assert_eq!(peer.chain.tip(), tip_after(&headers));
+    }
+
+    #[test]
+    fn headers_off_our_locator_do_not_restart_the_headers_timeout() {
+        let mut chain = regtest();
+        let start = std::time::Instant::now();
+        let headers = crate::fixtures::headers_on_genesis(2);
+        let timeout = start + super::HEADERS_TIMEOUT;
+        let (peer, _) = idle(asked(&mut chain, start, 7), timeout - NANOSECOND);
+        let peer = accept(peer, &headers_message(&headers[1..]));
+        assert_eq!(
+            peer.tick(timeout, 8).err(),
+            Some(super::PeerError::HeadersTimeout)
+        );
     }
 
     #[test]
