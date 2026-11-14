@@ -95,7 +95,6 @@ enum AboveFork {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExtendError {
     NotOnTip,
-    NotOnLocator,
     NotContinuous,
     ProofOfWork,
     WrongBits,
@@ -161,10 +160,12 @@ impl Chain {
         }
         let tip_height = self.below_tip.len();
         let first_prev = first.prev;
-        let fork_height = locator_heights(tip_height)
+        let Some(fork_height) = locator_heights(tip_height)
             .skip(1)
             .find(|height| self.header_at(*height).hash() == first_prev)
-            .ok_or(ExtendError::NotOnLocator)?;
+        else {
+            panic!("an answer to our `getheaders` does not start on our locator");
+        };
         assert!(fork_height < tip_height);
         let branch = self.branch_on_fork(fork_height);
         self.extend_above(branch, Batch::Answer(headers), clock, work_min)
@@ -779,9 +780,6 @@ impl std::fmt::Display for ExtendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ExtendError::NotOnTip => write!(f, "headers do not start at our tip"),
-            ExtendError::NotOnLocator => {
-                write!(f, "headers do not start at a header of our locator")
-            }
             ExtendError::NotContinuous => write!(f, "headers do not form a chain"),
             ExtendError::ProofOfWork => write!(f, "a header fails proof of work"),
             ExtendError::WrongBits => write!(f, "a header has the wrong bits"),
@@ -1764,16 +1762,15 @@ mod tests {
     }
 
     #[test]
-    fn extend_on_locator_refuses_a_batch_on_a_header_that_is_not_in_the_locator() {
+    fn extend_on_locator_takes_a_branch_on_each_side_of_a_gap_in_the_locator() {
         let headers = crate::fixtures::headers_on_genesis(14);
-        for (below, expected) in [
-            (&headers[0], Ok(super::Extended::Taken { full: false })),
-            (&headers[1], Err(super::ExtendError::NotOnLocator)),
-            (&headers[2], Ok(super::Extended::Taken { full: false })),
-        ] {
+        for below in [&headers[0], &headers[2]] {
             let branch = crate::fixtures::branch_on(below, 20);
             let mut chain = regtest_with(&headers);
-            assert_eq!(on_locator(&mut chain, &branch), expected);
+            assert_eq!(
+                on_locator(&mut chain, &branch),
+                Ok(super::Extended::Taken { full: false })
+            );
         }
     }
 

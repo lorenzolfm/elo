@@ -2045,17 +2045,12 @@ pub(crate) mod fuzz {
             let Some(first) = headers.first() else {
                 return Ok(ExtendedModel::Kept);
             };
-            let fork = match self
+            let Some(fork) = self
                 .locator_heights()
                 .into_iter()
                 .find(|height| self.chain[*height] == first.prev)
-            {
-                Some(height) => height,
-                None => {
-                    return Err(super::PeerError::Extend(
-                        crate::chain::ExtendError::NotOnLocator,
-                    ));
-                }
+            else {
+                panic!("an answer to our `getheaders` does not start on our locator");
             };
             let batch = script_hashes(self.network, first.prev, headers).map_err(extend_error)?;
             if fork == self.height() {
@@ -3825,6 +3820,22 @@ mod tests {
         }
         assert_eq!(asked_chain.tip(), tip_after(&headers));
         assert_eq!(announced_chain.tip(), tip_after(&headers));
+    }
+
+    #[test]
+    fn headers_on_a_header_in_a_gap_of_our_locator_are_skipped() {
+        let mut chain = regtest();
+        let start = std::time::Instant::now();
+        let headers = crate::fixtures::headers_on_genesis(14);
+        chain
+            .extend(
+                crate::fixtures::headers_batch(&headers),
+                crate::fixtures::CLOCK,
+            )
+            .unwrap();
+        let branch = crate::fixtures::branch_on(&headers[1], 20);
+        let peer = accept(asked(&mut chain, start, 7), &headers_message(&branch));
+        assert_eq!(peer.chain.tip(), tip_after(&headers));
     }
 
     #[test]
