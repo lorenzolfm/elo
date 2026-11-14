@@ -82,7 +82,7 @@ async fn run(
         // The destination of the command line, and not the address of the connection: the next
         // dial looks up a name again.
         let logged = log(&elo::logging::Event::End {
-            peer: &destination,
+            destination: &destination,
             reason: &end,
             wait: RECONNECT_WAIT,
         });

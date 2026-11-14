@@ -8,7 +8,7 @@ use std::fmt::Write;
 
 /// The most bytes of a value before its escapes. A longer value is cut, and ends with `...`. So
 /// a peer that sends a long string cannot make a long line. The longest destination of the
-/// command line fits, so the `peer` of an `end` line is never cut.
+/// command line fits, so the `destination` of an `end` line is never cut.
 const VALUE_LENGTH_MAX: usize = 260;
 
 const _: () = assert!(crate::net::DESTINATION_LENGTH_MAX <= VALUE_LENGTH_MAX);
@@ -55,10 +55,11 @@ pub enum Event<'a> {
         peer: std::net::SocketAddr,
         tip: &'a crate::chain::Tip,
     },
-    /// The connection to `peer` ended for `reason`, and elo dials it again after `wait`. `peer` is
-    /// the destination of the command line: an IP address, or a name that elo looks up again.
+    /// The connection to `destination` ended for `reason`, and elo dials it again after `wait`.
+    /// `destination` is the peer of the command line: an IP address, or a name that elo looks up
+    /// again. It has its own key, so `peer` is always the address of a connection.
     End {
-        peer: &'a crate::net::Destination,
+        destination: &'a crate::net::Destination,
         reason: &'a dyn std::fmt::Display,
         wait: std::time::Duration,
     },
@@ -116,8 +117,12 @@ impl Event<'_> {
                 line.field("hash", tip.hash_display());
                 line.field("work", tip.work());
             }
-            Event::End { peer, reason, wait } => {
-                line.field("peer", peer);
+            Event::End {
+                destination,
+                reason,
+                wait,
+            } => {
+                line.field("destination", destination);
                 line.field("reason", reason);
                 line.field("wait_ms", wait.as_millis());
             }
@@ -306,13 +311,13 @@ mod tests {
             ),
             (
                 super::Event::End {
-                    peer: &crate::net::Destination::Address(
+                    destination: &crate::net::Destination::Address(
                         crate::net::PeerAddress::new(PEER).unwrap(),
                     ),
                     reason: &"the peer closed the connection",
                     wait: std::time::Duration::from_secs(5),
                 },
-                "level=warn event=end peer=127.0.0.1:18444 \
+                "level=warn event=end destination=127.0.0.1:18444 \
                  reason=\"the peer closed the connection\" wait_ms=5000",
             ),
             (

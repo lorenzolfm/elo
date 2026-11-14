@@ -277,7 +277,7 @@ fn our_ping_gets_a_pong_from_bitcoind() {
     assert_eq!(
         end,
         format!(
-            "level=warn event=end peer={} reason=\"the peer closed the connection\" wait_ms=5000",
+            "level=warn event=end destination={} reason=\"the peer closed the connection\" wait_ms=5000",
             bitcoind.peer
         )
     );
@@ -330,7 +330,7 @@ fn peer_with_a_name_gets_a_lookup_and_a_dial_to_its_address() {
     bitcoind.cli(&["-named", "disconnectnode", "nodeid=0"]);
     let end = elo.event("end", END_TIMEOUT);
     assert!(
-        end.starts_with(&format!("level=warn event=end peer={named} ")),
+        end.starts_with(&format!("level=warn event=end destination={named} ")),
         "{end}"
     );
 }

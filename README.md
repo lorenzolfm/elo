@@ -74,7 +74,7 @@ container runtime, reads stdout and adds the time. elo sends nothing to a log se
 ```text
 level=info event=version peer=127.0.0.1:18444 version=70016 services=0000000000000c09 user_agent=/Satoshi:31.1.0/ start_height=0 relay=true
 level=info event=tip peer=127.0.0.1:18444 height=0 hash=0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206 work=0000000000000000000000000000000000000000000000000000000000000002
-level=warn event=end peer=127.0.0.1:18444 reason="the peer closed the connection" wait_ms=5000
+level=warn event=end destination=127.0.0.1:18444 reason="the peer closed the connection" wait_ms=5000
 level=info event=stop signal=SIGTERM
 ```
 
@@ -82,7 +82,7 @@ level=info event=stop signal=SIGTERM
 | --- | --- | --- |
 | `version` | `info` | `peer` `version` `services` `user_agent` `start_height` `relay` |
 | `tip` | `info` | `peer` `height` `hash` `work` |
-| `end` | `warn` | `peer` `reason` `wait_ms`: elo dials the peer again after `wait_ms`. `peer` is the peer of the command line, also a name |
+| `end` | `warn` | `destination` `reason` `wait_ms`: elo dials `destination` again after `wait_ms`. `destination` is the peer of the command line, also a name. `peer` is always the address of a connection |
 | `exit` | `error` | `reason`: a fault of this host, and elo exits with 1 |
 | `stop` | `info` | `signal`: elo exits with 0 |
 | `panic` | `error` | `reason`: a bug, and elo exits with 101 |
