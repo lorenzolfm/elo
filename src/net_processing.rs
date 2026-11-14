@@ -798,7 +798,7 @@ fn receive_announcement(
             assert!(tip.work() <= chain.tip().work());
             assert_ne!(tip.hash(), chain.tip().hash());
             let tip = tip
-                .extend(chain.network(), headers.as_slice())
+                .extend(chain.network(), &headers)
                 .map_err(PeerError::Extend)?;
             if tip.work() > chain.tip().work() {
                 return Ok(Some(Download::on_tip(chain, work_min)));

@@ -212,7 +212,11 @@ impl Chain {
                 AboveFork::Empty { .. } => Extended::Kept,
                 AboveFork::Headers {
                     work, last_hash, ..
-                } => Extended::KeptOver(self.branch_tip(branch.fork_height, work, last_hash)),
+                } => Extended::KeptOver(self.branch_tip(
+                    self.work_at(branch.fork_height),
+                    work,
+                    last_hash,
+                )),
             });
         }
         self.extend_above(branch, batch, clock, work_min)
@@ -302,6 +306,7 @@ impl Chain {
         }
         assert!(work_above_fork > crate::pow::Work::ZERO);
         let time_max = time_max.max(time_max_before);
+        let work_at_fork = self.work.minus(work_above_fork);
         if work_branch <= work_above_fork {
             if full {
                 return Ok(Extended::Branch(Branch {
@@ -315,14 +320,13 @@ impl Chain {
                     chain_work: self.work,
                 }));
             }
-            let work_at_fork = self.work.minus(work_above_fork);
-            return Ok(Extended::KeptOver(BranchTip {
-                hash: last_hash,
-                work: work_at_fork.saturating_add(work_branch),
-            }));
+            return Ok(Extended::KeptOver(self.branch_tip(
+                work_at_fork,
+                work_branch,
+                last_hash,
+            )));
         }
 
-        let work_at_fork = self.work.minus(work_above_fork);
         let count = headers.len();
         self.tip = self.below_tip[fork_height];
         self.below_tip.truncate(fork_height);
@@ -394,11 +398,12 @@ impl Chain {
 
     fn branch_tip(
         &self,
-        fork_height: usize,
-        work_above_fork: crate::pow::Work,
+        work_at_fork: crate::pow::Work,
+        work_branch: crate::pow::Work,
         hash: bitcoin_hashes::sha256d::Hash,
     ) -> BranchTip {
-        let work = self.work_at(fork_height).saturating_add(work_above_fork);
+        assert!(work_at_fork <= self.work);
+        let work = work_at_fork.saturating_add(work_branch);
         assert!(work <= self.work);
         BranchTip { hash, work }
     }
@@ -708,9 +713,9 @@ impl BranchTip {
     pub(crate) fn extend(
         self,
         network: crate::chainparams::Network,
-        headers: &[crate::block::BlockHeader],
+        headers: &crate::protocol::Headers,
     ) -> Result<BranchTip, ExtendError> {
-        headers.iter().try_fold(self, |tip, header| {
+        headers.as_slice().iter().try_fold(self, |tip, header| {
             if header.prev != tip.hash {
                 return Err(ExtendError::NotContinuous);
             }
@@ -1973,17 +1978,21 @@ mod tests {
         let branch = crate::fixtures::branch_on(&genesis(), 3);
         let network = crate::chainparams::Network::Regtest;
         let tip = tip_of_branch(&branch[..1]);
-        assert_eq!(tip.extend(network, &[]), Ok(tip));
-        assert_eq!(
-            tip.extend(network, &branch[1..]),
-            Ok(tip_of_branch(&branch))
-        );
+        let extend = |headers: &[crate::block::BlockHeader]| {
+            tip.extend(network, &crate::fixtures::headers_batch(headers))
+        };
+        assert_eq!(extend(&[]), Ok(tip));
+        assert_eq!(extend(&branch[1..]), Ok(tip_of_branch(&branch)));
         let unproven = unproven(branch[2]);
         for (headers, error) in [
             (&branch[2..], super::ExtendError::NotContinuous),
+            (
+                &[branch[1], branch[1]][..],
+                super::ExtendError::NotContinuous,
+            ),
             (&[branch[1], unproven][..], super::ExtendError::ProofOfWork),
         ] {
-            assert_eq!(tip.extend(network, headers), Err(error));
+            assert_eq!(extend(headers), Err(error), "{headers:?}");
         }
     }
 }
