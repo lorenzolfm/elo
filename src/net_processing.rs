@@ -1601,7 +1601,8 @@ pub(crate) mod fuzz {
         let base = MessageBase {
             our_nonce: nonce,
             ping_nonce: 0,
-            bases: vec![(bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]), 0)],
+            last: (bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]), 0),
+            locator_below: Vec::new(),
         };
         let mut model = HandshakeModel {
             nonce,
@@ -1660,7 +1661,8 @@ pub(crate) mod fuzz {
             let base = MessageBase {
                 our_nonce: 0,
                 ping_nonce: model.ping_nonce,
-                bases: model.bases(),
+                last: model.download_last(),
+                locator_below: model.locator_below(),
             };
             // The wait of the driver can end with no message.
             if let Some(message) = script.message(&base) {
@@ -1840,13 +1842,9 @@ pub(crate) mod fuzz {
                 3 => (crate::protocol::PING, self.nonce().to_le_bytes().to_vec()),
                 4 => (crate::protocol::PONG, self.pong_payload(base.ping_nonce)),
                 5 => {
-                    // The first base is the last header of the download.
                     let payload = match usize::from(kind / 8).checked_sub(1) {
-                        None => self.headers_payload(base.bases[0], false),
-                        Some(index) => {
-                            let last = base.bases.len() - 1;
-                            self.headers_payload(base.bases[index.min(last)], true)
-                        }
+                        None => self.headers_payload(base.last, false),
+                        Some(index) => self.headers_payload(base.on_locator(index), true),
                     };
                     (crate::protocol::HEADERS, payload)
                 }
@@ -1905,12 +1903,16 @@ pub(crate) mod fuzz {
             assert!(self.headers_written_count + count <= SCRIPT_HEADERS_COUNT_MAX);
             // The loop below takes its bound from this.
             assert!(count <= HEADERS_FULL_COUNT + 1);
+            // An index past the batch changes no header, so it is `None`.
             let wrong_prev_index = match self.byte() {
                 0 => None,
                 255 => count.checked_sub(1),
                 byte => Some(usize::from(byte) - 1),
-            };
-            let branch_index = branches.then(|| branch_index_read(self.byte()));
+            }
+            .filter(|index| *index < count);
+            let branch_index = branches
+                .then(|| branch_index_read(self.byte()))
+                .filter(|index| *index < count);
 
             let mut payload = Vec::new();
             crate::serialize::write_compact_size(&mut payload, count);
@@ -1983,10 +1985,26 @@ pub(crate) mod fuzz {
         our_nonce: u64,
         /// The nonce of our last `ping`. A `pong` starts from it, so a `pong` can repeat.
         ping_nonce: u64,
-        /// The hash and the height of each header that a batch can start from: the last header of
-        /// the download, then the other hashes of the locator of our next `getheaders`. It is not
-        /// empty.
-        bases: Vec<(bitcoin_hashes::sha256d::Hash, usize)>,
+        /// The hash and the height of the last header of the download. A batch starts from it.
+        last: (bitcoin_hashes::sha256d::Hash, usize),
+        /// The hash and the height of each other header of the locator of our next `getheaders`,
+        /// below `last`, in order. A batch can also start from one of them.
+        locator_below: Vec<(bitcoin_hashes::sha256d::Hash, usize)>,
+    }
+
+    impl MessageBase {
+        /// The hash and the height of hash `index` of our locator, which starts with `last`, or of
+        /// its last hash when `index` is past its end.
+        fn on_locator(&self, index: usize) -> (bitcoin_hashes::sha256d::Hash, usize) {
+            let Some(below) = index.checked_sub(1) else {
+                return self.last;
+            };
+            self.locator_below
+                .get(below)
+                .or(self.locator_below.last())
+                .copied()
+                .unwrap_or(self.last)
+        }
     }
 
     /// `hash` with one bit of its last byte flipped, so a compare of only its start does not see
@@ -2111,36 +2129,37 @@ pub(crate) mod fuzz {
             hashes: Vec<bitcoin_hashes::sha256d::Hash>,
         },
         /// The first download of a low-work sync on the header of the chain at `start`, which must
-        /// reach `work_min`. It holds the hash of each header that it took, in order. On the tip,
-        /// which is then genesis, it is `Presync`. Below the tip, it is `BranchPresync`, and
-        /// `start` is the fork of a branch below the margin.
+        /// reach `PeerModel::branch_work_min`. It holds the hash of each header that it took, in
+        /// order. On the tip, which is then genesis, it is `Presync`. Below the tip, it is
+        /// `BranchPresync`, and `start` is the fork of a branch below the margin.
         Presync {
             start: usize,
-            work_min: u128,
             hashes: Vec<bitcoin_hashes::sha256d::Hash>,
         },
         /// The second download: `Redownload` or `BranchRedownload`. It holds the hashes of the
         /// first download, and the hash of each header that it took, in order.
         Redownload {
             start: usize,
-            work_min: u128,
             presync: Vec<bitcoin_hashes::sha256d::Hash>,
             buffer: Vec<bitcoin_hashes::sha256d::Hash>,
         },
     }
 
     /// What the chain does with a batch that passed each check, as `crate::chain::Extended` says.
+    /// `crate::chain::Extended` gives `Branch` and `BelowMargin` only after a full batch. Here they
+    /// come after a batch of each length, and `PeerModel::chain_next` reads one after a batch that
+    /// is not full as `Kept`.
     enum ExtendedModel {
         Taken,
         Kept,
-        /// The branch on the header of the chain at `fork` goes on, with the hash of each of its
-        /// headers above the fork.
+        /// The branch on the header of the chain at `fork` goes on after a full batch, with the
+        /// hash of each of its headers above the fork.
         Branch {
             fork: usize,
             hashes: Vec<bitcoin_hashes::sha256d::Hash>,
         },
-        /// A low-work sync on the header of the chain at `fork` can get the branch. Its first
-        /// download starts with the batch, whose hashes these are.
+        /// After a full batch, a low-work sync on the header of the chain at `fork` can get the
+        /// branch. Its first download starts with the batch, whose hashes these are.
         BelowMargin {
             fork: usize,
             hashes: Vec<bitcoin_hashes::sha256d::Hash>,
@@ -2257,26 +2276,27 @@ pub(crate) mod fuzz {
             heights
         }
 
-        /// The hash and the height of each header of the locator of our `getheaders`. In a
-        /// download that is not on the tip, it has only the last header of the download. Else it
-        /// has each header of the locator of the chain, and the tip is the first.
-        fn bases(&self) -> Vec<(bitcoin_hashes::sha256d::Hash, usize)> {
+        /// The hash and the height of each header of the locator of our `getheaders` below its
+        /// first, the last header of the download. In a download that is not on the tip, the
+        /// locator has only that header. Else it is the locator of the chain, whose first height
+        /// is the tip.
+        fn locator_below(&self) -> Vec<(bitcoin_hashes::sha256d::Hash, usize)> {
             if !matches!(self.download, DownloadModel::Chain) {
-                return vec![self.download_last()];
+                return Vec::new();
             }
-            let bases: Vec<_> = self
-                .locator_heights()
+            self.locator_heights()
                 .into_iter()
+                .skip(1)
                 .map(|height| (self.chain[height], height))
-                .collect();
-            // `Script::message` reads the first base as the last header of the download.
-            assert_eq!(bases[0], self.download_last());
-            bases
+                .collect()
         }
 
         /// The locator of our `getheaders`.
         fn locator(&self) -> Vec<bitcoin_hashes::sha256d::Hash> {
-            self.bases().into_iter().map(|(hash, _)| hash).collect()
+            std::iter::once(self.download_last())
+                .chain(self.locator_below())
+                .map(|(hash, _)| hash)
+                .collect()
         }
 
         fn is_synced(&self) -> bool {
@@ -2402,10 +2422,10 @@ pub(crate) mod fuzz {
                     assert_eq!(self.height(), 0);
                     let hashes =
                         script_hashes(self.network, self.tip(), &headers).map_err(sync_error)?;
-                    self.presync_start(0, self.work_min, hashes, full)?
+                    self.presync_start(0, hashes, full)?
                 }
                 DownloadModel::Chain => {
-                    let extended = self.extend_on_locator(&headers, full)?;
+                    let extended = self.extend_on_locator(&headers)?;
                     self.chain_next(extended, full)?
                 }
                 DownloadModel::Branch { fork, hashes } => {
@@ -2416,26 +2436,21 @@ pub(crate) mod fuzz {
                             let last = hashes.last().copied().unwrap_or(self.chain[fork]);
                             let batch = script_hashes(self.network, last, &headers)
                                 .map_err(extend_error)?;
-                            self.extend_above(fork, hashes, batch, full)
+                            self.extend_above(fork, hashes, batch)
                         }
                     };
                     self.chain_next(extended, full)?
                 }
-                DownloadModel::Presync {
-                    start,
-                    work_min,
-                    hashes,
-                } => {
+                DownloadModel::Presync { start, hashes } => {
                     let last = hashes.last().copied().unwrap_or(self.chain[start]);
                     let batch = script_hashes(self.network, last, &headers).map_err(sync_error)?;
-                    self.receive_presync(start, work_min, hashes, batch, full)?
+                    self.receive_presync(start, hashes, batch, full)?
                 }
                 DownloadModel::Redownload {
                     start,
-                    work_min,
                     presync,
                     buffer,
-                } => self.receive_redownload(start, work_min, presync, buffer, &headers)?,
+                } => self.receive_redownload(start, presync, buffer, &headers)?,
             };
             match next {
                 Some(download) => {
@@ -2456,7 +2471,6 @@ pub(crate) mod fuzz {
         fn extend_on_locator(
             &mut self,
             headers: &[crate::block::BlockHeader],
-            full: bool,
         ) -> Result<ExtendedModel, super::PeerError> {
             let Some(first) = headers.first() else {
                 return Ok(ExtendedModel::Kept);
@@ -2478,22 +2492,20 @@ pub(crate) mod fuzz {
                 self.chain.extend(batch);
                 return Ok(ExtendedModel::Taken);
             }
-            Ok(self.extend_above(fork, Vec::new(), batch, full))
+            Ok(self.extend_above(fork, Vec::new(), batch))
         }
 
         /// The chain goes on with the branch on the header at `base` whose headers have `branch`,
         /// and with `batch`, the hashes of headers that passed each check on its last header. With
         /// no header of the branch yet, the batch can start with our headers, and the fork is the
-        /// last of these, or `base`. The chain takes a branch with more work than ours, and keeps
-        /// a branch with at most our work while it gets full batches. Below the margin, a full
-        /// batch with none of our headers can go to a low-work sync from the fork, and else the
-        /// branch has no header.
+        /// last of these, or `base`. The chain takes a branch with more work than ours, and else
+        /// the branch goes on. Below the margin, a batch with none of our headers can go to a
+        /// low-work sync from the fork, and else the branch has no header.
         fn extend_above(
             &mut self,
             base: usize,
             branch: Vec<bitcoin_hashes::sha256d::Hash>,
             batch: Vec<bitcoin_hashes::sha256d::Hash>,
-            full: bool,
         ) -> ExtendedModel {
             assert!(!batch.is_empty());
             assert!(base < self.height());
@@ -2513,13 +2525,9 @@ pub(crate) mod fuzz {
                 return ExtendedModel::Taken;
             }
             if rest.is_empty() {
-                return if full {
-                    ExtendedModel::Branch {
-                        fork,
-                        hashes: Vec::new(),
-                    }
-                } else {
-                    ExtendedModel::Kept
+                return ExtendedModel::Branch {
+                    fork,
+                    hashes: Vec::new(),
                 };
             }
             let branch_count = branch.len();
@@ -2529,21 +2537,17 @@ pub(crate) mod fuzz {
             if branch_work < self.branch_work_min() {
                 // A branch with a header of its own passed the margin, and its work only rises.
                 assert_eq!(branch_count, 0);
-                return match (full, shared) {
-                    (false, _) => ExtendedModel::Kept,
-                    (true, 0) => ExtendedModel::BelowMargin { fork, hashes },
-                    (true, _) => ExtendedModel::Branch {
+                return if shared == 0 {
+                    ExtendedModel::BelowMargin { fork, hashes }
+                } else {
+                    ExtendedModel::Branch {
                         fork,
                         hashes: Vec::new(),
-                    },
+                    }
                 };
             }
             if branch_work <= self.work() {
-                return if full {
-                    ExtendedModel::Branch { fork, hashes }
-                } else {
-                    ExtendedModel::Kept
-                };
+                return ExtendedModel::Branch { fork, hashes };
             }
             self.chain.truncate(fork + 1);
             self.chain.extend(hashes);
@@ -2551,7 +2555,9 @@ pub(crate) mod fuzz {
         }
 
         /// The lowest work of the chain of a branch from genesis that goes on: our work less the
-        /// work of 144 script headers, or the minimum work if that is higher.
+        /// work of 144 script headers, or the minimum work if that is higher. A low-work sync must
+        /// reach it. On genesis, which is below the minimum, it is the minimum. The chain stays
+        /// until the sync ends, so it stays too.
         fn branch_work_min(&self) -> u128 {
             const { assert!(usize::BITS <= 64) };
             let behind = SCRIPT_HEADER_WORK * crate::chain::BRANCH_TIP_HEADERS_BEHIND_MAX as u128;
@@ -2559,7 +2565,8 @@ pub(crate) mod fuzz {
         }
 
         /// Where the next batch goes after the chain did `extended` with a batch that was `full`,
-        /// or with the headers of a low-work sync whose last batch was `full`.
+        /// or with the headers of a low-work sync whose last batch was `full`. After a batch that
+        /// is not full, the peer has no more of a branch, so the chain keeps its tip.
         fn chain_next(
             &mut self,
             extended: ExtendedModel,
@@ -2568,14 +2575,12 @@ pub(crate) mod fuzz {
             match extended {
                 ExtendedModel::Taken => Ok(full.then_some(DownloadModel::Chain)),
                 ExtendedModel::Kept => Ok(None),
+                _ if !full => Ok(None),
                 ExtendedModel::Branch { fork, hashes } => {
-                    assert!(full);
                     Ok(Some(DownloadModel::Branch { fork, hashes }))
                 }
                 ExtendedModel::BelowMargin { fork, hashes } => {
-                    assert!(full);
-                    let work_min = self.branch_work_min();
-                    self.presync_start(fork, work_min, hashes, full)
+                    self.presync_start(fork, hashes, full)
                 }
             }
         }
@@ -2585,7 +2590,6 @@ pub(crate) mod fuzz {
         fn presync_start(
             &mut self,
             start: usize,
-            work_min: u128,
             batch: Vec<bitcoin_hashes::sha256d::Hash>,
             full: bool,
         ) -> Result<Option<DownloadModel>, super::PeerError> {
@@ -2594,8 +2598,8 @@ pub(crate) mod fuzz {
             }
             self.salt_left = false;
             // The sync starts below its minimum, so it gets at least one header.
-            assert!(self.work_at(start) < work_min);
-            self.receive_presync(start, work_min, Vec::new(), batch, full)
+            assert!(self.work_at(start) < self.branch_work_min());
+            self.receive_presync(start, Vec::new(), batch, full)
         }
 
         /// The first download takes `batch` after `hashes`. When the work reaches the minimum,
@@ -2605,25 +2609,19 @@ pub(crate) mod fuzz {
         fn receive_presync(
             &self,
             start: usize,
-            work_min: u128,
             mut hashes: Vec<bitcoin_hashes::sha256d::Hash>,
             batch: Vec<bitcoin_hashes::sha256d::Hash>,
             full: bool,
         ) -> Result<Option<DownloadModel>, super::PeerError> {
             hashes.extend(batch);
-            if self.work_at(start + hashes.len()) >= work_min {
+            if self.work_at(start + hashes.len()) >= self.branch_work_min() {
                 Ok(Some(DownloadModel::Redownload {
                     start,
-                    work_min,
                     presync: hashes,
                     buffer: Vec::new(),
                 }))
             } else if full {
-                Ok(Some(DownloadModel::Presync {
-                    start,
-                    work_min,
-                    hashes,
-                }))
+                Ok(Some(DownloadModel::Presync { start, hashes }))
             } else {
                 Err(super::PeerError::HeadersSync(
                     crate::headerssync::HeadersSyncError::WorkTooLow,
@@ -2641,11 +2639,12 @@ pub(crate) mod fuzz {
         fn receive_redownload(
             &mut self,
             start: usize,
-            work_min: u128,
             presync: Vec<bitcoin_hashes::sha256d::Hash>,
             mut buffer: Vec<bitcoin_hashes::sha256d::Hash>,
             headers: &[crate::block::BlockHeader],
         ) -> Result<Option<DownloadModel>, super::PeerError> {
+            // The chain takes the headers only after the loop, so this stays in it.
+            let work_min = self.branch_work_min();
             let period = self.network.commitment_period();
             let mut last = buffer.last().copied().unwrap_or(self.chain[start]);
             for header in headers {
@@ -2675,7 +2674,7 @@ pub(crate) mod fuzz {
                     self.chain.extend(buffer);
                     return Ok(full.then_some(DownloadModel::Chain));
                 }
-                let extended = self.extend_above(start, Vec::new(), buffer, full);
+                let extended = self.extend_above(start, Vec::new(), buffer);
                 // The headers reach the lowest work of a branch that goes on.
                 assert!(!matches!(extended, ExtendedModel::BelowMargin { .. }));
                 self.chain_next(extended, full)
@@ -2686,7 +2685,6 @@ pub(crate) mod fuzz {
                 assert!(buffer.len() <= self.network.redownload_buffer_size());
                 Ok(Some(DownloadModel::Redownload {
                     start,
-                    work_min,
                     presync,
                     buffer,
                 }))
