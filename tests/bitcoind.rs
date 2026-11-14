@@ -561,6 +561,35 @@ fn announcement_on_a_branch_that_lost_to_ours_after_a_low_work_sync_gets_no_geth
     );
 }
 
+#[test]
+fn announcement_before_the_answer_to_our_getheaders_keeps_the_connection() {
+    let bitcoind = Bitcoind::start();
+    bitcoind.cli(&["generatetodescriptor", "1", "raw(51)"]);
+    let elo = Elo::start(&bitcoind);
+    elo.event("tip", SYNC_TIMEOUT);
+    wait_for_send_headers(&bitcoind, &elo);
+
+    for round in 0..10 {
+        let tip = bitcoind.cli(&["getbestblockhash"]);
+        bitcoind.cli(&["invalidateblock", tip.trim_end()]);
+        let script = format!("raw({:x})", 0x53 + round % 2);
+        bitcoind.cli(&["generatetodescriptor", "2", &script]);
+    }
+    settle(&bitcoind, &elo);
+
+    let best = bitcoind.cli(&["getbestblockhash"]);
+    let tips = elo.events("tip");
+    let expected = format!(
+        "level=info event=tip peer={} height=11 hash={} ",
+        bitcoind.peer,
+        best.trim_end()
+    );
+    assert!(
+        tips.last().is_some_and(|tip| tip.starts_with(&expected)),
+        "{tips:?}"
+    );
+}
+
 fn settle(bitcoind: &Bitcoind, elo: &Elo) {
     let start = std::time::Instant::now();
     loop {
