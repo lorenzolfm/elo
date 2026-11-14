@@ -29,6 +29,9 @@ pub enum Event<'a> {
         peer: std::net::SocketAddr,
         tip: &'a crate::chain::Tip,
     },
+    Metrics {
+        address: std::net::SocketAddr,
+    },
     End {
         destination: &'a crate::net::Destination,
         reason: &'a dyn std::fmt::Display,
@@ -55,6 +58,7 @@ impl Event<'_> {
         match self {
             Event::Version { .. } => "version",
             Event::Tip { .. } => "tip",
+            Event::Metrics { .. } => "metrics",
             Event::End { .. } => "end",
             Event::Exit { .. } => "exit",
             Event::Stop { .. } => "stop",
@@ -64,7 +68,10 @@ impl Event<'_> {
 
     fn level(&self) -> Level {
         match self {
-            Event::Version { .. } | Event::Tip { .. } | Event::Stop { .. } => Level::Info,
+            Event::Version { .. }
+            | Event::Tip { .. }
+            | Event::Metrics { .. }
+            | Event::Stop { .. } => Level::Info,
             Event::End { .. } => Level::Warn,
             Event::Exit { .. } | Event::Panic { .. } => Level::Error,
         }
@@ -89,6 +96,7 @@ impl Event<'_> {
                 line.field("hash", tip.hash_display());
                 line.field("work", tip.work());
             }
+            Event::Metrics { address } => line.field("address", address),
             Event::End {
                 destination,
                 reason,
@@ -263,6 +271,10 @@ mod tests {
                 "level=info event=tip peer=127.0.0.1:18444 height=0 \
                  hash=0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206 \
                  work=0000000000000000000000000000000000000000000000000000000000000002",
+            ),
+            (
+                super::Event::Metrics { address: PEER },
+                "level=info event=metrics address=127.0.0.1:18444",
             ),
             (
                 super::Event::End {
