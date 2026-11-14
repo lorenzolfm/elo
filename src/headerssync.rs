@@ -226,7 +226,8 @@ impl Redownload {
         for header in headers.into_vec() {
             let (link, work) = checked(self.network, self.last, &header)?;
             self.work = self.work.saturating_add(work);
-            if self.work < self.work_min && self.commitments.is_at(link.height) {
+            let first_download = self.work < self.work_min;
+            if first_download && self.commitments.is_at(link.height) {
                 let kept = self.commitments.get(link.height);
                 if kept != Some(self.commitments.commitment(link.hash)) {
                     return Err(HeadersSyncError::CommitmentMismatch);

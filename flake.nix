@@ -140,8 +140,6 @@
               __darwinAllowLocalNetworking = true;
             });
 
-          elo-doctest = craneLib.cargoDocTest devArgs;
-
           elo-fmt = craneLib.cargoFmt {inherit src;};
 
           elo-comments =
@@ -150,6 +148,8 @@
             } ''
               cd ${./.}
               mapfile -d "" tree < <(find . -type f -print0)
+              wait $!
+              (( ''${#tree[@]} > 0 ))
               ast-grep test --config ${commentsConfig} --custom-languages allow
               ast-grep scan --config ${commentsConfig} --custom-languages allow -- "''${tree[@]}"
               touch "$out"

@@ -110,7 +110,7 @@ Nix builds everything. `flake.lock` pins nixpkgs and the other inputs, and
 
 ```sh
 nix build          # the binary, at ./result/bin/elo
-nix flake check    # every CI gate: build, clippy, tests, doctests, rustfmt, no comments, fuzz corpus
+nix flake check    # every CI gate: build, clippy, tests, rustfmt, no comments, fuzz corpus
 nix develop        # a shell with the pinned toolchain (direnv: `direnv allow`)
 ```
 

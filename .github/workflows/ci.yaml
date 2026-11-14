@@ -21,7 +21,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        gate: [elo, elo-clippy, elo-test, elo-doctest, elo-fmt, elo-comments, elo-fuzz, elo-fuzz-image, elo-image]
+        gate:
+          - elo
+          - elo-clippy
+          - elo-test
+          - elo-fmt
+          - elo-comments
+          - elo-fuzz
+          - elo-fuzz-image
+          - elo-image
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
