@@ -52,9 +52,10 @@ pub enum Event<'a> {
         peer: std::net::SocketAddr,
         tip: &'a crate::chain::Tip,
     },
-    /// The connection to `peer` ended for `reason`, and elo dials it again after `wait`.
+    /// The connection to `peer` ended for `reason`, and elo dials it again after `wait`. `peer` is
+    /// the peer of the command line: an IP address, or a name that elo looks up again.
     End {
-        peer: std::net::SocketAddr,
+        peer: &'a dyn std::fmt::Display,
         reason: &'a dyn std::fmt::Display,
         wait: std::time::Duration,
     },
@@ -302,7 +303,7 @@ mod tests {
             ),
             (
                 super::Event::End {
-                    peer: PEER,
+                    peer: &PEER,
                     reason: &"the peer closed the connection",
                     wait: std::time::Duration::from_secs(5),
                 },

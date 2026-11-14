@@ -50,8 +50,15 @@ chain stays in memory, so the next connection syncs from its tip. A chain below
 the minimum work starts again from genesis.
 
 ```sh
-elo <mainnet|testnet4|signet|regtest> <ip>[:port]    # IPv6 as [::1]:8333
+elo <mainnet|testnet4|signet|regtest> <ip|name>[:port]    # IPv6 as [::1]:8333
 ```
+
+The peer is an IP address or a name. Before each dial, elo looks up the name
+with the resolver of the OS, within 30 s. It takes at most 256 of its
+addresses, in a random order, and dials them in that order until one takes the
+connect. So a name with many addresses, such as a DNS seed, gives a new peer
+on each dial. A failed lookup is an `end`, and elo looks up the name again
+after 5 s.
 
 SIGTERM and SIGINT (Ctrl-C) stop elo at any step, also in the wait before a
 dial. It logs the signal and exits with 0. elo exits with 1 only on a fault of
@@ -75,7 +82,7 @@ level=info event=stop signal=SIGTERM
 | --- | --- | --- |
 | `version` | `info` | `peer` `version` `services` `user_agent` `start_height` `relay` |
 | `tip` | `info` | `peer` `height` `hash` `work` |
-| `end` | `warn` | `peer` `reason` `wait_ms`: elo dials the peer again after `wait_ms` |
+| `end` | `warn` | `peer` `reason` `wait_ms`: elo dials the peer again after `wait_ms`. `peer` is the peer of the command line, also a name |
 | `exit` | `error` | `reason`: a fault of this host, and elo exits with 1 |
 | `stop` | `info` | `signal`: elo exits with 0 |
 | `panic` | `error` | `reason`: a bug, and elo exits with 101 |

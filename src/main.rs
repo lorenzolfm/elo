@@ -1,11 +1,15 @@
-//! `elo <network> <ip>[:port]`: dials one peer, does the handshake, and logs the peer's
-//! `version`. Then it syncs the header chain from the peer and logs the tip. It asks the peer to
-//! announce each new header, takes it on the tip, and logs the tip when it moves. It pings the
-//! peer and answers its `ping` messages until the connection ends. Then it waits and dials the
-//! peer again. The chain stays in memory, so the next connection syncs from its tip. SIGTERM
-//! and SIGINT stop it at any of these steps. Each step writes a line of `elo::logging` to stdout.
+//! `elo <network> <host>[:port]`: dials one peer, does the handshake, and logs the peer's
+//! `version`. The host is an IP address or a name. Before each dial, elo looks up the name, and
+//! dials its addresses in a random order until one takes the connect. Then it syncs the header
+//! chain from the peer and logs the tip. It asks the peer to announce each new header, takes it on
+//! the tip, and logs the tip when it moves. It pings the peer and answers its `ping` messages
+//! until the connection ends. Then it waits and dials the peer again. The chain stays in memory,
+//! so the next connection syncs from its tip. SIGTERM and SIGINT stop it at any of these steps.
+//! Each step writes a line of `elo::logging` to stdout.
 
-const USAGE: &str = "usage: elo <mainnet|testnet4|signet|regtest> <ip>[:port]";
+use std::hash::BuildHasher;
+
+const USAGE: &str = "usage: elo <mainnet|testnet4|signet|regtest> <ip|name>[:port]";
 
 /// The exit code for bad usage. A stop by a signal exits with 0, and a panic with 101. Every
 /// other exit is 1, because only a fault of this host ends elo.
@@ -14,6 +18,14 @@ const EXIT_USAGE: u8 = 2;
 /// How long elo waits after a connection ends before it dials the peer again. So a peer that is
 /// down, or that ends each connection at once, gets at most one try in each wait.
 const RECONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long the lookup of a name may take. The resolver of the OS tries each name server again
+/// after its own timeout, by default 5 s, two times for each of at most 3 servers.
+const LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The most addresses of a name that one dial tries. Each try takes at most the connect timeout,
+/// so this bounds the time of a dial.
+const ADDRESSES_COUNT_MAX: usize = 256;
 
 fn main() -> std::process::ExitCode {
     // First of all, so each panic writes a `panic` line, and not the text of the default hook,
@@ -40,14 +52,15 @@ fn main() -> std::process::ExitCode {
         Ok(runtime) => runtime,
         Err(error) => return exit(&format_args!("runtime: {error}")),
     };
-    runtime.block_on(run(network, peer))
+    let code = runtime.block_on(run(network, peer));
+    // A lookup runs on a blocking thread of the runtime, and a stop or a lookup timeout does not
+    // end it. The drop of the runtime would wait for that thread, so the runtime does not wait.
+    runtime.shutdown_background();
+    code
 }
 
 /// Dials `peer` again after each end that retries, until a signal or an end that exits.
-async fn run(
-    network: elo::chainparams::Network,
-    peer: std::net::SocketAddr,
-) -> std::process::ExitCode {
+async fn run(network: elo::chainparams::Network, peer: Peer) -> std::process::ExitCode {
     // Before the first dial, so a signal from here on stops elo. As PID 1 in a container, a
     // process with no handler never sees a SIGTERM: the kernel drops it, and the stop ends in
     // SIGKILL after its timeout.
@@ -63,7 +76,7 @@ async fn run(
     loop {
         // The drop of the connection closes its socket. elo keeps nothing on disk, so the stop
         // has nothing else to finish.
-        let end = match signals.unless(dial(peer, &mut chain)).await {
+        let end = match signals.unless(dial(&peer, &mut chain)).await {
             Ok(Ok(end)) => end,
             Ok(Err(error)) => return exit_stdout(error),
             Err(signal) => return stop(signal),
@@ -73,8 +86,10 @@ async fn run(
         if !end.retries() {
             return exit(&end);
         }
+        // The peer of the command line, and not the address of the connection: the next dial
+        // looks up a name again.
         let logged = log(&elo::logging::Event::End {
-            peer,
+            peer: &peer,
             reason: &end,
             wait: RECONNECT_WAIT,
         });
@@ -188,6 +203,8 @@ impl Signals {
 /// How one connection ended. A failed write to stdout is no end of a connection: it ends elo.
 #[derive(Debug)]
 enum End {
+    /// The lookup of the name of the peer failed.
+    Lookup(LookupError),
     /// The connect or the handshake failed.
     Handshake(elo::net::HandshakeError),
     /// The connection ended in the sync or after it.
@@ -201,6 +218,7 @@ impl End {
     /// a new error does not compile until it has a side.
     fn retries(&self) -> bool {
         match self {
+            End::Lookup(LookupError::Failed(_) | LookupError::Timeout | LookupError::Empty) => true,
             End::Handshake(elo::net::HandshakeError::Salt(_)) => false,
             End::Handshake(
                 elo::net::HandshakeError::Connect(_)
@@ -225,6 +243,7 @@ impl End {
 impl std::fmt::Display for End {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            End::Lookup(error) => write!(f, "{error}"),
             End::Handshake(error) => write!(f, "{error}"),
             End::Run(error) => write!(f, "{error}"),
         }
@@ -234,14 +253,19 @@ impl std::fmt::Display for End {
 /// Dials `peer`, does the handshake and logs the `version` of the peer. Then syncs `chain` and
 /// logs its tip, and logs it again each time an announcement of the peer moves it, until the
 /// connection ends. `Err` is a failed write to stdout.
-async fn dial(
-    peer: std::net::SocketAddr,
-    chain: &mut elo::chain::Chain,
-) -> Result<End, std::io::Error> {
-    let (connection, version) = match elo::net::handshake(peer, chain).await {
+async fn dial(peer: &Peer, chain: &mut elo::chain::Chain) -> Result<End, std::io::Error> {
+    let addresses = match peer {
+        Peer::Address(address) => vec![*address],
+        Peer::Name { host, port } => match lookup(host, *port).await {
+            Ok(addresses) => addresses,
+            Err(error) => return Ok(End::Lookup(error)),
+        },
+    };
+    let (connection, version) = match elo::net::handshake(&addresses, chain).await {
         Ok(handshake) => handshake,
         Err(error) => return Ok(End::Handshake(error)),
     };
+    let peer = connection.address();
     log(&elo::logging::Event::Version {
         peer,
         version: &version,
@@ -262,11 +286,83 @@ async fn dial(
     }
 }
 
+/// The peer that the command line names.
+#[derive(Debug, PartialEq, Eq)]
+enum Peer {
+    /// An IP address, which elo dials with no lookup.
+    Address(std::net::SocketAddr),
+    /// A name, which elo looks up before each dial.
+    Name { host: String, port: u16 },
+}
+
+impl std::fmt::Display for Peer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Peer::Address(address) => write!(f, "{address}"),
+            Peer::Name { host, port } => write!(f, "{host}:{port}"),
+        }
+    }
+}
+
+/// Why the lookup of a name gave no address to dial.
+#[derive(Debug)]
+enum LookupError {
+    /// The resolver of the OS failed.
+    Failed(std::io::Error),
+    /// The lookup took longer than `LOOKUP_TIMEOUT`.
+    Timeout,
+    /// The name has no address that names a peer.
+    Empty,
+}
+
+impl std::fmt::Display for LookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LookupError::Failed(error) => write!(f, "lookup: {error}"),
+            LookupError::Timeout => write!(
+                f,
+                "the lookup took longer than {} s",
+                LOOKUP_TIMEOUT.as_secs()
+            ),
+            LookupError::Empty => write!(f, "the lookup gave no address"),
+        }
+    }
+}
+
+/// The addresses of `host` at `port`, as `dial_order` gives them.
+async fn lookup(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>, LookupError> {
+    match tokio::time::timeout(LOOKUP_TIMEOUT, tokio::net::lookup_host((host, port))).await {
+        Ok(Ok(answers)) => dial_order(answers),
+        Ok(Err(error)) => Err(LookupError::Failed(error)),
+        Err(_elapsed) => Err(LookupError::Timeout),
+    }
+}
+
+/// The `answers` of a lookup that name a peer, at most `ADDRESSES_COUNT_MAX`, in a random order.
+/// So each dial can start on another address of a name that has many, such as a seed. The order
+/// needs no secret, so it comes from the keys of `RandomState`.
+fn dial_order(
+    answers: impl Iterator<Item = std::net::SocketAddr>,
+) -> Result<Vec<std::net::SocketAddr>, LookupError> {
+    // As in `parse`: `0.0.0.0` and `::` name no peer. Some resolvers give them for a name that
+    // they block.
+    let mut addresses: Vec<std::net::SocketAddr> = answers
+        .filter(|address| !address.ip().to_canonical().is_unspecified())
+        .take(ADDRESSES_COUNT_MAX)
+        .collect();
+    if addresses.is_empty() {
+        return Err(LookupError::Empty);
+    }
+    let random = std::hash::RandomState::new();
+    addresses.sort_by_cached_key(|address| random.hash_one(address));
+    Ok(addresses)
+}
+
 /// The args after the program name. `None` is bad usage.
 ///
 /// An IPv6 address needs brackets even without a port, because `::1:8333` is an IPv6 address
 /// and not `::1` with a port.
-fn parse(args: &[std::ffi::OsString]) -> Option<(elo::chainparams::Network, std::net::SocketAddr)> {
+fn parse(args: &[std::ffi::OsString]) -> Option<(elo::chainparams::Network, Peer)> {
     let [network, peer] = args else {
         return None;
     };
@@ -279,25 +375,66 @@ fn parse(args: &[std::ffi::OsString]) -> Option<(elo::chainparams::Network, std:
     };
 
     let peer = peer.to_str()?;
-    let peer = if let Ok(peer) = peer.parse() {
-        peer
-    } else if let Some(ip) = peer.strip_prefix('[').and_then(|ip| ip.strip_suffix(']')) {
-        let ip = ip.parse::<std::net::Ipv6Addr>().ok()?;
-        std::net::SocketAddr::from((ip, network.default_port()))
+    let peer = if let Some(address) = address(peer, network.default_port()) {
+        // Port 0, `0.0.0.0`, `[::]` and `[::ffff:0.0.0.0]` name no peer.
+        if address.port() == 0 || address.ip().to_canonical().is_unspecified() {
+            return None;
+        }
+        Peer::Address(address)
     } else {
-        let ip = peer.parse::<std::net::Ipv4Addr>().ok()?;
-        std::net::SocketAddr::from((ip, network.default_port()))
+        let (host, port) = match peer.split_once(':') {
+            Some((host, port)) => (host, port.parse().ok()?),
+            None => (peer, network.default_port()),
+        };
+        if port == 0 || !is_name(host) {
+            return None;
+        }
+        Peer::Name {
+            host: host.to_owned(),
+            port,
+        }
     };
-    // Port 0, `0.0.0.0`, `[::]` and `[::ffff:0.0.0.0]` name no peer.
-    if peer.port() == 0 || peer.ip().to_canonical().is_unspecified() {
-        return None;
-    }
     Some((network, peer))
+}
+
+/// `peer` as an IP address with an optional port, or `None` if it is no IP address.
+fn address(peer: &str, default_port: u16) -> Option<std::net::SocketAddr> {
+    if let Ok(address) = peer.parse() {
+        return Some(address);
+    }
+    let ip = match peer.strip_prefix('[').and_then(|ip| ip.strip_suffix(']')) {
+        Some(ip) => std::net::IpAddr::V6(ip.parse().ok()?),
+        None => std::net::IpAddr::V4(peer.parse().ok()?),
+    };
+    Some(std::net::SocketAddr::from((ip, default_port)))
+}
+
+/// Whether `host` is a name of a host: labels of letters, digits and `-`, split by `.`. A label
+/// has 1 to 63 bytes, and does not start or end with `-`. The name has at most 253 bytes, and can
+/// have one more `.` at the end, as a name with all its labels. The last label is not only
+/// digits, so the resolver cannot read the name as an IPv4 address in a short form, such as
+/// `127.1`.
+fn is_name(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let label = |label: &str| {
+        (1..=63).contains(&label.len())
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    };
+    host.len() <= 253
+        && host.split('.').all(label)
+        && host
+            .rsplit('.')
+            .next()
+            .is_some_and(|last| !last.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 #[cfg(test)]
 mod tests {
-    fn parse(args: &[&str]) -> Option<(elo::chainparams::Network, std::net::SocketAddr)> {
+    fn parse(args: &[&str]) -> Option<(elo::chainparams::Network, super::Peer)> {
         let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
         super::parse(&args)
     }
@@ -305,7 +442,7 @@ mod tests {
     // The L3 tests also hold a closed connection, which retries, and a stdout fault, which
     // exits. A stdout fault is no `End`, so it has no row here.
     #[test]
-    fn a_fault_of_this_host_ends_elo_and_a_failed_connect_retries() {
+    fn a_fault_of_this_host_ends_elo_and_a_failed_connect_or_lookup_retries() {
         for (end, retries) in [
             (
                 super::End::Handshake(elo::net::HandshakeError::Salt(std::io::Error::other(
@@ -323,6 +460,7 @@ mod tests {
                 super::End::Handshake(elo::net::HandshakeError::ConnectTimeout),
                 true,
             ),
+            (super::End::Lookup(super::LookupError::Timeout), true),
         ] {
             assert_eq!(end.retries(), retries, "{end}");
         }
@@ -347,37 +485,115 @@ mod tests {
             ("signet", elo::chainparams::Network::Signet, 38333),
             ("regtest", elo::chainparams::Network::Regtest, 18444),
         ] {
-            let peer = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            let peer = super::Peer::Address(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
             assert_eq!(parse(&[name, "127.0.0.1"]), Some((network, peer)), "{name}");
+            let peer = super::Peer::Name {
+                host: "localhost".to_owned(),
+                port,
+            };
+            assert_eq!(parse(&[name, "localhost"]), Some((network, peer)), "{name}");
         }
     }
 
     #[test]
-    fn peer_is_an_ip_literal_with_an_optional_port() {
+    fn peer_is_an_ip_literal_or_a_name_with_an_optional_port() {
         let localhost_v6 = std::net::Ipv6Addr::LOCALHOST;
+        let address = |address| Some(super::Peer::Address(address));
+        let name = |host: &str, port| {
+            Some(super::Peer::Name {
+                host: host.to_owned(),
+                port,
+            })
+        };
+        let label = "a".repeat(63);
+        let long = [label.as_str(); 4].join(".");
+        let longest = &long[..253];
         for (peer, expected) in [
             (
                 "127.0.0.1:1",
-                Some(std::net::SocketAddr::from(([127, 0, 0, 1], 1))),
+                address(std::net::SocketAddr::from(([127, 0, 0, 1], 1))),
             ),
             (
                 "[::1]",
-                Some(std::net::SocketAddr::from((localhost_v6, 18444))),
+                address(std::net::SocketAddr::from((localhost_v6, 18444))),
             ),
             (
                 "[::1]:1",
-                Some(std::net::SocketAddr::from((localhost_v6, 1))),
+                address(std::net::SocketAddr::from((localhost_v6, 1))),
             ),
             ("::1:8333", None),
             ("127.0.0.1:0", None),
             ("0.0.0.0", None),
             ("[::]", None),
             ("[::ffff:0.0.0.0]", None),
-            ("localhost", None),
-            ("localhost:18444", None),
+            ("[localhost]", None),
+            ("localhost", name("localhost", 18444)),
+            ("localhost:1", name("localhost", 1)),
+            ("seed-1.example.org", name("seed-1.example.org", 18444)),
+            ("x9.Seed.example", name("x9.Seed.example", 18444)),
+            ("1a", name("1a", 18444)),
+            (longest, name(longest, 18444)),
+            (&long[..254], None),
+            (&format!("{label}a"), None),
+            ("localhost:0", None),
+            ("localhost:65536", None),
+            ("localhost:", None),
+            ("localhost.", name("localhost.", 18444)),
+            ("localhost..", None),
+            (".", None),
+            (&format!("{longest}."), name(&format!("{longest}."), 18444)),
+            (".localhost", None),
+            ("local..host", None),
+            ("-localhost", None),
+            ("localhost-", None),
+            ("local_host", None),
+            ("local host", None),
+            ("127.1", None),
+            ("999.0.0.1", None),
+            ("", None),
         ] {
             let parsed = parse(&["regtest", peer]).map(|(_, peer)| peer);
             assert_eq!(parsed, expected, "{peer}");
+        }
+    }
+
+    #[test]
+    fn dial_order_drops_the_answers_that_name_no_peer_and_keeps_at_most_the_count_max() {
+        let unspecified = [
+            std::net::SocketAddr::from(([0, 0, 0, 0], 1)),
+            std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 1)),
+            std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED.to_ipv6_mapped(), 1)),
+        ];
+        let result = super::dial_order(unspecified.into_iter());
+        assert!(
+            matches!(result, Err(super::LookupError::Empty)),
+            "{result:?}"
+        );
+
+        // One more than the count max, after the unspecified ones. Each port is new, so the
+        // ones that it keeps are the first ones.
+        let answers: Vec<std::net::SocketAddr> = (1..=super::ADDRESSES_COUNT_MAX + 1)
+            .map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], u16::try_from(port).unwrap())))
+            .collect();
+        let mut kept =
+            super::dial_order(unspecified.into_iter().chain(answers.iter().copied())).unwrap();
+        kept.sort_unstable();
+        assert_eq!(kept, answers[..super::ADDRESSES_COUNT_MAX]);
+    }
+
+    // The resolver of the OS reads `localhost` from its hosts file, with no name server.
+    #[test]
+    fn lookup_gives_the_addresses_of_a_name_with_the_port() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        let addresses = runtime.block_on(super::lookup("localhost", 1)).unwrap();
+        assert!(!addresses.is_empty());
+        for address in addresses {
+            assert!(address.ip().is_loopback(), "{address}");
+            assert_eq!(address.port(), 1, "{address}");
         }
     }
 

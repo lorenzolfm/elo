@@ -137,6 +137,8 @@ enum ReceiveError {
 pub struct Connection<'a> {
     socket: Socket,
     peer: crate::net_processing::Peer<'a>,
+    /// The address of the peer that took the connect.
+    address: std::net::SocketAddr,
 }
 
 /// One peer after the header sync. Only `Connection::sync` makes one, so `next_tip` cannot start
@@ -176,23 +178,45 @@ enum PartialFrame {
     },
 }
 
-/// Dials `peer` on the network of `chain` and runs the handshake. Returns the connection for the
-/// messages after it, and their `version`. The sync of the connection extends `chain` from its
+/// Dials the first of `peers` that takes the TCP connect, in their order, on the network of
+/// `chain`, and runs the handshake. Returns the connection for the messages after it, and their
+/// `version`. The sync of the connection extends `chain` from its
 /// tip, so the next connection with the same chain does not get those headers again. A chain
 /// below the minimum work starts again from genesis. A peer whose chain does not have our tip
 /// answers from the highest header of our locator on its chain, and a branch with more work takes
 /// the place of ours.
-pub async fn handshake(
-    peer: std::net::SocketAddr,
-    chain: &mut crate::chain::Chain,
-) -> Result<(Connection<'_>, crate::protocol::Version), HandshakeError> {
-    let connect = tokio::net::TcpStream::connect(peer);
-    let stream = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => return Err(HandshakeError::Connect(error)),
-        Err(_elapsed) => return Err(HandshakeError::ConnectTimeout),
-    };
+pub async fn handshake<'a>(
+    peers: &[std::net::SocketAddr],
+    chain: &'a mut crate::chain::Chain,
+) -> Result<(Connection<'a>, crate::protocol::Version), HandshakeError> {
+    let (peer, stream) = connect_first(peers).await?;
     handshake_stream(peer, stream, chain).await
+}
+
+/// The TCP connect to the first of `peers` that takes it. Each try takes at most
+/// `CONNECT_TIMEOUT`, so the length of `peers` bounds the time. When each try fails, the error is
+/// the one of the last peer.
+async fn connect_first(
+    peers: &[std::net::SocketAddr],
+) -> Result<(std::net::SocketAddr, tokio::net::TcpStream), HandshakeError> {
+    let Some((&last, before)) = peers.split_last() else {
+        panic!("no peer to dial");
+    };
+    for &peer in before {
+        if let Ok(stream) = connect(peer).await {
+            return Ok((peer, stream));
+        }
+    }
+    connect(last).await.map(|stream| (last, stream))
+}
+
+/// The TCP connect to `peer`, within `CONNECT_TIMEOUT`.
+async fn connect(peer: std::net::SocketAddr) -> Result<tokio::net::TcpStream, HandshakeError> {
+    match tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::TcpStream::connect(peer)).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(error)) => Err(HandshakeError::Connect(error)),
+        Err(_elapsed) => Err(HandshakeError::ConnectTimeout),
+    }
 }
 
 /// The handshake on a connected `stream`, within `HANDSHAKE_TIMEOUT`.
@@ -211,7 +235,7 @@ async fn handshake_stream(
 /// Sends our `version`, then reads messages until the handshake is done. The handshake
 /// bounds the loop: it refuses a peer that sends too many messages without its `verack`.
 async fn handshake_stream_exchange(
-    peer: std::net::SocketAddr,
+    address: std::net::SocketAddr,
     stream: tokio::net::TcpStream,
     chain: &mut crate::chain::Chain,
 ) -> Result<(Connection<'_>, crate::protocol::Version), HandshakeError> {
@@ -219,8 +243,14 @@ async fn handshake_stream_exchange(
     let mut socket = Socket::new(stream, network);
     let work_min = crate::pow::chain_work_min(network);
     let salt = salt().map_err(HandshakeError::Salt)?;
-    let (mut handshake, outbound) =
-        crate::net_processing::Handshake::start(peer, timestamp(), nonce(), chain, work_min, salt);
+    let (mut handshake, outbound) = crate::net_processing::Handshake::start(
+        address,
+        timestamp(),
+        nonce(),
+        chain,
+        work_min,
+        salt,
+    );
     socket
         .send_handshake_outbound(&outbound)
         .await
@@ -243,7 +273,11 @@ async fn handshake_stream_exchange(
                 // The peer can send more frames in the same segment as its `verack`. Each read
                 // stops at the end of a frame, so they are still in the stream, and `sync` reads
                 // them next.
-                let connection = Connection { socket, peer };
+                let connection = Connection {
+                    socket,
+                    peer,
+                    address,
+                };
                 return Ok((connection, theirs));
             }
         }
@@ -251,6 +285,11 @@ async fn handshake_stream_exchange(
 }
 
 impl<'a> Connection<'a> {
+    /// The address of the peer: of the peers that `handshake` got, the one that took the connect.
+    pub fn address(&self) -> std::net::SocketAddr {
+        self.address
+    }
+
     /// Runs one turn after the other until a batch that is not full ends the sync. Returns the
     /// peer for `Synced::next_tip`, and the tip of our chain. The loop has no count bound, because
     /// only the chain of the peer bounds the sync. A low-work sync gets the chain twice, and the
@@ -268,6 +307,7 @@ impl<'a> Connection<'a> {
         let Connection {
             mut socket,
             mut peer,
+            address: _,
         } = self;
         loop {
             match run_turn(&mut socket, peer).await? {
@@ -820,7 +860,7 @@ mod tests {
             verack
         });
 
-        let result = block_on(super::handshake(peer, &mut chain));
+        let result = block_on(super::handshake(&[peer], &mut chain));
         let verack = peer_thread.join().unwrap();
         assert_eq!(verack, crate::fixtures::hex(crate::fixtures::VERACK_FRAME));
         assert!(result.is_ok(), "{result:?}");
@@ -849,7 +889,7 @@ mod tests {
             i64::try_from(elapsed.as_secs()).unwrap()
         };
         let before = seconds();
-        let _closed = block_on(super::handshake(peer, &mut chain));
+        let _closed = block_on(super::handshake(&[peer], &mut chain));
         let after = seconds();
         let message = peer_thread.join().unwrap();
         assert_eq!(message.msg_type(), crate::protocol::VERSION);
@@ -903,7 +943,7 @@ mod tests {
         });
 
         let (result, elapsed) = block_on(async {
-            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
+            let (connection, _theirs) = super::handshake(&[peer], &mut chain).await.unwrap();
             tokio::time::pause();
             let start = tokio::time::Instant::now();
             let result = connection.sync().await;
@@ -960,7 +1000,7 @@ mod tests {
         });
 
         let result = block_on(async {
-            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
+            let (connection, _theirs) = super::handshake(&[peer], &mut chain).await.unwrap();
             connection.sync().await
         });
         peer_thread.join().unwrap();
@@ -1019,7 +1059,7 @@ mod tests {
         });
 
         let result = block_on(async {
-            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
+            let (connection, _theirs) = super::handshake(&[peer], &mut chain).await.unwrap();
             connection.sync().await
         });
         let expected = [
@@ -1063,7 +1103,7 @@ mod tests {
         });
 
         let (error, elapsed) = block_on(async {
-            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
+            let (connection, _theirs) = super::handshake(&[peer], &mut chain).await.unwrap();
             let start = tokio::time::Instant::now();
             let (synced, _tip) = connection.sync().await.unwrap();
             tokio::time::pause();
@@ -1118,7 +1158,7 @@ mod tests {
         });
 
         let (synced_tip, next_tip) = block_on(async {
-            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
+            let (connection, _theirs) = super::handshake(&[peer], &mut chain).await.unwrap();
             let (synced, synced_tip) = connection.sync().await.unwrap();
             let (_synced, next_tip) = synced.next_tip().await.unwrap();
             (synced_tip, next_tip)
@@ -1160,7 +1200,7 @@ mod tests {
         });
 
         let (error, elapsed) = block_on(async {
-            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
+            let (connection, _theirs) = super::handshake(&[peer], &mut chain).await.unwrap();
             let start = tokio::time::Instant::now();
             let (synced, _tip) = connection.sync().await.unwrap();
             tokio::time::pause();
@@ -1197,7 +1237,7 @@ mod tests {
         let peer_thread = std::thread::spawn(move || accept_handshake(&listener));
 
         let (result, elapsed) = block_on(async {
-            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
+            let (connection, _theirs) = super::handshake(&[peer], &mut chain).await.unwrap();
             // The peer thread ends when it has sent its `verack`, so this wait blocks nothing.
             // The stream stays open, and nothing reads it.
             let _stream = peer_thread.join().unwrap();
@@ -1239,7 +1279,7 @@ mod tests {
             stream.write_all(&frame[..frame.len() - 1]).unwrap();
         });
 
-        let result = block_on(super::handshake(peer, &mut chain));
+        let result = block_on(super::handshake(&[peer], &mut chain));
         peer_thread.join().unwrap();
         assert!(
             matches!(result, Err(super::HandshakeError::Closed)),
@@ -1318,7 +1358,7 @@ mod tests {
         });
 
         let result = block_on(async {
-            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
+            let (connection, _theirs) = super::handshake(&[peer], &mut chain).await.unwrap();
             connection.sync().await
         });
         let pong = peer_thread.join().unwrap();
@@ -1340,7 +1380,7 @@ mod tests {
             .unwrap()
             .local_addr()
             .unwrap();
-        let result = block_on(super::handshake(peer, &mut chain));
+        let result = block_on(super::handshake(&[peer], &mut chain));
         assert!(
             matches!(
                 result,
@@ -1349,6 +1389,22 @@ mod tests {
             ),
             "{result:?}"
         );
+    }
+
+    #[test]
+    fn connect_takes_the_first_peer_that_takes_it() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listening = listener.local_addr().unwrap();
+        // Nothing listens on a port that was bound and then freed. The listener is open while
+        // the bind picks the port, so the two ports differ.
+        let refused = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        for peers in [[refused, listening], [listening, refused]] {
+            let (peer, _stream) = block_on(super::connect_first(&peers)).unwrap();
+            assert_eq!(peer, listening, "{peers:?}");
+        }
     }
 
     #[test]
