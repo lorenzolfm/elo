@@ -1273,6 +1273,7 @@ pub(crate) mod fuzz {
                     Ok(received) => received,
                     Err(error) => return ScriptEnd::PeerRefused(error),
                 };
+                branch_tip_check(&peer, &model);
             }
             now = now_next(script.byte(), now, wake);
             assert!(model.height() <= script.headers_written_count);
@@ -1368,6 +1369,16 @@ pub(crate) mod fuzz {
             }
             (received, expected) => panic!("the peer gave {received:?}, not {expected:?}"),
         }
+    }
+
+    fn branch_tip_check(peer: &super::Peer<'_>, model: &PeerModel) {
+        let tip = peer
+            .branch_tip
+            .map(|tip| (tip.hash(), tip.work().to_string()));
+        let expected = model
+            .branch_tip
+            .map(|(hash, work)| (hash, format!("{work:064x}")));
+        assert_eq!(tip, expected);
     }
 
     fn now_next(byte: u8, now: std::time::Instant, wake: std::time::Instant) -> std::time::Instant {
