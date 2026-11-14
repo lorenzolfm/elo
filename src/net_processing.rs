@@ -1180,8 +1180,12 @@ pub(crate) mod fuzz {
     // A low-work sync of a branch whose last batch is full, and that has at most our work, gives
     // a branch that goes on. Its fork is below the margin, so at least 2,145 of our headers are
     // above it. The second download needs two full batches, so we need 4,000. The first download
-    // then needs 3,856, so the seed needs 11,856 headers.
-    const _: () = assert!(SCRIPT_HEADERS_COUNT_MAX >= 2 * 2 * HEADERS_FULL_COUNT + 3856);
+    // then needs our 4,000 less the 144 of the margin, so the seed needs 11,856 headers.
+    const _: () = assert!(
+        SCRIPT_HEADERS_COUNT_MAX
+            >= 2 * 2 * HEADERS_FULL_COUNT
+                + (2 * HEADERS_FULL_COUNT - crate::chain::BRANCH_TIP_HEADERS_BEHIND_MAX)
+    );
 
     // Below the minimum, the second download of a low-work sync on genesis is shorter than the
     // first, so it gets fewer than half of the headers of a script. So it keeps at most its buffer
@@ -1209,6 +1213,10 @@ pub(crate) mod fuzz {
     /// network, so a script goes past its first header only on regtest. Regtest requires them at
     /// each height, so no script ends at `WrongBits`.
     const SCRIPT_HEADER_BITS: u32 = crate::chainparams::Network::Regtest.genesis().bits;
+
+    /// The work of a header with `SCRIPT_HEADER_BITS`. A person wrote the 2. The model compares
+    /// the work of each tip with the machine, so another value fails each seed above genesis.
+    const SCRIPT_HEADER_WORK: u128 = 2;
 
     /// The `version` of each header that a script writes. It is the lowest version that regtest
     /// takes at each height above genesis, so no script ends at `VersionTooLow`. A person wrote
@@ -1473,7 +1481,7 @@ pub(crate) mod fuzz {
         let mut script = Script {
             unread: data,
             headers_written_count: 0,
-            next: std::collections::HashMap::new(),
+            written_on: std::collections::HashMap::new(),
             branch_last: 0,
         };
         let (network, work_min, work_min_model) = script_network_work_min(script.byte());
@@ -1795,7 +1803,8 @@ pub(crate) mod fuzz {
         headers_written_count: usize,
         /// The last header that the script wrote on each header, by the hash of that header. It
         /// holds at most one entry for each header that the script wrote.
-        next: std::collections::HashMap<bitcoin_hashes::sha256d::Hash, crate::block::BlockHeader>,
+        written_on:
+            std::collections::HashMap<bitcoin_hashes::sha256d::Hash, crate::block::BlockHeader>,
         /// The tag of the last branch that the script started. Each new header gets it.
         branch_last: u32,
     }
@@ -1901,7 +1910,7 @@ pub(crate) mod fuzz {
                 255 => count.checked_sub(1),
                 byte => Some(usize::from(byte) - 1),
             };
-            let branch_index = branches.then(|| count_read(self.byte()));
+            let branch_index = branches.then(|| branch_index_read(self.byte()));
 
             let mut payload = Vec::new();
             crate::serialize::write_compact_size(&mut payload, count);
@@ -1916,11 +1925,13 @@ pub(crate) mod fuzz {
                     // No batch goes on it, so the script keeps it nowhere.
                     script_header_mined(hash_wrong(prev), height, self.branch_last)
                 } else {
-                    match self.next.get(&prev) {
-                        Some(next) if Some(index) != branch_index => *next,
+                    match self.written_on.get(&prev) {
+                        Some(written) if Some(index) != branch_index => *written,
                         _ => {
                             let header = script_header_mined(prev, height, self.branch_last);
-                            self.next.insert(prev, header);
+                            self.written_on.insert(prev, header);
+                            // The script adds at most one entry for each header that it writes.
+                            assert!(self.written_on.len() <= self.headers_written_count);
                             header
                         }
                     }
@@ -1933,9 +1944,8 @@ pub(crate) mod fuzz {
         }
     }
 
-    /// The count of a batch, or the header of a batch where a new branch starts, from `byte`: 253
-    /// is one above a full batch, 254 is one below it, 255 is a full batch, and each other byte is
-    /// the count.
+    /// The count of a batch from `byte`: 253 is one above a full batch, 254 is one below it, 255 is
+    /// a full batch, and each other byte is the count.
     fn count_read(byte: u8) -> usize {
         match byte {
             253 => HEADERS_FULL_COUNT + 1,
@@ -1943,6 +1953,12 @@ pub(crate) mod fuzz {
             255 => HEADERS_FULL_COUNT,
             byte => usize::from(byte),
         }
+    }
+
+    /// The index in a batch of the header where a new branch starts, from `byte`. It reads as the
+    /// count byte, so 253 is past the last header of each batch, and starts no branch.
+    fn branch_index_read(byte: u8) -> usize {
+        count_read(byte)
     }
 
     /// A script header on `prev`, at `height`, on the branch with `tag`.
@@ -2248,10 +2264,14 @@ pub(crate) mod fuzz {
             if !matches!(self.download, DownloadModel::Chain) {
                 return vec![self.download_last()];
             }
-            self.locator_heights()
+            let bases: Vec<_> = self
+                .locator_heights()
                 .into_iter()
                 .map(|height| (self.chain[height], height))
-                .collect()
+                .collect();
+            // `Script::message` reads the first base as the last header of the download.
+            assert_eq!(bases[0], self.download_last());
+            bases
         }
 
         /// The locator of our `getheaders`.
@@ -2461,31 +2481,32 @@ pub(crate) mod fuzz {
             Ok(self.extend_above(fork, Vec::new(), batch, full))
         }
 
-        /// The chain goes on with the branch on the header at `fork` whose headers have `branch`,
+        /// The chain goes on with the branch on the header at `base` whose headers have `branch`,
         /// and with `batch`, the hashes of headers that passed each check on its last header. With
-        /// no header of the branch yet, the batch can start with our headers, and these move the
-        /// fork up. The chain takes a branch with more work than ours, and keeps a branch with at
-        /// most our work while it gets full batches. Below the margin, a full batch with none of
-        /// our headers can go to a low-work sync from the fork, and else the branch has no header.
+        /// no header of the branch yet, the batch can start with our headers, and the fork is the
+        /// last of these, or `base`. The chain takes a branch with more work than ours, and keeps
+        /// a branch with at most our work while it gets full batches. Below the margin, a full
+        /// batch with none of our headers can go to a low-work sync from the fork, and else the
+        /// branch has no header.
         fn extend_above(
             &mut self,
-            fork: usize,
+            base: usize,
             branch: Vec<bitcoin_hashes::sha256d::Hash>,
             batch: Vec<bitcoin_hashes::sha256d::Hash>,
             full: bool,
         ) -> ExtendedModel {
             assert!(!batch.is_empty());
-            assert!(fork < self.height());
+            assert!(base < self.height());
             let shared = if branch.is_empty() {
                 batch
                     .iter()
-                    .zip(&self.chain[fork + 1..])
+                    .zip(&self.chain[base + 1..])
                     .take_while(|(theirs, ours)| theirs == ours)
                     .count()
             } else {
                 0
             };
-            let fork = fork + shared;
+            let fork = base + shared;
             let rest = &batch[shared..];
             if fork == self.height() {
                 self.chain.extend_from_slice(rest);
@@ -2530,11 +2551,10 @@ pub(crate) mod fuzz {
         }
 
         /// The lowest work of the chain of a branch from genesis that goes on: our work less the
-        /// work of 144 script headers, or the minimum work if that is higher. Each script header
-        /// has a work of 2.
+        /// work of 144 script headers, or the minimum work if that is higher.
         fn branch_work_min(&self) -> u128 {
             const { assert!(usize::BITS <= 64) };
-            let behind = 2 * crate::chain::BRANCH_TIP_HEADERS_BEHIND_MAX as u128;
+            let behind = SCRIPT_HEADER_WORK * crate::chain::BRANCH_TIP_HEADERS_BEHIND_MAX as u128;
             self.work().saturating_sub(behind).max(self.work_min)
         }
 
@@ -2632,8 +2652,9 @@ pub(crate) mod fuzz {
                 let hash = script_hash(self.network, last, header).map_err(sync_error)?;
                 buffer.push(hash);
                 let height = start + buffer.len();
-                if self.work_at(height) < work_min && height % period == SCRIPT_SALT.offset % period
-                {
+                let below_minimum = self.work_at(height) < work_min;
+                let at_commitment = height % period == SCRIPT_SALT.offset % period;
+                if below_minimum && at_commitment {
                     // Each header of the second download has the work of each header of the
                     // first, so below the minimum the first download has a header at each height.
                     let Some(first) = presync.get(buffer.len() - 1) else {
@@ -2659,10 +2680,10 @@ pub(crate) mod fuzz {
                 assert!(!matches!(extended, ExtendedModel::BelowMargin { .. }));
                 self.chain_next(extended, full)
             } else if full {
+                // Below the minimum, the second download is not longer than the first, so it has
+                // at most half of the headers of a script, on genesis or on a fork.
                 // `SCRIPT_HEADERS_COUNT_MAX` says why the batch releases no header on our chain.
-                if on_tip {
-                    assert!(buffer.len() <= self.network.redownload_buffer_size());
-                }
+                assert!(buffer.len() <= self.network.redownload_buffer_size());
                 Ok(Some(DownloadModel::Redownload {
                     start,
                     work_min,
@@ -2687,9 +2708,9 @@ pub(crate) mod fuzz {
         }
 
         /// The work of a chain of script headers to `height`. A person wrote the work of each
-        /// genesis. Each script header has the regtest limit, whose work is 2, and off regtest no
-        /// script header passes. A height has at most 64 bits, so the work fits a `u128` with no
-        /// overflow.
+        /// genesis. Each script header has the regtest limit, whose work is `SCRIPT_HEADER_WORK`,
+        /// and off regtest no script header passes. A height has at most 64 bits, so the work fits
+        /// a `u128` with no overflow.
         fn work_at(&self, height: usize) -> u128 {
             let genesis_work: u128 = match self.network {
                 crate::chainparams::Network::Mainnet | crate::chainparams::Network::Testnet4 => {
@@ -2699,7 +2720,7 @@ pub(crate) mod fuzz {
                 crate::chainparams::Network::Regtest => 2,
             };
             const { assert!(usize::BITS <= 64) };
-            genesis_work + height as u128 * 2
+            genesis_work + height as u128 * SCRIPT_HEADER_WORK
         }
     }
 
@@ -2724,15 +2745,15 @@ pub(crate) mod fuzz {
         Ok(header.hash())
     }
 
-    /// The hash of each of `headers`, each on the header below it, the first on `last_hash`.
+    /// The hash of each of `headers`, each on the header below it, the first on `below_first`.
     fn script_hashes(
         network: crate::chainparams::Network,
-        last_hash: bitcoin_hashes::sha256d::Hash,
+        below_first: bitcoin_hashes::sha256d::Hash,
         headers: &[crate::block::BlockHeader],
     ) -> Result<Vec<bitcoin_hashes::sha256d::Hash>, HeaderFault> {
         let mut hashes: Vec<bitcoin_hashes::sha256d::Hash> = Vec::with_capacity(headers.len());
         for header in headers {
-            let below = hashes.last().copied().unwrap_or(last_hash);
+            let below = hashes.last().copied().unwrap_or(below_first);
             hashes.push(script_hash(network, below, header)?);
         }
         Ok(hashes)
