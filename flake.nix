@@ -62,6 +62,22 @@
         bitcoinCli = pkgs.lib.getExe' pkgs.bitcoind "bitcoin-cli";
 
         comments = ./.config/ast-grep/comments;
+        commentGlobs = {
+          rust = ["*.rs"];
+          nix = ["*.nix"];
+          bash = ["*.sh" ".envrc" ".gitignore"];
+          yaml = ["*.yml" "*.yaml"];
+          toml = ["*.toml"];
+        };
+        commentFree = ["./Cargo.lock" "./fuzz/Cargo.lock" "./flake.lock" "./README.md" "./fuzz/corpus/*"];
+        commentRead = pkgs.lib.concatStringsSep "|" (
+          map (glob:
+            if pkgs.lib.hasPrefix "*" glob
+            then glob
+            else "*/${glob}")
+          (pkgs.lib.concatLists (builtins.attrValues commentGlobs))
+          ++ commentFree
+        );
         runBlock = {
           kind = "block_node";
           inside = {
@@ -79,7 +95,7 @@
             libraryPath = "${pkgs.tree-sitter-grammars.tree-sitter-toml}/parser";
             extensions = ["toml"];
           };
-          languageGlobs.bash = [".envrc" ".gitignore"];
+          languageGlobs = commentGlobs;
           languageInjections = [
             {
               hostLanguage = "nix";
@@ -150,6 +166,22 @@
               mapfile -d "" tree < <(find . -type f -print0)
               wait $!
               (( ''${#tree[@]} > 0 ))
+              unread() {
+                local file
+                for file in "$@"; do
+                  case "$file" in
+                    ${commentRead}) ;;
+                    *) echo "$file" ;;
+                  esac
+                done
+              }
+              test "$(unread ./a.rs ./a/.envrc ./Cargo.lock ./fuzz/corpus/a/b ./a.py ./a/Cargo.lock)" \
+                = "$(printf '%s\n' ./a.py ./a/Cargo.lock)"
+              unread_files="$(unread "''${tree[@]}")"
+              if test -n "$unread_files"; then
+                echo "elo-comments: no rule reads these files: $unread_files" >&2
+                exit 1
+              fi
               ast-grep test --config ${commentsConfig} --custom-languages allow
               ast-grep scan --config ${commentsConfig} --custom-languages allow -- "''${tree[@]}"
               touch "$out"
