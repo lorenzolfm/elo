@@ -39,7 +39,7 @@ pub(crate) enum Extended {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BranchTip {
     hash: bitcoin_hashes::sha256d::Hash,
-    work: crate::pow::Work,
+    work_max: crate::pow::Work,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -410,9 +410,9 @@ impl Chain {
         hash: bitcoin_hashes::sha256d::Hash,
     ) -> BranchTip {
         assert!(work_at_fork <= self.work);
-        let work = work_at_fork.saturating_add(work_branch);
-        assert!(work <= self.work);
-        BranchTip { hash, work }
+        let work_max = work_at_fork.saturating_add(work_branch);
+        assert!(work_max <= self.work);
+        BranchTip { hash, work_max }
     }
 
     fn branch_on_fork(&self, fork_height: usize) -> Branch {
@@ -713,8 +713,8 @@ impl BranchTip {
         self.hash
     }
 
-    pub(crate) fn work(&self) -> crate::pow::Work {
-        self.work
+    pub(crate) fn work_max(&self) -> crate::pow::Work {
+        self.work_max
     }
 
     pub(crate) fn extend(
@@ -730,7 +730,7 @@ impl BranchTip {
                 crate::pow::proven(header, network).ok_or(ExtendError::ProofOfWork)?;
             Ok(BranchTip {
                 hash,
-                work: tip.work.saturating_add(work),
+                work_max: tip.work_max.saturating_add(work),
             })
         })
     }
@@ -1574,7 +1574,7 @@ mod tests {
         let tip = regtest_with(headers).tip();
         super::BranchTip {
             hash: tip.hash(),
-            work: tip.work(),
+            work_max: tip.work(),
         }
     }
 
@@ -1864,7 +1864,7 @@ mod tests {
                     extended,
                     Ok(super::Extended::KeptOver(super::BranchTip {
                         hash: branch[1_998].hash(),
-                        work: regtest_with(&headers[..2_000]).tip().work(),
+                        work_max: regtest_with(&headers[..2_000]).tip().work(),
                     }))
                 ),
             }

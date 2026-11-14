@@ -766,7 +766,7 @@ fn chain_next(
         }
         crate::chain::Extended::KeptOver(tip) => {
             assert!(!full);
-            assert!(chain.tip().work() >= tip.work());
+            assert!(chain.tip().work() >= tip.work_max());
             *branch_tip = Some(tip);
             Ok(None)
         }
@@ -797,12 +797,12 @@ fn receive_announcement(
     if let Some(tip) = *branch_tip
         && first_prev == Some(tip.hash())
     {
-        assert!(tip.work() <= chain.tip().work());
+        assert!(tip.work_max() <= chain.tip().work());
         assert_ne!(tip.hash(), chain.tip().hash());
         let tip = tip
             .extend(chain.network(), &headers)
             .map_err(PeerError::Extend)?;
-        if full || tip.work() > chain.tip().work() {
+        if full || tip.work_max() > chain.tip().work() {
             *branch_tip = None;
             return Ok(Some(Download::on_tip(chain, work_min)));
         }
@@ -1375,7 +1375,7 @@ pub(crate) mod fuzz {
     fn branch_tip_check(peer: &super::Peer<'_>, model: &PeerModel) {
         let tip = peer
             .branch_tip
-            .map(|tip| (tip.hash(), tip.work().to_string()));
+            .map(|tip| (tip.hash(), tip.work_max().to_string()));
         let expected = model
             .branch_tip
             .map(|(hash, work)| (hash, format!("{work:064x}")));
@@ -1694,7 +1694,7 @@ pub(crate) mod fuzz {
         },
         KeptOver {
             hash: bitcoin_hashes::sha256d::Hash,
-            work: u128,
+            work_max: u128,
         },
     }
 
@@ -1934,7 +1934,7 @@ pub(crate) mod fuzz {
                         (None, None) => ExtendedModel::Kept,
                         (None, Some(last)) => ExtendedModel::KeptOver {
                             hash: *last,
-                            work: self.work_at(fork + hashes.len()),
+                            work_max: self.work_at(fork + hashes.len()),
                         },
                         (Some(_), _) => {
                             let last = hashes.last().copied().unwrap_or(self.chain[fork]);
@@ -2067,7 +2067,7 @@ pub(crate) mod fuzz {
                     };
                     return ExtendedModel::KeptOver {
                         hash: *last,
-                        work: self.below_margin_work_max(hashes.len()),
+                        work_max: self.below_margin_work_max(hashes.len()),
                     };
                 }
                 return if shared == 0 {
@@ -2086,7 +2086,7 @@ pub(crate) mod fuzz {
                     };
                     return ExtendedModel::KeptOver {
                         hash: *last,
-                        work: branch_work,
+                        work_max: branch_work,
                     };
                 }
                 return ExtendedModel::Branch { fork, hashes };
@@ -2124,10 +2124,10 @@ pub(crate) mod fuzz {
                     Ok(full.then_some(DownloadModel::Chain))
                 }
                 ExtendedModel::Kept => Ok(None),
-                ExtendedModel::KeptOver { hash, work } => {
+                ExtendedModel::KeptOver { hash, work_max } => {
                     assert!(!full);
-                    assert!(work <= self.work());
-                    self.branch_tip = Some((hash, work));
+                    assert!(work_max <= self.work());
+                    self.branch_tip = Some((hash, work_max));
                     Ok(None)
                 }
                 _ if !full => Ok(None),
