@@ -47,7 +47,10 @@ fork. Headers that the peer announces on that header do not make elo ask. elo
 adds the work of each one that has its proof of work. It asks when the branch
 has more work, or when the announcement is a full batch.
 A peer announces a block with an `inv` when its headers do not connect to the
-last header it sent, so an `inv` of a block makes elo ask too. From the
+last header it sent, so an `inv` of a block makes elo ask too. While a
+`getheaders` of elo is out, a `headers` that does not start on one of its hashes
+is an announcement. elo skips it, and the answer or the next `getheaders` gets
+those headers again. From the
 handshake on, it pings the peer every 2 min.
 It drops a peer that does not answer a `ping` within 20 min, or a `getheaders`
 within 2 min. It also drops a peer that sends `wtxidrelay` or `sendaddrv2` after
