@@ -538,14 +538,9 @@ fn announcement_on_a_branch_that_lost_to_ours_after_a_low_work_sync_gets_no_geth
     let expected = format!("level=info event=tip peer={} height=3001 ", bitcoind.peer);
     assert!(ours.starts_with(&expected), "{ours}");
 
-    bitcoind.cli(&["setban", "127.0.0.1", "add"]);
-    elo.event("end", END_TIMEOUT);
     bitcoind.cli(&["invalidateblock", second.trim_end()]);
-    bitcoind.cli(&["setban", "127.0.0.1", "remove"]);
-    elo.event("version", RECONNECT_TIMEOUT);
-    assert_eq!(elo.event("tip", SYNC_TIMEOUT), ours);
-    let ends = elo.events("end").len();
-    pong_from(&bitcoind, &elo, ends);
+    settle(&bitcoind, &elo);
+    assert_eq!(elo.events("tip"), [ours]);
 
     let get_headers = message_bytes(&bitcoind, "bytesrecv_per_msg", "getheaders");
     let headers_sent = message_bytes(&bitcoind, "bytessent_per_msg", "headers");
@@ -558,12 +553,36 @@ fn announcement_on_a_branch_that_lost_to_ours_after_a_low_work_sync_gets_no_geth
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    pong_from(&bitcoind, &elo, ends);
-    pong_from(&bitcoind, &elo, ends);
+    pong_from(&bitcoind, &elo, 0);
+    pong_from(&bitcoind, &elo, 0);
     assert_eq!(
         message_bytes(&bitcoind, "bytesrecv_per_msg", "getheaders"),
         get_headers
     );
+}
+
+fn settle(bitcoind: &Bitcoind, elo: &Elo) {
+    let start = std::time::Instant::now();
+    loop {
+        let before = relay_bytes(bitcoind);
+        pong_from(bitcoind, elo, 0);
+        pong_from(bitcoind, elo, 0);
+        if relay_bytes(bitcoind) == before {
+            return;
+        }
+        assert!(
+            start.elapsed() < SYNC_TIMEOUT,
+            "bitcoind and elo still relay headers"
+        );
+    }
+}
+
+fn relay_bytes(bitcoind: &Bitcoind) -> [u64; 3] {
+    [
+        message_bytes(bitcoind, "bytesrecv_per_msg", "getheaders"),
+        message_bytes(bitcoind, "bytessent_per_msg", "headers"),
+        message_bytes(bitcoind, "bytessent_per_msg", "inv"),
+    ]
 }
 
 fn pong_from(bitcoind: &Bitcoind, elo: &Elo, ends: usize) {
