@@ -172,7 +172,7 @@ pub(crate) enum Received {
 pub(crate) enum Step<'a> {
     Wait(Handshake<'a>),
     Reply(Handshake<'a>, HandshakeOutbound),
-    Done(Peer<'a>, crate::protocol::Version),
+    Done(Box<Peer<'a>>, crate::protocol::Version),
 }
 
 impl<'a> Handshake<'a> {
@@ -264,7 +264,7 @@ impl<'a> Handshake<'a> {
                         salt,
                         branch_tip: None,
                     };
-                    Ok(Step::Done(peer, theirs))
+                    Ok(Step::Done(Box::new(peer), theirs))
                 } else {
                     let state = State::AwaitingVerack(theirs);
                     let handshake = next(
@@ -350,6 +350,7 @@ enum SyncState {
     Outstanding {
         download: Download,
         sent: std::time::Instant,
+        tip: bitcoin_hashes::sha256d::Hash,
     },
     Synced,
 }
@@ -507,7 +508,12 @@ impl<'a> Peer<'a> {
         let mut input = message.payload();
         let headers = crate::protocol::Headers::decode(&mut input).map_err(PeerError::Headers)?;
         let next = match self.sync {
-            SyncState::Outstanding { download, sent } => {
+            SyncState::Outstanding {
+                download,
+                sent,
+                tip,
+            } => {
+                assert_eq!(self.chain.tip().hash(), tip);
                 match receive_answer(
                     self.chain,
                     self.work_min,
@@ -519,7 +525,11 @@ impl<'a> Peer<'a> {
                 )? {
                     Answer::Next(next) => next,
                     Answer::Skipped(download) => {
-                        self.sync = SyncState::Outstanding { download, sent };
+                        self.sync = SyncState::Outstanding {
+                            download,
+                            sent,
+                            tip,
+                        };
                         return Ok((self, Received::NoReply));
                     }
                 }
@@ -643,6 +653,7 @@ impl SyncState {
                 let sync = SyncState::Outstanding {
                     download,
                     sent: now,
+                    tip: chain.tip().hash(),
                 };
                 Ok((sync, Some(get_headers), Some(now + HEADERS_TIMEOUT)))
             }
@@ -1269,7 +1280,7 @@ pub(crate) mod fuzz {
                 ) => handshake = next,
                 (Ok(super::Step::Done(peer, theirs)), Ok(HandshakeExpected::Done(expected))) => {
                     assert_eq!(theirs, expected);
-                    return Ok(peer);
+                    return Ok(*peer);
                 }
                 (Err(error), Err(expected)) => {
                     assert_eq!(error, expected);
@@ -2581,7 +2592,7 @@ mod tests {
         let (handshake, _) =
             reply(handshake.receive(&core_message(crate::fixtures::VERSION_FRAME)));
         match handshake.receive(&core_message(crate::fixtures::VERACK_FRAME)) {
-            Ok(super::Step::Done(peer, _)) => peer,
+            Ok(super::Step::Done(peer, _)) => *peer,
             other => panic!("{other:?}"),
         }
     }
