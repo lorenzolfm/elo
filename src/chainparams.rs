@@ -63,6 +63,12 @@ const CHAIN_WORK_MIN_SIGNET: [u8; 32] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b, 0x46, 0x3e, 0xa0, 0xa4, 0xb8,
 ];
 
+// `NonZeroU16::new` runs at compile time here, so a port of 0 does not build.
+const PORT_MAINNET: std::num::NonZeroU16 = std::num::NonZeroU16::new(8333).expect("not 0");
+const PORT_TESTNET4: std::num::NonZeroU16 = std::num::NonZeroU16::new(48333).expect("not 0");
+const PORT_SIGNET: std::num::NonZeroU16 = std::num::NonZeroU16::new(38333).expect("not 0");
+const PORT_REGTEST: std::num::NonZeroU16 = std::num::NonZeroU16::new(18444).expect("not 0");
+
 impl Network {
     /// The bytes that start every message.
     pub(crate) const fn magic(self) -> [u8; MAGIC_SIZE] {
@@ -75,12 +81,12 @@ impl Network {
     }
 
     /// The port that a node of the network listens on.
-    pub const fn default_port(self) -> u16 {
+    pub const fn default_port(self) -> std::num::NonZeroU16 {
         match self {
-            Network::Mainnet => 8333,
-            Network::Testnet4 => 48333,
-            Network::Signet => 38333,
-            Network::Regtest => 18444,
+            Network::Mainnet => PORT_MAINNET,
+            Network::Testnet4 => PORT_TESTNET4,
+            Network::Signet => PORT_SIGNET,
+            Network::Regtest => PORT_REGTEST,
         }
     }
 

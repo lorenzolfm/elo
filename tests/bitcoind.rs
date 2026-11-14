@@ -167,7 +167,10 @@ fn handshake_with_bitcoind_returns_its_version() {
         .unwrap();
     let mut chain = elo::chain::Chain::new(elo::chainparams::Network::Regtest);
     let (_connection, version) = runtime
-        .block_on(elo::net::handshake(bitcoind.peer, &mut chain))
+        .block_on(elo::net::handshake(
+            &elo::net::Destination::Address(elo::net::PeerAddress::new(bitcoind.peer).unwrap()),
+            &mut chain,
+        ))
         .unwrap();
 
     assert_eq!(version.version(), 70016);
@@ -274,7 +277,7 @@ fn our_ping_gets_a_pong_from_bitcoind() {
     assert_eq!(
         end,
         format!(
-            "level=warn event=end peer={} reason=\"the peer closed the connection\" wait_ms=5000",
+            "level=warn event=end destination={} reason=\"the peer closed the connection\" wait_ms=5000",
             bitcoind.peer
         )
     );
@@ -302,6 +305,34 @@ fn closed_connection_gets_a_new_handshake_and_sync() {
     let wait = close.elapsed();
     assert!(wait >= std::time::Duration::from_secs(5), "{wait:?}");
     assert_eq!(elo.event("tip", SYNC_TIMEOUT), tip);
+}
+
+#[test]
+fn peer_with_a_name_gets_a_lookup_and_a_dial_to_its_address() {
+    let bitcoind = Bitcoind::start();
+    let named = format!("localhost:{}", bitcoind.peer.port());
+    let elo = Elo::start_on(&named);
+
+    // `localhost` can also have `::1`, where bitcoind does not listen. elo tries each address of
+    // the name in one dial, so the first dial gets to bitcoind, with no `end` before it.
+    let version = elo.event("version", SYNC_TIMEOUT);
+    let expected = format!(
+        "level=info event=version peer={} version=70016 ",
+        bitcoind.peer
+    );
+    assert!(version.starts_with(&expected), "{version}");
+    let ends = elo.events("end");
+    assert!(ends.is_empty(), "{ends:?}");
+
+    // The `end` has the name, because the next dial looks it up again. elo is the only peer of
+    // bitcoind, so it is node 0.
+    elo.event("tip", SYNC_TIMEOUT);
+    bitcoind.cli(&["-named", "disconnectnode", "nodeid=0"]);
+    let end = elo.event("end", END_TIMEOUT);
+    assert!(
+        end.starts_with(&format!("level=warn event=end destination={named} ")),
+        "{end}"
+    );
 }
 
 #[test]
@@ -640,9 +671,14 @@ struct Elo {
 
 impl Elo {
     fn start(bitcoind: &Bitcoind) -> Self {
+        Self::start_on(&bitcoind.peer.to_string())
+    }
+
+    /// elo on regtest with `peer` as the peer of its command line.
+    fn start_on(peer: &str) -> Self {
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
             .arg("regtest")
-            .arg(bitcoind.peer.to_string())
+            .arg(peer)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()

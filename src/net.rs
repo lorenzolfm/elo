@@ -17,13 +17,181 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60
 /// read can block forever. The ping timeout covers each read.
 const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(20);
 
-/// Why the connect or the handshake failed.
+/// How long the lookup of a name may take. The resolver of the OS tries each name server again
+/// after its own timeout, by default 5 s, two times for each of at most 3 servers.
+const LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The most addresses of a name that one dial tries. Each try takes at most `CONNECT_TIMEOUT`, so
+/// this bounds the time of a dial.
+const ADDRESSES_COUNT_MAX: usize = 256;
+
+/// The most bytes of a name, with no `.` at the end.
+const NAME_LENGTH_MAX: usize = 253;
+
+/// The most bytes of one label of a name.
+const LABEL_LENGTH_MAX: usize = 63;
+
+/// The most bytes of the text of a `Destination`: a name of `NAME_LENGTH_MAX` bytes, its `.` at
+/// the end, and the longest port. An IP address with its port is shorter: at most 58 bytes, an
+/// IPv6 address with a scope.
+pub(crate) const DESTINATION_LENGTH_MAX: usize = NAME_LENGTH_MAX + ".".len() + ":65535".len();
+
+/// The peer that the command line names.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Destination {
+    /// An IP address, which `handshake` dials with no lookup.
+    Address(PeerAddress),
+    /// A name, which `handshake` looks up before each dial.
+    Name {
+        name: Name,
+        port: std::num::NonZeroU16,
+    },
+}
+
+impl std::fmt::Display for Destination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Destination::Address(address) => write!(f, "{}", address.0),
+            Destination::Name { name, port } => write!(f, "{name}:{port}"),
+        }
+    }
+}
+
+/// An address that names a peer: its port is not 0, and its IP is not `0.0.0.0` or `::`. A
+/// connect to those reaches this host. Only `PeerAddress::new` makes one, so each address that
+/// `handshake` dials names a peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PeerAddress(std::net::SocketAddr);
+
+impl PeerAddress {
+    /// `address` as the address of a peer, or `None` if it names no peer. An IPv4 address in
+    /// IPv6, such as `[::ffff:0.0.0.0]`, is checked as the IPv4 address.
+    pub fn new(address: std::net::SocketAddr) -> Option<PeerAddress> {
+        if address.port() == 0 || address.ip().to_canonical().is_unspecified() {
+            return None;
+        }
+        Some(PeerAddress(address))
+    }
+}
+
+/// The name of a host. Only `Name::new` makes one, so each name has the form that it checks.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Name(String);
+
+impl Name {
+    /// `host` as a name, or `None` if it is no name. A name has labels, split by `.`, of at most
+    /// `NAME_LENGTH_MAX` bytes in all, and can have one more `.` at the end, as a name with all
+    /// its labels. The last label is no number, so the resolver cannot read the name as an IPv4
+    /// address.
+    pub fn new(host: &str) -> Option<Name> {
+        let labels = host.strip_suffix('.').unwrap_or(host);
+        if labels.len() > NAME_LENGTH_MAX {
+            return None;
+        }
+        if !labels.split('.').all(is_label) {
+            return None;
+        }
+        let last = labels.rsplit_once('.').map_or(labels, |(_, last)| last);
+        if is_number(last) {
+            return None;
+        }
+        Some(Name(host.to_owned()))
+    }
+}
+
+impl std::fmt::Display for Name {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Whether `label` is a label of a name: 1 to `LABEL_LENGTH_MAX` letters, digits and `-`, with no
+/// `-` at the start or the end.
+fn is_label(label: &str) -> bool {
+    if label.is_empty() {
+        return false;
+    }
+    if label.len() > LABEL_LENGTH_MAX {
+        return false;
+    }
+    if label.starts_with('-') || label.ends_with('-') {
+        return false;
+    }
+    label
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// Whether the IPv4 parse of the resolver reads `label` as a number: only digits, or `0x` and
+/// only hex digits. That parse also reads the short forms, so `127.1`, `0x7f000001` and `127.0x1`
+/// are each `127.0.0.1`. It needs each part to be a number, so a name whose last label is no
+/// number goes to DNS. Octal, after a `0`, has only digits.
+fn is_number(label: &str) -> bool {
+    let (digits, radix) = match label
+        .strip_prefix("0x")
+        .or_else(|| label.strip_prefix("0X"))
+    {
+        Some(hex) => (hex, 16),
+        None => (label, 10),
+    };
+    digits.chars().all(|digit| digit.is_digit(radix))
+}
+
+/// Why the lookup of a name gave no address to dial.
+#[derive(Debug)]
+pub enum LookupError {
+    /// The resolver of the OS failed.
+    Failed(std::io::Error),
+    /// The lookup took longer than `LOOKUP_TIMEOUT`.
+    Timeout,
+    /// The name has no address that names a peer.
+    Empty,
+}
+
+impl std::fmt::Display for LookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LookupError::Failed(error) => write!(f, "lookup: {error}"),
+            LookupError::Timeout => write!(
+                f,
+                "the lookup took longer than {} s",
+                LOOKUP_TIMEOUT.as_secs()
+            ),
+            LookupError::Empty => write!(f, "the lookup gave no address"),
+        }
+    }
+}
+
+/// Why the TCP connect to one address failed.
+#[derive(Debug)]
+pub enum ConnectError {
+    /// The connect failed.
+    Io(std::io::Error),
+    /// The connect took longer than `CONNECT_TIMEOUT`.
+    Timeout,
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectError::Io(error) => write!(f, "{error}"),
+            ConnectError::Timeout => write!(f, "took longer than {} s", CONNECT_TIMEOUT.as_secs()),
+        }
+    }
+}
+
+/// Why the lookup, the connect or the handshake failed.
 #[derive(Debug)]
 pub enum HandshakeError {
-    /// The TCP connect failed.
-    Connect(std::io::Error),
-    /// The TCP connect took longer than `CONNECT_TIMEOUT`.
-    ConnectTimeout,
+    /// The lookup of the name of the destination failed.
+    Lookup(LookupError),
+    /// The TCP connect to each address of the destination failed. `address` is the last one,
+    /// `error` is its error, and `addresses_count` is how many addresses `handshake` tried.
+    Connect {
+        address: std::net::SocketAddr,
+        addresses_count: usize,
+        error: ConnectError,
+    },
     /// The handshake took longer than `HANDSHAKE_TIMEOUT`.
     HandshakeTimeout,
     /// A read or a write on the socket failed.
@@ -41,14 +209,20 @@ pub enum HandshakeError {
 impl std::fmt::Display for HandshakeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HandshakeError::Connect(error) => write!(f, "connect: {error}"),
-            HandshakeError::ConnectTimeout => {
-                write!(
-                    f,
-                    "connect took longer than {} s",
-                    CONNECT_TIMEOUT.as_secs()
-                )
-            }
+            HandshakeError::Lookup(error) => write!(f, "{error}"),
+            HandshakeError::Connect {
+                address,
+                addresses_count: 1,
+                error,
+            } => write!(f, "connect to {address}: {error}"),
+            HandshakeError::Connect {
+                address,
+                addresses_count,
+                error,
+            } => write!(
+                f,
+                "connect to {address}, the last of {addresses_count} addresses: {error}"
+            ),
             HandshakeError::HandshakeTimeout => {
                 write!(
                     f,
@@ -137,6 +311,8 @@ enum ReceiveError {
 pub struct Connection<'a> {
     socket: Socket,
     peer: crate::net_processing::Peer<'a>,
+    /// The address of the peer that took the connect.
+    address: std::net::SocketAddr,
 }
 
 /// One peer after the header sync. Only `Connection::sync` makes one, so `next_tip` cannot start
@@ -176,32 +352,112 @@ enum PartialFrame {
     },
 }
 
-/// Dials `peer` on the network of `chain` and runs the handshake. Returns the connection for the
-/// messages after it, and their `version`. The sync of the connection extends `chain` from its
-/// tip, so the next connection with the same chain does not get those headers again. A chain
-/// below the minimum work starts again from genesis. A peer whose chain does not have our tip
-/// answers from the highest header of our locator on its chain, and a branch with more work takes
-/// the place of ours.
-pub async fn handshake(
-    peer: std::net::SocketAddr,
-    chain: &mut crate::chain::Chain,
-) -> Result<(Connection<'_>, crate::protocol::Version), HandshakeError> {
-    let connect = tokio::net::TcpStream::connect(peer);
-    let stream = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => return Err(HandshakeError::Connect(error)),
-        Err(_elapsed) => return Err(HandshakeError::ConnectTimeout),
+/// Looks up `destination` if it is a name. Then dials the first of its addresses that takes the
+/// TCP connect, in the order of `dial_order`, on the network of `chain`, and runs the handshake.
+/// Returns the connection for the messages after it, and their `version`. The sync of the
+/// connection extends `chain` from its tip, so the next connection with the same chain does not
+/// get those headers again. A chain below the minimum work starts again from genesis. A peer
+/// whose chain does not have our tip answers from the highest header of our locator on its chain,
+/// and a branch with more work takes the place of ours.
+pub async fn handshake<'a>(
+    destination: &Destination,
+    chain: &'a mut crate::chain::Chain,
+) -> Result<(Connection<'a>, crate::protocol::Version), HandshakeError> {
+    let addresses = match destination {
+        Destination::Address(address) => Addresses {
+            before: Vec::new(),
+            last: *address,
+        },
+        Destination::Name { name, port } => {
+            lookup(name, *port).await.map_err(HandshakeError::Lookup)?
+        }
     };
-    handshake_stream(peer, stream, chain).await
+    let (address, stream) = connect_first(&addresses).await?;
+    handshake_stream(address, stream, chain).await
+}
+
+/// The addresses that one dial tries, in order: each one of `before`, then `last`. So a dial has
+/// at least one address, with no check.
+#[derive(Debug)]
+struct Addresses {
+    before: Vec<PeerAddress>,
+    last: PeerAddress,
+}
+
+/// The addresses of `name` at `port`, as `dial_order` gives them.
+async fn lookup(name: &Name, port: std::num::NonZeroU16) -> Result<Addresses, LookupError> {
+    let answers = tokio::net::lookup_host((name.0.as_str(), port.get()));
+    match tokio::time::timeout(LOOKUP_TIMEOUT, answers).await {
+        Ok(Ok(answers)) => dial_order(answers),
+        Ok(Err(error)) => Err(LookupError::Failed(error)),
+        Err(_elapsed) => Err(LookupError::Timeout),
+    }
+}
+
+/// The `answers` of a lookup that name a peer, at most `ADDRESSES_COUNT_MAX`, each one time, in a
+/// random order. So each dial can start on another address of a name that has many, such as a
+/// seed. The order needs no secret, so it comes from the keys of `RandomState`.
+fn dial_order(
+    answers: impl Iterator<Item = std::net::SocketAddr>,
+) -> Result<Addresses, LookupError> {
+    // Some resolvers give `0.0.0.0` or `::` for a name that they block.
+    let mut before: Vec<PeerAddress> = answers
+        .filter_map(PeerAddress::new)
+        .take(ADDRESSES_COUNT_MAX)
+        .collect();
+    // A hosts file can have the same name and address on two lines. A second try of an address
+    // costs up to `CONNECT_TIMEOUT` again.
+    before.sort_unstable_by_key(|address| address.0);
+    before.dedup();
+    let random = std::hash::RandomState::new();
+    before.sort_by_cached_key(|address| random.hash_one(address));
+    let Some(last) = before.pop() else {
+        return Err(LookupError::Empty);
+    };
+    Ok(Addresses { before, last })
+}
+
+/// The TCP connect to the first of `addresses` that takes it. Each try takes at most
+/// `CONNECT_TIMEOUT`, and `ADDRESSES_COUNT_MAX` bounds the tries, so the time of a dial is
+/// bounded. When each try fails, the error has the last address, its error, and the count.
+async fn connect_first(
+    addresses: &Addresses,
+) -> Result<(std::net::SocketAddr, tokio::net::TcpStream), HandshakeError> {
+    let Addresses { before, last } = addresses;
+    // `dial_order` keeps at most `ADDRESSES_COUNT_MAX`, with `last`.
+    assert!(before.len() < ADDRESSES_COUNT_MAX, "{}", before.len());
+    for &address in before {
+        if let Ok(stream) = connect(address).await {
+            return Ok((address.0, stream));
+        }
+    }
+    match connect(*last).await {
+        Ok(stream) => Ok((last.0, stream)),
+        Err(error) => Err(HandshakeError::Connect {
+            address: last.0,
+            addresses_count: before.len() + 1,
+            error,
+        }),
+    }
+}
+
+/// The TCP connect to `address`, within `CONNECT_TIMEOUT`.
+async fn connect(address: PeerAddress) -> Result<tokio::net::TcpStream, ConnectError> {
+    let connect = tokio::net::TcpStream::connect(address.0);
+    match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(error)) => Err(ConnectError::Io(error)),
+        Err(_elapsed) => Err(ConnectError::Timeout),
+    }
 }
 
 /// The handshake on a connected `stream`, within `HANDSHAKE_TIMEOUT`.
 async fn handshake_stream(
-    peer: std::net::SocketAddr,
+    address: std::net::SocketAddr,
     stream: tokio::net::TcpStream,
     chain: &mut crate::chain::Chain,
 ) -> Result<(Connection<'_>, crate::protocol::Version), HandshakeError> {
-    let exchange = handshake_stream_exchange(peer, stream, chain);
+    let exchange = handshake_stream_exchange(address, stream, chain);
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, exchange).await {
         Ok(result) => result,
         Err(_elapsed) => Err(HandshakeError::HandshakeTimeout),
@@ -211,7 +467,7 @@ async fn handshake_stream(
 /// Sends our `version`, then reads messages until the handshake is done. The handshake
 /// bounds the loop: it refuses a peer that sends too many messages without its `verack`.
 async fn handshake_stream_exchange(
-    peer: std::net::SocketAddr,
+    address: std::net::SocketAddr,
     stream: tokio::net::TcpStream,
     chain: &mut crate::chain::Chain,
 ) -> Result<(Connection<'_>, crate::protocol::Version), HandshakeError> {
@@ -219,8 +475,14 @@ async fn handshake_stream_exchange(
     let mut socket = Socket::new(stream, network);
     let work_min = crate::pow::chain_work_min(network);
     let salt = salt().map_err(HandshakeError::Salt)?;
-    let (mut handshake, outbound) =
-        crate::net_processing::Handshake::start(peer, timestamp(), nonce(), chain, work_min, salt);
+    let (mut handshake, outbound) = crate::net_processing::Handshake::start(
+        address,
+        timestamp(),
+        nonce(),
+        chain,
+        work_min,
+        salt,
+    );
     socket
         .send_handshake_outbound(&outbound)
         .await
@@ -243,7 +505,11 @@ async fn handshake_stream_exchange(
                 // The peer can send more frames in the same segment as its `verack`. Each read
                 // stops at the end of a frame, so they are still in the stream, and `sync` reads
                 // them next.
-                let connection = Connection { socket, peer };
+                let connection = Connection {
+                    socket,
+                    peer,
+                    address,
+                };
                 return Ok((connection, theirs));
             }
         }
@@ -251,6 +517,12 @@ async fn handshake_stream_exchange(
 }
 
 impl<'a> Connection<'a> {
+    /// The address of the peer: of the addresses of the destination, the one that took the
+    /// connect.
+    pub fn address(&self) -> std::net::SocketAddr {
+        self.address
+    }
+
     /// Runs one turn after the other until a batch that is not full ends the sync. Returns the
     /// peer for `Synced::next_tip`, and the tip of our chain. The loop has no count bound, because
     /// only the chain of the peer bounds the sync. A low-work sync gets the chain twice, and the
@@ -268,6 +540,7 @@ impl<'a> Connection<'a> {
         let Connection {
             mut socket,
             mut peer,
+            address: _,
         } = self;
         loop {
             match run_turn(&mut socket, peer).await? {
@@ -718,6 +991,29 @@ mod tests {
             .block_on(future)
     }
 
+    fn destination(peer: std::net::SocketAddr) -> super::Destination {
+        super::Destination::Address(super::PeerAddress::new(peer).unwrap())
+    }
+
+    fn peer_addresses(addresses: &[std::net::SocketAddr]) -> Vec<super::PeerAddress> {
+        let peer_address = |address| super::PeerAddress::new(address).unwrap();
+        addresses.iter().copied().map(peer_address).collect()
+    }
+
+    /// `addresses` in their order, with the last one as `last`.
+    fn dial(addresses: &[std::net::SocketAddr]) -> super::Addresses {
+        let mut before = peer_addresses(addresses);
+        let last = before.pop().unwrap();
+        super::Addresses { before, last }
+    }
+
+    /// The addresses of a dial, in their order.
+    fn dialed(addresses: super::Addresses) -> Vec<super::PeerAddress> {
+        let super::Addresses { mut before, last } = addresses;
+        before.push(last);
+        before
+    }
+
     /// Reads one frame on the peer's side of the socket.
     fn read_frame(stream: &mut std::net::TcpStream) -> Vec<u8> {
         read_frame_on(stream, crate::chainparams::Network::Regtest)
@@ -820,7 +1116,7 @@ mod tests {
             verack
         });
 
-        let result = block_on(super::handshake(peer, &mut chain));
+        let result = block_on(super::handshake(&destination(peer), &mut chain));
         let verack = peer_thread.join().unwrap();
         assert_eq!(verack, crate::fixtures::hex(crate::fixtures::VERACK_FRAME));
         assert!(result.is_ok(), "{result:?}");
@@ -849,7 +1145,7 @@ mod tests {
             i64::try_from(elapsed.as_secs()).unwrap()
         };
         let before = seconds();
-        let _closed = block_on(super::handshake(peer, &mut chain));
+        let _closed = block_on(super::handshake(&destination(peer), &mut chain));
         let after = seconds();
         let message = peer_thread.join().unwrap();
         assert_eq!(message.msg_type(), crate::protocol::VERSION);
@@ -903,7 +1199,9 @@ mod tests {
         });
 
         let (result, elapsed) = block_on(async {
-            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+                .await
+                .unwrap();
             tokio::time::pause();
             let start = tokio::time::Instant::now();
             let result = connection.sync().await;
@@ -960,7 +1258,9 @@ mod tests {
         });
 
         let result = block_on(async {
-            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+                .await
+                .unwrap();
             connection.sync().await
         });
         peer_thread.join().unwrap();
@@ -1019,7 +1319,9 @@ mod tests {
         });
 
         let result = block_on(async {
-            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+                .await
+                .unwrap();
             connection.sync().await
         });
         let expected = [
@@ -1063,7 +1365,9 @@ mod tests {
         });
 
         let (error, elapsed) = block_on(async {
-            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+                .await
+                .unwrap();
             let start = tokio::time::Instant::now();
             let (synced, _tip) = connection.sync().await.unwrap();
             tokio::time::pause();
@@ -1118,7 +1422,9 @@ mod tests {
         });
 
         let (synced_tip, next_tip) = block_on(async {
-            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+                .await
+                .unwrap();
             let (synced, synced_tip) = connection.sync().await.unwrap();
             let (_synced, next_tip) = synced.next_tip().await.unwrap();
             (synced_tip, next_tip)
@@ -1160,7 +1466,9 @@ mod tests {
         });
 
         let (error, elapsed) = block_on(async {
-            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+                .await
+                .unwrap();
             let start = tokio::time::Instant::now();
             let (synced, _tip) = connection.sync().await.unwrap();
             tokio::time::pause();
@@ -1197,7 +1505,9 @@ mod tests {
         let peer_thread = std::thread::spawn(move || accept_handshake(&listener));
 
         let (result, elapsed) = block_on(async {
-            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+                .await
+                .unwrap();
             // The peer thread ends when it has sent its `verack`, so this wait blocks nothing.
             // The stream stays open, and nothing reads it.
             let _stream = peer_thread.join().unwrap();
@@ -1239,7 +1549,7 @@ mod tests {
             stream.write_all(&frame[..frame.len() - 1]).unwrap();
         });
 
-        let result = block_on(super::handshake(peer, &mut chain));
+        let result = block_on(super::handshake(&destination(peer), &mut chain));
         peer_thread.join().unwrap();
         assert!(
             matches!(result, Err(super::HandshakeError::Closed)),
@@ -1318,7 +1628,9 @@ mod tests {
         });
 
         let result = block_on(async {
-            let (connection, _theirs) = super::handshake(peer, &mut chain).await.unwrap();
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+                .await
+                .unwrap();
             connection.sync().await
         });
         let pong = peer_thread.join().unwrap();
@@ -1340,15 +1652,125 @@ mod tests {
             .unwrap()
             .local_addr()
             .unwrap();
-        let result = block_on(super::handshake(peer, &mut chain));
+        let result = block_on(super::handshake(&destination(peer), &mut chain));
+        let Err(error) = result else {
+            panic!("{result:?}");
+        };
+        let super::HandshakeError::Connect {
+            address,
+            addresses_count,
+            error: super::ConnectError::Io(io),
+        } = &error
+        else {
+            panic!("{error:?}");
+        };
+        assert_eq!(io.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert_eq!(*address, peer);
+        assert_eq!(*addresses_count, 1);
+        let text = error.to_string();
+        assert!(text.starts_with(&format!("connect to {peer}: ")), "{text}");
+    }
+
+    #[test]
+    fn connect_takes_the_first_address_that_takes_it() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listening = listener.local_addr().unwrap();
+        // Nothing listens on a port that was bound and then freed. The listener is open while
+        // the bind picks the port, so the two ports differ.
+        let refused = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        for addresses in [[refused, listening], [listening, refused]] {
+            let (address, _stream) = block_on(super::connect_first(&dial(&addresses))).unwrap();
+            assert_eq!(address, listening, "{addresses:?}");
+        }
+    }
+
+    #[test]
+    fn connect_to_no_address_gives_the_last_one_and_the_count() {
+        // Both listeners are open while the binds pick the ports, so the two ports differ.
+        // Nothing listens on them after the drop.
+        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let last = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addresses = [first.local_addr().unwrap(), last.local_addr().unwrap()];
+        drop((first, last));
+
+        let result = block_on(super::connect_first(&dial(&addresses)));
+        let Err(error) = result else {
+            panic!("{result:?}");
+        };
+        let super::HandshakeError::Connect {
+            address,
+            addresses_count,
+            error: super::ConnectError::Io(_),
+        } = &error
+        else {
+            panic!("{error:?}");
+        };
+        assert_eq!(*address, addresses[1]);
+        assert_eq!(*addresses_count, 2);
+        let text = error.to_string();
+        let expected = format!("connect to {}, the last of 2 addresses: ", addresses[1]);
+        assert!(text.starts_with(&expected), "{text}");
+    }
+
+    #[test]
+    fn dial_order_drops_the_answers_that_name_no_peer_and_keeps_at_most_the_count_max() {
+        let unspecified = [
+            std::net::SocketAddr::from(([0, 0, 0, 0], 1)),
+            std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 1)),
+            std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED.to_ipv6_mapped(), 1)),
+            std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        ];
+        let result = super::dial_order(unspecified.into_iter());
         assert!(
-            matches!(
-                result,
-                Err(super::HandshakeError::Connect(ref error))
-                    if error.kind() == std::io::ErrorKind::ConnectionRefused
-            ),
+            matches!(result, Err(super::LookupError::Empty)),
             "{result:?}"
         );
+
+        // One more than the count max, after the unspecified ones. Each port is new, so the
+        // ones that it keeps are the first ones.
+        let answers: Vec<std::net::SocketAddr> = (1..=super::ADDRESSES_COUNT_MAX + 1)
+            .map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], u16::try_from(port).unwrap())))
+            .collect();
+        let kept = super::dial_order(unspecified.into_iter().chain(answers.iter().copied()));
+        let mut kept = dialed(kept.unwrap());
+        kept.sort_unstable_by_key(|address| address.0);
+        assert_eq!(kept, peer_addresses(&answers[..super::ADDRESSES_COUNT_MAX]));
+    }
+
+    #[test]
+    fn dial_order_keeps_each_address_one_time() {
+        let first = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
+        let second = std::net::SocketAddr::from(([127, 0, 0, 1], 2));
+        let addresses = super::dial_order([first, second, first, first].into_iter()).unwrap();
+        let mut kept = dialed(addresses);
+        kept.sort_unstable_by_key(|address| address.0);
+        assert_eq!(kept, peer_addresses(&[first, second]));
+    }
+
+    // The resolver of the OS reads `localhost` from its hosts file, with no name server.
+    #[test]
+    fn lookup_gives_the_addresses_of_a_name_with_the_port() {
+        let name = super::Name::new("localhost").unwrap();
+        let addresses = block_on(super::lookup(&name, std::num::NonZeroU16::MIN)).unwrap();
+        for super::PeerAddress(address) in dialed(addresses) {
+            assert!(address.ip().is_loopback(), "{address}");
+            assert_eq!(address.port(), 1, "{address}");
+        }
+    }
+
+    #[test]
+    fn longest_destination_has_the_length_max() {
+        let label = "a".repeat(super::LABEL_LENGTH_MAX);
+        let labels = [label.as_str(); 4].join(".");
+        let longest = format!("{}.", &labels[..super::NAME_LENGTH_MAX]);
+        let destination = super::Destination::Name {
+            name: super::Name::new(&longest).unwrap(),
+            port: std::num::NonZeroU16::MAX,
+        };
+        assert_eq!(destination.to_string().len(), super::DESTINATION_LENGTH_MAX);
     }
 
     #[test]
