@@ -525,6 +525,74 @@ fn branch_below_the_margin_takes_the_place_of_ours_after_a_low_work_sync() {
     assert!(ends.is_empty(), "elo ended the connection: {ends:?}");
 }
 
+#[test]
+fn announcement_on_a_branch_that_lost_to_ours_after_a_low_work_sync_gets_no_getheaders() {
+    let bitcoind = Bitcoind::start();
+    bitcoind.cli(&["generatetodescriptor", "3001", "raw(51)"]);
+    let second = bitcoind.cli(&["getblockhash", "2"]);
+    bitcoind.cli(&["invalidateblock", second.trim_end()]);
+    bitcoind.cli(&["generatetodescriptor", "2950", "raw(52)"]);
+    bitcoind.cli(&["reconsiderblock", second.trim_end()]);
+    let elo = Elo::start(&bitcoind);
+    let ours = elo.event("tip", SYNC_TIMEOUT);
+    let expected = format!("level=info event=tip peer={} height=3001 ", bitcoind.peer);
+    assert!(ours.starts_with(&expected), "{ours}");
+
+    bitcoind.cli(&["setban", "127.0.0.1", "add"]);
+    elo.event("end", END_TIMEOUT);
+    bitcoind.cli(&["invalidateblock", second.trim_end()]);
+    bitcoind.cli(&["setban", "127.0.0.1", "remove"]);
+    elo.event("version", RECONNECT_TIMEOUT);
+    assert_eq!(elo.event("tip", SYNC_TIMEOUT), ours);
+    let ends = elo.events("end").len();
+    pong_from(&bitcoind, &elo, ends);
+
+    let get_headers = message_bytes(&bitcoind, "bytesrecv_per_msg", "getheaders");
+    let headers_sent = message_bytes(&bitcoind, "bytessent_per_msg", "headers");
+    bitcoind.cli(&["generatetodescriptor", "1", "raw(52)"]);
+    let start = std::time::Instant::now();
+    while message_bytes(&bitcoind, "bytessent_per_msg", "headers") == headers_sent {
+        assert!(
+            start.elapsed() < PEER_INFO_TIMEOUT,
+            "bitcoind sent no headers"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    pong_from(&bitcoind, &elo, ends);
+    pong_from(&bitcoind, &elo, ends);
+    assert_eq!(
+        message_bytes(&bitcoind, "bytesrecv_per_msg", "getheaders"),
+        get_headers
+    );
+}
+
+fn pong_from(bitcoind: &Bitcoind, elo: &Elo, ends: usize) {
+    let start = std::time::Instant::now();
+    let before = message_bytes(bitcoind, "bytesrecv_per_msg", "pong");
+    bitcoind.cli(&["ping"]);
+    while message_bytes(bitcoind, "bytesrecv_per_msg", "pong") == before {
+        let all = elo.events("end");
+        assert_eq!(all.len(), ends, "elo ended the connection: {all:?}");
+        assert!(
+            start.elapsed() < PEER_INFO_TIMEOUT,
+            "bitcoind got no pong from elo"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let all = elo.events("end");
+    assert_eq!(all.len(), ends, "elo ended the connection: {all:?}");
+}
+
+fn message_bytes(bitcoind: &Bitcoind, field: &str, message: &str) -> u64 {
+    let peer_info = bitcoind.cli(&["getpeerinfo"]);
+    let key = format!("\"{message}\": ");
+    let Some((_, rest)) = object_text(&peer_info, field).split_once(&key) else {
+        return 0;
+    };
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().unwrap()
+}
+
 fn wait_for_send_headers(bitcoind: &Bitcoind, elo: &Elo) {
     let start = std::time::Instant::now();
     loop {
