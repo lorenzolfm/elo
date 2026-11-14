@@ -29,8 +29,6 @@ const ADDRESSES_COUNT_MAX: usize = 256;
 /// a seed again, so a seed whose answers are down costs at most this many tries.
 const SEED_ADDRESSES_COUNT_MAX: usize = 32;
 
-const _: () = assert!(SEED_ADDRESSES_COUNT_MAX <= ADDRESSES_COUNT_MAX);
-
 /// The most bytes of a name, with no `.` at the end.
 const NAME_LENGTH_MAX: usize = 253;
 
@@ -556,7 +554,7 @@ fn name_order(
 ) -> Result<Addresses, LookupError> {
     // Some resolvers give `0.0.0.0` or `::` for a name that they block.
     let answers = answers.into_iter().filter_map(PeerAddress::new);
-    dial_order(answers, ADDRESSES_COUNT_MAX)
+    dial_order::<ADDRESSES_COUNT_MAX>(answers)
 }
 
 /// The `answers` of the lookup of a seed that name a peer that the internet routes to, at most
@@ -569,18 +567,18 @@ fn seed_order(
         .into_iter()
         .filter_map(PeerAddress::new)
         .filter(|address| !is_reserved(address.0.ip()));
-    dial_order(routable, SEED_ADDRESSES_COUNT_MAX)
+    dial_order::<SEED_ADDRESSES_COUNT_MAX>(routable)
 }
 
-/// At most `count_max` of `answers`, each one time, in a random order. So each dial can start on
+/// At most `COUNT_MAX` of `answers`, each one time, in a random order. So each dial can start on
 /// another address of a name that has many, such as a seed. The order needs no secret, so it comes
 /// from the keys of `RandomState`.
-fn dial_order(
+fn dial_order<const COUNT_MAX: usize>(
     answers: impl Iterator<Item = PeerAddress>,
-    count_max: usize,
 ) -> Result<Addresses, LookupError> {
-    assert!(count_max <= ADDRESSES_COUNT_MAX, "{count_max}");
-    let mut before: Vec<PeerAddress> = answers.take(count_max).collect();
+    // `connect_first` takes at most `ADDRESSES_COUNT_MAX`, so each cap fits in it.
+    const { assert!(COUNT_MAX <= ADDRESSES_COUNT_MAX) };
+    let mut before: Vec<PeerAddress> = answers.take(COUNT_MAX).collect();
     // A hosts file can have the same name and address on two lines. A second try of an address
     // costs up to `CONNECT_TIMEOUT` again.
     before.sort_unstable_by_key(|address| address.0);
@@ -591,7 +589,7 @@ fn dial_order(
         return Err(LookupError::Empty);
     };
     // `connect_first` checks only `ADDRESSES_COUNT_MAX`, so the cap of a seed is checked here.
-    assert!(before.len() < count_max, "{} {count_max}", before.len());
+    assert!(before.len() < COUNT_MAX, "{} {COUNT_MAX}", before.len());
     Ok(Addresses { before, last })
 }
 
