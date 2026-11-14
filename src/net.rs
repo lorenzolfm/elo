@@ -83,15 +83,12 @@ impl Seeds {
     /// secret, so it comes from the keys of `RandomState`: the seed with the lowest hash.
     fn choose(&self) -> Destination {
         let random = std::hash::RandomState::new();
-        let first = (self.first, random.hash_one(self.first));
-        let (seed, _) = self.rest.iter().fold(first, |chosen, &seed| {
-            let hash = random.hash_one(seed);
-            if hash < chosen.1 {
-                (seed, hash)
-            } else {
-                chosen
-            }
-        });
+        let first = (random.hash_one(self.first), self.first);
+        let (_, seed) = self
+            .rest
+            .iter()
+            .map(|&seed| (random.hash_one(seed), seed))
+            .fold(first, std::cmp::min);
         Destination::Seed {
             seed: Seed(seed),
             port: self.port,
