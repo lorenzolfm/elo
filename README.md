@@ -43,8 +43,8 @@ the hash and the work of its last header until it takes a branch or the
 connection ends. For a branch below the margin, the work that elo keeps can be
 more than the true work, but not less: the true work needs the work of each
 header of elo above the fork. Headers that the peer announces on that header do
-not make elo ask. elo adds the work of each one that has its proof of work, and asks only
-when the branch has more work.
+not make elo ask. elo adds the work of each one that has its proof of work. It
+asks when the branch has more work, or when the announcement is a full batch.
 A peer announces a block with an `inv` when its headers do not connect to the
 last header it sent, so an `inv` of a block makes elo ask too. From the
 handshake on, it pings the peer every 2 min.

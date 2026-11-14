@@ -792,23 +792,23 @@ fn receive_announcement(
     headers: crate::protocol::Headers,
     clock: u64,
 ) -> Result<Option<Download>, PeerError> {
-    let first_prev = headers.first().map(|first| first.prev);
-    match branch_tip.take() {
-        Some(tip) if first_prev == Some(tip.hash()) => {
-            assert!(tip.work() <= chain.tip().work());
-            assert_ne!(tip.hash(), chain.tip().hash());
-            let tip = tip
-                .extend(chain.network(), &headers)
-                .map_err(PeerError::Extend)?;
-            if tip.work() > chain.tip().work() {
-                return Ok(Some(Download::on_tip(chain, work_min)));
-            }
-            *branch_tip = Some(tip);
-            return Ok(None);
-        }
-        tip => *branch_tip = tip,
-    }
     let full = headers.is_full();
+    let first_prev = headers.first().map(|first| first.prev);
+    if let Some(tip) = *branch_tip
+        && first_prev == Some(tip.hash())
+    {
+        assert!(tip.work() <= chain.tip().work());
+        assert_ne!(tip.hash(), chain.tip().hash());
+        let tip = tip
+            .extend(chain.network(), &headers)
+            .map_err(PeerError::Extend)?;
+        if full || tip.work() > chain.tip().work() {
+            *branch_tip = None;
+            return Ok(Some(Download::on_tip(chain, work_min)));
+        }
+        *branch_tip = Some(tip);
+        return Ok(None);
+    }
     match chain.extend(headers, clock) {
         Ok(()) => {
             let next = Download::on_tip(chain, work_min);
@@ -1970,17 +1970,20 @@ pub(crate) mod fuzz {
             if let Some((hash, work)) = self.branch_tip
                 && hash == prev
             {
-                self.branch_tip = None;
                 let hashes = script_hashes(self.network, hash, headers).map_err(extend_error)?;
                 const { assert!(usize::BITS <= 64) };
                 let work = work + hashes.len() as u128 * SCRIPT_HEADER_WORK;
-                if work <= self.work() {
-                    let Some(last) = hashes.last() else {
-                        panic!("an announcement off our tip has no header");
-                    };
-                    self.branch_tip = Some((*last, work));
+                let full = headers.len() == HEADERS_FULL_COUNT;
+                if full || work > self.work() {
+                    self.branch_tip = None;
+                    self.get_headers = GetHeadersModel::Due;
                     return Ok(());
                 }
+                let Some(last) = hashes.last() else {
+                    panic!("an announcement off our tip has no header");
+                };
+                self.branch_tip = Some((*last, work));
+                return Ok(());
             }
             self.get_headers = GetHeadersModel::Due;
             Ok(())
