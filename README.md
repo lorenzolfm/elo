@@ -60,7 +60,7 @@ chain stays in memory, so the next connection syncs from its tip. A chain below
 the minimum work starts again from genesis.
 
 ```sh
-elo <mainnet|testnet4|signet|regtest> [<ip|name>[:port]]    # IPv6 as [::1]:8333
+elo [--metrics [<ip>:]<port>] <mainnet|testnet4|signet|regtest> [<ip|name>[:port]]    # IPv6 as [::1]:8333
 ```
 
 The peer is an IP address or a name. Before each dial, elo looks up the name
@@ -82,8 +82,9 @@ peer.
 
 SIGTERM and SIGINT (Ctrl-C) stop elo at any step, also in the wait before a
 dial. It logs the signal and exits with 0. elo exits with 1 only on a fault of
-this host: its async runtime or its signal handlers do not start, a write to
-stdout fails, or a read of `/dev/urandom` fails. A bug panics: elo logs the
+this host: its async runtime or its signal handlers do not start, it cannot
+listen on the address of `--metrics`, a write to stdout fails, or a read of
+`/dev/urandom` fails. A bug panics: elo logs the
 panic and exits with 101. Bad usage exits with 2.
 
 ## Log
@@ -102,6 +103,7 @@ level=info event=stop signal=SIGTERM
 | --- | --- | --- |
 | `version` | `info` | `peer` `version` `services` `user_agent` `start_height` `relay` |
 | `tip` | `info` | `peer` `height` `hash` `work` |
+| `metrics` | `info` | `address`: elo serves its metrics there |
 | `end` | `warn` | `destination` `reason` `wait_ms`: elo dials again after `wait_ms`. `destination` is what the dial looked up or dialed: the peer of the command line, also a name, or the seed, such as `seed.bitcoin.sipa.be.:8333`. `peer` is always the address of a connection |
 | `exit` | `error` | `reason`: a fault of this host, and elo exits with 1 |
 | `stop` | `info` | `signal`: elo exits with 0 |
@@ -112,6 +114,25 @@ alerts that match on them. `src/logging.rs` holds the one list of them. A value 
 a `"` or a control character is in quotes, with escapes. A value is at most 260 bytes, so a line is
 at most 16 KiB, whatever the peer sends. When a write to stdout fails, elo writes the `exit` line to
 stderr only, because the write that failed can leave part of its line on stdout.
+
+## Metrics
+
+With `--metrics`, elo serves its metrics at `GET /metrics`, in the Prometheus text format. A
+scraper, such as Prometheus or Grafana Alloy, pulls them, and elo pushes nothing. The flag takes a
+port on 127.0.0.1, or an address and a port, such as `0.0.0.0:9332` for a scraper in another
+container. Port 0 takes a free port. elo logs the address in a `metrics` line before it dials.
+
+| Metric | Type | Value |
+| --- | --- | --- |
+| `elo_header_tip_height` | gauge | The height of the tip of the header chain |
+| `elo_header_tip_work` | gauge | The work of the chain up to the tip, in decimal |
+| `elo_peer_state` | gauge | 1 for the step of the connection, and 0 for each other. The `state` label is `dial`, `sync`, `synced` or `wait` |
+| `elo_reconnects_total` | counter | The connections that ended, and that elo dials again after the wait |
+
+The tip moves when the `tip` line does: at the end of a sync, and then with each new tip. As for the
+log, the names are an interface, and `src/metrics.rs` holds them. elo answers one connection at a
+time, each in at most 10 s, and closes it after the answer. A request head is at most 8 KiB. Another
+path gets 404, and another method gets 405.
 
 ## Build
 
@@ -130,7 +151,8 @@ Each push to `main` also pushes an image of elo to GHCR, as `ghcr.io/lorenzolfm/
 `:sha-<commit>`. CI runs one push at a time and drops a push that waits when a newer one comes, so
 a burst of merges gets an image for its last commit only. Before the push, CI runs the image against
 a regtest `bitcoind` until it prints the `tip`. The arguments of the image are the arguments of
-elo. It runs as user 65534 and needs no volume, no port and no writable path:
+elo. It runs as user 65534 and needs no volume, no port (unless you give `--metrics`) and no
+writable path:
 
 ```sh
 nix build .#elo-image && docker load --input result
