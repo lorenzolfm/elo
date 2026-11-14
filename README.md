@@ -89,7 +89,7 @@ level=info event=stop signal=SIGTERM
 
 The names of the events and of the fields are an interface, so a rename breaks the dashboards and
 alerts that match on them. `src/logging.rs` holds the one list of them. A value with a space, a `=`,
-a `"` or a control character is in quotes, with escapes. A value is at most 256 bytes, so a line is
+a `"` or a control character is in quotes, with escapes. A value is at most 260 bytes, so a line is
 at most 16 KiB, whatever the peer sends. When a write to stdout fails, elo writes the `exit` line to
 stderr only, because the write that failed can leave part of its line on stdout.
 
