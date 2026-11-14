@@ -364,7 +364,10 @@ pub async fn handshake<'a>(
     chain: &'a mut crate::chain::Chain,
 ) -> Result<(Connection<'a>, crate::protocol::Version), HandshakeError> {
     let addresses = match destination {
-        Destination::Address(address) => vec![*address],
+        Destination::Address(address) => Addresses {
+            before: Vec::new(),
+            last: *address,
+        },
         Destination::Name { name, port } => {
             lookup(name, *port).await.map_err(HandshakeError::Lookup)?
         }
@@ -373,8 +376,16 @@ pub async fn handshake<'a>(
     handshake_stream(address, stream, chain).await
 }
 
+/// The addresses that one dial tries, in order: each one of `before`, then `last`. So a dial has
+/// at least one address, with no check.
+#[derive(Debug)]
+struct Addresses {
+    before: Vec<PeerAddress>,
+    last: PeerAddress,
+}
+
 /// The addresses of `name` at `port`, as `dial_order` gives them.
-async fn lookup(name: &Name, port: std::num::NonZeroU16) -> Result<Vec<PeerAddress>, LookupError> {
+async fn lookup(name: &Name, port: std::num::NonZeroU16) -> Result<Addresses, LookupError> {
     let answers = tokio::net::lookup_host((name.0.as_str(), port.get()));
     match tokio::time::timeout(LOOKUP_TIMEOUT, answers).await {
         Ok(Ok(answers)) => dial_order(answers),
@@ -388,45 +399,39 @@ async fn lookup(name: &Name, port: std::num::NonZeroU16) -> Result<Vec<PeerAddre
 /// needs no secret, so it comes from the keys of `RandomState`.
 fn dial_order(
     answers: impl Iterator<Item = std::net::SocketAddr>,
-) -> Result<Vec<PeerAddress>, LookupError> {
+) -> Result<Addresses, LookupError> {
     // Some resolvers give `0.0.0.0` or `::` for a name that they block.
-    let mut addresses: Vec<PeerAddress> = answers
+    let mut before: Vec<PeerAddress> = answers
         .filter_map(PeerAddress::new)
         .take(ADDRESSES_COUNT_MAX)
         .collect();
-    if addresses.is_empty() {
-        return Err(LookupError::Empty);
-    }
     let random = std::hash::RandomState::new();
-    addresses.sort_by_cached_key(|address| random.hash_one(address));
-    Ok(addresses)
+    before.sort_by_cached_key(|address| random.hash_one(address));
+    let Some(last) = before.pop() else {
+        return Err(LookupError::Empty);
+    };
+    Ok(Addresses { before, last })
 }
 
 /// The TCP connect to the first of `addresses` that takes it. Each try takes at most
 /// `CONNECT_TIMEOUT`, and `ADDRESSES_COUNT_MAX` bounds the tries, so the time of a dial is
 /// bounded. When each try fails, the error has the last address, its error, and the count.
 async fn connect_first(
-    addresses: &[PeerAddress],
+    addresses: &Addresses,
 ) -> Result<(std::net::SocketAddr, tokio::net::TcpStream), HandshakeError> {
-    // `dial_order` keeps at most `ADDRESSES_COUNT_MAX`, and gives no empty list.
-    assert!(
-        addresses.len() <= ADDRESSES_COUNT_MAX,
-        "{}",
-        addresses.len()
-    );
-    let Some((&last, before)) = addresses.split_last() else {
-        panic!("no address to dial");
-    };
+    let Addresses { before, last } = addresses;
+    // `dial_order` keeps at most `ADDRESSES_COUNT_MAX`, with `last`.
+    assert!(before.len() < ADDRESSES_COUNT_MAX, "{}", before.len());
     for &address in before {
         if let Ok(stream) = connect(address).await {
             return Ok((address.0, stream));
         }
     }
-    match connect(last).await {
+    match connect(*last).await {
         Ok(stream) => Ok((last.0, stream)),
         Err(error) => Err(HandshakeError::Connect {
             address: last.0,
-            addresses_count: addresses.len(),
+            addresses_count: before.len() + 1,
             error,
         }),
     }
@@ -989,6 +994,20 @@ mod tests {
     fn peer_addresses(addresses: &[std::net::SocketAddr]) -> Vec<super::PeerAddress> {
         let peer_address = |address| super::PeerAddress::new(address).unwrap();
         addresses.iter().copied().map(peer_address).collect()
+    }
+
+    /// `addresses` in their order, with the last one as `last`.
+    fn dial(addresses: &[std::net::SocketAddr]) -> super::Addresses {
+        let mut before = peer_addresses(addresses);
+        let last = before.pop().unwrap();
+        super::Addresses { before, last }
+    }
+
+    /// The addresses of a dial, in their order.
+    fn dialed(addresses: super::Addresses) -> Vec<super::PeerAddress> {
+        let super::Addresses { mut before, last } = addresses;
+        before.push(last);
+        before
     }
 
     /// Reads one frame on the peer's side of the socket.
@@ -1659,8 +1678,7 @@ mod tests {
             .local_addr()
             .unwrap();
         for addresses in [[refused, listening], [listening, refused]] {
-            let addresses = peer_addresses(&addresses);
-            let (address, _stream) = block_on(super::connect_first(&addresses)).unwrap();
+            let (address, _stream) = block_on(super::connect_first(&dial(&addresses))).unwrap();
             assert_eq!(address, listening, "{addresses:?}");
         }
     }
@@ -1674,7 +1692,7 @@ mod tests {
         let addresses = [first.local_addr().unwrap(), last.local_addr().unwrap()];
         drop((first, last));
 
-        let result = block_on(super::connect_first(&peer_addresses(&addresses)));
+        let result = block_on(super::connect_first(&dial(&addresses)));
         let Err(error) = result else {
             panic!("{result:?}");
         };
@@ -1712,8 +1730,8 @@ mod tests {
         let answers: Vec<std::net::SocketAddr> = (1..=super::ADDRESSES_COUNT_MAX + 1)
             .map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], u16::try_from(port).unwrap())))
             .collect();
-        let mut kept =
-            super::dial_order(unspecified.into_iter().chain(answers.iter().copied())).unwrap();
+        let kept = super::dial_order(unspecified.into_iter().chain(answers.iter().copied()));
+        let mut kept = dialed(kept.unwrap());
         kept.sort_unstable_by_key(|address| address.0);
         assert_eq!(kept, peer_addresses(&answers[..super::ADDRESSES_COUNT_MAX]));
     }
@@ -1723,8 +1741,7 @@ mod tests {
     fn lookup_gives_the_addresses_of_a_name_with_the_port() {
         let name = super::Name::new("localhost").unwrap();
         let addresses = block_on(super::lookup(&name, std::num::NonZeroU16::MIN)).unwrap();
-        assert!(!addresses.is_empty());
-        for super::PeerAddress(address) in addresses {
+        for super::PeerAddress(address) in dialed(addresses) {
             assert!(address.ip().is_loopback(), "{address}");
             assert_eq!(address.port(), 1, "{address}");
         }
