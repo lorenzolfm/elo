@@ -769,6 +769,7 @@ impl BranchTip {
     }
 
     #[cfg(fuzzing)]
+    #[cfg_attr(false, mutants::skip)]
     pub(crate) fn work_max(&self) -> crate::pow::Work {
         self.work_max
     }
