@@ -766,7 +766,6 @@ fn chain_next(
         }
         crate::chain::Extended::KeptOver(tip) => {
             assert!(!full);
-            assert!(chain.tip().work() >= tip.work_max());
             *branch_tip = Some(tip);
             Ok(None)
         }
@@ -797,17 +796,19 @@ fn receive_announcement(
     if let Some(tip) = *branch_tip
         && first_prev == Some(tip.hash())
     {
-        assert!(tip.work_max() <= chain.tip().work());
-        assert_ne!(tip.hash(), chain.tip().hash());
-        let tip = tip
-            .extend(chain.network(), &headers)
-            .map_err(PeerError::Extend)?;
-        if full || tip.work_max() > chain.tip().work() {
-            *branch_tip = None;
-            return Ok(Some(Download::on_tip(chain, work_min)));
-        }
-        *branch_tip = Some(tip);
-        return Ok(None);
+        return match chain
+            .extend_branch_tip(tip, &headers)
+            .map_err(PeerError::Extend)?
+        {
+            crate::chain::Announced::Kept(tip) => {
+                *branch_tip = Some(tip);
+                Ok(None)
+            }
+            crate::chain::Announced::Ask => {
+                *branch_tip = None;
+                Ok(Some(Download::on_tip(chain, work_min)))
+            }
+        };
     }
     match chain.extend(headers, clock) {
         Ok(()) => {

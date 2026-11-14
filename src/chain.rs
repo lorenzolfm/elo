@@ -42,6 +42,12 @@ pub(crate) struct BranchTip {
     work_max: crate::pow::Work,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Announced {
+    Kept(BranchTip),
+    Ask,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SyncStart {
     network: crate::chainparams::Network,
@@ -415,6 +421,30 @@ impl Chain {
         BranchTip { hash, work_max }
     }
 
+    pub(crate) fn extend_branch_tip(
+        &self,
+        tip: BranchTip,
+        headers: &crate::protocol::Headers,
+    ) -> Result<Announced, ExtendError> {
+        assert!(tip.work_max <= self.work);
+        assert_ne!(tip.hash, self.tip.hash());
+        let (hash, work_max) = headers.as_slice().iter().try_fold(
+            (tip.hash, tip.work_max),
+            |(hash, work_max), header| {
+                if header.prev != hash {
+                    return Err(ExtendError::NotContinuous);
+                }
+                let (hash, work) =
+                    crate::pow::proven(header, self.network).ok_or(ExtendError::ProofOfWork)?;
+                Ok((hash, work_max.saturating_add(work)))
+            },
+        )?;
+        if headers.is_full() || work_max > self.work {
+            return Ok(Announced::Ask);
+        }
+        Ok(Announced::Kept(BranchTip { hash, work_max }))
+    }
+
     fn branch_on_fork(&self, fork_height: usize) -> Branch {
         assert!(fork_height < self.below_tip.len());
         Branch {
@@ -713,26 +743,9 @@ impl BranchTip {
         self.hash
     }
 
+    #[cfg(fuzzing)]
     pub(crate) fn work_max(&self) -> crate::pow::Work {
         self.work_max
-    }
-
-    pub(crate) fn extend(
-        self,
-        network: crate::chainparams::Network,
-        headers: &crate::protocol::Headers,
-    ) -> Result<BranchTip, ExtendError> {
-        headers.as_slice().iter().try_fold(self, |tip, header| {
-            if header.prev != tip.hash {
-                return Err(ExtendError::NotContinuous);
-            }
-            let (hash, work) =
-                crate::pow::proven(header, network).ok_or(ExtendError::ProofOfWork)?;
-            Ok(BranchTip {
-                hash,
-                work_max: tip.work_max.saturating_add(work),
-            })
-        })
     }
 }
 
@@ -1987,17 +2000,22 @@ mod tests {
     }
 
     #[test]
-    fn branch_tip_takes_the_work_of_headers_on_it_that_have_their_proof_of_work() {
-        let branch = crate::fixtures::branch_on(&genesis(), 3);
-        let network = crate::chainparams::Network::Regtest;
+    fn extend_branch_tip_keeps_a_tip_with_no_more_work_and_asks_for_more_work_or_a_full_batch() {
+        let headers = crate::fixtures::headers_on_genesis(2_100);
+        let branch = crate::fixtures::branch_on(&genesis(), 2_001);
         let tip = tip_of_branch(&branch[..1]);
-        let extend = |headers: &[crate::block::BlockHeader]| {
-            tip.extend(network, &crate::fixtures::headers_batch(headers))
+        let extend = |count: usize, theirs: &[crate::block::BlockHeader]| {
+            regtest_with(&headers[..count])
+                .extend_branch_tip(tip, &crate::fixtures::headers_batch(theirs))
         };
-        assert_eq!(extend(&[]), Ok(tip));
-        assert_eq!(extend(&branch[1..]), Ok(tip_of_branch(&branch)));
+        let kept = |count: usize| Ok(super::Announced::Kept(tip_of_branch(&branch[..count])));
+        assert_eq!(extend(3, &[]), kept(1));
+        assert_eq!(extend(3, &branch[1..3]), kept(3));
+        assert_eq!(extend(3, &branch[1..4]), Ok(super::Announced::Ask));
+        assert_eq!(extend(2_100, &branch[1..2_000]), kept(2_000));
+        assert_eq!(extend(2_100, &branch[1..]), Ok(super::Announced::Ask));
         let unproven = unproven(branch[2]);
-        for (headers, error) in [
+        for (theirs, error) in [
             (&branch[2..], super::ExtendError::NotContinuous),
             (
                 &[branch[1], branch[1]][..],
@@ -2005,7 +2023,7 @@ mod tests {
             ),
             (&[branch[1], unproven][..], super::ExtendError::ProofOfWork),
         ] {
-            assert_eq!(extend(headers), Err(error), "{headers:?}");
+            assert_eq!(extend(3, theirs), Err(error), "{theirs:?}");
         }
     }
 }
