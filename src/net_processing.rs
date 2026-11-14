@@ -987,6 +987,7 @@ pub(crate) mod fuzz {
         seed!("fork-below-margin-after-our-headers", "PeerOpen { height: 2200, synced: false }"),
         seed!("fork-below-margin-of-the-minimum", "PeerRefused(SecondLowWorkSync)"),
         seed!("fork-below-margin-short-kept", "PeerOpen { height: 2200, synced: true }"),
+        seed!("fork-below-margin-short-kept-then-announce-on-tip", "PeerOpen { height: 2147, synced: true }"),
         seed!("fork-full-at-margin-then-more-work", "PeerOpen { height: 2145, synced: true }"),
         seed!("fork-full-in-margin-then-empty", "PeerOpen { height: 2005, synced: true }"),
         seed!("fork-full-in-margin-then-more-work", "PeerOpen { height: 2006, synced: true }"),
@@ -1895,6 +1896,7 @@ pub(crate) mod fuzz {
                 .map_err(super::PeerError::Headers)?
                 .into_vec();
             assert!(headers.len() <= HEADERS_FULL_COUNT);
+            let announced = matches!(self.get_headers, GetHeadersModel::Ended);
             match self.get_headers {
                 GetHeadersModel::Outstanding(_) => {}
                 GetHeadersModel::Ended => {
@@ -1911,6 +1913,12 @@ pub(crate) mod fuzz {
             let full = headers.len() == HEADERS_FULL_COUNT;
             let download = std::mem::replace(&mut self.download, DownloadModel::Chain);
             let next = match download {
+                DownloadModel::Chain if announced => {
+                    let batch =
+                        script_hashes(self.network, self.tip(), &headers).map_err(extend_error)?;
+                    self.chain.extend(batch);
+                    full.then_some(DownloadModel::Chain)
+                }
                 DownloadModel::Chain if full && self.work() < self.work_min => {
                     assert_eq!(self.height(), 0);
                     let hashes =
