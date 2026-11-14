@@ -3594,6 +3594,28 @@ mod tests {
     }
 
     #[test]
+    fn headers_off_the_locator_of_a_low_work_sync_are_skipped() {
+        let mut chain = regtest();
+        let start = std::time::Instant::now();
+        let headers = crate::fixtures::headers_on_genesis(3_500);
+        let work_min = tip_after(&headers).work();
+        let (peer, _) = batch_then_tick(
+            asked_with(&mut chain, work_min, start),
+            &headers[..2_000],
+            start,
+        );
+        let off_locator = crate::fixtures::branch_on(&headers[1_000], 20);
+        let peer = accept(peer, &headers_message(&off_locator));
+        let (peer, _) = batch_then_tick(peer, &headers[2_000..], start);
+        let (peer, _) = batch_then_tick(peer, &headers[..2_000], start);
+        let received = peer.receive(&headers_message(&headers[2_000..]), crate::fixtures::CLOCK);
+        let Ok((_, super::Received::Synced(tip))) = received else {
+            panic!("{received:?}");
+        };
+        assert_eq!(tip, tip_after(&headers));
+    }
+
+    #[test]
     fn low_work_sync_that_refuses_a_batch_ends_the_connection() {
         let mut chain = regtest();
         let start = std::time::Instant::now();
