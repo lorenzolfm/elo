@@ -638,13 +638,13 @@ fn receive_answer(
             let extended = chain
                 .extend_on_locator(headers, clock, work_min)
                 .map_err(PeerError::Extend)?;
-            chain_next(chain, work_min, salt, branch_tip, full, extended, clock)
+            chain_next(chain, work_min, salt, branch_tip, extended, clock)
         }
         Download::Branch(branch) => {
             let extended = chain
                 .extend_branch(*branch, headers, clock, work_min)
                 .map_err(PeerError::Extend)?;
-            chain_next(chain, work_min, salt, branch_tip, full, extended, clock)
+            chain_next(chain, work_min, salt, branch_tip, extended, clock)
         }
         Download::BranchPresync(sync) => {
             let BranchPresync { start, presync } = *sync;
@@ -676,7 +676,7 @@ fn receive_answer(
                     let extended = chain
                         .extend_low_work_branch(start, released, full, clock, work_min)
                         .map_err(PeerError::Extend)?;
-                    chain_next(chain, work_min, salt, branch_tip, full, extended, clock)
+                    chain_next(chain, work_min, salt, branch_tip, extended, clock)
                 }
             }
         }
@@ -724,7 +724,10 @@ fn receive_on_genesis(
         .extend_on_locator(headers, clock, work_min)
         .map_err(PeerError::Extend)?
     {
-        crate::chain::Extended::Taken => assert!(!empty),
+        crate::chain::Extended::Taken { full } => {
+            assert!(!full);
+            assert!(!empty);
+        }
         crate::chain::Extended::Kept => assert!(empty),
         crate::chain::Extended::KeptOver(_)
         | crate::chain::Extended::Branch(_)
@@ -745,18 +748,16 @@ fn chain_next(
     work_min: crate::pow::Work,
     salt: &mut Option<crate::headerssync::Salt>,
     branch_tip: &mut Option<crate::chain::BranchTip>,
-    full: bool,
     extended: crate::chain::Extended,
     clock: u64,
 ) -> Result<Option<Download>, PeerError> {
     match extended {
-        crate::chain::Extended::Taken => {
+        crate::chain::Extended::Taken { full } => {
             *branch_tip = None;
             let next = Download::on_tip(chain, work_min);
             Ok(full.then_some(next))
         }
         crate::chain::Extended::Branch(branch) => {
-            assert!(full);
             assert!(chain.tip().work() >= work_min);
             Ok(Some(Download::Branch(Box::new(branch))))
         }
@@ -765,7 +766,6 @@ fn chain_next(
             Ok(None)
         }
         crate::chain::Extended::KeptOver(tip) => {
-            assert!(!full);
             *branch_tip = Some(tip);
             Ok(None)
         }
@@ -774,7 +774,6 @@ fn chain_next(
             branch_work_min,
             headers,
         } => {
-            assert!(full);
             assert!(chain.tip().work() >= work_min);
             let salt = salt.take().ok_or(PeerError::SecondLowWorkSync)?;
             let presync = crate::headerssync::Presync::new(start, branch_work_min, clock, salt);
