@@ -753,7 +753,6 @@ fn chain_next(
 ) -> Result<Option<Download>, PeerError> {
     match extended {
         crate::chain::Extended::Taken { full } => {
-            *branch_tip = None;
             let next = Download::on_tip(chain, work_min);
             Ok(full.then_some(next))
         }
@@ -792,6 +791,7 @@ fn receive_announcement(
 ) -> Result<Option<Download>, PeerError> {
     let full = headers.is_full();
     let first_prev = headers.first().map(|first| first.prev);
+    *branch_tip = branch_tip.and_then(|tip| chain.branch_tip_current(tip));
     if let Some(tip) = *branch_tip
         && first_prev == Some(tip.hash())
     {
@@ -1375,10 +1375,11 @@ pub(crate) mod fuzz {
     fn branch_tip_check(peer: &super::Peer<'_>, model: &PeerModel) {
         let tip = peer
             .branch_tip
+            .and_then(|tip| peer.chain.branch_tip_current(tip))
             .map(|tip| (tip.hash(), tip.work_max().to_string()));
         let expected = model
             .branch_tip
-            .map(|(hash, work)| (hash, format!("{work:064x}")));
+            .map(|(hash, work, _)| (hash, format!("{work:064x}")));
         assert_eq!(tip, expected);
     }
 
@@ -1660,7 +1661,7 @@ pub(crate) mod fuzz {
         network: crate::chainparams::Network,
         work_min: u128,
         salt_left: bool,
-        branch_tip: Option<(bitcoin_hashes::sha256d::Hash, u128)>,
+        branch_tip: Option<(bitcoin_hashes::sha256d::Hash, u128, usize)>,
         download: DownloadModel,
     }
 
@@ -1975,7 +1976,7 @@ pub(crate) mod fuzz {
             prev: bitcoin_hashes::sha256d::Hash,
             headers: &[crate::block::BlockHeader],
         ) -> Result<(), super::PeerError> {
-            if let Some((hash, work)) = self.branch_tip
+            if let Some((hash, work, _)) = self.branch_tip
                 && hash == prev
             {
                 let hashes = script_hashes(self.network, hash, headers).map_err(extend_error)?;
@@ -1990,7 +1991,7 @@ pub(crate) mod fuzz {
                 let Some(last) = hashes.last() else {
                     panic!("an announcement off our tip has no header");
                 };
-                self.branch_tip = Some((*last, work));
+                self.branch_tip = Some((*last, work, self.height()));
                 return Ok(());
             }
             self.get_headers = GetHeadersModel::Due;
@@ -2091,6 +2092,11 @@ pub(crate) mod fuzz {
                 }
                 return ExtendedModel::Branch { fork, hashes };
             }
+            if let Some((_, _, height)) = self.branch_tip
+                && fork < height
+            {
+                self.branch_tip = None;
+            }
             self.chain.truncate(fork + 1);
             self.chain.extend(hashes);
             ExtendedModel::Taken
@@ -2119,15 +2125,12 @@ pub(crate) mod fuzz {
             full: bool,
         ) -> Result<Option<DownloadModel>, super::PeerError> {
             match extended {
-                ExtendedModel::Taken => {
-                    self.branch_tip = None;
-                    Ok(full.then_some(DownloadModel::Chain))
-                }
+                ExtendedModel::Taken => Ok(full.then_some(DownloadModel::Chain)),
                 ExtendedModel::Kept => Ok(None),
                 ExtendedModel::KeptOver { hash, work_max } => {
                     assert!(!full);
                     assert!(work_max <= self.work());
-                    self.branch_tip = Some((hash, work_max));
+                    self.branch_tip = Some((hash, work_max, self.height()));
                     Ok(None)
                 }
                 _ if !full => Ok(None),
@@ -3298,6 +3301,30 @@ mod tests {
         let peer = synced(peer, &more[1..]);
         let (peer, _) = idle(peer, start);
         assert_eq!(peer.chain.tip(), tip_after(&theirs));
+    }
+
+    #[test]
+    fn branch_that_lost_to_ours_stays_a_branch_tip_after_an_answer_that_extends_our_tip() {
+        let start = std::time::Instant::now();
+        let mut chain = regtest();
+        let ours = crate::fixtures::headers_on_genesis(101);
+        let work_min = tip_after(&ours[..2]).work();
+        let peer = synced(asked_with(&mut chain, work_min, start), &ours[..100]);
+        let peer = sent_send_headers(peer, start);
+        let branch = crate::fixtures::branch_on(&ours[97], 2);
+        let (peer, _) = batch_then_tick(peer, &branch, start);
+        let peer = synced(peer, &branch);
+        let (peer, _) = batch_then_tick(peer, &ours[99..], start);
+        let peer = synced(peer, &ours[100..]);
+        assert_eq!(peer.chain.tip(), tip_after(&ours));
+        let more = crate::fixtures::headers_on(&branch[1], 2);
+        let peer = synced(peer, &more[..1]);
+        let (peer, _) = idle(peer, start);
+        let (peer, get_headers) = batch_then_tick(peer, &more[1..], start);
+        assert_eq!(
+            get_headers,
+            crate::protocol::GetHeaders::new(peer.chain.locator())
+        );
     }
 
     #[test]

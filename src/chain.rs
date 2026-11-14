@@ -42,6 +42,8 @@ pub(crate) enum Extended {
 pub(crate) struct BranchTip {
     hash: bitcoin_hashes::sha256d::Hash,
     work_max: crate::pow::Work,
+    ours_height: usize,
+    ours_hash: bitcoin_hashes::sha256d::Hash,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -421,7 +423,21 @@ impl Chain {
         assert!(work_at_fork <= self.work);
         let work_max = work_at_fork.saturating_add(work_branch);
         assert!(work_max <= self.work);
-        BranchTip { hash, work_max }
+        BranchTip {
+            hash,
+            work_max,
+            ours_height: self.below_tip.len(),
+            ours_hash: self.tip.hash(),
+        }
+    }
+
+    pub(crate) fn branch_tip_current(&self, tip: BranchTip) -> Option<BranchTip> {
+        self.has_ours(tip).then_some(tip)
+    }
+
+    fn has_ours(&self, tip: BranchTip) -> bool {
+        tip.ours_height <= self.below_tip.len()
+            && self.header_at(tip.ours_height).hash() == tip.ours_hash
     }
 
     pub(crate) fn extend_branch_tip(
@@ -429,6 +445,7 @@ impl Chain {
         tip: BranchTip,
         headers: &crate::protocol::Headers,
     ) -> Result<Announced, ExtendError> {
+        assert!(self.has_ours(tip));
         assert!(tip.work_max <= self.work);
         assert_ne!(tip.hash, self.tip.hash());
         let (hash, work_max) = headers.as_slice().iter().try_fold(
@@ -445,7 +462,12 @@ impl Chain {
         if headers.is_full() || work_max > self.work {
             return Ok(Announced::Ask);
         }
-        Ok(Announced::Kept(BranchTip { hash, work_max }))
+        Ok(Announced::Kept(BranchTip {
+            hash,
+            work_max,
+            ours_height: self.below_tip.len(),
+            ours_hash: self.tip.hash(),
+        }))
     }
 
     fn branch_on_fork(&self, fork_height: usize) -> Branch {
@@ -1586,16 +1608,24 @@ mod tests {
         )
     }
 
-    fn tip_of_branch(headers: &[crate::block::BlockHeader]) -> super::BranchTip {
+    fn tip_of_branch(
+        headers: &[crate::block::BlockHeader],
+        ours: &[crate::block::BlockHeader],
+    ) -> super::BranchTip {
         let tip = regtest_with(headers).tip();
         super::BranchTip {
             hash: tip.hash(),
             work_max: tip.work(),
+            ours_height: ours.len(),
+            ours_hash: regtest_with(ours).tip().hash(),
         }
     }
 
-    fn kept_over(headers: &[crate::block::BlockHeader]) -> super::Extended {
-        super::Extended::KeptOver(tip_of_branch(headers))
+    fn kept_over(
+        headers: &[crate::block::BlockHeader],
+        ours: &[crate::block::BlockHeader],
+    ) -> super::Extended {
+        super::Extended::KeptOver(tip_of_branch(headers, ours))
     }
 
     fn branch_of(extended: Result<super::Extended, super::ExtendError>) -> super::Branch {
@@ -1713,7 +1743,7 @@ mod tests {
                 )
             } else {
                 let theirs = [&headers[..1], &branch[..]].concat();
-                (kept_over(&theirs), headers.to_vec())
+                (kept_over(&theirs, &headers), headers.to_vec())
             };
             assert_eq!(on_locator(&mut chain, &branch), Ok(expected), "{count}");
             assert_eq!(chain.tip(), regtest_with(&ours).tip(), "{count}");
@@ -1815,7 +1845,10 @@ mod tests {
         for (rest, theirs) in [(&branch[2_000..], &branch[..]), (&[], &branch[..2_000])] {
             let mut chain = regtest_with(&headers);
             let pending = branch_of(on_locator(&mut chain, &branch[..2_000]));
-            assert_eq!(on_branch(&mut chain, pending, rest), Ok(kept_over(theirs)));
+            assert_eq!(
+                on_branch(&mut chain, pending, rest),
+                Ok(kept_over(theirs, &headers))
+            );
             assert_eq!(chain.tip(), regtest_with(&headers).tip());
         }
     }
@@ -1884,6 +1917,8 @@ mod tests {
                     Ok(super::Extended::KeptOver(super::BranchTip {
                         hash: branch[1_998].hash(),
                         work_max: regtest_with(&headers[..2_000]).tip().work(),
+                        ours_height: headers.len(),
+                        ours_hash: regtest_with(&headers).tip().hash(),
                     }))
                 ),
             }
@@ -1993,7 +2028,7 @@ mod tests {
                     assert_eq!(chain.tip(), regtest_with(&branch).tip());
                 }
                 (_, false) => {
-                    assert_eq!(extended, Ok(kept_over(&branch)), "{count}");
+                    assert_eq!(extended, Ok(kept_over(&branch, &headers)), "{count}");
                     assert_eq!(chain.tip(), regtest_with(&headers).tip());
                 }
                 (_, true) => {
@@ -2009,16 +2044,21 @@ mod tests {
     fn extend_branch_tip_keeps_a_tip_with_no_more_work_and_asks_for_more_work_or_a_full_batch() {
         let headers = crate::fixtures::headers_on_genesis(2_100);
         let branch = crate::fixtures::branch_on(&genesis(), 2_001);
-        let tip = tip_of_branch(&branch[..1]);
+        let tip = tip_of_branch(&branch[..1], &headers[..3]);
         let extend = |count: usize, theirs: &[crate::block::BlockHeader]| {
             regtest_with(&headers[..count])
                 .extend_branch_tip(tip, &crate::fixtures::headers_batch(theirs))
         };
-        let kept = |count: usize| Ok(super::Announced::Kept(tip_of_branch(&branch[..count])));
-        assert_eq!(extend(3, &[]), kept(1));
-        assert_eq!(extend(3, &branch[1..3]), kept(3));
+        let kept = |count: usize, ours: usize| {
+            Ok(super::Announced::Kept(tip_of_branch(
+                &branch[..count],
+                &headers[..ours],
+            )))
+        };
+        assert_eq!(extend(3, &[]), kept(1, 3));
+        assert_eq!(extend(3, &branch[1..3]), kept(3, 3));
         assert_eq!(extend(3, &branch[1..4]), Ok(super::Announced::Ask));
-        assert_eq!(extend(2_100, &branch[1..2_000]), kept(2_000));
+        assert_eq!(extend(2_100, &branch[1..2_000]), kept(2_000, 2_100));
         assert_eq!(extend(2_100, &branch[1..]), Ok(super::Announced::Ask));
         let unproven = unproven(branch[2]);
         for (theirs, error) in [
@@ -2031,5 +2071,40 @@ mod tests {
         ] {
             assert_eq!(extend(3, theirs), Err(error), "{theirs:?}");
         }
+    }
+
+    #[test]
+    fn branch_tip_is_current_while_our_chain_has_our_tip_of_the_time_it_was_kept() {
+        let headers = crate::fixtures::headers_on_genesis(4);
+        let mut chain = regtest_with(&headers[..3]);
+        let branch = crate::fixtures::branch_on(&headers[0], 1);
+        let Ok(super::Extended::KeptOver(tip)) = on_locator(&mut chain, &branch) else {
+            panic!("no branch tip");
+        };
+        assert_eq!(
+            tip,
+            tip_of_branch(&[&headers[..1], &branch[..]].concat(), &headers[..3])
+        );
+        assert_eq!(chain.branch_tip_current(tip), Some(tip));
+        assert_eq!(
+            on_locator(&mut chain, &headers[3..]),
+            Ok(super::Extended::Taken { full: false })
+        );
+        assert_eq!(chain.branch_tip_current(tip), Some(tip));
+        let above = crate::fixtures::branch_on(&headers[2], 2);
+        assert_eq!(
+            on_locator(&mut chain, &above),
+            Ok(super::Extended::Taken { full: false })
+        );
+        assert_eq!(chain.branch_tip_current(tip), Some(tip));
+        let below = crate::fixtures::branch_on(&headers[1], 4);
+        assert_eq!(
+            on_locator(&mut chain, &below),
+            Ok(super::Extended::Taken { full: false })
+        );
+        assert_eq!(chain.branch_tip_current(tip), None);
+        let mut chain = regtest_with(&headers[..3]);
+        chain.restart();
+        assert_eq!(chain.branch_tip_current(tip), None);
     }
 }
