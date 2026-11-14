@@ -62,11 +62,13 @@ after 5 s.
 
 With no peer, each dial looks up one DNS seed of the network, at random, as
 `x9.<seed>`: a seed answers that name with nodes that serve each block and its
-witness data. Some seeds have no such names, so when that lookup gives no
-address to dial, elo looks up the seed itself. elo takes at most 32 of its
+witness data. Some seeds have no such names, so when that lookup fails or gives
+no address to dial, elo looks up the seed itself. elo takes at most 32 of its
 addresses that the internet routes to, so not this host, a private network, a
 link or a test range. A seed chose those peers, and elo trusts them as much as
-a peer that you name. Regtest has no seeds, so `elo regtest` needs a peer.
+a peer that you name. A lookup that times out ends the dial at once, because
+the resolver does not answer. Regtest has no seeds, so `elo regtest` needs a
+peer.
 
 SIGTERM and SIGINT (Ctrl-C) stop elo at any step, also in the wait before a
 dial. It logs the signal and exits with 0. elo exits with 1 only on a fault of

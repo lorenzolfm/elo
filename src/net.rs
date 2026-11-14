@@ -132,8 +132,8 @@ pub enum Destination {
         port: std::num::NonZeroU16,
     },
     /// A seed, which `handshake` looks up with the services that elo asks for, and then without
-    /// them if that gives no address. Of its answers, it dials only the addresses that the
-    /// internet routes to.
+    /// them if that lookup fails or gives no address. Of its answers, it dials only the addresses
+    /// that the internet routes to.
     Seed {
         seed: Seed,
         port: std::num::NonZeroU16,
@@ -198,25 +198,25 @@ impl std::fmt::Display for Name {
     }
 }
 
-/// Whether the internet routes to `ip`. The others are this host, a private network, a link, or
-/// a range for documentation or tests. A node on the internet cannot have them, so a seed that
+/// Whether the internet does not route to `ip`: this host, a private network, a link, or a range
+/// for documentation or tests. A node on the internet cannot have such an address, so a seed that
 /// gives one is wrong, or points elo at a host that is not on the network. An IPv4 address in IPv6
-/// is checked as the IPv4 address. A multicast address passes, and its connect fails.
-fn is_routable(ip: std::net::IpAddr) -> bool {
+/// is checked as the IPv4 address. A multicast address is not reserved, and its connect fails.
+fn is_reserved(ip: std::net::IpAddr) -> bool {
     match ip.to_canonical() {
         std::net::IpAddr::V4(ip) => {
             let [first, second, _, _] = ip.octets();
             let is_this_network = first == 0;
             let is_shared = first == 100 && (64..=127).contains(&second);
-            let is_benchmarking = first == 198 && (second == 18 || second == 19);
-            !(is_this_network
+            let is_benchmarking = first == 198 && (18..=19).contains(&second);
+            is_this_network
                 || ip.is_loopback()
                 || ip.is_private()
                 || ip.is_link_local()
                 || is_shared
                 || is_benchmarking
                 || ip.is_documentation()
-                || ip.is_broadcast())
+                || ip.is_broadcast()
         }
         std::net::IpAddr::V6(ip) => {
             let [first, second, ..] = ip.segments();
@@ -224,12 +224,12 @@ fn is_routable(ip: std::net::IpAddr) -> bool {
             // ORCHID, `2001:10::/28`, and ORCHIDv2, `2001:20::/28`: names that no route reaches.
             let is_orchid =
                 first == 0x2001 && (second & 0xfff0 == 0x0010 || second & 0xfff0 == 0x0020);
-            !(ip.is_unspecified()
+            ip.is_unspecified()
                 || ip.is_loopback()
                 || ip.is_unique_local()
                 || ip.is_unicast_link_local()
                 || is_documentation
-                || is_orchid)
+                || is_orchid
         }
     }
 }
@@ -509,11 +509,18 @@ async fn addresses(destination: &Destination) -> Result<Addresses, LookupError> 
         }),
         Destination::Name { name, port } => name_order(lookup(&name.0, *port).await?),
         Destination::Seed { seed, port } => {
-            // The error of the second lookup is the one that the dial gives.
-            let services = lookup(&seed.services_name(), *port).await;
+            let services_name = seed.services_name();
+            let services = lookup(&services_name, *port).await;
             match services.and_then(seed_order) {
                 Ok(addresses) => Ok(addresses),
-                Err(_) => seed_order(lookup(seed.0, *port).await?),
+                // The resolver does not answer, so a lookup of the seed itself would only wait
+                // `LOOKUP_TIMEOUT` again.
+                Err(LookupError::Timeout) => Err(LookupError::Timeout),
+                // A seed with no such names fails the lookup. The error of the lookup of the seed
+                // itself is the one that the dial gives.
+                Err(LookupError::Failed(_) | LookupError::Empty) => {
+                    seed_order(lookup(seed.0, *port).await?)
+                }
             }
         }
     }
@@ -527,14 +534,15 @@ struct Addresses {
     last: PeerAddress,
 }
 
-/// The addresses of `host` at `port`, as the resolver of the OS gives them.
+/// The addresses of `host` at `port`, as the resolver of the OS gives them. The caller takes at
+/// most its count max of them, so it does not copy the others.
 async fn lookup(
     host: &str,
     port: std::num::NonZeroU16,
-) -> Result<Vec<std::net::SocketAddr>, LookupError> {
+) -> Result<impl Iterator<Item = std::net::SocketAddr>, LookupError> {
     let answers = tokio::net::lookup_host((host, port.get()));
     match tokio::time::timeout(LOOKUP_TIMEOUT, answers).await {
-        Ok(Ok(answers)) => Ok(answers.collect()),
+        Ok(Ok(answers)) => Ok(answers),
         Ok(Err(error)) => Err(LookupError::Failed(error)),
         Err(_elapsed) => Err(LookupError::Timeout),
     }
@@ -560,7 +568,7 @@ fn seed_order(
     let routable = answers
         .into_iter()
         .filter_map(PeerAddress::new)
-        .filter(|address| is_routable(address.0.ip()));
+        .filter(|address| !is_reserved(address.0.ip()));
     dial_order(routable, SEED_ADDRESSES_COUNT_MAX)
 }
 
@@ -582,6 +590,8 @@ fn dial_order(
     let Some(last) = before.pop() else {
         return Err(LookupError::Empty);
     };
+    // `connect_first` checks only `ADDRESSES_COUNT_MAX`, so the cap of a seed is checked here.
+    assert!(before.len() < count_max, "{} {count_max}", before.len());
     Ok(Addresses { before, last })
 }
 
@@ -2029,7 +2039,7 @@ mod tests {
             (v6("febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), false),
             (v6("fec0::"), true),
         ] {
-            assert_eq!(super::is_routable(ip), routable, "{ip}");
+            assert_eq!(super::is_reserved(ip), !routable, "{ip}");
         }
     }
 
