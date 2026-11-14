@@ -7,8 +7,11 @@
 use std::fmt::Write;
 
 /// The most bytes of a value before its escapes. A longer value is cut, and ends with `...`. So
-/// a peer that sends a long string cannot make a long line.
-const VALUE_LENGTH_MAX: usize = 256;
+/// a peer that sends a long string cannot make a long line. The longest destination of the
+/// command line fits, so the `peer` of an `end` line is never cut.
+const VALUE_LENGTH_MAX: usize = 260;
+
+const _: () = assert!(crate::net::DESTINATION_LENGTH_MAX <= VALUE_LENGTH_MAX);
 
 /// What `...` adds to a value that is cut.
 const CUT_MARK: &str = "...";
@@ -53,9 +56,9 @@ pub enum Event<'a> {
         tip: &'a crate::chain::Tip,
     },
     /// The connection to `peer` ended for `reason`, and elo dials it again after `wait`. `peer` is
-    /// the peer of the command line: an IP address, or a name that elo looks up again.
+    /// the destination of the command line: an IP address, or a name that elo looks up again.
     End {
-        peer: &'a dyn std::fmt::Display,
+        peer: &'a crate::net::Destination,
         reason: &'a dyn std::fmt::Display,
         wait: std::time::Duration,
     },
@@ -303,7 +306,7 @@ mod tests {
             ),
             (
                 super::Event::End {
-                    peer: &PEER,
+                    peer: &crate::net::Destination::Address(PEER),
                     reason: &"the peer closed the connection",
                     wait: std::time::Duration::from_secs(5),
                 },

@@ -167,7 +167,10 @@ fn handshake_with_bitcoind_returns_its_version() {
         .unwrap();
     let mut chain = elo::chain::Chain::new(elo::chainparams::Network::Regtest);
     let (_connection, version) = runtime
-        .block_on(elo::net::handshake(&[bitcoind.peer], &mut chain))
+        .block_on(elo::net::handshake(
+            &elo::net::Destination::Address(bitcoind.peer),
+            &mut chain,
+        ))
         .unwrap();
 
     assert_eq!(version.version(), 70016);
