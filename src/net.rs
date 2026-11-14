@@ -394,9 +394,9 @@ async fn lookup(name: &Name, port: std::num::NonZeroU16) -> Result<Addresses, Lo
     }
 }
 
-/// The `answers` of a lookup that name a peer, at most `ADDRESSES_COUNT_MAX`, in a random order.
-/// So each dial can start on another address of a name that has many, such as a seed. The order
-/// needs no secret, so it comes from the keys of `RandomState`.
+/// The `answers` of a lookup that name a peer, at most `ADDRESSES_COUNT_MAX`, each one time, in a
+/// random order. So each dial can start on another address of a name that has many, such as a
+/// seed. The order needs no secret, so it comes from the keys of `RandomState`.
 fn dial_order(
     answers: impl Iterator<Item = std::net::SocketAddr>,
 ) -> Result<Addresses, LookupError> {
@@ -405,6 +405,10 @@ fn dial_order(
         .filter_map(PeerAddress::new)
         .take(ADDRESSES_COUNT_MAX)
         .collect();
+    // A hosts file can have the same name and address on two lines. A second try of an address
+    // costs up to `CONNECT_TIMEOUT` again.
+    before.sort_unstable_by_key(|address| address.0);
+    before.dedup();
     let random = std::hash::RandomState::new();
     before.sort_by_cached_key(|address| random.hash_one(address));
     let Some(last) = before.pop() else {
@@ -1734,6 +1738,16 @@ mod tests {
         let mut kept = dialed(kept.unwrap());
         kept.sort_unstable_by_key(|address| address.0);
         assert_eq!(kept, peer_addresses(&answers[..super::ADDRESSES_COUNT_MAX]));
+    }
+
+    #[test]
+    fn dial_order_keeps_each_address_one_time() {
+        let first = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
+        let second = std::net::SocketAddr::from(([127, 0, 0, 1], 2));
+        let addresses = super::dial_order([first, second, first, first].into_iter()).unwrap();
+        let mut kept = dialed(addresses);
+        kept.sort_unstable_by_key(|address| address.0);
+        assert_eq!(kept, peer_addresses(&[first, second]));
     }
 
     // The resolver of the OS reads `localhost` from its hosts file, with no name server.
