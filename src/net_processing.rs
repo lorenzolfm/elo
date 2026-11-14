@@ -355,6 +355,12 @@ enum SyncState {
 }
 
 #[derive(Debug)]
+enum Answer {
+    Next(Option<Download>),
+    Skipped(Download),
+}
+
+#[derive(Debug)]
 enum SendHeadersState {
     Unsent,
     Sent,
@@ -414,9 +420,17 @@ impl Download {
         chain: &crate::chain::Chain,
         headers: &crate::protocol::Headers,
     ) -> bool {
-        headers
-            .first()
-            .is_none_or(|first| self.locator(chain).contains(&first.prev))
+        match self {
+            Download::Chain => true,
+            Download::Genesis(_)
+            | Download::Presync(_)
+            | Download::Redownload(_)
+            | Download::Branch(_)
+            | Download::BranchPresync(_)
+            | Download::BranchRedownload(_) => headers
+                .first()
+                .is_none_or(|first| self.locator(chain).contains(&first.prev)),
+        }
     }
 }
 
@@ -492,21 +506,24 @@ impl<'a> Peer<'a> {
 
         let mut input = message.payload();
         let headers = crate::protocol::Headers::decode(&mut input).map_err(PeerError::Headers)?;
-        if let SyncState::Outstanding { download, .. } = &self.sync
-            && !download.is_answered_by(self.chain, &headers)
-        {
-            return Ok((self, Received::NoReply));
-        }
         let next = match self.sync {
-            SyncState::Outstanding { download, .. } => receive_answer(
-                self.chain,
-                self.work_min,
-                &mut self.salt,
-                &mut self.branch_tip,
-                download,
-                headers,
-                clock,
-            )?,
+            SyncState::Outstanding { download, sent } => {
+                match receive_answer(
+                    self.chain,
+                    self.work_min,
+                    &mut self.salt,
+                    &mut self.branch_tip,
+                    download,
+                    headers,
+                    clock,
+                )? {
+                    Answer::Next(next) => next,
+                    Answer::Skipped(download) => {
+                        self.sync = SyncState::Outstanding { download, sent };
+                        return Ok((self, Received::NoReply));
+                    }
+                }
+            }
             SyncState::Synced => receive_announcement(
                 self.chain,
                 self.work_min,
@@ -654,28 +671,34 @@ fn receive_answer(
     download: Download,
     headers: crate::protocol::Headers,
     clock: u64,
-) -> Result<Option<Download>, PeerError> {
+) -> Result<Answer, PeerError> {
+    if !download.is_answered_by(chain, &headers) {
+        return Ok(Answer::Skipped(download));
+    }
     let full = headers.is_full();
-    match download {
+    let next = match download {
         Download::Genesis(genesis_salt) => {
-            receive_on_genesis(chain, work_min, salt, genesis_salt, headers, clock)
+            receive_on_genesis(chain, work_min, salt, genesis_salt, headers, clock)?
         }
         Download::Chain => {
-            let extended = chain
+            let Some(extended) = chain
                 .extend_on_locator(headers, clock, work_min)
-                .map_err(PeerError::Extend)?;
-            chain_next(chain, work_min, salt, branch_tip, extended, clock)
+                .map_err(PeerError::Extend)?
+            else {
+                return Ok(Answer::Skipped(Download::Chain));
+            };
+            chain_next(chain, work_min, salt, branch_tip, extended, clock)?
         }
         Download::Branch(branch) => {
             let extended = chain
                 .extend_branch(*branch, headers, clock, work_min)
                 .map_err(PeerError::Extend)?;
-            chain_next(chain, work_min, salt, branch_tip, extended, clock)
+            chain_next(chain, work_min, salt, branch_tip, extended, clock)?
         }
         Download::BranchPresync(sync) => {
             let BranchPresync { start, presync } = *sync;
             let step = presync.receive(headers).map_err(PeerError::HeadersSync)?;
-            Ok(Some(branch_presync_next(start, step)))
+            Some(branch_presync_next(start, step))
         }
         Download::BranchRedownload(sync) => {
             let BranchRedownload {
@@ -689,26 +712,24 @@ fn receive_answer(
             {
                 crate::headerssync::RedownloadStep::More(redownload, more) => {
                     keep_released(chain.network(), &mut released, more);
-                    Ok(Some(Download::BranchRedownload(Box::new(
-                        BranchRedownload {
-                            start,
-                            redownload: *redownload,
-                            released,
-                        },
-                    ))))
+                    Some(Download::BranchRedownload(Box::new(BranchRedownload {
+                        start,
+                        redownload: *redownload,
+                        released,
+                    })))
                 }
                 crate::headerssync::RedownloadStep::Done(rest) => {
                     keep_released(chain.network(), &mut released, rest);
                     let extended = chain
                         .extend_low_work_branch(start, released, full, clock, work_min)
                         .map_err(PeerError::Extend)?;
-                    chain_next(chain, work_min, salt, branch_tip, extended, clock)
+                    chain_next(chain, work_min, salt, branch_tip, extended, clock)?
                 }
             }
         }
         Download::Presync(presync) => {
             let step = presync.receive(headers).map_err(PeerError::HeadersSync)?;
-            Ok(Some(presync_next(step)))
+            Some(presync_next(step))
         }
         Download::Redownload(redownload) => {
             match redownload
@@ -717,16 +738,17 @@ fn receive_answer(
             {
                 crate::headerssync::RedownloadStep::More(redownload, released) => {
                     extend_released(chain, released, clock)?;
-                    Ok(Some(Download::Redownload(redownload)))
+                    Some(Download::Redownload(redownload))
                 }
                 crate::headerssync::RedownloadStep::Done(released) => {
                     extend_released(chain, released, clock)?;
                     let next = Download::on_tip(chain, work_min);
-                    Ok(full.then_some(next))
+                    full.then_some(next)
                 }
             }
         }
-    }
+    };
+    Ok(Answer::Next(next))
 }
 
 fn receive_on_genesis(
@@ -745,22 +767,7 @@ fn receive_on_genesis(
         let step = presync.receive(headers).map_err(PeerError::HeadersSync)?;
         return Ok(Some(presync_next(step)));
     }
-    let empty = headers.first().is_none();
-    match chain
-        .extend_on_locator(headers, clock, work_min)
-        .map_err(PeerError::Extend)?
-    {
-        crate::chain::Extended::Taken { full } => {
-            assert!(!full);
-            assert!(!empty);
-        }
-        crate::chain::Extended::Kept => assert!(empty),
-        crate::chain::Extended::KeptOver(_)
-        | crate::chain::Extended::Branch(_)
-        | crate::chain::Extended::BelowMargin { .. } => {
-            panic!("genesis has no header below it")
-        }
-    }
+    chain.extend(headers, clock).map_err(PeerError::Extend)?;
     assert!(salt_left.replace(salt).is_none());
     if chain.tip().work() >= work_min {
         Ok(None)
@@ -1838,6 +1845,13 @@ pub(crate) mod fuzz {
                 .collect()
         }
 
+        fn locator_height(&self, prev: bitcoin_hashes::sha256d::Hash) -> Option<usize> {
+            std::iter::once(self.download_last())
+                .chain(self.locator_below())
+                .find(|(hash, _)| *hash == prev)
+                .map(|(_, height)| height)
+        }
+
         fn is_synced(&self) -> bool {
             matches!(self.get_headers, GetHeadersModel::Ended)
         }
@@ -1932,12 +1946,14 @@ pub(crate) mod fuzz {
                 .into_vec();
             assert!(headers.len() <= HEADERS_FULL_COUNT);
             let announced = matches!(self.get_headers, GetHeadersModel::Ended);
+            let mut fork = None;
             match self.get_headers {
                 GetHeadersModel::Outstanding(_) => {
-                    if let Some(first) = headers.first()
-                        && !self.locator().contains(&first.prev)
-                    {
-                        return Ok(ReceivedExpected::NoReply);
+                    if let Some(first) = headers.first() {
+                        let Some(height) = self.locator_height(first.prev) else {
+                            return Ok(ReceivedExpected::NoReply);
+                        };
+                        fork = Some(height);
                     }
                 }
                 GetHeadersModel::Ended => {
@@ -1967,7 +1983,10 @@ pub(crate) mod fuzz {
                     self.presync_start(0, hashes, full)?
                 }
                 DownloadModel::Chain => {
-                    let extended = self.extend_on_locator(&headers)?;
+                    let extended = match fork {
+                        None => ExtendedModel::Kept,
+                        Some(fork) => self.extend_on_locator(fork, &headers)?,
+                    };
                     self.chain_next(extended, full)?
                 }
                 DownloadModel::Branch { fork, hashes } => {
@@ -2040,19 +2059,13 @@ pub(crate) mod fuzz {
 
         fn extend_on_locator(
             &mut self,
+            fork: usize,
             headers: &[crate::block::BlockHeader],
         ) -> Result<ExtendedModel, super::PeerError> {
-            let Some(first) = headers.first() else {
-                return Ok(ExtendedModel::Kept);
-            };
-            let Some(fork) = self
-                .locator_heights()
-                .into_iter()
-                .find(|height| self.chain[*height] == first.prev)
-            else {
-                panic!("an answer to our `getheaders` does not start on our locator");
-            };
-            let batch = script_hashes(self.network, first.prev, headers).map_err(extend_error)?;
+            assert!(!headers.is_empty());
+            assert!(fork <= self.height());
+            let batch =
+                script_hashes(self.network, self.chain[fork], headers).map_err(extend_error)?;
             if fork == self.height() {
                 self.chain.extend(batch);
                 return Ok(ExtendedModel::Taken);
