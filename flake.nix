@@ -37,14 +37,6 @@
           (crane.mkLib pkgs).overrideToolchain (p:
             p.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml);
 
-        # The gates build with the toolchain file as it is written: minimal. The
-        # dev shell adds rust-src on top, because rust-analyzer reads the
-        # documentation of the standard library from those sources. No gate
-        # needs the sources, so they stay out of the build closure.
-        #
-        # `override` replaces the component list, it does not add to it. Read
-        # the list from the toolchain file, so the dev shell keeps clippy,
-        # rustfmt and rust-analyzer.
         toolchainFile = builtins.fromTOML (builtins.readFile ./rust-toolchain.toml);
 
         craneLibDev = (crane.mkLib pkgs).overrideToolchain (p:
@@ -59,7 +51,6 @@
           strictDeps = true;
         };
 
-        # The fuzz gate replays the corpus, and the filter above drops those files.
         fuzzSrc = pkgs.lib.cleanSourceWith {
           src = ./.;
           filter = path: type:
@@ -67,20 +58,67 @@
             || pkgs.lib.hasInfix "/fuzz/corpus/" path;
         };
 
-        # The L3 tests run elo against this bitcoind. They use bitcoin-cli from
-        # the same package to see when it is ready and to read its peer info.
-        # Its version is the one in their asserts.
         bitcoind = pkgs.lib.getExe' pkgs.bitcoind "bitcoind";
         bitcoinCli = pkgs.lib.getExe' pkgs.bitcoind "bitcoin-cli";
 
-        # Build only the dependencies, so a change to the crate's own code does
-        # not build them again.
+        comments = ./.config/ast-grep/comments;
+        commentGlobs = {
+          rust = ["*.rs"];
+          nix = ["*.nix"];
+          bash = ["*.sh" ".envrc" ".gitignore"];
+          yaml = ["*.yml" "*.yaml"];
+          toml = ["*.toml"];
+        };
+        commentFree = ["./Cargo.lock" "./fuzz/Cargo.lock" "./flake.lock" "./README.md" "./fuzz/corpus/*"];
+        commentRead = pkgs.lib.concatStringsSep "|" (
+          map (glob:
+            if pkgs.lib.hasPrefix "*" glob
+            then glob
+            else "*/${glob}")
+          (pkgs.lib.concatLists (builtins.attrValues commentGlobs))
+          ++ commentFree
+        );
+        runBlock = {
+          kind = "block_node";
+          inside = {
+            kind = "block_mapping_pair";
+            has = {
+              field = "key";
+              regex = "^run$";
+            };
+          };
+        };
+        commentsConfig = pkgs.writeText "comments.json" (builtins.toJSON {
+          ruleDirs = ["${comments}/rules"];
+          testConfigs = [{testDir = "${comments}/rule-tests";}];
+          customLanguages.toml = {
+            libraryPath = "${pkgs.tree-sitter-grammars.tree-sitter-toml}/parser";
+            extensions = ["toml"];
+          };
+          languageGlobs = commentGlobs;
+          languageInjections = [
+            {
+              hostLanguage = "nix";
+              rule = {
+                kind = "indented_string_expression";
+                pattern = "$CONTENT";
+              };
+              injected = "bash";
+            }
+            {
+              hostLanguage = "yaml";
+              rule = {
+                kind = "block_scalar";
+                pattern = "$CONTENT";
+                inside = runBlock;
+              };
+              injected = "bash";
+            }
+          ];
+        });
+
         cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
-        # The test gates run in the dev profile, as `cargo test` does in the
-        # dev shell. The release profile turns off overflow checks and
-        # `debug_assert!`. The dev profile needs its own build of the
-        # dependencies.
         devArgs =
           commonArgs
           // {
@@ -92,7 +130,6 @@
           // {
             inherit cargoArtifacts;
 
-            # The test gate runs the tests. Do not run them two times.
             doCheck = false;
 
             meta = {
@@ -103,8 +140,6 @@
             };
           });
 
-        # One derivation for each gate. CI builds them in parallel, and
-        # `nix flake check` runs all of them.
         gates = {
           inherit elo;
 
@@ -118,75 +153,77 @@
             // {
               BITCOIND = bitcoind;
               BITCOIN_CLI = bitcoinCli;
-              # The tests listen and connect on loopback. The macOS sandbox
-              # blocks that without this flag.
               __darwinAllowLocalNetworking = true;
             });
 
-          # nextest does not run doctests.
-          elo-doctest = craneLib.cargoDocTest devArgs;
-
           elo-fmt = craneLib.cargoFmt {inherit src;};
 
-          # Builds each fuzz target and replays its committed corpus once, so an input
-          # that crashed elo cannot crash it again. CI does no random run. The compiler
-          # is stable and sanitizers need nightly, so the targets have no sanitizer.
+          elo-comments =
+            pkgs.runCommand "elo-comments" {
+              nativeBuildInputs = [pkgs.ast-grep];
+            } ''
+              cd ${./.}
+              mapfile -d "" tree < <(find . -type f -print0)
+              wait $!
+              (( ''${#tree[@]} > 0 ))
+              unread() {
+                local file
+                for file in "$@"; do
+                  case "$file" in
+                    ${commentRead}) ;;
+                    *) echo "$file" ;;
+                  esac
+                done
+              }
+              test "$(unread ./a.rs ./a/.envrc ./Cargo.lock ./fuzz/corpus/a/b ./a.py ./a/Cargo.lock)" \
+                = "$(printf '%s\n' ./a.py ./a/Cargo.lock)"
+              unread_files="$(unread "''${tree[@]}")"
+              if test -n "$unread_files"; then
+                echo "elo-comments: no rule reads these files: $unread_files" >&2
+                exit 1
+              fi
+              ast-grep test --config ${commentsConfig} --custom-languages allow
+              ast-grep scan --config ${commentsConfig} --custom-languages allow -- "''${tree[@]}"
+              touch "$out"
+            '';
+
           elo-fuzz = craneLib.mkCargoDerivation (commonArgs
             // {
               src = fuzzSrc;
               pnameSuffix = "-fuzz";
               cargoArtifacts = null;
               doInstallCargoArtifacts = false;
-              # `fuzz/` is its own workspace, so it has its own lockfile.
               cargoVendorDir = craneLib.vendorMultipleCargoDeps {
                 cargoLockList = [./Cargo.lock ./fuzz/Cargo.lock];
               };
               nativeBuildInputs = [pkgs.cargo-fuzz];
-              # The last step runs the tests, which listen and connect on loopback. The macOS
-              # sandbox blocks that without this flag.
               __darwinAllowLocalNetworking = true;
               buildPhaseCargoCommand = ''
-                # The normal gates do not see these: `fuzz/` is outside their
-                # workspace, and they build without `--cfg fuzzing`. Clippy checks
-                # only the workspace it runs in, so it runs in both.
                 cargo fmt --manifest-path fuzz/Cargo.toml --check
                 RUSTFLAGS="--cfg fuzzing" cargo clippy --locked --all-targets -- --deny warnings
                 RUSTFLAGS="--cfg fuzzing" cargo clippy --manifest-path fuzz/Cargo.toml \
                   --locked -- --deny warnings
 
-                # The log shows only the `cargo` commands, so a `test` that fails must say
-                # why. Without this, the log ends on the last `cargo` command, which passed.
                 fail() { echo "elo-fuzz: $1" >&2; exit 1; }
 
-                # The committed corpus is at most 1 MiB, so a clone stays small.
                 corpus_size="$(du --summarize --bytes fuzz/corpus | cut --fields=1)"
                 test "$corpus_size" -le 1048576 || fail "the corpus is $corpus_size bytes, above 1 MiB"
 
-                # A session reads at most 4096 bytes of an input: the `-max_len` of `session.sh`.
-                # The replay below reads all of a seed, so a longer seed is not what passed here.
                 long_seeds="$(find fuzz/corpus -type f -size +4096c)"
                 test -z "$long_seeds" || fail "these seeds are above 4096 bytes: $long_seeds"
 
-                # The targets build elo with the versions that elo ships. `--locked` checks
-                # each lockfile alone, so it does not see an update of only one. With no
-                # packages in the list, the comparison passes.
                 packages() { sed --quiet '/^name = /{N;s/\n/ /;p}' "$1" | sort; }
                 test -n "$(packages Cargo.lock)" || fail "found no packages in Cargo.lock"
                 comm -23 <(packages Cargo.lock) <(packages fuzz/Cargo.lock) | tee only-in-root
                 test ! -s only-in-root || fail "fuzz/Cargo.lock does not have the packages above"
 
-                # With no targets, the loop runs zero times and the gate passes.
                 targets="$(cargo fuzz list)"
                 test -n "$targets" || fail "found no fuzz targets"
 
-                # A target has one name in its manifest entry, file, entry point and corpus.
-                # A copy that keeps an old name replays a corpus through another entry point,
-                # and the replay passes.
                 test "$(ls fuzz/corpus | sort)" = "$(sort <<< "$targets")" \
                   || fail "the corpus directories are not the targets"
                 test "$(ls fuzz/fuzz_targets | sed 's/\.rs$//' | sort)" = "$(sort <<< "$targets")" \
                   || fail "the files in fuzz_targets are not the targets"
-                # `packages` also prints each `[[bin]]`: its name and its path, on one line.
                 manifest="$(packages fuzz/Cargo.toml)"
                 for target in $targets; do
                   grep --fixed-strings --line-regexp --quiet \
@@ -197,17 +234,12 @@
                 done
 
                 for target in $targets; do
-                  # `cargo fuzz run` makes a missing corpus, and an empty one passes.
                   test -n "$(ls --almost-all "fuzz/corpus/$target")" || fail "target $target has no corpus"
                   cargo fuzz run --sanitizer none "$target" -- -runs=0
                 done
 
-                # The tests of `SEED_ENDS` have `cfg(fuzzing)`, so only this gate runs them. After
-                # the replay, so a machine bug has its seed as the failing input. No filter, because
-                # a filter that matches no test exits 0.
                 RUSTFLAGS="--cfg fuzzing" cargo test --locked --lib
               '';
-              # The bytes that the replay ran, so the image holds what passed this gate.
               installPhaseCommand = ''
                 mkdir --parents "$out/targets"
                 cp --recursive fuzz/corpus "$out/corpus"
@@ -224,14 +256,11 @@
           text = builtins.readFile ./fuzz/session.sh;
         };
 
-        # The targets and the corpus of the gate. Panic locations and line tables name each store
-        # path that the build read, so without this the image holds a compiler: 150 MB, not 42 MB.
         fuzzTargets = let
           kept = [pkgs.stdenv.cc.libc.out pkgs.stdenv.cc.cc.lib];
         in
           pkgs.runCommand "elo-fuzz-targets" {
             nativeBuildInputs = [pkgs.removeReferencesTo];
-            # This sees only a path that the loop below cannot find. The load check holds the rest.
             allowedReferences = kept;
           } ''
             cp --recursive --no-preserve=mode ${gates.elo-fuzz} "$out"
@@ -244,18 +273,13 @@
               esac
             done
 
-            # The loop removes each path outside `kept`, and a target can need one at run time. Then
-            # no reference is left to stop the build, so load each target. The last line of a target
-            # that does not load is the error of the loader.
             for target in "$out"/targets/*; do
               "$target" -help=1 2>&1 | tail --lines=1
             done
-            # `session.sh` names these two targets.
             test -x "$out/targets/compact_size"
             test -x "$out/targets/machines"
           '';
 
-        # A long run on a home machine. The session holds no secret and needs no network.
         elo-fuzz-image = pkgs.dockerTools.buildLayeredImage {
           name = "elo-fuzz";
           tag = "local";
@@ -271,10 +295,6 @@
           };
         };
 
-        # The daemon. The deployment gives the arguments of elo: the network and the peer. elo is
-        # PID 1. The kernel gives PID 1 no default action for a signal, so elo handles SIGTERM
-        # itself, and a stop ends it at once. elo starts no child process, so no init needs to
-        # reap one. The image needs no volume, no port and no writable path.
         elo-image = pkgs.dockerTools.buildLayeredImage {
           name = "elo";
           tag = "local";
@@ -296,8 +316,6 @@
 
         checks = gates;
 
-        # Give each gate a package name, so CI can build one gate with
-        # `nix build .#<gate>`.
         packages =
           gates
           // {

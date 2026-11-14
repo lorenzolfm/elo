@@ -1,51 +1,22 @@
-//! Frames that Bitcoin Core sent and real headers, for the tests.
-//!
-//! Captured on 2026-10-25 from `bitcoind -regtest` v31.1.0 (nixpkgs). A Python
-//! script opened a v1 connection, sent a `version`, and read each frame Core
-//! sent back until `verack`.
-//!
-//! The frames after the handshake were captured on 2026-10-26 the same way. The script also
-//! sent its `verack` and answered the `ping`. Then `generatetodescriptor 1` mined block 1.
-//!
-//! The `headers` frame was captured on 2026-11-03 the same way, on a new chain. First
-//! `generatetodescriptor 2` mined blocks 1 and 2. After the handshake, the script sent its
-//! `verack` and a `getheaders` with genesis as the only locator hash.
-//!
-//! The `getheaders` frame was captured on 2026-11-03 from a new node with only genesis. The
-//! script listened, and `addnode 127.0.0.1:<port> onetry false` made Core connect to it with
-//! v1. The script claimed `NODE_NETWORK` in its `version`, then sent its `verack`. Core sent
-//! the `getheaders` after its `ping`.
-//!
-//! The real headers of the other networks were captured on 2026-11-06 from the API of
-//! mempool.space. A script checked that each hash is the hash of the explorer and is at most its
-//! target, and that each `prev` of a next height is the hash below it.
-
 use crate::serialize::{Decode, Encode};
 
-/// The real header of mainnet at height 1. Its hash is
-/// `00000000839a8e6886ab5951d76f411475428afc90947ee320161bbf18eb6048`.
 pub(crate) const MAINNET_BLOCK_1: &str = concat!(
     "010000006fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000",
     "982051fd1e4ba744bbbe680e1fee14677ba1a3c3540bf7b1cdb606e857233e0e",
     "61bc6649ffff001d01e36299",
 );
 
-/// Real headers of mainnet at the first change of its target: the first header of the period, the
-/// last header of the period, and the next header.
 pub(crate) const MAINNET_RETARGET: [&str; 3] = [
-    // Height 30240.
     concat!(
         "01000000e6bf7fd7f7790a63786faa878d0dc7fd8f2ff365732e45862c66075100000000",
         "700d342f65c7b6834dffb615358a1897016f0448913372190cbe3d27a4b53355",
         "b1512b4bffff001dbfb02519",
     ),
-    // Height 32255.
     concat!(
         "0100000049c1daab3b6536ff1b2633c3a316a6e06ec287676cdeec4ca7baae6b00000000",
         "ac10b36b8f354b3353207de15940a5edbc05bb8364af75b4b5409e7823f2b489",
         "23ec3a4bffff001dbd5fa412",
     ),
-    // Height 32256.
     concat!(
         "010000004b0360d834a330ec7833e30e1f523ee05a0793361e29a73421964f9800000000",
         "27b64a020af294e903feed93768705336a20090612a043f47af462a2f5e5b564",
@@ -53,21 +24,17 @@ pub(crate) const MAINNET_RETARGET: [&str; 3] = [
     ),
 ];
 
-/// Real headers of signet at a change of its target, in the same order.
 pub(crate) const SIGNET_RETARGET: [&str; 3] = [
-    // Height 199584.
     concat!(
         "000000200b61bb8b36ad40ceea78544687903a9524f92bcc323cf6810f64dc7a35000000",
         "cce50bd7b2b2b377dc68951f0949e1b07aa6815da7ad2e323e8fc62af42d880e",
         "c2976866354e011e0fef3f00",
     ),
-    // Height 201599.
     concat!(
         "00000020e0b6148086d41986b33ed15c9207ded875683697d11d0ced283a15bf33000000",
         "2dd8f34d9c5ae2edff24ffe6fdfd4e55fcc3024c6167ccbb069d7e6c38457eed",
         "b94e7b66354e011ea0d60000",
     ),
-    // Height 201600.
     concat!(
         "00000020c0bd6f869a30e6d558b41ee8f54844e59714e340b6684574ca5935d974000000",
         "1bf0ef8a32407a2f59509bb8e159e4f163f40f94a9c519b424178e2a86ec0f4b",
@@ -75,22 +42,17 @@ pub(crate) const SIGNET_RETARGET: [&str; 3] = [
     ),
 ];
 
-/// Real headers of testnet4 at a change of its target, in the same order. The last header of the
-/// period has the limit.
 pub(crate) const TESTNET4_RETARGET: [&str; 3] = [
-    // Height 38304.
     concat!(
         "00600020a4d64c4535d2a737f425706bfb4a0c9f52d7a76ec5ec79b41e7a241c00000000",
         "b99b6fafb6db698ef72c8ae17342aebff5f0ddc0f286fe2423501d4cfa3f96db",
         "786fb26604fa5419aa34e108",
     ),
-    // Height 40319.
     concat!(
         "00000020e83bfb271fc94cb48f2c36a9210a221fe9129f463527e853ef748b2800000000",
         "6853ee76759f221c3d39b55a002002af5a133a0e9c81fd6bb1140e20d78f7fa4",
         "6749c366ffff001d6a2a2005",
     ),
-    // Height 40320.
     concat!(
         "0000c0201e5267e7ec4667f281a835b7e505ad93496475d661f301480a40d1ac00000000",
         "6a6f0580e2cf0fbc656a008c77dd0d49c362023400c471f96e7005203efd16c6",
@@ -98,35 +60,27 @@ pub(crate) const TESTNET4_RETARGET: [&str; 3] = [
     ),
 ];
 
-/// Five real headers of testnet4, from one period. The first has the real `bits`. The next three
-/// are late, so they have the limit. The last is not late, because its time goes back, so it has
-/// the real `bits` again.
 pub(crate) const TESTNET4_RUN: [&str; 5] = [
-    // Height 40025.
     concat!(
         "0000dc216d0958dac42bbcadd080874bcadbf82a2bf5d471e4b959bd3400000000000000",
         "7396863d29deaf6fb0ac5f5af5d8e98b9fa2810716fbff15c2dbccbc9e425768",
         "8bf0c06604fa54194c40645f",
     ),
-    // Height 40026.
     concat!(
         "0000002031d230c6c901c3469f269ccf25ad8ce08c34e96c8cd295145100000000000000",
         "6649dc40961450e280de1923d61e0a21c41fbf38c8b592888b6bb3c5ac984654",
         "3ff5c066ffff001d4a3c0049",
     ),
-    // Height 40027.
     concat!(
         "00000020ac7be0202186a0ea4f47beefe9af0f01013df1e7965bd7103c6d130000000000",
         "4822df05bb5d3870089469c58b924c9bd994193a8b1556ddd9e0824204709e98",
         "f0f9c066ffff001d7a7d6401",
     ),
-    // Height 40028.
     concat!(
         "00000020788681150d8e65f1e65c4b7b9657af7366d21c597613a930ff53b94900000000",
         "c7d27773128946d83d4d41443d284df3a13b7a0212887cb1f625768eb832df5e",
         "a1fec066ffff001d2da93aba",
     ),
-    // Height 40029.
     concat!(
         "00c01122c4a8d8f4dff4af9bb9a64a5cb63e52cd8a978ef1283fb4518f9261a100000000",
         "76db80a56014e1f355a5feb695234cddc8987bfeaaeca35dac88af61c74cfa34",
@@ -134,45 +88,32 @@ pub(crate) const TESTNET4_RUN: [&str; 5] = [
     ),
 ];
 
-/// Made-up headers of testnet4 around the first header of a period, which no real chain has. A real
-/// chain cannot hold a first header that the rule on its time refuses, and a test cannot mine at
-/// this limit. So a script mined the last five once, on 2026-11-07, in about 60 s on 32 threads.
-/// Each has the `bits` of the limit, a merkle root that is made up, and a version and a time that
-/// are legal on a real chain.
 pub(crate) const TESTNET4_TIMEWARP: [&str; 6] = [
-    // The header below the last header of the period. It has no proof of work, and its time is one
-    // second above the genesis time.
     concat!(
         "000000200000000000000000000000000000000000000000000000000000000000000000",
         "0000000000000000000000000000000000000000000000000000000000000000",
         "056f3566ffff001d00000000",
     ),
-    // The last header of the period, on the header above. Its time is two weeks above the genesis
-    // time.
     concat!(
         "00000020d63865c0c977eb51da864c86dd3ddf2b907a23e55cc8fd6246d1e118a0603a7b",
         "0000000000000000000000000000000000000000000000000000000000000000",
         "04e44766ffff001d59bec392",
     ),
-    // A first header of the next period, 600 seconds below the last header.
     concat!(
         "0000002002ef6c700351a00f5afa2a1cf4c333bed29d117217d764cbb5b13bc700000000",
         "0200000000000000000000000000000000000000000000000000000000000000",
         "ace14766ffff001d540ba5d9",
     ),
-    // A first header of the next period, 601 seconds below the last header.
     concat!(
         "0000002002ef6c700351a00f5afa2a1cf4c333bed29d117217d764cbb5b13bc700000000",
         "0100000000000000000000000000000000000000000000000000000000000000",
         "abe14766ffff001d7ccbb794",
     ),
-    // A first header of the next period, one second above the genesis time.
     concat!(
         "0000002002ef6c700351a00f5afa2a1cf4c333bed29d117217d764cbb5b13bc700000000",
         "0000000000000000000000000000000000000000000000000000000000000000",
         "056f3566ffff001dd9769580",
     ),
-    // A header on the 601 seconds one, with the time of the last header.
     concat!(
         "00000020efab162c3e3a395a6dd031370d87d1b31ba9120c8d99bc5078d5d87500000000",
         "0000000000000000000000000000000000000000000000000000000000000000",
@@ -180,29 +121,19 @@ pub(crate) const TESTNET4_TIMEWARP: [&str; 6] = [
     ),
 ];
 
-/// Made-up headers of mainnet at each height where the lowest version rises, which no real chain
-/// has: each real header near these heights already has the higher version. The tip is two below
-/// each height. It has no proof of work, a version of 4, and a time one second above the genesis
-/// time. Each pair is a header on the tip and a header on that header, one second apart. Both have
-/// the version one below the bound of the higher height. A test cannot mine at this limit, so a
-/// script mined the six once, on 2026-11-07, in about 3 min on 32 threads. Each has the `bits` of
-/// the limit and a merkle root of zeros.
 pub(crate) const MAINNET_VERSION_TIP: &str = concat!(
     "040000000000000000000000000000000000000000000000000000000000000000000000",
     "0000000000000000000000000000000000000000000000000000000000000000",
     "2aab5f49ffff001d00000000",
 );
 
-/// The pairs on `MAINNET_VERSION_TIP`, in the order of their heights.
 pub(crate) const MAINNET_VERSION_RISE: [[&str; 2]; 3] = [
     [
-        // Height 227930, version 1.
         concat!(
             "01000000311c94dcd9b9616ed0f17d035b4087bebd67463b9bfdd9f1a301759093b52ea7",
             "0000000000000000000000000000000000000000000000000000000000000000",
             "2bab5f49ffff001d1d0c43d1",
         ),
-        // Height 227931, version 1.
         concat!(
             "01000000cfd1b41513dc62aa325fbf3089f90528fd65c037e28ea87a1b15a2f100000000",
             "0000000000000000000000000000000000000000000000000000000000000000",
@@ -210,13 +141,11 @@ pub(crate) const MAINNET_VERSION_RISE: [[&str; 2]; 3] = [
         ),
     ],
     [
-        // Height 363724, version 2.
         concat!(
             "02000000311c94dcd9b9616ed0f17d035b4087bebd67463b9bfdd9f1a301759093b52ea7",
             "0000000000000000000000000000000000000000000000000000000000000000",
             "2bab5f49ffff001db6a6079a",
         ),
-        // Height 363725, version 2.
         concat!(
             "020000002666940377a7a458eb0a8affcb6927e7f9b8f93f7f1fb1ae07f698e900000000",
             "0000000000000000000000000000000000000000000000000000000000000000",
@@ -224,13 +153,11 @@ pub(crate) const MAINNET_VERSION_RISE: [[&str; 2]; 3] = [
         ),
     ],
     [
-        // Height 388380, version 3.
         concat!(
             "03000000311c94dcd9b9616ed0f17d035b4087bebd67463b9bfdd9f1a301759093b52ea7",
             "0000000000000000000000000000000000000000000000000000000000000000",
             "2bab5f49ffff001dfea525cc",
         ),
-        // Height 388381, version 3.
         concat!(
             "030000007f534b5ac5a6f5c787751a970dc067f080a748e628f8aaddf0e3293c00000000",
             "0000000000000000000000000000000000000000000000000000000000000000",
@@ -239,7 +166,6 @@ pub(crate) const MAINNET_VERSION_RISE: [[&str; 2]; 3] = [
     ],
 ];
 
-/// The `version`. On loopback, the IPs and ports of both addresses are zero.
 pub(crate) const VERSION_FRAME: &str = concat!(
     "fabfb5da76657273696f6e000000000066000000b34372e3",
     "80110100090c0000000000002358de6a00000000",
@@ -248,36 +174,26 @@ pub(crate) const VERSION_FRAME: &str = concat!(
     "c9f081ae97771971102f5361746f7368693a33312e312e302f0000000001",
 );
 
-/// The `wtxidrelay`, which Core sends after its `version`. No payload.
 pub(crate) const WTXIDRELAY_FRAME: &str = "fabfb5da777478696472656c61790000000000005df6e0e2";
 
-/// The `sendaddrv2`, which Core sends after its `wtxidrelay`. No payload.
 pub(crate) const SENDADDRV2_FRAME: &str = "fabfb5da73656e646164647276320000000000005df6e0e2";
 
-/// The `verack`: a header and no payload.
 pub(crate) const VERACK_FRAME: &str = "fabfb5da76657261636b000000000000000000005df6e0e2";
 
-/// The `sendcmpct`, which Core sends after our `verack`: high bandwidth off, version 2.
 pub(crate) const SENDCMPCT_FRAME: &str =
     "fabfb5da73656e64636d70637400000009000000e92f5ef8000200000000000000";
 
-/// The `ping`, which Core sends after its `sendcmpct`. The nonce is random.
 pub(crate) const PING_FRAME: &str =
     "fabfb5da70696e670000000000000000080000006c3569e3d84520892932e934";
 
-/// The `feefilter`, which Core sends after its `ping`. Core was in IBD, so the fee rate is
-/// its highest: 9,936,506 sat/kvB.
 pub(crate) const FEEFILTER_FRAME: &str =
     "fabfb5da66656566696c746572000000080000000a19f7997a9e970000000000";
 
-/// The `inv` for block 1, which Core sends when its tip changes.
 pub(crate) const BLOCK_INV_FRAME: &str = concat!(
     "fabfb5da696e7600000000000000000025000000dcc9e6bf",
     "0102000000faf4d233a8d1e92d0b03cd5dcc530307fdca5133639c54520be1a98d48ff6939",
 );
 
-/// The `headers` reply to a `getheaders` from genesis: blocks 1 and 2, each with a
-/// transaction count of 0.
 pub(crate) const HEADERS_FRAME: &str = concat!(
     "fabfb5da686561646572730000000000a30000006ba96776",
     "02",
@@ -291,16 +207,12 @@ pub(crate) const HEADERS_FRAME: &str = concat!(
     "00",
 );
 
-/// The hash of block 1 in `HEADERS_FRAME`, as `getblockhash 1` wrote it.
 pub(crate) const BLOCK_1_HASH: &str =
     "41650b9b585fd56a907a5286e7304582ee102c563563a9572bdf898c4f53d96f";
 
-/// The hash of block 2 in `HEADERS_FRAME`, as `getblockhash 2` wrote it.
 pub(crate) const BLOCK_2_HASH: &str =
     "29d4ecbe35de0c35851f0ae8bb5070fbc2273c65b1538591f3deb3179883456a";
 
-/// The `getheaders` that Core sends to a new peer: version 70016, the genesis hash as the only
-/// locator hash, and a `hash_stop` of all zeros.
 pub(crate) const GETHEADERS_FRAME: &str = concat!(
     "fabfb5da6765746865616465727300004500000070e012a4",
     "80110100",
@@ -309,21 +221,16 @@ pub(crate) const GETHEADERS_FRAME: &str = concat!(
     "0000000000000000000000000000000000000000000000000000000000000000",
 );
 
-/// The payload of `VERSION_FRAME`.
 pub(crate) fn version_payload() -> Vec<u8> {
     hex(VERSION_FRAME).split_off(crate::transport::MESSAGE_HEADER_SIZE)
 }
 
-/// The payload of `HEADERS_FRAME`.
 pub(crate) fn headers_payload() -> Vec<u8> {
     hex(HEADERS_FRAME).split_off(crate::transport::MESSAGE_HEADER_SIZE)
 }
 
-/// The `version` of each header that a test makes. It is the version of the blocks in
-/// `HEADERS_FRAME`, and it is legal at each height of each network.
 pub(crate) const HEADER_VERSION: i32 = 0x2000_0000;
 
-// The lowest version only rises with the height, so the bound at the top height is the highest.
 const _: () =
     assert!(HEADER_VERSION >= crate::chainparams::Network::Mainnet.version_min(usize::MAX));
 const _: () =
@@ -333,14 +240,10 @@ const _: () =
 const _: () =
     assert!(HEADER_VERSION >= crate::chainparams::Network::Regtest.version_min(usize::MAX));
 
-/// `count` headers, each on the header before it, the first on the regtest genesis header. Each
-/// is the genesis header with its `version`, its `prev`, its `time` and its `nonce` changed. Each
-/// time is one second above the header below it, so it is legal.
 pub(crate) fn headers_on_genesis(count: usize) -> Vec<crate::block::BlockHeader> {
     headers_on(&crate::chainparams::Network::Regtest.genesis(), count)
 }
 
-/// `headers_on_genesis`, with the first header on `below`.
 pub(crate) fn headers_on(
     below: &crate::block::BlockHeader,
     count: usize,
@@ -359,8 +262,6 @@ pub(crate) fn headers_on(
         .collect()
 }
 
-/// `headers_on`, with another merkle root in each header. So each header has another hash than the
-/// header of `headers_on` at the same height, and a batch of these is a branch on `below`.
 pub(crate) fn branch_on(
     below: &crate::block::BlockHeader,
     count: usize,
@@ -381,7 +282,6 @@ pub(crate) fn branch_on(
         .collect()
 }
 
-/// A `headers` payload with `headers`, each with a transaction count of 0.
 pub(crate) fn headers_payload_with(headers: &[crate::block::BlockHeader]) -> Vec<u8> {
     let mut payload = Vec::new();
     crate::serialize::write_compact_size(&mut payload, headers.len());
@@ -392,8 +292,6 @@ pub(crate) fn headers_payload_with(headers: &[crate::block::BlockHeader]) -> Vec
     payload
 }
 
-/// An `inv` payload with an entry of each type in `types`. Each hash is 0xbb in each byte, so a
-/// read of a type from a hash does not give 2, the type of a block.
 pub(crate) fn inv_payload(types: &[u32]) -> Vec<u8> {
     let mut payload = Vec::new();
     crate::serialize::write_compact_size(&mut payload, types.len());
@@ -404,22 +302,16 @@ pub(crate) fn inv_payload(types: &[u32]) -> Vec<u8> {
     payload
 }
 
-/// The local clock in each test that does not test it. It is the last second of a `u32` time, so
-/// the chain takes each time.
 pub(crate) const CLOCK: u64 = u32::MAX as u64;
 
-/// `headers` as a batch for the chain. It goes through `decode`, so `Headers` has no constructor
-/// for the tests.
 pub(crate) fn headers_batch(headers: &[crate::block::BlockHeader]) -> crate::protocol::Headers {
     crate::protocol::Headers::decode(&mut headers_payload_with(headers).as_slice()).unwrap()
 }
 
-/// A header from its 80 bytes in hex.
 pub(crate) fn header(s: &str) -> crate::block::BlockHeader {
     crate::block::BlockHeader::decode(&mut hex(s).as_slice()).unwrap()
 }
 
-/// A hash in hex, in the order a display shows it: the reverse of the wire order.
 pub(crate) fn hash_from_display_hex(s: &str) -> bitcoin_hashes::sha256d::Hash {
     let mut bytes: [u8; 32] = hex(s).try_into().unwrap();
     bytes.reverse();

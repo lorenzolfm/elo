@@ -1,20 +1,14 @@
-//! The v1 message framing.
-
 use crate::serialize::{Decode, Encode};
 
-/// The size of the checksum in a message header.
 const CHECKSUM_SIZE: usize = 4;
 
-/// Magic, message type, length and checksum.
 pub(crate) const MESSAGE_HEADER_SIZE: usize = crate::chainparams::MAGIC_SIZE
     + crate::protocol::MESSAGE_TYPE_SIZE
     + size_of::<u32>()
     + CHECKSUM_SIZE;
 
-/// The longest payload a peer may send.
 const PAYLOAD_LENGTH_MAX: u32 = 4_000_000;
 
-/// Why a frame was refused. Each one ends the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     WrongMagic([u8; crate::chainparams::MAGIC_SIZE]),
@@ -43,28 +37,20 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// A message header that passed the checks of `decode_header`. It does not keep
-/// the magic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MessageHeader {
     msg_type: crate::protocol::MessageType,
-    /// The length of the payload in bytes.
     length: u32,
-    /// The start of the sha256d of the payload.
     checksum: [u8; CHECKSUM_SIZE],
 }
 
 impl MessageHeader {
-    /// The number of payload bytes to read next, at most `PAYLOAD_LENGTH_MAX`.
     pub(crate) fn payload_length(&self) -> usize {
-        // `decode_header` and `encode` make the only headers, and both check the length. The
-        // driver sizes its payload buffer with this, so it checks again before the allocation.
         assert!(self.length <= PAYLOAD_LENGTH_MAX);
         usize::try_from(self.length).expect("PAYLOAD_LENGTH_MAX fits in a usize")
     }
 }
 
-/// A payload whose checksum matched its header. Only `check_payload` makes one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Message {
     msg_type: crate::protocol::MessageType,
@@ -76,13 +62,11 @@ impl Message {
         self.msg_type
     }
 
-    /// The whole payload of the frame, and nothing after it.
     pub(crate) fn payload(&self) -> &[u8] {
         &self.payload
     }
 }
 
-/// Checks the magic, the message type and the length.
 pub(crate) fn decode_header(
     network: crate::chainparams::Network,
     bytes: &[u8; MESSAGE_HEADER_SIZE],
@@ -113,9 +97,6 @@ pub(crate) fn decode_header(
     }
 }
 
-/// Checks the payload against the checksum in its header.
-///
-/// Panics if the payload is not `header.length` bytes. The caller reads exactly that many.
 pub(crate) fn check_payload(header: MessageHeader, payload: Vec<u8>) -> Result<Message, Error> {
     assert!(header.length <= PAYLOAD_LENGTH_MAX);
     assert_eq!(u32::try_from(payload.len()), Ok(header.length));
@@ -130,9 +111,6 @@ pub(crate) fn check_payload(header: MessageHeader, payload: Vec<u8>) -> Result<M
     }
 }
 
-/// A header, then the payload.
-///
-/// Panics if the payload is longer than `PAYLOAD_LENGTH_MAX`, because a peer refuses it.
 pub(crate) fn encode(
     network: crate::chainparams::Network,
     msg_type: crate::protocol::MessageType,
@@ -151,7 +129,6 @@ pub(crate) fn encode(
     header.msg_type.as_bytes().encode(&mut frame);
     header.length.encode(&mut frame);
     header.checksum.encode(&mut frame);
-    // The header passes the same checks as a header elo reads.
     let written = frame.first_chunk().expect("the header is written");
     assert_eq!(decode_header(network, written), Ok(header));
 
@@ -159,7 +136,6 @@ pub(crate) fn encode(
     frame
 }
 
-/// The start of the sha256d.
 fn checksum(payload: &[u8]) -> [u8; CHECKSUM_SIZE] {
     let hash = bitcoin_hashes::sha256d::Hash::hash(payload).to_byte_array();
     *hash.first_chunk().expect("a sha256d is 32 bytes")
@@ -171,7 +147,6 @@ mod tests {
         frame.split_first_chunk().unwrap()
     }
 
-    /// A regtest frame's header, decoded, and its payload.
     fn decode(frame: &[u8]) -> (super::MessageHeader, &[u8]) {
         let (header, payload) = split(frame);
         (

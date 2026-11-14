@@ -1,80 +1,51 @@
-//! The log: one line for each event, in logfmt. Each line is `level=<level> event=<name>`, then
-//! the fields of the event, each as `<key>=<value>`. A value that is empty, or that has a space, a
-//! `=`, a `"` or a control character, is in quotes, with the escapes `\"`, `\\`, `\n`, `\r`, `\t`
-//! and `\u00XX`. In a value with no quotes, a `\` is only a `\`. The line has no time, because the
-//! collector of the log adds one.
-
 use std::fmt::Write;
 
-/// The most bytes of a value before its escapes. A longer value is cut, and ends with `...`. So
-/// a peer that sends a long string cannot make a long line. The longest destination of the
-/// command line fits, so the `destination` of an `end` line is never cut.
 const VALUE_LENGTH_MAX: usize = 260;
 
 const _: () = assert!(crate::net::DESTINATION_LENGTH_MAX <= VALUE_LENGTH_MAX);
 
-/// What `...` adds to a value that is cut.
 const CUT_MARK: &str = "...";
 
-/// The most fields of a line, `level` and `event` too. A `version` line has the most.
 const FIELDS_COUNT_MAX: usize = 8;
 
-/// The most bytes of a key.
 const KEY_LENGTH_MAX: usize = 16;
 
-/// The most bytes that one escape writes for one byte of a value: `\u0001`.
 const ESCAPE_LENGTH_MAX: usize = 6;
 
-/// The most bytes of a field: a space, the key, `=`, two quotes, the escaped value and the `...`
-/// of a cut. The `...` needs no escape.
 const FIELD_LENGTH_MAX: usize =
     1 + KEY_LENGTH_MAX + 1 + 2 + ESCAPE_LENGTH_MAX * VALUE_LENGTH_MAX + CUT_MARK.len();
 
-/// The most bytes of a line. The first field has no space before it, and the line has a newline
-/// after it.
 const LINE_LENGTH_MAX: usize = FIELDS_COUNT_MAX * FIELD_LENGTH_MAX;
 
-// Docker cuts a line of more than 16 KiB into parts, and a collector reads each part as a line.
 const _: () = assert!(LINE_LENGTH_MAX <= 16 * 1024);
 
-/// An event that elo logs. The name of each event and the key of each field are an interface:
-/// dashboards and alerts match on them, so a rename breaks them. `Event::name` and `Event::line`
-/// are the one list of them. Only the fields here go into a line, so no secret, such as the salt
-/// of a peer, can. A `reason` or a `signal` is any `Display`, so its text is what that `Display`
-/// writes: a type that holds a secret has no `Display`, as the salt has none, and its `Debug`
-/// writes no secret, so a `{:?}` in a `reason` cannot write it either.
 #[derive(Clone, Copy)]
 pub enum Event<'a> {
-    /// The handshake with `peer` is done, and it sent `version`.
     Version {
         peer: std::net::SocketAddr,
         version: &'a crate::protocol::Version,
     },
-    /// The sync with `peer` ended, with our chain at `tip`.
     Tip {
         peer: std::net::SocketAddr,
         tip: &'a crate::chain::Tip,
     },
-    /// The connection to `destination` ended for `reason`, and elo dials again after `wait`.
-    /// `destination` is what the dial looked up or dialed: the IP address or the name of the
-    /// command line, or a seed of the network. It has its own key, so `peer` is always the address
-    /// of a connection.
     End {
         destination: &'a crate::net::Destination,
         reason: &'a dyn std::fmt::Display,
         wait: std::time::Duration,
     },
-    /// A fault of this host ends elo, with exit code 1.
-    Exit { reason: &'a dyn std::fmt::Display },
-    /// `signal` stops elo, with exit code 0.
-    Stop { signal: &'a dyn std::fmt::Display },
-    /// A bug ends elo, with exit code 101. `reason` is the place in the code and the message.
-    Panic { reason: &'a dyn std::fmt::Display },
+    Exit {
+        reason: &'a dyn std::fmt::Display,
+    },
+    Stop {
+        signal: &'a dyn std::fmt::Display,
+    },
+    Panic {
+        reason: &'a dyn std::fmt::Display,
+    },
 }
 
 impl Event<'_> {
-    /// Writes the line of the event, with its newline, to `out` in one write, and flushes `out`.
-    /// stdout is not always line buffered.
     pub fn write(&self, out: &mut impl std::io::Write) -> Result<(), std::io::Error> {
         out.write_all(self.line().as_bytes())?;
         out.flush()
@@ -136,11 +107,8 @@ impl Event<'_> {
 
 #[derive(Clone, Copy)]
 enum Level {
-    /// What elo does when all goes well.
     Info,
-    /// A fault that elo gets past, such as a peer that drops.
     Warn,
-    /// A fault or a bug that ends elo.
     Error,
 }
 
@@ -154,7 +122,6 @@ impl Level {
     }
 }
 
-/// A line that `field` writes to, one field at a time.
 #[derive(Default)]
 struct Line {
     text: String,
@@ -182,8 +149,6 @@ impl Line {
         self.text.push('=');
 
         let mut capped = Capped::default();
-        // `Capped` never fails, so only a `Display` that fails by itself can fail here. That is a
-        // bug of the `Display`: `std` asks a `Display` to fail only when its writer fails.
         let written = write!(capped, "{value}");
         assert!(written.is_ok(), "{key}: the value failed to write");
         let Capped {
@@ -206,9 +171,7 @@ impl Line {
                 '\n' => self.text.push_str("\\n"),
                 '\r' => self.text.push_str("\\r"),
                 '\t' => self.text.push_str("\\t"),
-                // Each control character is below U+00A0.
                 character if character.is_control() => {
-                    // A write to a `String` never fails.
                     let written = write!(self.text, "\\u{:04x}", u32::from(character));
                     assert!(written.is_ok());
                 }
@@ -219,11 +182,7 @@ impl Line {
     }
 
     fn end(mut self) -> String {
-        // Each line has its level and its event.
         assert!(self.fields_count >= 2, "{}", self.fields_count);
-        // The escapes keep each newline out of a value, so a value from a peer cannot start a
-        // line of its own. The one newline is the end of the line. `Debug` escapes the text of
-        // the panic too, so a bug of the escapes cannot split a line of stderr either.
         assert!(!self.text.contains('\n'), "{:?}", self.text);
         self.text.push('\n');
         assert!(self.text.len() <= LINE_LENGTH_MAX, "{}", self.text.len());
@@ -231,8 +190,6 @@ impl Line {
     }
 }
 
-/// Whether `character` puts its value in quotes. Each control character has an escape in quotes,
-/// and so do `"` and `\`. A `\` alone does not put a value in quotes.
 fn quotes(character: char) -> bool {
     match character {
         ' ' | '=' | '"' => true,
@@ -240,8 +197,6 @@ fn quotes(character: char) -> bool {
     }
 }
 
-/// The text of a value, up to `VALUE_LENGTH_MAX` bytes. At the first character that does not fit,
-/// `cut` is set and the rest is dropped, so the text ends on a whole character.
 #[derive(Default)]
 struct Capped {
     text: String,
@@ -277,7 +232,6 @@ mod tests {
         String::from_utf8(out).unwrap()
     }
 
-    /// The value of `text` in an `exit` line.
     fn value(text: &str) -> String {
         let line = line(super::Event::Exit { reason: &text });
         let value = line
@@ -373,12 +327,9 @@ mod tests {
         let long = "a".repeat(super::VALUE_LENGTH_MAX + 1);
         assert_eq!(value(&long), format!("{fits}..."));
 
-        // The last `é` needs 2 bytes, and only 1 is left.
         let first = "a".repeat(super::VALUE_LENGTH_MAX - 1);
         assert_eq!(value(&format!("{first}é")), format!("{first}..."));
 
-        // A `Display` that writes in parts: after the cut, a part that fits is dropped too, so the
-        // value is only the start of the text.
         let parts = line(super::Event::Exit {
             reason: &format_args!("{first}{}{}", 'é', 'b'),
         });
@@ -387,7 +338,6 @@ mod tests {
 
     #[test]
     fn the_longest_line_is_the_maximum() {
-        // Each byte is a control character, which needs the longest escape, and the value is cut.
         let value = "\u{1}".repeat(super::VALUE_LENGTH_MAX + 1);
         let mut line = super::Line::default();
         for _ in 0..super::FIELDS_COUNT_MAX {

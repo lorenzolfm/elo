@@ -1,27 +1,11 @@
-//! `elo <network> [<host>[:port]]`: dials one peer, does the handshake, and logs the peer's
-//! `version`. The host is an IP address or a name. With no host, each dial takes a seed of the
-//! network, at random. Before each dial, elo looks up the name or the seed, and dials its addresses
-//! in a random order until one takes the connect. Then it syncs the header chain from the peer and
-//! logs the tip. It asks the peer to announce each new header, takes it on the tip, and logs the
-//! tip when it moves. It pings the peer and answers its `ping` messages until the connection ends.
-//! Then it waits and dials again. The chain stays in memory, so the next connection syncs from its
-//! tip. SIGTERM and SIGINT stop it at any of these steps. Each step writes a line of
-//! `elo::logging` to stdout.
-
 const USAGE: &str = "usage: elo <mainnet|testnet4|signet|regtest> [<ip|name>[:port]]
 regtest has no seeds, so it needs a peer";
 
-/// The exit code for bad usage. A stop by a signal exits with 0, and a panic with 101. Every
-/// other exit is 1, because only a fault of this host ends elo.
 const EXIT_USAGE: u8 = 2;
 
-/// How long elo waits after a connection ends before it dials again. So a peer that is down, or
-/// that ends each connection at once, gets at most one try in each wait.
 const RECONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn main() -> std::process::ExitCode {
-    // First of all, so each panic writes a `panic` line, and not the text of the default hook,
-    // which is not a line of the log. A panic in this hook aborts elo.
     std::panic::set_hook(Box::new(|info| {
         let event = elo::logging::Event::Panic { reason: info };
         if log(&event).is_err() {
@@ -35,7 +19,6 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::from(EXIT_USAGE);
     };
 
-    // The I/O driver also gives the signals.
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -45,46 +28,29 @@ fn main() -> std::process::ExitCode {
         Err(error) => return exit(&format_args!("runtime: {error}")),
     };
     let code = runtime.block_on(run(network, source));
-    // A lookup runs on a blocking thread of the runtime, and a stop or a lookup timeout does not
-    // end it. The drop of the runtime would wait for that thread, so the runtime does not wait.
     runtime.shutdown_background();
     code
 }
 
-/// Dials a destination of `source` again after each end that retries, until a signal or an end
-/// that exits.
 async fn run(
     network: elo::chainparams::Network,
     source: elo::net::Source,
 ) -> std::process::ExitCode {
-    // Before the first dial, so a signal from here on stops elo. As PID 1 in a container, a
-    // process with no handler never sees a SIGTERM: the kernel drops it, and the stop ends in
-    // SIGKILL after its timeout.
     let mut signals = match Signals::new() {
         Ok(signals) => signals,
         Err(error) => return exit(&format_args!("signals: {error}")),
     };
-    // One chain for each connection, so a connection ends with the headers of the last one, and
-    // a sync gets only the headers after its tip.
     let mut chain = elo::chain::Chain::new(network);
-    // The loop has no count bound, because elo keeps its one peer for as long as it runs. Only
-    // a signal or an end that a new connection cannot fix gets out.
     loop {
         let destination = source.destination();
-        // The drop of the connection closes its socket. elo keeps nothing on disk, so the stop
-        // has nothing else to finish.
         let end = match signals.unless(dial(&destination, &mut chain)).await {
             Ok(Ok(end)) => end,
             Ok(Err(error)) => return exit_stdout(error),
             Err(signal) => return stop(signal),
         };
-        // The event says if elo dials again, so a reader of the log does not need the list of
-        // ends that exit.
         if !end.retries() {
             return exit(&end);
         }
-        // The destination of the dial, and not the address of the connection: the next dial looks
-        // up a name again, and a seed shows which seed gave the peer.
         let logged = log(&elo::logging::Event::End {
             destination: &destination,
             reason: &end,
@@ -99,16 +65,11 @@ async fn run(
     }
 }
 
-/// Logs the `signal` that stops elo, and gives the exit code of a stop: 0. A failed write does
-/// not change the exit code, because the signal asked for the stop.
 fn stop(signal: Signal) -> std::process::ExitCode {
     let _ = log(&elo::logging::Event::Stop { signal: &signal });
     std::process::ExitCode::SUCCESS
 }
 
-/// Logs the fault of this host that ends elo, and gives the exit code of a fault: 1. When stdout
-/// fails, the line goes to stderr, so a fault of stdout has a line too. Nothing is left to tell of
-/// a fault of stderr.
 fn exit(reason: &dyn std::fmt::Display) -> std::process::ExitCode {
     let event = elo::logging::Event::Exit { reason };
     if log(&event).is_err() {
@@ -117,9 +78,6 @@ fn exit(reason: &dyn std::fmt::Display) -> std::process::ExitCode {
     std::process::ExitCode::FAILURE
 }
 
-/// Logs a failed write to stdout, which ends elo, to stderr only, and gives the exit code of a
-/// fault: 1. The write that failed can leave part of its line on stdout, and a second write there
-/// would join the `exit` line to that part.
 fn exit_stdout(error: std::io::Error) -> std::process::ExitCode {
     let reason = format_args!("stdout: {error}");
     let event = elo::logging::Event::Exit { reason: &reason };
@@ -127,18 +85,13 @@ fn exit_stdout(error: std::io::Error) -> std::process::ExitCode {
     std::process::ExitCode::FAILURE
 }
 
-/// Writes the line of `event` to stdout. `println!` panics when stdout fails, for example on a
-/// full disk or a closed pipe.
 fn log(event: &elo::logging::Event<'_>) -> Result<(), std::io::Error> {
     event.write(&mut std::io::stdout().lock())
 }
 
-/// A signal that stops elo.
 #[derive(Clone, Copy, Debug)]
 enum Signal {
-    /// SIGTERM, from a container stop or a service manager.
     Terminate,
-    /// SIGINT, from Ctrl-C.
     Interrupt,
 }
 
@@ -151,8 +104,6 @@ impl std::fmt::Display for Signal {
     }
 }
 
-/// The handlers of the signals that stop elo. From their creation, these signals no longer end
-/// the process by their default action, and each one waits here until `unless` takes it.
 struct Signals {
     terminate: tokio::signal::unix::Signal,
     interrupt: tokio::signal::unix::Signal,
@@ -166,9 +117,6 @@ impl Signals {
         })
     }
 
-    /// The output of `work`, or the first signal if it comes before. A signal wins over an
-    /// output that is ready at the same time. A signal that came before this call is taken
-    /// first.
     async fn unless<T>(&mut self, work: impl Future<Output = T>) -> Result<T, Signal> {
         let mut work = std::pin::pin!(work);
         std::future::poll_fn(|context| {
@@ -180,15 +128,12 @@ impl Signals {
         .await
     }
 
-    /// The next signal. When none came, each handler holds the waker of `context`.
     fn poll_next(&mut self, context: &mut std::task::Context<'_>) -> std::task::Poll<Signal> {
         for (handler, signal) in [
             (&mut self.terminate, Signal::Terminate),
             (&mut self.interrupt, Signal::Interrupt),
         ] {
             if let std::task::Poll::Ready(received) = handler.poll_recv(context) {
-                // `None` is a runtime with no signal driver, which cannot be while this runs in
-                // it. As a signal, it would come again at each poll: a stop that no one sent.
                 assert!(received.is_some(), "{signal}: the signal driver ended");
                 return std::task::Poll::Ready(signal);
             }
@@ -197,20 +142,13 @@ impl Signals {
     }
 }
 
-/// How one connection ended. A failed write to stdout is no end of a connection: it ends elo.
 #[derive(Debug)]
 enum End {
-    /// The lookup, the connect or the handshake failed.
     Handshake(elo::net::HandshakeError),
-    /// The connection ended in the sync or after it.
     Run(elo::net::RunError),
 }
 
 impl End {
-    /// Whether elo dials the peer again. Each end that the peer or the network causes retries,
-    /// also a peer that sent bytes that elo refuses: the user named that peer. A fault of this
-    /// host that a new connection cannot fix does not. The match names each variant, so
-    /// a new error does not compile until it has a side.
     fn retries(&self) -> bool {
         match self {
             End::Handshake(elo::net::HandshakeError::Salt(_)) => false,
@@ -250,9 +188,6 @@ impl std::fmt::Display for End {
     }
 }
 
-/// Dials `destination`, does the handshake and logs the `version` of the peer. Then syncs
-/// `chain` and logs its tip, and logs it again each time an announcement of the peer moves it,
-/// until the connection ends. `Err` is a failed write to stdout.
 async fn dial(
     destination: &elo::net::Destination,
     chain: &mut elo::chain::Chain,
@@ -271,8 +206,6 @@ async fn dial(
         Ok(sync) => sync,
         Err(error) => return Ok(End::Run(error)),
     };
-    // The loop has no count bound, because the peer announces headers for as long as it is
-    // connected. Only the end of the connection or a fault of stdout gets out.
     loop {
         log(&elo::logging::Event::Tip {
             peer: address,
@@ -285,8 +218,6 @@ async fn dial(
     }
 }
 
-/// The args after the program name. `None` is bad usage. With no peer, the source is the seeds
-/// of the network, so a network with no seeds needs a peer.
 fn parse(args: &[std::ffi::OsString]) -> Option<(elo::chainparams::Network, elo::net::Source)> {
     let (network, peer) = match args {
         [network] => (network, None),
@@ -307,16 +238,10 @@ fn parse(args: &[std::ffi::OsString]) -> Option<(elo::chainparams::Network, elo:
     Some((network, source))
 }
 
-/// `peer` as the destination of each dial, or `None` if it is no IP address and no name.
-///
-/// An IPv6 address needs brackets even without a port, because `::1:8333` is an IPv6 address
-/// and not `::1` with a port.
 fn destination(peer: &str, network: elo::chainparams::Network) -> Option<elo::net::Destination> {
     let destination = if let Some(address) = address(peer, network.default_port()) {
-        // Port 0, `0.0.0.0`, `[::]` and `[::ffff:0.0.0.0]` name no peer.
         elo::net::Destination::Address(elo::net::PeerAddress::new(address)?)
     } else {
-        // The parse of a `NonZeroU16` refuses port 0.
         let (host, port) = match peer.split_once(':') {
             Some((host, port)) => (host, port.parse().ok()?),
             None => (peer, network.default_port()),
@@ -329,7 +254,6 @@ fn destination(peer: &str, network: elo::chainparams::Network) -> Option<elo::ne
     Some(destination)
 }
 
-/// `peer` as an IP address with an optional port, or `None` if it is no IP address.
 fn address(peer: &str, default_port: std::num::NonZeroU16) -> Option<std::net::SocketAddr> {
     if let Ok(address) = peer.parse() {
         return Some(address);
@@ -348,8 +272,6 @@ mod tests {
         super::parse(&args)
     }
 
-    // The L3 tests also hold a closed connection, which retries, and a stdout fault, which
-    // exits. A stdout fault is no `End`, so it has no row here.
     #[test]
     fn a_fault_of_this_host_ends_elo_and_a_failed_connect_or_lookup_retries() {
         for (end, retries) in [
@@ -380,8 +302,6 @@ mod tests {
         }
     }
 
-    // An L3 test cannot make the runtime, the signal handlers or `/dev/urandom` fail, so this
-    // test holds the exit code of a fault of this host. It writes an `exit` line to stdout.
     #[test]
     fn a_fault_of_this_host_exits_with_1() {
         let code = super::exit(&"a test of the exit code");

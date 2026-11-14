@@ -46,5 +46,4 @@ test = false
 doc = false
 bench = false
 
-# Its own workspace, so its dependencies stay out of the lockfile of elo.
 [workspace]

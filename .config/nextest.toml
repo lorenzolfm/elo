@@ -1,4 +1,2 @@
 [profile.default]
-# A test that reaches this limit fails, so a hang is a failed test and does not stop the job. The
-# limit is above each wait in `tests/bitcoind.rs`, so those asserts still give their message.
 slow-timeout = { period = "35s", terminate-after = 1 }

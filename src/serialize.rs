@@ -1,21 +1,12 @@
-//! The wire encoding.
-
-/// The largest value a CompactSize may hold.
 const COMPACT_SIZE_MAX: u32 = 0x0200_0000;
 
-// A CompactSize elo accepts fits in a `usize`.
 const _: () = assert!(usize::BITS >= u32::BITS);
 
-/// Why a decode failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// The input ended inside a field.
     UnexpectedEnd,
-    /// A CompactSize used more bytes than its value needs.
     NonCanonicalCompactSize,
-    /// A CompactSize above `COMPACT_SIZE_MAX`.
     CompactSizeTooLarge(u64),
-    /// A string longer than its limit.
     StringTooLong { length: usize, length_max: usize },
 }
 
@@ -36,12 +27,10 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Writes a value in the wire encoding.
 pub(crate) trait Encode {
     fn encode(&self, out: &mut Vec<u8>);
 }
 
-/// Reads a value in the wire encoding, and moves `input` past it.
 pub(crate) trait Decode: Sized {
     fn decode(input: &mut &[u8]) -> Result<Self, Error>;
 }
@@ -78,7 +67,6 @@ macro_rules! little_endian {
 
 little_endian!(u8, u16, u32, u64, i32, i64);
 
-/// The bytes in the order that SHA-256 writes them. A hash shows as hex in the reverse order.
 impl Encode for bitcoin_hashes::sha256d::Hash {
     fn encode(&self, out: &mut Vec<u8>) {
         self.as_byte_array().encode(out);
@@ -97,16 +85,12 @@ impl Encode for bool {
     }
 }
 
-/// Any byte other than zero is true.
 impl Decode for bool {
     fn decode(input: &mut &[u8]) -> Result<Self, Error> {
         Ok(u8::decode(input)? != 0)
     }
 }
 
-/// One, three or five bytes: the shortest form that holds `value`.
-///
-/// Panics if `value` is above `COMPACT_SIZE_MAX`, because a peer refuses it.
 pub(crate) fn write_compact_size(out: &mut Vec<u8>, value: usize) {
     assert!(value <= COMPACT_SIZE_MAX as usize);
 
@@ -130,8 +114,6 @@ pub(crate) fn write_compact_size(out: &mut Vec<u8>, value: usize) {
     }
 }
 
-/// Refuses a form longer than the value needs, and a value above `COMPACT_SIZE_MAX`. So the
-/// value fits in a `usize`.
 pub(crate) fn read_compact_size(input: &mut &[u8]) -> Result<usize, Error> {
     let (value, value_min) = match u8::decode(input)? {
         0xfd => (u64::from(u16::decode(input)?), 0xfd),
@@ -149,13 +131,11 @@ pub(crate) fn read_compact_size(input: &mut &[u8]) -> Result<usize, Error> {
     }
 }
 
-/// A CompactSize length, then the bytes.
 pub(crate) fn write_string(out: &mut Vec<u8>, bytes: &[u8]) {
     write_compact_size(out, bytes.len());
     out.extend_from_slice(bytes);
 }
 
-/// Refuses a string longer than `length_max` bytes.
 pub(crate) fn read_limited_string(input: &mut &[u8], length_max: usize) -> Result<Vec<u8>, Error> {
     let length = read_compact_size(input)?;
     if length <= length_max {
@@ -167,31 +147,19 @@ pub(crate) fn read_limited_string(input: &mut &[u8], length_max: usize) -> Resul
     }
 }
 
-/// The entry point of the `compact_size` fuzz target.
 #[cfg(fuzzing)]
-// Only cargo-mutants reads this attribute. Its test runs do not build this module.
 #[cfg_attr(false, mutants::skip)]
 pub(crate) mod fuzz {
-    // The seeds hold this limit as bytes, and the check takes its limit from the same constant. So
-    // a new limit moves the check and not the seeds, and the replay still passes. A new limit must
-    // rewrite the seeds at the limit.
     const _: () = assert!(super::COMPACT_SIZE_MAX == 0x0200_0000);
 
-    /// Checks that a value from a read writes back as the bytes that the read took, and that a
-    /// value from `data` reads back after a write.
-    ///
-    /// The value is the first four bytes of `data`, little-endian, with zeros after their end. The
-    /// committed corpus uses this layout, so a change to the layout must rewrite the corpus.
     pub fn compact_size(data: &[u8]) {
         let mut input = data;
         if let Ok(value) = super::read_compact_size(&mut input) {
             let mut written = Vec::new();
-            // A write panics above `COMPACT_SIZE_MAX`, so a read cannot let such a value through.
             super::write_compact_size(&mut written, value);
             assert_eq!(written, data[..data.len() - input.len()]);
         }
 
-        // A reader that refuses each value passes the check above, so read a value that elo wrote.
         let mut value_bytes = [0; size_of::<u32>()];
         for (value_byte, byte) in value_bytes.iter_mut().zip(data) {
             *value_byte = *byte;
