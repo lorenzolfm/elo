@@ -269,8 +269,9 @@ fn is_number(label: &str) -> bool {
 pub enum LookupError {
     /// The resolver of the OS failed.
     Failed(std::io::Error),
-    /// The lookup took longer than `LOOKUP_TIMEOUT`.
-    Timeout,
+    /// The lookup of `host` took longer than `LOOKUP_TIMEOUT`. A dial to a seed has two lookups,
+    /// so the error names the one that did not end.
+    Timeout { host: String },
     /// The lookup gave no address that `handshake` may dial.
     Empty,
 }
@@ -279,9 +280,9 @@ impl std::fmt::Display for LookupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LookupError::Failed(error) => write!(f, "lookup: {error}"),
-            LookupError::Timeout => write!(
+            LookupError::Timeout { host } => write!(
                 f,
-                "the lookup took longer than {} s",
+                "the lookup of {host} took longer than {} s",
                 LOOKUP_TIMEOUT.as_secs()
             ),
             LookupError::Empty => write!(f, "the lookup gave no address"),
@@ -513,7 +514,7 @@ async fn addresses(destination: &Destination) -> Result<Addresses, LookupError> 
                 Ok(addresses) => Ok(addresses),
                 // The resolver does not answer, so a lookup of the seed itself would only wait
                 // `LOOKUP_TIMEOUT` again.
-                Err(LookupError::Timeout) => Err(LookupError::Timeout),
+                Err(error @ LookupError::Timeout { .. }) => Err(error),
                 // A seed with no such names fails the lookup. The error of the lookup of the seed
                 // itself is the one that the dial gives.
                 Err(LookupError::Failed(_) | LookupError::Empty) => {
@@ -542,7 +543,9 @@ async fn lookup(
     match tokio::time::timeout(LOOKUP_TIMEOUT, answers).await {
         Ok(Ok(answers)) => Ok(answers),
         Ok(Err(error)) => Err(LookupError::Failed(error)),
-        Err(_elapsed) => Err(LookupError::Timeout),
+        Err(_elapsed) => Err(LookupError::Timeout {
+            host: host.to_owned(),
+        }),
     }
 }
 

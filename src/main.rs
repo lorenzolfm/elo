@@ -217,7 +217,7 @@ impl End {
             End::Handshake(
                 elo::net::HandshakeError::Lookup(
                     elo::net::LookupError::Failed(_)
-                    | elo::net::LookupError::Timeout
+                    | elo::net::LookupError::Timeout { .. }
                     | elo::net::LookupError::Empty,
                 )
                 | elo::net::HandshakeError::Connect {
@@ -369,7 +369,9 @@ mod tests {
             ),
             (
                 super::End::Handshake(elo::net::HandshakeError::Lookup(
-                    elo::net::LookupError::Timeout,
+                    elo::net::LookupError::Timeout {
+                        host: String::from("localhost"),
+                    },
                 )),
                 true,
             ),
