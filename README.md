@@ -128,14 +128,15 @@ container. Port 0 takes a free port. elo logs the address in a `metrics` line be
 | `elo_header_tip_work` | gauge | The work of the chain up to the tip, in decimal |
 | `elo_peer_state` | gauge | 1 for the step of the connection, and 0 for each other. The `state` label is `dial`, `sync`, `synced` or `wait` |
 | `elo_reconnects_total` | counter | The connections that ended, and that elo dials again after the wait |
-| `elo_metrics_failures_total` | counter | The connections to the metrics that failed. The `kind` label is `accept` for an accept error, `io` for a read or write error, or `timeout` for no answer in 1 s |
+| `elo_metrics_failures_total` | counter | The connections to the metrics that failed. The `kind` label is `accept` for an accept error, `io` for a read or write error, `timeout` for no answer in 1 s, or `evicted` for 8 newer connections before the answer |
 
 The tip moves when the `tip` line does: at the end of a sync, and then with each new tip. As for the
-log, the names are an interface, and `src/metrics.rs` holds them. elo answers one connection at a
-time, each in at most 1 s, and closes it after the answer. The listen backlog is 4, so at most 5
-connections come before a scrape, and it gets its answer in at most 6 s. The scrape timeout of
-Prometheus is 10 s by default. A request head is at most 8 KiB. Another
-path gets 404, and another method gets 405.
+log, the names are an interface, and `src/metrics.rs` holds them. elo accepts each connection when
+it comes and answers at most 8 at the same time, each in at most 1 s. It closes each connection after
+its answer, and also closes a connection when 8 newer connections come before its answer, so idle
+clients cannot hold a scrape. A scrape gets its answer in at most 1 s, unless 8 newer connections
+come before its answer. The scrape timeout of Prometheus is 10 s by default. A request
+head is at most 8 KiB. Another path gets 404, and another method gets 405.
 
 ## Build
 

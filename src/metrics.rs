@@ -8,12 +8,8 @@ const BODY_LENGTH_MAX: usize = 2 * 1024;
 
 const SCRAPE_TIMEOUT_DEFAULT: std::time::Duration = std::time::Duration::from_secs(10);
 
-const _: () = assert!(
-    crate::http::EXCHANGE_TIMEOUT
-        .saturating_mul(crate::http::LISTEN_BACKLOG + 2)
-        .as_millis()
-        < SCRAPE_TIMEOUT_DEFAULT.as_millis()
-);
+const _: () =
+    assert!(crate::http::EXCHANGE_TIMEOUT.as_millis() < SCRAPE_TIMEOUT_DEFAULT.as_millis());
 
 #[derive(Debug)]
 pub struct Metrics {
@@ -23,6 +19,7 @@ pub struct Metrics {
     accept_failures: std::cell::Cell<u64>,
     io_failures: std::cell::Cell<u64>,
     timeout_failures: std::cell::Cell<u64>,
+    evicted_failures: std::cell::Cell<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +57,7 @@ impl Metrics {
             accept_failures: std::cell::Cell::new(0),
             io_failures: std::cell::Cell::new(0),
             timeout_failures: std::cell::Cell::new(0),
+            evicted_failures: std::cell::Cell::new(0),
         }
     }
 
@@ -102,6 +100,7 @@ impl Metrics {
             crate::http::Failure::Accept => &self.accept_failures,
             crate::http::Failure::Io => &self.io_failures,
             crate::http::Failure::Timeout => &self.timeout_failures,
+            crate::http::Failure::Evicted => &self.evicted_failures,
         };
         failures.set(failures.get().saturating_add(1));
     }
@@ -152,12 +151,13 @@ impl Metrics {
         let mut family = text.family(
             "elo_metrics_failures_total",
             Kind::Counter,
-            "The connections to the metrics that failed: an accept error, a read or write error, or no answer in time.",
+            "The connections to the metrics that failed: an accept error, a read or write error, no answer in time, or a newer connection in its place.",
         );
         for (kind, failures) in [
             ("accept", &self.accept_failures),
             ("io", &self.io_failures),
             ("timeout", &self.timeout_failures),
+            ("evicted", &self.evicted_failures),
         ] {
             family.sample_labelled("kind", kind, failures.get());
         }
@@ -299,7 +299,7 @@ elo_header_tip_work 2
 ";
 
     const EXPECTED_FAILURES_HEAD: &str = "\
-# HELP elo_metrics_failures_total The connections to the metrics that failed: an accept error, a read or write error, or no answer in time.
+# HELP elo_metrics_failures_total The connections to the metrics that failed: an accept error, a read or write error, no answer in time, or a newer connection in its place.
 # TYPE elo_metrics_failures_total counter
 ";
 
@@ -324,11 +324,12 @@ elo_header_tip_work 2
         metrics
     }
 
-    fn failures(accept: u8, io: u8, timeout: u8) -> String {
+    fn failures(accept: u8, io: u8, timeout: u8, evicted: u8) -> String {
         format!(
             "elo_metrics_failures_total{{kind=\"accept\"}} {accept}\n\
              elo_metrics_failures_total{{kind=\"io\"}} {io}\n\
-             elo_metrics_failures_total{{kind=\"timeout\"}} {timeout}\n"
+             elo_metrics_failures_total{{kind=\"timeout\"}} {timeout}\n\
+             elo_metrics_failures_total{{kind=\"evicted\"}} {evicted}\n"
         )
     }
 
@@ -344,7 +345,7 @@ elo_header_tip_work 2
         let expected = format!(
             "{EXPECTED_START}{}{EXPECTED_END}elo_reconnects_total 0\n{EXPECTED_FAILURES_HEAD}{}",
             states(1, 0, 0, 0),
-            failures(0, 0, 0)
+            failures(0, 0, 0, 0)
         );
         assert_eq!(metrics().text(), expected);
     }
@@ -384,10 +385,11 @@ elo_header_tip_work 2
     fn text_has_each_failure_of_its_kind() {
         let metrics = metrics();
         for (failure, expected) in [
-            (crate::http::Failure::Timeout, failures(0, 0, 1)),
-            (crate::http::Failure::Io, failures(0, 1, 1)),
-            (crate::http::Failure::Accept, failures(1, 1, 1)),
-            (crate::http::Failure::Timeout, failures(1, 1, 2)),
+            (crate::http::Failure::Timeout, failures(0, 0, 1, 0)),
+            (crate::http::Failure::Io, failures(0, 1, 1, 0)),
+            (crate::http::Failure::Evicted, failures(0, 1, 1, 1)),
+            (crate::http::Failure::Accept, failures(1, 1, 1, 1)),
+            (crate::http::Failure::Timeout, failures(1, 1, 2, 1)),
         ] {
             metrics.failed(failure);
             let text = metrics.text();

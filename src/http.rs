@@ -4,7 +4,9 @@ pub(crate) const HEAD_LENGTH_MAX: usize = 8 * 1024;
 
 pub(crate) const EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
-pub(crate) const LISTEN_BACKLOG: u32 = 4;
+pub(crate) const EXCHANGES_MAX: usize = 8;
+
+const LISTEN_BACKLOG: u32 = 4;
 
 pub(crate) const ACCEPT_ERROR_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -34,6 +36,7 @@ pub(crate) enum Failure {
     Accept,
     Io,
     Timeout,
+    Evicted,
 }
 
 #[derive(Debug)]
@@ -60,22 +63,56 @@ pub(crate) async fn serve(
     answer: impl Fn(Request<'_>) -> Response,
     failed: impl Fn(Failure),
 ) -> std::convert::Infallible {
-    loop {
-        match listener.accept().await {
-            Ok((mut stream, _)) => {
-                let exchange = exchange(&mut stream, &answer);
-                match tokio::time::timeout(EXCHANGE_TIMEOUT, exchange).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_)) => failed(Failure::Io),
-                    Err(_) => failed(Failure::Timeout),
+    let answer = &answer;
+    let mut exchanges: [Option<_>; EXCHANGES_MAX] = std::array::from_fn(|_| None);
+    let mut next: usize = 0;
+    let mut accept_wait = std::pin::pin!(tokio::time::sleep(std::time::Duration::ZERO));
+    let mut accept_waits = false;
+    std::future::poll_fn(|context| {
+        loop {
+            if accept_waits {
+                if accept_wait.as_mut().poll(context).is_pending() {
+                    break;
                 }
+                accept_waits = false;
             }
-            Err(_) => {
-                failed(Failure::Accept);
-                tokio::time::sleep(ACCEPT_ERROR_WAIT).await;
+            match listener.poll_accept(context) {
+                std::task::Poll::Ready(Ok((mut stream, _))) => {
+                    let slot = &mut exchanges[next];
+                    if slot.is_some() {
+                        failed(Failure::Evicted);
+                    }
+                    *slot = Some(Box::pin(tokio::time::timeout(
+                        EXCHANGE_TIMEOUT,
+                        async move { exchange(&mut stream, answer).await },
+                    )));
+                    next = (next + 1) % EXCHANGES_MAX;
+                }
+                std::task::Poll::Ready(Err(_)) => {
+                    failed(Failure::Accept);
+                    accept_wait.set(tokio::time::sleep(ACCEPT_ERROR_WAIT));
+                    accept_waits = true;
+                }
+                std::task::Poll::Pending => break,
             }
         }
-    }
+        for slot in &mut exchanges {
+            let Some(exchange) = slot else {
+                continue;
+            };
+            let std::task::Poll::Ready(exchanged) = exchange.as_mut().poll(context) else {
+                continue;
+            };
+            match exchanged {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => failed(Failure::Io),
+                Err(_) => failed(Failure::Timeout),
+            }
+            *slot = None;
+        }
+        std::task::Poll::Pending
+    })
+    .await
 }
 
 async fn exchange(
@@ -322,39 +359,91 @@ mod tests {
         });
     }
 
-    #[test]
-    fn serve_counts_a_connection_with_no_head_in_time_and_one_reset_and_answers_the_next() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .start_paused(true)
-            .build()
-            .unwrap()
-            .block_on(async {
-                let listener = super::listen("127.0.0.1:0".parse().unwrap()).unwrap();
-                let address = listener.local_addr().unwrap();
-                let idle = tokio::net::TcpStream::connect(address).await.unwrap();
-                let reset = tokio::net::TcpStream::connect(address).await.unwrap();
-                reset.set_zero_linger().unwrap();
-                drop(reset);
-                let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
-                client.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
-                let failures = std::cell::RefCell::new(Vec::new());
+    fn served<F: Future>(
+        clients: impl FnOnce(std::net::SocketAddr) -> F,
+    ) -> (F::Output, Vec<super::Failure>) {
+        block_on(async {
+            let listener = super::listen("127.0.0.1:0".parse().unwrap()).unwrap();
+            let address = listener.local_addr().unwrap();
+            let failures = std::cell::RefCell::new(Vec::new());
+            let output = {
                 let serve = super::serve(listener, answer, |failure| {
                     failures.borrow_mut().push(failure);
                 });
-                let served = tokio::time::timeout(super::EXCHANGE_TIMEOUT * 3, serve).await;
-                assert!(served.is_err());
-                assert_eq!(
-                    *failures.borrow(),
-                    [super::Failure::Timeout, super::Failure::Io]
-                );
-                let mut received = String::new();
-                client.read_to_string(&mut received).await.unwrap();
-                assert!(received.starts_with("HTTP/1.1 200 OK\r\n"), "{received}");
-                assert!(received.ends_with("\r\n\r\nGET /"), "{received}");
-                drop(idle);
+                let mut serve = std::pin::pin!(serve);
+                let mut clients = std::pin::pin!(clients(address));
+                std::future::poll_fn(|context| {
+                    if let std::task::Poll::Ready(output) = clients.as_mut().poll(context) {
+                        return std::task::Poll::Ready(output);
+                    }
+                    match serve.as_mut().poll(context) {
+                        std::task::Poll::Ready(never) => match never {},
+                        std::task::Poll::Pending => std::task::Poll::Pending,
+                    }
+                })
+                .await
+            };
+            (output, failures.into_inner())
+        })
+    }
+
+    async fn scrape(address: std::net::SocketAddr) -> String {
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+        let mut received = String::new();
+        client.read_to_string(&mut received).await.unwrap();
+        received
+    }
+
+    #[test]
+    fn serve_answers_a_head_while_a_connection_has_none_and_counts_its_timeout_and_a_reset() {
+        let ((received, answered, idle_end), failures) = served(async |address| {
+            let start = std::time::Instant::now();
+            let mut idle = tokio::net::TcpStream::connect(address).await.unwrap();
+            let reset = tokio::net::TcpStream::connect(address).await.unwrap();
+            reset.set_zero_linger().unwrap();
+            drop(reset);
+            let received = scrape(address).await;
+            let answered = start.elapsed();
+            let read = idle.read(&mut [0; 1]).await.unwrap();
+            assert_eq!(read, 0);
+            (received, answered, start.elapsed())
+        });
+        assert!(received.starts_with("HTTP/1.1 200 OK\r\n"), "{received}");
+        assert!(received.ends_with("\r\n\r\nGET /"), "{received}");
+        assert!(answered < super::EXCHANGE_TIMEOUT / 2, "{answered:?}");
+        assert!(idle_end >= super::EXCHANGE_TIMEOUT, "{idle_end:?}");
+        assert_eq!(failures, [super::Failure::Io, super::Failure::Timeout]);
+    }
+
+    #[test]
+    fn connection_with_as_many_newer_ones_as_the_maximum_is_evicted_for_the_newest() {
+        for (idle_count, evicted) in [
+            (super::EXCHANGES_MAX - 1, false),
+            (super::EXCHANGES_MAX, true),
+        ] {
+            let ((received, oldest_end), failures) = served(async |address| {
+                let mut idle = Vec::new();
+                for _ in 0..idle_count {
+                    idle.push(tokio::net::TcpStream::connect(address).await.unwrap());
+                }
+                let received = scrape(address).await;
+                let wait = super::EXCHANGE_TIMEOUT / 10;
+                let oldest_end = tokio::time::timeout(wait, idle[0].read(&mut [0; 1])).await;
+                (received, oldest_end.map(Result::unwrap))
             });
+            assert!(
+                received.ends_with("\r\n\r\nGET /"),
+                "{idle_count}: {received}"
+            );
+            assert_eq!(oldest_end.is_ok(), evicted, "{idle_count}: {oldest_end:?}");
+            if evicted {
+                assert_eq!(oldest_end, Ok(0), "{idle_count}");
+                assert_eq!(failures, [super::Failure::Evicted], "{idle_count}");
+            } else {
+                assert_eq!(failures, [], "{idle_count}");
+            }
+        }
     }
 
     #[test]
