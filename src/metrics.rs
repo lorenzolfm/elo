@@ -6,6 +6,15 @@ const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 const BODY_LENGTH_MAX: usize = 1024;
 
+const SCRAPE_TIMEOUT_DEFAULT: std::time::Duration = std::time::Duration::from_secs(10);
+
+const _: () = assert!(
+    crate::http::EXCHANGE_TIMEOUT
+        .saturating_mul(crate::http::LISTEN_BACKLOG + 2)
+        .as_millis()
+        < SCRAPE_TIMEOUT_DEFAULT.as_millis()
+);
+
 #[derive(Debug)]
 pub struct Metrics {
     tip: std::cell::Cell<crate::chain::Tip>,
@@ -65,6 +74,12 @@ impl Metrics {
             }
         }
         self.peer.set(state);
+    }
+
+    pub fn listen(
+        address: std::net::SocketAddr,
+    ) -> Result<tokio::net::TcpListener, std::io::Error> {
+        crate::http::listen(address)
     }
 
     pub async fn serve(&self, listener: tokio::net::TcpListener) -> std::convert::Infallible {

@@ -2,7 +2,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub(crate) const HEAD_LENGTH_MAX: usize = 8 * 1024;
 
-pub(crate) const EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+pub(crate) const LISTEN_BACKLOG: u32 = 4;
 
 pub(crate) const ACCEPT_ERROR_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -32,6 +34,18 @@ enum HeadError {
     Io(std::io::Error),
     Closed,
     TooLong,
+}
+
+pub(crate) fn listen(
+    address: std::net::SocketAddr,
+) -> Result<tokio::net::TcpListener, std::io::Error> {
+    let socket = match address {
+        std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    };
+    socket.set_reuseaddr(true)?;
+    socket.bind(address)?;
+    socket.listen(LISTEN_BACKLOG)
 }
 
 pub(crate) async fn serve(
@@ -277,7 +291,7 @@ mod tests {
         };
         let bad = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         block_on(async {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let listener = super::listen("127.0.0.1:0".parse().unwrap()).unwrap();
             for (sent, expected) in [
                 (&b"GET /metrics HTTP/1.1\r\n\r\n"[..], ok("GET /metrics")),
                 (b"GET /metrics HTTP/1.1\r\n\r\nbody", ok("GET /metrics")),

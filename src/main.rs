@@ -47,7 +47,7 @@ async fn run(options: Options) -> std::process::ExitCode {
     };
     let listener = match options.metrics {
         None => None,
-        Some(address) => match listen(address).await {
+        Some(address) => match listen(address) {
             Ok((listener, address)) => {
                 if let Err(error) = log(&elo::logging::Event::Metrics { address }) {
                     return exit_stdout(error);
@@ -69,10 +69,10 @@ async fn run(options: Options) -> std::process::ExitCode {
     beside(serve, node).await
 }
 
-async fn listen(
+fn listen(
     address: std::net::SocketAddr,
 ) -> Result<(tokio::net::TcpListener, std::net::SocketAddr), std::io::Error> {
-    let listener = tokio::net::TcpListener::bind(address).await?;
+    let listener = elo::metrics::Metrics::listen(address)?;
     let address = listener.local_addr()?;
     Ok((listener, address))
 }

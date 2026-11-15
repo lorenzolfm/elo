@@ -131,7 +131,9 @@ container. Port 0 takes a free port. elo logs the address in a `metrics` line be
 
 The tip moves when the `tip` line does: at the end of a sync, and then with each new tip. As for the
 log, the names are an interface, and `src/metrics.rs` holds them. elo answers one connection at a
-time, each in at most 10 s, and closes it after the answer. A request head is at most 8 KiB. Another
+time, each in at most 1 s, and closes it after the answer. The listen backlog is 4, so at most 5
+connections come before a scrape, and it gets its answer in at most 6 s. The scrape timeout of
+Prometheus is 10 s by default. A request head is at most 8 KiB. Another
 path gets 404, and another method gets 405.
 
 ## Build
