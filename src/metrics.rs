@@ -124,19 +124,19 @@ impl Metrics {
         let mut text = Text::new();
         text.family(
             "elo_header_tip_height",
-            "gauge",
+            Kind::Gauge,
             "The height of the tip of the header chain.",
         )
         .sample(tip.height());
         text.family(
             "elo_header_tip_work",
-            "gauge",
+            Kind::Gauge,
             "The work of the header chain up to its tip: the expected number of hashes.",
         )
         .sample(tip.work().decimal());
         let mut family = text.family(
             "elo_peer_state",
-            "gauge",
+            Kind::Gauge,
             "The step of the connection to the peer: 1 for the step it is in, 0 for each other.",
         );
         let peer = self.peer.get();
@@ -145,13 +145,13 @@ impl Metrics {
         }
         text.family(
             "elo_reconnects_total",
-            "counter",
+            Kind::Counter,
             "The connections that ended, and that elo dials again after a wait.",
         )
         .sample(self.reconnects.get());
         let mut family = text.family(
             "elo_metrics_failures_total",
-            "counter",
+            Kind::Counter,
             "The connections to the metrics that failed: an accept error, a read or write error, or no answer in time.",
         );
         for (kind, failures) in [
@@ -162,6 +162,21 @@ impl Metrics {
             family.sample_labelled("kind", kind, failures.get());
         }
         text.end()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Kind {
+    Gauge,
+    Counter,
+}
+
+impl Kind {
+    fn name(self) -> &'static str {
+        match self {
+            Kind::Gauge => "gauge",
+            Kind::Counter => "counter",
+        }
     }
 }
 
@@ -181,10 +196,16 @@ impl Text {
         }
     }
 
-    fn family(&mut self, name: &'static str, kind: &'static str, help: &'static str) -> Family<'_> {
+    fn family(&mut self, name: &'static str, kind: Kind, help: &'static str) -> Family<'_> {
         assert!(name.starts_with("elo_"), "{name}");
         assert!(name.bytes().all(name_byte), "{name}");
+        assert_eq!(
+            name.ends_with("_total"),
+            matches!(kind, Kind::Counter),
+            "{name}"
+        );
         assert!(!help.contains(['\\', '\n']), "{name}");
+        let kind = kind.name();
         let written = write!(self.text, "# HELP {name} {help}\n# TYPE {name} {kind}\n");
         assert!(written.is_ok(), "{name}");
         Family {
@@ -433,17 +454,37 @@ elo_header_tip_work 2
         ] {
             let sampled = std::panic::catch_unwind(|| {
                 let mut text = super::Text::new();
-                text.family("elo_a", "gauge", "A.")
+                text.family("elo_a", super::Kind::Gauge, "A.")
                     .sample_labelled(label, label_value, 0);
             });
             assert!(sampled.is_err(), "{label:?} {label_value:?}");
         }
         let mut text = super::Text::new();
-        text.family("elo_a", "gauge", "A.")
+        text.family("elo_a", super::Kind::Gauge, "A.")
             .sample_labelled("b", "c_d", 0);
         assert_eq!(
             text.end(),
             "# HELP elo_a A.\n# TYPE elo_a gauge\nelo_a{b=\"c_d\"} 0\n"
+        );
+    }
+
+    #[test]
+    fn counter_name_ends_with_total_and_a_gauge_name_does_not() {
+        for (name, kind) in [
+            ("elo_a", super::Kind::Counter),
+            ("elo_a_total", super::Kind::Gauge),
+        ] {
+            let written = std::panic::catch_unwind(|| {
+                super::Text::new().family(name, kind, "A.").sample(0);
+            });
+            assert!(written.is_err(), "{name} {kind:?}");
+        }
+        let mut text = super::Text::new();
+        text.family("elo_a_total", super::Kind::Counter, "A.")
+            .sample(0);
+        assert_eq!(
+            text.end(),
+            "# HELP elo_a_total A.\n# TYPE elo_a_total counter\nelo_a_total 0\n"
         );
     }
 }
