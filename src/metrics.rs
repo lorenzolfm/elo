@@ -180,12 +180,35 @@ impl Kind {
     }
 }
 
+trait Value: std::fmt::Display {
+    const LENGTH_MAX: usize;
+}
+
+impl Value for u64 {
+    const LENGTH_MAX: usize = 20;
+}
+
+const _: () = assert!(usize::BITS <= u64::BITS);
+
+impl Value for usize {
+    const LENGTH_MAX: usize = <u64 as Value>::LENGTH_MAX;
+}
+
+impl Value for u8 {
+    const LENGTH_MAX: usize = 3;
+}
+
+impl Value for crate::pow::Decimal {
+    const LENGTH_MAX: usize = crate::pow::Decimal::LENGTH_MAX;
+}
+
 struct Text {
     text: String,
+    growth: usize,
 }
 
 struct Family<'a> {
-    text: &'a mut String,
+    text: &'a mut Text,
     name: &'static str,
 }
 
@@ -193,6 +216,7 @@ impl Text {
     fn new() -> Text {
         Text {
             text: String::with_capacity(BODY_LENGTH_MAX),
+            growth: 0,
         }
     }
 
@@ -208,38 +232,47 @@ impl Text {
         let kind = kind.name();
         let written = write!(self.text, "# HELP {name} {help}\n# TYPE {name} {kind}\n");
         assert!(written.is_ok(), "{name}");
-        Family {
-            text: &mut self.text,
-            name,
-        }
+        Family { text: self, name }
+    }
+
+    fn value<V: Value>(&mut self, value: V) {
+        let start = self.text.len();
+        let written = writeln!(self.text, "{value}");
+        assert!(written.is_ok());
+        let length = self.text.len() - start - 1;
+        assert!(length <= V::LENGTH_MAX, "{length}");
+        self.growth += V::LENGTH_MAX - length;
     }
 
     fn end(self) -> String {
         assert!(self.text.ends_with('\n'));
-        assert!(self.text.len() <= BODY_LENGTH_MAX, "{}", self.text.len());
+        let length_max = self.text.len() + self.growth;
+        assert!(length_max <= BODY_LENGTH_MAX, "{length_max}");
         self.text
     }
 }
 
 impl Family<'_> {
-    fn sample(&mut self, value: impl std::fmt::Display) {
+    fn sample(&mut self, value: impl Value) {
         let name = self.name;
-        let written = writeln!(self.text, "{name} {value}");
+        let written = write!(self.text.text, "{name} ");
         assert!(written.is_ok(), "{name}");
+        self.text.value(value);
     }
 
     fn sample_labelled(
         &mut self,
         label: &'static str,
         label_value: &'static str,
-        value: impl std::fmt::Display,
+        value: impl Value,
     ) {
         let name = self.name;
         assert!(!label.is_empty(), "{name}");
         assert!(label.bytes().all(name_byte), "{name}");
         assert!(!label_value.contains(['"', '\\', '\n']), "{name}");
-        let written = writeln!(self.text, "{name}{{{label}=\"{label_value}\"}} {value}");
+        let written = write!(self.text.text, "{name}{{{label}=\"{label_value}\"}} ");
         assert!(written.is_ok(), "{name}");
+        self.text.value(value);
     }
 }
 
@@ -432,14 +465,26 @@ elo_header_tip_work 2
     }
 
     #[test]
-    fn longest_text_is_below_the_maximum() {
-        let text = metrics().text();
-        let one_digit_values_length = 6;
-        let work_max_decimal_length = 78;
-        let longest_values_length =
-            usize::MAX.to_string().len() + work_max_decimal_length + 4 * u64::MAX.to_string().len();
-        let longest = text.len() - one_digit_values_length + longest_values_length;
-        assert!(longest <= super::BODY_LENGTH_MAX, "{longest}");
+    fn longest_text_of_each_value_has_its_maximum_length() {
+        use super::Value;
+        assert_eq!(u64::MAX.to_string().len(), u64::LENGTH_MAX);
+        assert!(usize::MAX.to_string().len() <= usize::LENGTH_MAX);
+        assert_eq!(u8::MAX.to_string().len(), u8::LENGTH_MAX);
+    }
+
+    #[test]
+    fn text_whose_values_can_grow_past_the_maximum_is_a_bug() {
+        let text = |samples| {
+            let mut text = super::Text::new();
+            let mut family = text.family("elo_a", super::Kind::Gauge, "AAAAAAAAAAAAAAAAA");
+            for _ in 0..samples {
+                family.sample(0_u64);
+            }
+            text.end()
+        };
+        assert_eq!(text(74).len() + 74 * 19, super::BODY_LENGTH_MAX);
+        let ended = std::panic::catch_unwind(|| text(75));
+        assert!(ended.is_err());
     }
 
     #[test]
@@ -455,13 +500,13 @@ elo_header_tip_work 2
             let sampled = std::panic::catch_unwind(|| {
                 let mut text = super::Text::new();
                 text.family("elo_a", super::Kind::Gauge, "A.")
-                    .sample_labelled(label, label_value, 0);
+                    .sample_labelled(label, label_value, 0_u8);
             });
             assert!(sampled.is_err(), "{label:?} {label_value:?}");
         }
         let mut text = super::Text::new();
         text.family("elo_a", super::Kind::Gauge, "A.")
-            .sample_labelled("b", "c_d", 0);
+            .sample_labelled("b", "c_d", 0_u8);
         assert_eq!(
             text.end(),
             "# HELP elo_a A.\n# TYPE elo_a gauge\nelo_a{b=\"c_d\"} 0\n"
@@ -475,13 +520,13 @@ elo_header_tip_work 2
             ("elo_a_total", super::Kind::Gauge),
         ] {
             let written = std::panic::catch_unwind(|| {
-                super::Text::new().family(name, kind, "A.").sample(0);
+                super::Text::new().family(name, kind, "A.").sample(0_u8);
             });
             assert!(written.is_err(), "{name} {kind:?}");
         }
         let mut text = super::Text::new();
         text.family("elo_a_total", super::Kind::Counter, "A.")
-            .sample(0);
+            .sample(0_u8);
         assert_eq!(
             text.end(),
             "# HELP elo_a_total A.\n# TYPE elo_a_total counter\nelo_a_total 0\n"

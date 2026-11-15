@@ -140,27 +140,8 @@ impl Work {
         (quotient, remainder)
     }
 
-    pub(crate) fn decimal(self) -> impl std::fmt::Display {
-        std::fmt::from_fn(move |f| {
-            let mut chunks = [0_u64; DECIMAL_CHUNKS_COUNT];
-            let mut rest = self;
-            for chunk in chunks.iter_mut().rev() {
-                let (quotient, remainder) = rest.divided_with_remainder(DECIMAL_CHUNK_DIVISOR);
-                assert_eq!(remainder.high, 0);
-                *chunk = u64::try_from(remainder.low).unwrap_or(u64::MAX);
-                assert!(*chunk < DECIMAL_CHUNK_BASE);
-                rest = quotient;
-            }
-            assert_eq!(rest, Work::ZERO);
-            let first_index = chunks
-                .iter()
-                .position(|chunk| *chunk != 0)
-                .unwrap_or(DECIMAL_CHUNKS_COUNT - 1);
-            write!(f, "{}", chunks[first_index])?;
-            chunks[first_index + 1..]
-                .iter()
-                .try_for_each(|chunk| write!(f, "{chunk:019}"))
-        })
+    pub(crate) fn decimal(self) -> Decimal {
+        Decimal(self)
     }
 
     fn shifted_left(self, bits: u32) -> Work {
@@ -202,6 +183,36 @@ impl Work {
                 ..shifted
             }
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Decimal(Work);
+
+impl Decimal {
+    pub(crate) const LENGTH_MAX: usize = 78;
+}
+
+impl std::fmt::Display for Decimal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut chunks = [0_u64; DECIMAL_CHUNKS_COUNT];
+        let mut rest = self.0;
+        for chunk in chunks.iter_mut().rev() {
+            let (quotient, remainder) = rest.divided_with_remainder(DECIMAL_CHUNK_DIVISOR);
+            assert_eq!(remainder.high, 0);
+            *chunk = u64::try_from(remainder.low).unwrap_or(u64::MAX);
+            assert!(*chunk < DECIMAL_CHUNK_BASE);
+            rest = quotient;
+        }
+        assert_eq!(rest, Work::ZERO);
+        let first_index = chunks
+            .iter()
+            .position(|chunk| *chunk != 0)
+            .unwrap_or(DECIMAL_CHUNKS_COUNT - 1);
+        write!(f, "{}", chunks[first_index])?;
+        chunks[first_index + 1..]
+            .iter()
+            .try_for_each(|chunk| write!(f, "{chunk:019}"))
     }
 }
 
@@ -1026,6 +1037,10 @@ mod tests {
         ] {
             assert_eq!(number.decimal().to_string(), expected, "{number}");
         }
+        assert_eq!(
+            super::Work::MAX.decimal().to_string().len(),
+            super::Decimal::LENGTH_MAX
+        );
     }
 
     #[test]
