@@ -174,7 +174,7 @@ impl Metrics {
         text.family(
             "elo_reconnects_total",
             Kind::Counter,
-            "The connections that ended, and that elo dials again after a wait.",
+            "Each failed lookup, dial or handshake and each connection that ended, after which elo waits and dials again.",
         )
         .sample(self.reconnects.get());
         for (name, help, counts) in [
@@ -385,7 +385,7 @@ elo_header_tip_work 2
 ";
 
     const EXPECTED_END: &str = "\
-# HELP elo_reconnects_total The connections that ended, and that elo dials again after a wait.
+# HELP elo_reconnects_total Each failed lookup, dial or handshake and each connection that ended, after which elo waits and dials again.
 # TYPE elo_reconnects_total counter
 ";
 

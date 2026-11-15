@@ -125,9 +125,9 @@ container. Port 0 takes a free port. elo logs the address in a `metrics` line be
 | Metric | Type | Value |
 | --- | --- | --- |
 | `elo_header_tip_height` | gauge | The height of the tip of the header chain |
-| `elo_header_tip_work` | gauge | The work of the chain up to the tip, in decimal |
+| `elo_header_tip_work` | gauge | The work of the chain up to the tip, in decimal with all its digits. Prometheus keeps each value as a 64-bit float, so it rounds a work above 2^53 |
 | `elo_peer_state` | gauge | 1 for the step of the connection, and 0 for each other. The `state` label is `dial`, `sync`, `synced` or `wait` |
-| `elo_reconnects_total` | counter | The connections that ended, and that elo dials again after the wait |
+| `elo_reconnects_total` | counter | Each failed lookup, dial or handshake and each connection that ended, after which elo waits and dials again |
 | `elo_peer_received_messages_total` | counter | The messages from the peer, for each command. The `command` label is `version`, `verack`, `ping`, `pong`, `getheaders`, `headers`, `wtxidrelay`, `sendaddrv2`, `sendheaders`, `inv`, or `other` for each other command |
 | `elo_peer_received_bytes_total` | counter | The bytes of the messages from the peer, with their headers, for each command |
 | `elo_peer_sent_messages_total` | counter | The messages to the peer, for each command |
