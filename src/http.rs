@@ -103,10 +103,16 @@ fn request(head: &[u8]) -> Option<Request<'_>> {
     else {
         return None;
     };
-    if method.is_empty() || !method.bytes().all(token_byte) {
+    if method.is_empty() {
         return None;
     }
-    if target.is_empty() || !target.bytes().all(|byte| byte.is_ascii_graphic()) {
+    if !method.bytes().all(token_byte) {
+        return None;
+    }
+    if target.is_empty() {
+        return None;
+    }
+    if !target.bytes().all(|byte| byte.is_ascii_graphic()) {
         return None;
     }
     if !matches!(version, "HTTP/1.1" | "HTTP/1.0") {
@@ -122,14 +128,18 @@ fn token_byte(byte: u8) -> bool {
 impl Response {
     fn bytes(&self) -> Vec<u8> {
         let (status, headers, body) = match self {
-            Response::Ok { content_type, body } => (
-                "200 OK",
-                format!("Content-Type: {content_type}\r\n"),
-                body.as_str(),
-            ),
+            Response::Ok { content_type, body } => {
+                assert!(!content_type.contains(['\r', '\n']), "{content_type:?}");
+                (
+                    "200 OK",
+                    format!("Content-Type: {content_type}\r\n"),
+                    body.as_str(),
+                )
+            }
             Response::BadRequest => ("400 Bad Request", String::new(), ""),
             Response::NotFound => ("404 Not Found", String::new(), ""),
             Response::MethodNotAllowed { allow } => {
+                assert!(!allow.contains(['\r', '\n']), "{allow:?}");
                 ("405 Method Not Allowed", format!("Allow: {allow}\r\n"), "")
             }
         };
@@ -228,6 +238,22 @@ mod tests {
             ),
         ] {
             assert_eq!(String::from_utf8(response.bytes()).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn header_value_with_a_line_end_is_a_bug() {
+        for value in ["a\rb", "a\nb", "a\r\nB: c"] {
+            for response in [
+                super::Response::Ok {
+                    content_type: value,
+                    body: String::new(),
+                },
+                super::Response::MethodNotAllowed { allow: value },
+            ] {
+                let written = std::panic::catch_unwind(|| response.bytes());
+                assert!(written.is_err(), "{value:?}");
+            }
         }
     }
 
