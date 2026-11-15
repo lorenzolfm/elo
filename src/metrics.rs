@@ -49,15 +49,22 @@ impl Metrics {
     }
 
     pub fn tip(&self, tip: &crate::chain::Tip) {
+        assert!(tip.work() >= self.tip.get().work());
         self.tip.set(*tip);
     }
 
     pub fn peer(&self, state: PeerState) {
+        let before = self.peer.get();
+        match state {
+            PeerState::Dial => assert_eq!(before, PeerState::Wait),
+            PeerState::Sync => assert_eq!(before, PeerState::Dial),
+            PeerState::Synced => assert_eq!(before, PeerState::Sync),
+            PeerState::Wait => {
+                assert_ne!(before, PeerState::Wait);
+                self.reconnects.set(self.reconnects.get().saturating_add(1));
+            }
+        }
         self.peer.set(state);
-    }
-
-    pub fn reconnect(&self) {
-        self.reconnects.set(self.reconnects.get().saturating_add(1));
     }
 
     pub async fn serve(&self, listener: tokio::net::TcpListener) -> std::convert::Infallible {
@@ -178,6 +185,21 @@ elo_header_tip_work 2
         ))
     }
 
+    fn metrics_in(state: super::PeerState) -> super::Metrics {
+        let metrics = metrics();
+        let path: &[super::PeerState] = match state {
+            super::PeerState::Dial => &[],
+            super::PeerState::Sync => &[super::PeerState::Sync],
+            super::PeerState::Synced => &[super::PeerState::Sync, super::PeerState::Synced],
+            super::PeerState::Wait => &[super::PeerState::Wait],
+        };
+        for step in path {
+            metrics.peer(*step);
+        }
+        assert_eq!(metrics.peer.get(), state);
+        metrics
+    }
+
     fn states(dial: u8, sync: u8, synced: u8, wait: u8) -> String {
         format!(
             "elo_peer_state{{state=\"dial\"}} {dial}\nelo_peer_state{{state=\"sync\"}} {sync}\n\
@@ -195,7 +217,7 @@ elo_header_tip_work 2
     }
 
     #[test]
-    fn text_has_the_last_tip_the_state_and_each_reconnect() {
+    fn text_has_the_last_tip_the_state_and_each_wait_as_a_reconnect() {
         let metrics = metrics();
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
         let headers = crate::fixtures::headers_on_genesis(3);
@@ -205,20 +227,65 @@ elo_header_tip_work 2
         );
         assert_eq!(extended, Ok(()));
         metrics.tip(&chain.tip());
-        for (state, expected) in [
-            (super::PeerState::Sync, states(0, 1, 0, 0)),
-            (super::PeerState::Synced, states(0, 0, 1, 0)),
-            (super::PeerState::Wait, states(0, 0, 0, 1)),
-            (super::PeerState::Dial, states(1, 0, 0, 0)),
+        for (state, expected, reconnects) in [
+            (super::PeerState::Wait, states(0, 0, 0, 1), 1),
+            (super::PeerState::Dial, states(1, 0, 0, 0), 1),
+            (super::PeerState::Sync, states(0, 1, 0, 0), 1),
+            (super::PeerState::Wait, states(0, 0, 0, 1), 2),
+            (super::PeerState::Dial, states(1, 0, 0, 0), 2),
+            (super::PeerState::Sync, states(0, 1, 0, 0), 2),
+            (super::PeerState::Synced, states(0, 0, 1, 0), 2),
+            (super::PeerState::Wait, states(0, 0, 0, 1), 3),
         ] {
             metrics.peer(state);
-            metrics.reconnect();
             let text = metrics.text();
             assert!(text.contains("elo_header_tip_height 3\n"), "{text}");
             assert!(text.contains("elo_header_tip_work 8\n"), "{text}");
             assert!(text.contains(&expected), "{state:?}: {text}");
+            let reconnects_line = format!("elo_reconnects_total {reconnects}\n");
+            assert!(text.ends_with(&reconnects_line), "{state:?}: {text}");
         }
-        assert!(metrics.text().ends_with("elo_reconnects_total 4\n"));
+    }
+
+    #[test]
+    fn peer_state_moves_only_on_the_steps_of_a_connection() {
+        for before in super::PeerState::ALL {
+            for after in super::PeerState::ALL {
+                let allowed = matches!(
+                    (before, after),
+                    (super::PeerState::Dial, super::PeerState::Sync)
+                        | (super::PeerState::Sync, super::PeerState::Synced)
+                        | (
+                            super::PeerState::Dial
+                                | super::PeerState::Sync
+                                | super::PeerState::Synced,
+                            super::PeerState::Wait
+                        )
+                        | (super::PeerState::Wait, super::PeerState::Dial)
+                );
+                let metrics = metrics_in(before);
+                let moved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    metrics.peer(after);
+                }));
+                assert_eq!(moved.is_ok(), allowed, "{before:?} -> {after:?}");
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "tip.work() >= self.tip.get().work()")]
+    fn tip_with_less_work_than_the_last_is_a_bug() {
+        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        let genesis = chain.tip();
+        let headers = crate::fixtures::headers_on_genesis(1);
+        let extended = chain.extend(
+            crate::fixtures::headers_batch(&headers),
+            crate::fixtures::CLOCK,
+        );
+        assert_eq!(extended, Ok(()));
+        let metrics = super::Metrics::new(&chain);
+        metrics.tip(&chain.tip());
+        metrics.tip(&genesis);
     }
 
     #[test]

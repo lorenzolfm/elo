@@ -103,7 +103,6 @@ async fn node(
 ) -> std::process::ExitCode {
     loop {
         let destination = source.destination();
-        metrics.peer(elo::metrics::PeerState::Dial);
         let end = match signals.unless(dial(&destination, chain, metrics)).await {
             Ok(Ok(end)) => end,
             Ok(Err(error)) => return exit_stdout(error),
@@ -112,7 +111,6 @@ async fn node(
         if !end.retries() {
             return exit(&end);
         }
-        metrics.reconnect();
         metrics.peer(elo::metrics::PeerState::Wait);
         let logged = log(&elo::logging::Event::End {
             destination: &destination,
@@ -125,6 +123,7 @@ async fn node(
         if let Err(signal) = signals.unless(tokio::time::sleep(RECONNECT_WAIT)).await {
             return stop(signal);
         }
+        metrics.peer(elo::metrics::PeerState::Dial);
     }
 }
 
