@@ -616,7 +616,7 @@ fn metrics_of_elo_have_its_tip_its_step_and_each_reconnect() {
     ] {
         assert!(metrics.contains(&line), "{line}: {metrics}");
     }
-    assert!(metrics.ends_with("elo_reconnects_total 0\n"), "{metrics}");
+    assert!(metrics.contains("elo_reconnects_total 0\n"), "{metrics}");
 
     bitcoind.cli(&["-named", "disconnectnode", "nodeid=0"]);
     elo.event("end", END_TIMEOUT);
@@ -625,7 +625,7 @@ fn metrics_of_elo_have_its_tip_its_step_and_each_reconnect() {
         metrics.contains("elo_peer_state{state=\"wait\"} 1\n"),
         "{metrics}"
     );
-    assert!(metrics.ends_with("elo_reconnects_total 1\n"), "{metrics}");
+    assert!(metrics.contains("elo_reconnects_total 1\n"), "{metrics}");
 }
 
 #[test]

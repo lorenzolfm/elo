@@ -4,7 +4,7 @@ const PATH: &str = "/metrics";
 
 const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-const BODY_LENGTH_MAX: usize = 1024;
+const BODY_LENGTH_MAX: usize = 2 * 1024;
 
 const SCRAPE_TIMEOUT_DEFAULT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -20,6 +20,9 @@ pub struct Metrics {
     tip: std::cell::Cell<crate::chain::Tip>,
     peer: std::cell::Cell<PeerState>,
     reconnects: std::cell::Cell<u64>,
+    accept_failures: std::cell::Cell<u64>,
+    io_failures: std::cell::Cell<u64>,
+    timeout_failures: std::cell::Cell<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +57,9 @@ impl Metrics {
             tip: std::cell::Cell::new(chain.tip()),
             peer: std::cell::Cell::new(PeerState::Dial),
             reconnects: std::cell::Cell::new(0),
+            accept_failures: std::cell::Cell::new(0),
+            io_failures: std::cell::Cell::new(0),
+            timeout_failures: std::cell::Cell::new(0),
         }
     }
 
@@ -83,7 +89,21 @@ impl Metrics {
     }
 
     pub async fn serve(&self, listener: tokio::net::TcpListener) -> std::convert::Infallible {
-        crate::http::serve(listener, |request| self.answer(request)).await
+        crate::http::serve(
+            listener,
+            |request| self.answer(request),
+            |failure| self.failed(failure),
+        )
+        .await
+    }
+
+    fn failed(&self, failure: crate::http::Failure) {
+        let failures = match failure {
+            crate::http::Failure::Accept => &self.accept_failures,
+            crate::http::Failure::Io => &self.io_failures,
+            crate::http::Failure::Timeout => &self.timeout_failures,
+        };
+        failures.set(failures.get().saturating_add(1));
     }
 
     fn answer(&self, request: crate::http::Request<'_>) -> crate::http::Response {
@@ -129,6 +149,18 @@ impl Metrics {
             "The connections that ended, and that elo dials again after a wait.",
         )
         .sample(self.reconnects.get());
+        let mut family = text.family(
+            "elo_metrics_failures_total",
+            "counter",
+            "The connections to the metrics that failed: an accept error, a read or write error, or no answer in time.",
+        );
+        for (kind, failures) in [
+            ("accept", &self.accept_failures),
+            ("io", &self.io_failures),
+            ("timeout", &self.timeout_failures),
+        ] {
+            family.sample_labelled("kind", kind, failures.get());
+        }
         text.end()
     }
 }
@@ -212,6 +244,11 @@ elo_header_tip_work 2
 # TYPE elo_reconnects_total counter
 ";
 
+    const EXPECTED_FAILURES_HEAD: &str = "\
+# HELP elo_metrics_failures_total The connections to the metrics that failed: an accept error, a read or write error, or no answer in time.
+# TYPE elo_metrics_failures_total counter
+";
+
     fn metrics() -> super::Metrics {
         super::Metrics::new(&crate::chain::Chain::new(
             crate::chainparams::Network::Regtest,
@@ -233,6 +270,14 @@ elo_header_tip_work 2
         metrics
     }
 
+    fn failures(accept: u8, io: u8, timeout: u8) -> String {
+        format!(
+            "elo_metrics_failures_total{{kind=\"accept\"}} {accept}\n\
+             elo_metrics_failures_total{{kind=\"io\"}} {io}\n\
+             elo_metrics_failures_total{{kind=\"timeout\"}} {timeout}\n"
+        )
+    }
+
     fn states(dial: u8, sync: u8, synced: u8, wait: u8) -> String {
         format!(
             "elo_peer_state{{state=\"dial\"}} {dial}\nelo_peer_state{{state=\"sync\"}} {sync}\n\
@@ -243,8 +288,9 @@ elo_header_tip_work 2
     #[test]
     fn text_has_the_tip_of_the_chain_the_dial_and_no_reconnect_at_start() {
         let expected = format!(
-            "{EXPECTED_START}{}{EXPECTED_END}elo_reconnects_total 0\n",
-            states(1, 0, 0, 0)
+            "{EXPECTED_START}{}{EXPECTED_END}elo_reconnects_total 0\n{EXPECTED_FAILURES_HEAD}{}",
+            states(1, 0, 0, 0),
+            failures(0, 0, 0)
         );
         assert_eq!(metrics().text(), expected);
     }
@@ -276,7 +322,22 @@ elo_header_tip_work 2
             assert!(text.contains("elo_header_tip_work 8\n"), "{text}");
             assert!(text.contains(&expected), "{state:?}: {text}");
             let reconnects_line = format!("elo_reconnects_total {reconnects}\n");
-            assert!(text.ends_with(&reconnects_line), "{state:?}: {text}");
+            assert!(text.contains(&reconnects_line), "{state:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn text_has_each_failure_of_its_kind() {
+        let metrics = metrics();
+        for (failure, expected) in [
+            (crate::http::Failure::Timeout, failures(0, 0, 1)),
+            (crate::http::Failure::Io, failures(0, 1, 1)),
+            (crate::http::Failure::Accept, failures(1, 1, 1)),
+            (crate::http::Failure::Timeout, failures(1, 1, 2)),
+        ] {
+            metrics.failed(failure);
+            let text = metrics.text();
+            assert!(text.ends_with(&expected), "{failure:?}: {text}");
         }
     }
 
@@ -352,10 +413,10 @@ elo_header_tip_work 2
     #[test]
     fn longest_text_is_below_the_maximum() {
         let text = metrics().text();
-        let one_digit_values_length = 3;
+        let one_digit_values_length = 6;
         let work_max_decimal_length = 78;
         let longest_values_length =
-            usize::MAX.to_string().len() + work_max_decimal_length + u64::MAX.to_string().len();
+            usize::MAX.to_string().len() + work_max_decimal_length + 4 * u64::MAX.to_string().len();
         let longest = text.len() - one_digit_values_length + longest_values_length;
         assert!(longest <= super::BODY_LENGTH_MAX, "{longest}");
     }

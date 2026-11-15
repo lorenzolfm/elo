@@ -29,6 +29,13 @@ pub(crate) enum Response {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Failure {
+    Accept,
+    Io,
+    Timeout,
+}
+
 #[derive(Debug)]
 enum HeadError {
     Io(std::io::Error),
@@ -51,14 +58,22 @@ pub(crate) fn listen(
 pub(crate) async fn serve(
     listener: tokio::net::TcpListener,
     answer: impl Fn(Request<'_>) -> Response,
+    failed: impl Fn(Failure),
 ) -> std::convert::Infallible {
     loop {
         match listener.accept().await {
             Ok((mut stream, _)) => {
                 let exchange = exchange(&mut stream, &answer);
-                let _ = tokio::time::timeout(EXCHANGE_TIMEOUT, exchange).await;
+                match tokio::time::timeout(EXCHANGE_TIMEOUT, exchange).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => failed(Failure::Io),
+                    Err(_) => failed(Failure::Timeout),
+                }
             }
-            Err(_) => tokio::time::sleep(ACCEPT_ERROR_WAIT).await,
+            Err(_) => {
+                failed(Failure::Accept);
+                tokio::time::sleep(ACCEPT_ERROR_WAIT).await;
+            }
         }
     }
 }
@@ -305,6 +320,41 @@ mod tests {
                 assert_eq!(received, expected, "{:?}", String::from_utf8_lossy(sent));
             }
         });
+    }
+
+    #[test]
+    fn serve_counts_a_connection_with_no_head_in_time_and_one_reset_and_answers_the_next() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let listener = super::listen("127.0.0.1:0".parse().unwrap()).unwrap();
+                let address = listener.local_addr().unwrap();
+                let idle = tokio::net::TcpStream::connect(address).await.unwrap();
+                let reset = tokio::net::TcpStream::connect(address).await.unwrap();
+                reset.set_zero_linger().unwrap();
+                drop(reset);
+                let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+                client.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+                let failures = std::cell::RefCell::new(Vec::new());
+                let serve = super::serve(listener, answer, |failure| {
+                    failures.borrow_mut().push(failure);
+                });
+                let served = tokio::time::timeout(super::EXCHANGE_TIMEOUT * 3, serve).await;
+                assert!(served.is_err());
+                assert_eq!(
+                    *failures.borrow(),
+                    [super::Failure::Timeout, super::Failure::Io]
+                );
+                let mut received = String::new();
+                client.read_to_string(&mut received).await.unwrap();
+                assert!(received.starts_with("HTTP/1.1 200 OK\r\n"), "{received}");
+                assert!(received.ends_with("\r\n\r\nGET /"), "{received}");
+                drop(idle);
+            });
     }
 
     #[test]

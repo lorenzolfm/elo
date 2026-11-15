@@ -128,6 +128,7 @@ container. Port 0 takes a free port. elo logs the address in a `metrics` line be
 | `elo_header_tip_work` | gauge | The work of the chain up to the tip, in decimal |
 | `elo_peer_state` | gauge | 1 for the step of the connection, and 0 for each other. The `state` label is `dial`, `sync`, `synced` or `wait` |
 | `elo_reconnects_total` | counter | The connections that ended, and that elo dials again after the wait |
+| `elo_metrics_failures_total` | counter | The connections to the metrics that failed. The `kind` label is `accept` for an accept error, `io` for a read or write error, or `timeout` for no answer in 1 s |
 
 The tip moves when the `tip` line does: at the end of a sync, and then with each new tip. As for the
 log, the names are an interface, and `src/metrics.rs` holds them. elo answers one connection at a
