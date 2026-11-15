@@ -343,23 +343,24 @@ enum ReceiveError {
 
 #[derive(Debug)]
 pub struct Connection<'a> {
-    socket: Socket,
+    socket: Socket<'a>,
     peer: crate::net_processing::Peer<'a>,
     address: std::net::SocketAddr,
 }
 
 #[derive(Debug)]
 pub struct Synced<'a> {
-    socket: Socket,
+    socket: Socket<'a>,
     peer: crate::net_processing::Peer<'a>,
     tip: crate::chain::Tip,
 }
 
 #[derive(Debug)]
-struct Socket {
+struct Socket<'a> {
     stream: tokio::net::TcpStream,
     network: crate::chainparams::Network,
     frame: PartialFrame,
+    metrics: &'a crate::metrics::Metrics,
 }
 
 #[derive(Debug)]
@@ -378,12 +379,13 @@ enum PartialFrame {
 pub async fn handshake<'a>(
     destination: &Destination,
     chain: &'a mut crate::chain::Chain,
+    metrics: &'a crate::metrics::Metrics,
 ) -> Result<(Connection<'a>, crate::protocol::Version), HandshakeError> {
     let addresses = addresses(destination)
         .await
         .map_err(HandshakeError::Lookup)?;
     let (address, stream) = connect_first(&addresses).await?;
-    handshake_stream(address, stream, chain).await
+    handshake_stream(address, stream, chain, metrics).await
 }
 
 async fn addresses(destination: &Destination) -> Result<Addresses, LookupError> {
@@ -489,25 +491,27 @@ async fn connect(address: PeerAddress) -> Result<tokio::net::TcpStream, ConnectE
     }
 }
 
-async fn handshake_stream(
+async fn handshake_stream<'a>(
     address: std::net::SocketAddr,
     stream: tokio::net::TcpStream,
-    chain: &mut crate::chain::Chain,
-) -> Result<(Connection<'_>, crate::protocol::Version), HandshakeError> {
-    let exchange = handshake_stream_exchange(address, stream, chain);
+    chain: &'a mut crate::chain::Chain,
+    metrics: &'a crate::metrics::Metrics,
+) -> Result<(Connection<'a>, crate::protocol::Version), HandshakeError> {
+    let exchange = handshake_stream_exchange(address, stream, chain, metrics);
     match tokio::time::timeout(HANDSHAKE_TIMEOUT, exchange).await {
         Ok(result) => result,
         Err(_elapsed) => Err(HandshakeError::HandshakeTimeout),
     }
 }
 
-async fn handshake_stream_exchange(
+async fn handshake_stream_exchange<'a>(
     address: std::net::SocketAddr,
     stream: tokio::net::TcpStream,
-    chain: &mut crate::chain::Chain,
-) -> Result<(Connection<'_>, crate::protocol::Version), HandshakeError> {
+    chain: &'a mut crate::chain::Chain,
+    metrics: &'a crate::metrics::Metrics,
+) -> Result<(Connection<'a>, crate::protocol::Version), HandshakeError> {
     let network = chain.network();
-    let mut socket = Socket::new(stream, network);
+    let mut socket = Socket::new(stream, network, metrics);
     let work_min = crate::pow::chain_work_min(network);
     let salt = salt().map_err(HandshakeError::Salt)?;
     let (mut handshake, outbound) = crate::net_processing::Handshake::start(
@@ -589,7 +593,7 @@ impl<'a> Synced<'a> {
 }
 
 async fn run_turn<'a>(
-    socket: &mut Socket,
+    socket: &mut Socket<'_>,
     peer: crate::net_processing::Peer<'a>,
 ) -> Result<(crate::net_processing::Peer<'a>, Option<crate::chain::Tip>), RunError> {
     let now = tokio::time::Instant::now().into_std();
@@ -605,7 +609,7 @@ async fn run_turn<'a>(
 }
 
 async fn run_exchange<'a>(
-    socket: &mut Socket,
+    socket: &mut Socket<'_>,
     peer: crate::net_processing::Peer<'a>,
     message: &crate::transport::Message,
 ) -> Result<(crate::net_processing::Peer<'a>, Option<crate::chain::Tip>), RunError> {
@@ -631,7 +635,7 @@ async fn run_exchange<'a>(
 }
 
 async fn run_send(
-    socket: &mut Socket,
+    socket: &mut Socket<'_>,
     outbound: &crate::net_processing::PeerOutbound,
 ) -> Result<(), RunError> {
     let send = socket.send_peer_outbound(outbound);
@@ -641,12 +645,17 @@ async fn run_send(
     }
 }
 
-impl Socket {
-    fn new(stream: tokio::net::TcpStream, network: crate::chainparams::Network) -> Socket {
+impl<'a> Socket<'a> {
+    fn new(
+        stream: tokio::net::TcpStream,
+        network: crate::chainparams::Network,
+        metrics: &'a crate::metrics::Metrics,
+    ) -> Socket<'a> {
         Socket {
             stream,
             network,
             frame: PartialFrame::new(),
+            metrics,
         }
     }
 
@@ -693,7 +702,9 @@ impl Socket {
         payload: &[u8],
     ) -> Result<(), std::io::Error> {
         let frame = crate::transport::encode(self.network, msg_type, payload);
-        self.stream.write_all(&frame).await
+        self.stream.write_all(&frame).await?;
+        self.metrics.sent(msg_type, payload.len());
+        Ok(())
     }
 
     async fn receive(&mut self) -> Result<crate::transport::Message, ReceiveError> {
@@ -704,6 +715,8 @@ impl Socket {
                 .map_err(ReceiveError::Transport)?
             {
                 assert!(matches!(self.frame, PartialFrame::Header { filled: 0, .. }));
+                self.metrics
+                    .received(message.msg_type(), message.payload().len());
                 return Ok(message);
             }
             self.read().await?;
@@ -1018,6 +1031,7 @@ mod tests {
     #[test]
     fn their_version_gets_our_verack() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        let metrics = crate::metrics::Metrics::new(&chain);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || {
@@ -1036,7 +1050,7 @@ mod tests {
             verack
         });
 
-        let result = block_on(super::handshake(&destination(peer), &mut chain));
+        let result = block_on(super::handshake(&destination(peer), &mut chain, &metrics));
         let verack = peer_thread.join().unwrap();
         assert_eq!(verack, crate::fixtures::hex(crate::fixtures::VERACK_FRAME));
         assert!(result.is_ok(), "{result:?}");
@@ -1045,6 +1059,7 @@ mod tests {
     #[test]
     fn our_version_has_the_local_clock_in_seconds() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        let metrics = crate::metrics::Metrics::new(&chain);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || {
@@ -1062,7 +1077,7 @@ mod tests {
             i64::try_from(elapsed.as_secs()).unwrap()
         };
         let before = seconds();
-        let _closed = block_on(super::handshake(&destination(peer), &mut chain));
+        let _closed = block_on(super::handshake(&destination(peer), &mut chain, &metrics));
         let after = seconds();
         let message = peer_thread.join().unwrap();
         assert_eq!(message.msg_type(), crate::protocol::VERSION);
@@ -1077,13 +1092,14 @@ mod tests {
     #[test]
     fn silent_peer_is_handshake_timeout() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        let metrics = crate::metrics::Metrics::new(&chain);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let (result, elapsed) = block_on(async {
             let stream = tokio::net::TcpStream::connect(peer).await.unwrap();
             tokio::time::pause();
             let start = tokio::time::Instant::now();
-            let result = super::handshake_stream(peer, stream, &mut chain).await;
+            let result = super::handshake_stream(peer, stream, &mut chain, &metrics).await;
             (result, start.elapsed())
         });
         assert!(
@@ -1096,6 +1112,7 @@ mod tests {
     #[test]
     fn silent_peer_after_our_getheaders_is_headers_timeout() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        let metrics = crate::metrics::Metrics::new(&chain);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || {
@@ -1108,7 +1125,7 @@ mod tests {
         });
 
         let (result, elapsed) = block_on(async {
-            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain, &metrics)
                 .await
                 .unwrap();
             tokio::time::pause();
@@ -1136,6 +1153,7 @@ mod tests {
     #[test]
     fn header_far_after_the_local_clock_ends_the_connection() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        let metrics = crate::metrics::Metrics::new(&chain);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || {
@@ -1160,7 +1178,7 @@ mod tests {
         });
 
         let result = block_on(async {
-            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain, &metrics)
                 .await
                 .unwrap();
             connection.sync().await
@@ -1181,6 +1199,7 @@ mod tests {
     fn sync_that_ends_below_the_minimum_of_the_network_ends_the_connection() {
         let network = crate::chainparams::Network::Signet;
         let mut chain = crate::chain::Chain::new(network);
+        let metrics = crate::metrics::Metrics::new(&chain);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || {
@@ -1215,7 +1234,7 @@ mod tests {
         });
 
         let result = block_on(async {
-            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain, &metrics)
                 .await
                 .unwrap();
             connection.sync().await
@@ -1242,6 +1261,7 @@ mod tests {
     #[test]
     fn silent_peer_after_the_sync_is_ping_timeout() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        let metrics = crate::metrics::Metrics::new(&chain);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || {
@@ -1256,7 +1276,7 @@ mod tests {
         });
 
         let (error, elapsed) = block_on(async {
-            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain, &metrics)
                 .await
                 .unwrap();
             let start = tokio::time::Instant::now();
@@ -1284,6 +1304,7 @@ mod tests {
     #[test]
     fn empty_announcement_after_the_sync_does_not_give_the_tip_again() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        let metrics = crate::metrics::Metrics::new(&chain);
         let headers = crate::fixtures::headers_on_genesis(1);
         let announcement = crate::transport::encode(
             crate::chainparams::Network::Regtest,
@@ -1307,7 +1328,7 @@ mod tests {
         });
 
         let (synced_tip, next_tip) = block_on(async {
-            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain, &metrics)
                 .await
                 .unwrap();
             let (synced, synced_tip) = connection.sync().await.unwrap();
@@ -1324,6 +1345,7 @@ mod tests {
     #[test]
     fn pong_moves_the_next_ping_to_ping_interval_after_the_last() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        let metrics = crate::metrics::Metrics::new(&chain);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || {
@@ -1345,7 +1367,7 @@ mod tests {
         });
 
         let (error, elapsed) = block_on(async {
-            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain, &metrics)
                 .await
                 .unwrap();
             let start = tokio::time::Instant::now();
@@ -1375,12 +1397,13 @@ mod tests {
     #[test]
     fn peer_that_stops_reading_is_send_timeout() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        let metrics = crate::metrics::Metrics::new(&chain);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || accept_handshake(&listener));
 
         let (result, elapsed) = block_on(async {
-            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain, &metrics)
                 .await
                 .unwrap();
             let _stream = peer_thread.join().unwrap();
@@ -1409,6 +1432,7 @@ mod tests {
     #[test]
     fn peer_that_closes_inside_a_frame_is_closed() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        let metrics = crate::metrics::Metrics::new(&chain);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || {
@@ -1418,7 +1442,7 @@ mod tests {
             stream.write_all(&frame[..frame.len() - 1]).unwrap();
         });
 
-        let result = block_on(super::handshake(&destination(peer), &mut chain));
+        let result = block_on(super::handshake(&destination(peer), &mut chain, &metrics));
         peer_thread.join().unwrap();
         assert!(
             matches!(result, Err(super::HandshakeError::Closed)),
@@ -1428,6 +1452,8 @@ mod tests {
 
     #[test]
     fn frame_split_by_a_timeout_is_received_whole() {
+        let chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        let metrics = crate::metrics::Metrics::new(&chain);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let (first_sent, first_sent_receiver) = std::sync::mpsc::channel();
@@ -1444,7 +1470,8 @@ mod tests {
 
         let (timeout, message) = block_on(async {
             let stream = tokio::net::TcpStream::connect(peer).await.unwrap();
-            let mut socket = super::Socket::new(stream, crate::chainparams::Network::Regtest);
+            let mut socket =
+                super::Socket::new(stream, crate::chainparams::Network::Regtest, &metrics);
             first_sent_receiver.recv().unwrap();
             tokio::time::pause();
             let receive = socket.receive();
@@ -1463,6 +1490,7 @@ mod tests {
     #[test]
     fn ping_in_one_write_with_their_verack_gets_a_pong() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        let metrics = crate::metrics::Metrics::new(&chain);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let peer = listener.local_addr().unwrap();
         let peer_thread = std::thread::spawn(move || {
@@ -1484,7 +1512,7 @@ mod tests {
         });
 
         let result = block_on(async {
-            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain)
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain, &metrics)
                 .await
                 .unwrap();
             connection.sync().await
@@ -1502,11 +1530,12 @@ mod tests {
     #[test]
     fn refused_connect_is_connect_error() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        let metrics = crate::metrics::Metrics::new(&chain);
         let peer = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap();
-        let result = block_on(super::handshake(&destination(peer), &mut chain));
+        let result = block_on(super::handshake(&destination(peer), &mut chain, &metrics));
         let Err(error) = result else {
             panic!("{result:?}");
         };

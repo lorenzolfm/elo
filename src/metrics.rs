@@ -4,18 +4,37 @@ const PATH: &str = "/metrics";
 
 const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
-const BODY_LENGTH_MAX: usize = 2 * 1024;
+const BODY_LENGTH_MAX: usize = 8 * 1024;
 
 const SCRAPE_TIMEOUT_DEFAULT: std::time::Duration = std::time::Duration::from_secs(10);
 
 const _: () =
     assert!(crate::http::EXCHANGE_TIMEOUT.as_millis() < SCRAPE_TIMEOUT_DEFAULT.as_millis());
 
+const COMMANDS: [(crate::protocol::MessageType, &str); 10] = [
+    (crate::protocol::VERSION, "version"),
+    (crate::protocol::VERACK, "verack"),
+    (crate::protocol::PING, "ping"),
+    (crate::protocol::PONG, "pong"),
+    (crate::protocol::GETHEADERS, "getheaders"),
+    (crate::protocol::HEADERS, "headers"),
+    (crate::protocol::WTXIDRELAY, "wtxidrelay"),
+    (crate::protocol::SENDADDRV2, "sendaddrv2"),
+    (crate::protocol::SENDHEADERS, "sendheaders"),
+    (crate::protocol::INV, "inv"),
+];
+
+const COMMAND_OTHER: &str = "other";
+
+const COMMANDS_COUNT: usize = COMMANDS.len() + 1;
+
 #[derive(Debug)]
 pub struct Metrics {
     tip: std::cell::Cell<crate::chain::Tip>,
     peer: std::cell::Cell<PeerState>,
     reconnects: std::cell::Cell<u64>,
+    received: Traffic,
+    sent: Traffic,
     accept_failures: std::cell::Cell<u64>,
     io_failures: std::cell::Cell<u64>,
     timeout_failures: std::cell::Cell<u64>,
@@ -54,6 +73,8 @@ impl Metrics {
             tip: std::cell::Cell::new(chain.tip()),
             peer: std::cell::Cell::new(PeerState::Dial),
             reconnects: std::cell::Cell::new(0),
+            received: Traffic::new(),
+            sent: Traffic::new(),
             accept_failures: std::cell::Cell::new(0),
             io_failures: std::cell::Cell::new(0),
             timeout_failures: std::cell::Cell::new(0),
@@ -78,6 +99,14 @@ impl Metrics {
             }
         }
         self.peer.set(state);
+    }
+
+    pub(crate) fn received(&self, msg_type: crate::protocol::MessageType, payload_length: usize) {
+        self.received.count(msg_type, payload_length);
+    }
+
+    pub(crate) fn sent(&self, msg_type: crate::protocol::MessageType, payload_length: usize) {
+        self.sent.count(msg_type, payload_length);
     }
 
     pub fn listen(
@@ -145,9 +174,36 @@ impl Metrics {
         text.family(
             "elo_reconnects_total",
             Kind::Counter,
-            "The connections that ended, and that elo dials again after a wait.",
+            "Each failed lookup, dial or handshake and each connection that ended, after which elo waits and dials again.",
         )
         .sample(self.reconnects.get());
+        for (name, help, counts) in [
+            (
+                "elo_peer_received_messages_total",
+                "The messages from the peer that elo read whole and checked, by command: other for each command that elo does not know.",
+                &self.received.messages,
+            ),
+            (
+                "elo_peer_received_bytes_total",
+                "The bytes of the messages from the peer, with their headers, by command.",
+                &self.received.bytes,
+            ),
+            (
+                "elo_peer_sent_messages_total",
+                "The messages to the peer that elo wrote whole, by command.",
+                &self.sent.messages,
+            ),
+            (
+                "elo_peer_sent_bytes_total",
+                "The bytes of the messages to the peer, with their headers, by command.",
+                &self.sent.bytes,
+            ),
+        ] {
+            let mut family = text.family(name, Kind::Counter, help);
+            for (command, count) in command_names().zip(counts) {
+                family.sample_labelled("command", command, count.get());
+            }
+        }
         let mut family = text.family(
             "elo_metrics_failures_total",
             Kind::Counter,
@@ -163,6 +219,41 @@ impl Metrics {
         }
         text.end()
     }
+}
+
+#[derive(Debug)]
+struct Traffic {
+    messages: [std::cell::Cell<u64>; COMMANDS_COUNT],
+    bytes: [std::cell::Cell<u64>; COMMANDS_COUNT],
+}
+
+impl Traffic {
+    fn new() -> Traffic {
+        Traffic {
+            messages: [const { std::cell::Cell::new(0) }; COMMANDS_COUNT],
+            bytes: [const { std::cell::Cell::new(0) }; COMMANDS_COUNT],
+        }
+    }
+
+    fn count(&self, msg_type: crate::protocol::MessageType, payload_length: usize) {
+        let index = COMMANDS
+            .iter()
+            .position(|(known, _)| *known == msg_type)
+            .unwrap_or(COMMANDS.len());
+        let length = crate::transport::MESSAGE_HEADER_SIZE.saturating_add(payload_length);
+        let length = u64::try_from(length).unwrap_or(u64::MAX);
+        let messages = &self.messages[index];
+        messages.set(messages.get().saturating_add(1));
+        let bytes = &self.bytes[index];
+        bytes.set(bytes.get().saturating_add(length));
+    }
+}
+
+fn command_names() -> impl Iterator<Item = &'static str> {
+    COMMANDS
+        .iter()
+        .map(|(_, name)| *name)
+        .chain([COMMAND_OTHER])
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -294,7 +385,7 @@ elo_header_tip_work 2
 ";
 
     const EXPECTED_END: &str = "\
-# HELP elo_reconnects_total The connections that ended, and that elo dials again after a wait.
+# HELP elo_reconnects_total Each failed lookup, dial or handshake and each connection that ended, after which elo waits and dials again.
 # TYPE elo_reconnects_total counter
 ";
 
@@ -302,6 +393,39 @@ elo_header_tip_work 2
 # HELP elo_metrics_failures_total The connections to the metrics that failed: an accept error, a read or write error, no answer in time, or a newer connection in its place.
 # TYPE elo_metrics_failures_total counter
 ";
+
+    const EXPECTED_TRAFFIC_HEADS: [&str; 4] = [
+        "\
+# HELP elo_peer_received_messages_total The messages from the peer that elo read whole and checked, by command: other for each command that elo does not know.
+# TYPE elo_peer_received_messages_total counter
+",
+        "\
+# HELP elo_peer_received_bytes_total The bytes of the messages from the peer, with their headers, by command.
+# TYPE elo_peer_received_bytes_total counter
+",
+        "\
+# HELP elo_peer_sent_messages_total The messages to the peer that elo wrote whole, by command.
+# TYPE elo_peer_sent_messages_total counter
+",
+        "\
+# HELP elo_peer_sent_bytes_total The bytes of the messages to the peer, with their headers, by command.
+# TYPE elo_peer_sent_bytes_total counter
+",
+    ];
+
+    const COMMAND_NAMES: [&str; 11] = [
+        "version",
+        "verack",
+        "ping",
+        "pong",
+        "getheaders",
+        "headers",
+        "wtxidrelay",
+        "sendaddrv2",
+        "sendheaders",
+        "inv",
+        "other",
+    ];
 
     fn metrics() -> super::Metrics {
         super::Metrics::new(&crate::chain::Chain::new(
@@ -333,6 +457,26 @@ elo_header_tip_work 2
         )
     }
 
+    fn traffic(family: usize, counts: [u64; 11]) -> String {
+        let name = [
+            "elo_peer_received_messages_total",
+            "elo_peer_received_bytes_total",
+            "elo_peer_sent_messages_total",
+            "elo_peer_sent_bytes_total",
+        ][family];
+        let mut traffic = String::from(EXPECTED_TRAFFIC_HEADS[family]);
+        for (command, count) in COMMAND_NAMES.into_iter().zip(counts) {
+            traffic.push_str(&format!("{name}{{command=\"{command}\"}} {count}\n"));
+        }
+        traffic
+    }
+
+    fn message_type(name: &str) -> crate::protocol::MessageType {
+        let mut bytes = [0; crate::protocol::MESSAGE_TYPE_SIZE];
+        bytes[..name.len()].copy_from_slice(name.as_bytes());
+        crate::protocol::MessageType::new(bytes).unwrap()
+    }
+
     fn states(dial: u8, sync: u8, synced: u8, wait: u8) -> String {
         format!(
             "elo_peer_state{{state=\"dial\"}} {dial}\nelo_peer_state{{state=\"sync\"}} {sync}\n\
@@ -343,8 +487,12 @@ elo_header_tip_work 2
     #[test]
     fn text_has_the_tip_of_the_chain_the_dial_and_no_reconnect_at_start() {
         let expected = format!(
-            "{EXPECTED_START}{}{EXPECTED_END}elo_reconnects_total 0\n{EXPECTED_FAILURES_HEAD}{}",
+            "{EXPECTED_START}{}{EXPECTED_END}elo_reconnects_total 0\n{}{}{}{}{EXPECTED_FAILURES_HEAD}{}",
             states(1, 0, 0, 0),
+            traffic(0, [0; 11]),
+            traffic(1, [0; 11]),
+            traffic(2, [0; 11]),
+            traffic(3, [0; 11]),
             failures(0, 0, 0, 0)
         );
         assert_eq!(metrics().text(), expected);
@@ -378,6 +526,106 @@ elo_header_tip_work 2
             assert!(text.contains(&expected), "{state:?}: {text}");
             let reconnects_line = format!("elo_reconnects_total {reconnects}\n");
             assert!(text.contains(&reconnects_line), "{state:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn text_has_each_message_and_its_bytes_with_the_header_by_its_command_and_other_for_an_unknown_one()
+     {
+        let metrics = metrics();
+        let none = [0; 11];
+        for (step, received, expected) in [
+            (
+                (crate::protocol::VERSION, 102),
+                true,
+                [
+                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [126, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    none,
+                    none,
+                ],
+            ),
+            (
+                (message_type("sendcmpct"), 9),
+                true,
+                [
+                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                    [126, 0, 0, 0, 0, 0, 0, 0, 0, 0, 33],
+                    none,
+                    none,
+                ],
+            ),
+            (
+                (message_type("feefilter"), 8),
+                true,
+                [
+                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+                    [126, 0, 0, 0, 0, 0, 0, 0, 0, 0, 65],
+                    none,
+                    none,
+                ],
+            ),
+            (
+                (crate::protocol::INV, 37),
+                true,
+                [
+                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2],
+                    [126, 0, 0, 0, 0, 0, 0, 0, 0, 61, 65],
+                    none,
+                    none,
+                ],
+            ),
+            (
+                (crate::protocol::VERSION, 0),
+                false,
+                [
+                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2],
+                    [126, 0, 0, 0, 0, 0, 0, 0, 0, 61, 65],
+                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                ],
+            ),
+            (
+                (crate::protocol::GETHEADERS, 1029),
+                false,
+                [
+                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2],
+                    [126, 0, 0, 0, 0, 0, 0, 0, 0, 61, 65],
+                    [1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
+                    [24, 0, 0, 0, 1053, 0, 0, 0, 0, 0, 0],
+                ],
+            ),
+            (
+                (crate::protocol::VERSION, 102),
+                true,
+                [
+                    [2, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2],
+                    [252, 0, 0, 0, 0, 0, 0, 0, 0, 61, 65],
+                    [1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
+                    [24, 0, 0, 0, 1053, 0, 0, 0, 0, 0, 0],
+                ],
+            ),
+        ] {
+            let (msg_type, payload_length) = step;
+            if received {
+                metrics.received(msg_type, payload_length);
+            } else {
+                metrics.sent(msg_type, payload_length);
+            }
+            let text = metrics.text();
+            let expected: String = (0..4)
+                .map(|family| traffic(family, expected[family]))
+                .collect();
+            assert!(text.contains(&expected), "{msg_type:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn name_of_each_known_command_is_its_message_type() {
+        let names: Vec<&str> = super::command_names().collect();
+        assert_eq!(names, COMMAND_NAMES);
+        for (msg_type, name) in super::COMMANDS {
+            assert_eq!(message_type(name), msg_type, "{name}");
         }
     }
 
@@ -478,14 +726,18 @@ elo_header_tip_work 2
     fn text_whose_values_can_grow_past_the_maximum_is_a_bug() {
         let text = |samples| {
             let mut text = super::Text::new();
-            let mut family = text.family("elo_a", super::Kind::Gauge, "AAAAAAAAAAAAAAAAA");
+            let mut family = text.family(
+                "elo_a",
+                super::Kind::Gauge,
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            );
             for _ in 0..samples {
                 family.sample(0_u64);
             }
             text.end()
         };
-        assert_eq!(text(74).len() + 74 * 19, super::BODY_LENGTH_MAX);
-        let ended = std::panic::catch_unwind(|| text(75));
+        assert_eq!(text(301).len() + 301 * 19, super::BODY_LENGTH_MAX);
+        let ended = std::panic::catch_unwind(|| text(302));
         assert!(ended.is_err());
     }
 
