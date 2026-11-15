@@ -590,6 +590,78 @@ fn announcement_before_the_answer_to_our_getheaders_keeps_the_connection() {
     );
 }
 
+#[test]
+fn metrics_of_elo_have_its_tip_its_step_and_each_reconnect() {
+    let bitcoind = Bitcoind::start();
+    bitcoind.cli(&["generatetodescriptor", "2001", "raw(51)"]);
+    let best = bitcoind.cli(&["getbestblockhash"]);
+    let chain_work = bitcoind.cli(&["getblockheader", best.trim_end()]);
+    let chain_work = u128::from_str_radix(string_field(&chain_work, "chainwork"), 16).unwrap();
+    let peer = bitcoind.peer.to_string();
+    let elo = Elo::start_with(&["--metrics", "127.0.0.1:0", "regtest", &peer]);
+    let listen = elo.event("metrics", SYNC_TIMEOUT);
+    let address = listen
+        .strip_prefix("level=info event=metrics address=")
+        .unwrap();
+    let address: std::net::SocketAddr = address.parse().unwrap();
+    assert!(address.ip().is_loopback(), "{address}");
+    assert_ne!(address.port(), 0);
+    elo.event("tip", SYNC_TIMEOUT);
+
+    let metrics = scrape(address);
+    for line in [
+        String::from("elo_header_tip_height 2001\n"),
+        format!("elo_header_tip_work {chain_work}\n"),
+        String::from("elo_peer_state{state=\"synced\"} 1\n"),
+    ] {
+        assert!(metrics.contains(&line), "{line}: {metrics}");
+    }
+    assert!(metrics.contains("elo_reconnects_total 0\n"), "{metrics}");
+
+    bitcoind.cli(&["-named", "disconnectnode", "nodeid=0"]);
+    elo.event("end", END_TIMEOUT);
+    let metrics = scrape(address);
+    assert!(
+        metrics.contains("elo_peer_state{state=\"wait\"} 1\n"),
+        "{metrics}"
+    );
+    assert!(metrics.contains("elo_reconnects_total 1\n"), "{metrics}");
+}
+
+#[test]
+fn metrics_address_in_use_exits_with_1() {
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = taken.local_addr().unwrap().to_string();
+    let mut elo = Elo::start_with(&["--metrics", &address, "regtest", "127.0.0.1"]);
+    let exit = elo.event("exit", END_TIMEOUT);
+    assert!(
+        exit.starts_with("level=error event=exit reason=\"metrics: "),
+        "{exit}"
+    );
+    assert_eq!(elo.exit_code(), Some(1));
+}
+
+fn scrape(address: std::net::SocketAddr) -> String {
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+    std::io::Write::write_all(
+        &mut stream,
+        b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n",
+    )
+    .unwrap();
+    let mut response = String::new();
+    std::io::Read::read_to_string(&mut stream, &mut response).unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    assert_eq!(
+        head,
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\n\
+             Content-Length: {}\r\nConnection: close",
+            body.len()
+        )
+    );
+    body.to_owned()
+}
+
 fn settle(bitcoind: &Bitcoind, elo: &Elo) {
     let start = std::time::Instant::now();
     loop {
@@ -672,9 +744,12 @@ impl Elo {
     }
 
     fn start_on(peer: &str) -> Self {
+        Self::start_with(&["regtest", peer])
+    }
+
+    fn start_with(args: &[&str]) -> Self {
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
-            .arg("regtest")
-            .arg(peer)
+            .args(args)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()

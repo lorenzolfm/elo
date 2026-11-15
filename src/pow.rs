@@ -54,6 +54,15 @@ impl Target {
     }
 }
 
+const DECIMAL_CHUNK_BASE: u64 = 10_u64.pow(19);
+
+const DECIMAL_CHUNK_DIVISOR: Work = Work {
+    high: 0,
+    low: DECIMAL_CHUNK_BASE as u128,
+};
+
+const DECIMAL_CHUNKS_COUNT: usize = 5;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Work {
     high: u128,
@@ -107,9 +116,13 @@ impl Work {
     }
 
     fn divided_by(self, divisor: Work) -> Work {
+        self.divided_with_remainder(divisor).0
+    }
+
+    fn divided_with_remainder(self, divisor: Work) -> (Work, Work) {
         assert_ne!(divisor, Work::ZERO);
         let Some(shift) = divisor.leading_zeros().checked_sub(self.leading_zeros()) else {
-            return Work::ZERO;
+            return (Work::ZERO, self);
         };
         let mut step_divisor = divisor.shifted_left(shift);
         let mut remainder = self;
@@ -124,7 +137,11 @@ impl Work {
         }
         assert!(remainder < divisor);
         assert!(quotient <= self);
-        quotient
+        (quotient, remainder)
+    }
+
+    pub(crate) fn decimal(self) -> Decimal {
+        Decimal(self)
     }
 
     fn shifted_left(self, bits: u32) -> Work {
@@ -166,6 +183,36 @@ impl Work {
                 ..shifted
             }
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Decimal(Work);
+
+impl Decimal {
+    pub(crate) const LENGTH_MAX: usize = 78;
+}
+
+impl std::fmt::Display for Decimal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut chunks = [0_u64; DECIMAL_CHUNKS_COUNT];
+        let mut rest = self.0;
+        for chunk in chunks.iter_mut().rev() {
+            let (quotient, remainder) = rest.divided_with_remainder(DECIMAL_CHUNK_DIVISOR);
+            assert_eq!(remainder.high, 0);
+            *chunk = u64::try_from(remainder.low).unwrap_or(u64::MAX);
+            assert!(*chunk < DECIMAL_CHUNK_BASE);
+            rest = quotient;
+        }
+        assert_eq!(rest, Work::ZERO);
+        let first_index = chunks
+            .iter()
+            .position(|chunk| *chunk != 0)
+            .unwrap_or(DECIMAL_CHUNKS_COUNT - 1);
+        write!(f, "{}", chunks[first_index])?;
+        chunks[first_index + 1..]
+            .iter()
+            .try_for_each(|chunk| write!(f, "{chunk:019}"))
     }
 }
 
@@ -967,6 +1014,33 @@ mod tests {
                 "{bits:#010x}"
             );
         }
+    }
+
+    #[test]
+    fn decimal_of_work_is_its_number_in_base_ten() {
+        let work = |high, low| super::Work { high, low };
+        for (number, expected) in [
+            (super::Work::ZERO, "0"),
+            (work(0, 2), "2"),
+            (work(0, 9_999_999_999_999_999_999), "9999999999999999999"),
+            (work(0, 10_000_000_000_000_000_000), "10000000000000000000"),
+            (work(0, 10_000_000_000_000_000_001), "10000000000000000001"),
+            (
+                work(0, u128::MAX),
+                "340282366920938463463374607431768211455",
+            ),
+            (work(1, 0), "340282366920938463463374607431768211456"),
+            (
+                super::Work::MAX,
+                "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+            ),
+        ] {
+            assert_eq!(number.decimal().to_string(), expected, "{number}");
+        }
+        assert_eq!(
+            super::Work::MAX.decimal().to_string().len(),
+            super::Decimal::LENGTH_MAX
+        );
     }
 
     #[test]

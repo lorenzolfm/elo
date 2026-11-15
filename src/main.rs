@@ -1,4 +1,5 @@
-const USAGE: &str = "usage: elo <mainnet|testnet4|signet|regtest> [<ip|name>[:port]]
+const USAGE: &str =
+    "usage: elo [--metrics [<ip>:]<port>] <mainnet|testnet4|signet|regtest> [<ip|name>[:port]]
 regtest has no seeds, so it needs a peer";
 
 const EXIT_USAGE: u8 = 2;
@@ -14,7 +15,7 @@ fn main() -> std::process::ExitCode {
     }));
 
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    let Some((network, source)) = parse(&args) else {
+    let Some(options) = parse(&args) else {
         eprintln!("{USAGE}");
         return std::process::ExitCode::from(EXIT_USAGE);
     };
@@ -27,23 +28,82 @@ fn main() -> std::process::ExitCode {
         Ok(runtime) => runtime,
         Err(error) => return exit(&format_args!("runtime: {error}")),
     };
-    let code = runtime.block_on(run(network, source));
+    let code = runtime.block_on(run(options));
     runtime.shutdown_background();
     code
 }
 
-async fn run(
+#[derive(Debug, PartialEq, Eq)]
+struct Options {
     network: elo::chainparams::Network,
     source: elo::net::Source,
-) -> std::process::ExitCode {
+    metrics: Option<std::net::SocketAddr>,
+}
+
+async fn run(options: Options) -> std::process::ExitCode {
     let mut signals = match Signals::new() {
         Ok(signals) => signals,
         Err(error) => return exit(&format_args!("signals: {error}")),
     };
-    let mut chain = elo::chain::Chain::new(network);
+    let listener = match options.metrics {
+        None => None,
+        Some(address) => match listen(address) {
+            Ok((listener, address)) => {
+                if let Err(error) = log(&elo::logging::Event::Metrics { address }) {
+                    return exit_stdout(error);
+                }
+                Some(listener)
+            }
+            Err(error) => return exit(&format_args!("metrics: {error}")),
+        },
+    };
+    let mut chain = elo::chain::Chain::new(options.network);
+    let metrics = elo::metrics::Metrics::new(&chain);
+    let serve = async {
+        match listener {
+            Some(listener) => metrics.serve(listener).await,
+            None => std::future::pending().await,
+        }
+    };
+    let node = node(&options.source, &mut chain, &metrics, &mut signals);
+    beside(serve, node).await
+}
+
+fn listen(
+    address: std::net::SocketAddr,
+) -> Result<(tokio::net::TcpListener, std::net::SocketAddr), std::io::Error> {
+    let listener = elo::metrics::Metrics::listen(address)?;
+    let address = listener.local_addr()?;
+    Ok((listener, address))
+}
+
+async fn beside<T>(
+    background: impl Future<Output = std::convert::Infallible>,
+    work: impl Future<Output = T>,
+) -> T {
+    let mut background = std::pin::pin!(background);
+    let mut work = std::pin::pin!(work);
+    std::future::poll_fn(|context| {
+        if let std::task::Poll::Ready(output) = work.as_mut().poll(context) {
+            return std::task::Poll::Ready(output);
+        }
+        match background.as_mut().poll(context) {
+            std::task::Poll::Ready(never) => match never {},
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    })
+    .await
+}
+
+async fn node(
+    source: &elo::net::Source,
+    chain: &mut elo::chain::Chain,
+    metrics: &elo::metrics::Metrics,
+    signals: &mut Signals,
+) -> std::process::ExitCode {
     loop {
         let destination = source.destination();
-        let end = match signals.unless(dial(&destination, &mut chain)).await {
+        let end = match signals.unless(dial(&destination, chain, metrics)).await {
             Ok(Ok(end)) => end,
             Ok(Err(error)) => return exit_stdout(error),
             Err(signal) => return stop(signal),
@@ -51,6 +111,7 @@ async fn run(
         if !end.retries() {
             return exit(&end);
         }
+        metrics.peer(elo::metrics::PeerState::Wait);
         let logged = log(&elo::logging::Event::End {
             destination: &destination,
             reason: &end,
@@ -62,6 +123,7 @@ async fn run(
         if let Err(signal) = signals.unless(tokio::time::sleep(RECONNECT_WAIT)).await {
             return stop(signal);
         }
+        metrics.peer(elo::metrics::PeerState::Dial);
     }
 }
 
@@ -191,11 +253,13 @@ impl std::fmt::Display for End {
 async fn dial(
     destination: &elo::net::Destination,
     chain: &mut elo::chain::Chain,
+    metrics: &elo::metrics::Metrics,
 ) -> Result<End, std::io::Error> {
     let (connection, version) = match elo::net::handshake(destination, chain).await {
         Ok(handshake) => handshake,
         Err(error) => return Ok(End::Handshake(error)),
     };
+    metrics.peer(elo::metrics::PeerState::Sync);
     let address = connection.address();
     log(&elo::logging::Event::Version {
         peer: address,
@@ -206,7 +270,9 @@ async fn dial(
         Ok(sync) => sync,
         Err(error) => return Ok(End::Run(error)),
     };
+    metrics.peer(elo::metrics::PeerState::Synced);
     loop {
+        metrics.tip(&tip);
         log(&elo::logging::Event::Tip {
             peer: address,
             tip: &tip,
@@ -218,7 +284,13 @@ async fn dial(
     }
 }
 
-fn parse(args: &[std::ffi::OsString]) -> Option<(elo::chainparams::Network, elo::net::Source)> {
+fn parse(args: &[std::ffi::OsString]) -> Option<Options> {
+    let (metrics, args) = match args {
+        [flag, address, args @ ..] if flag == "--metrics" => {
+            (Some(metrics_address(address.to_str()?)?), args)
+        }
+        args => (None, args),
+    };
     let (network, peer) = match args {
         [network] => (network, None),
         [network, peer] => (network, Some(peer)),
@@ -235,7 +307,21 @@ fn parse(args: &[std::ffi::OsString]) -> Option<(elo::chainparams::Network, elo:
         Some(peer) => elo::net::Source::Destination(destination(peer.to_str()?, network)?),
         None => elo::net::Source::Seeds(elo::net::Seeds::new(network)?),
     };
-    Some((network, source))
+    Some(Options {
+        network,
+        source,
+        metrics,
+    })
+}
+
+fn metrics_address(text: &str) -> Option<std::net::SocketAddr> {
+    if let Ok(port) = text.parse() {
+        return Some(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            port,
+        )));
+    }
+    text.parse().ok()
 }
 
 fn destination(peer: &str, network: elo::chainparams::Network) -> Option<elo::net::Destination> {
@@ -268,6 +354,12 @@ fn address(peer: &str, default_port: std::num::NonZeroU16) -> Option<std::net::S
 #[cfg(test)]
 mod tests {
     fn parse(args: &[&str]) -> Option<(elo::chainparams::Network, elo::net::Source)> {
+        let options = parse_options(args)?;
+        assert_eq!(options.metrics, None, "{args:?}");
+        Some((options.network, options.source))
+    }
+
+    fn parse_options(args: &[&str]) -> Option<super::Options> {
         let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
         super::parse(&args)
     }
@@ -412,6 +504,65 @@ mod tests {
                 expected.map(elo::net::Source::Destination),
                 "{peer}"
             );
+        }
+    }
+
+    #[test]
+    fn metrics_flag_before_the_network_takes_a_port_on_localhost_or_an_address() {
+        let localhost = |port| std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        for (address, expected) in [
+            ("9332", Some(localhost(9332))),
+            ("0", Some(localhost(0))),
+            ("127.0.0.1:9332", Some(localhost(9332))),
+            (
+                "0.0.0.0:9332",
+                Some(std::net::SocketAddr::from(([0, 0, 0, 0], 9332))),
+            ),
+            (
+                "[::1]:9332",
+                Some(std::net::SocketAddr::from((
+                    std::net::Ipv6Addr::LOCALHOST,
+                    9332,
+                ))),
+            ),
+            ("65536", None),
+            ("-1", None),
+            ("127.0.0.1", None),
+            ("localhost:9332", None),
+            (":9332", None),
+            ("", None),
+        ] {
+            let options = parse_options(&["--metrics", address, "regtest", "127.0.0.1"]);
+            assert_eq!(
+                options.map(|options| options.metrics),
+                expected.map(Some),
+                "{address}"
+            );
+        }
+        let options = parse_options(&["--metrics", "9332", "regtest", "127.0.0.1"]).unwrap();
+        assert_eq!(options.network, elo::chainparams::Network::Regtest);
+        assert_eq!(
+            options.source,
+            elo::net::Source::Destination(elo::net::Destination::Address(
+                elo::net::PeerAddress::new(localhost(18444)).unwrap()
+            ))
+        );
+        for args in [
+            &["--metrics"][..],
+            &["--metrics", "9332"],
+            &["regtest", "127.0.0.1", "--metrics", "9332"],
+            &["regtest", "--metrics", "9332"],
+            &["--metric", "9332", "regtest", "127.0.0.1"],
+            &[
+                "--metrics",
+                "9332",
+                "--metrics",
+                "9333",
+                "regtest",
+                "127.0.0.1",
+            ],
+        ] {
+            assert_eq!(parse_options(args), None, "{args:?}");
         }
     }
 
