@@ -128,10 +128,12 @@ fn handshake_with_bitcoind_returns_its_version() {
         .build()
         .unwrap();
     let mut chain = elo::chain::Chain::new(elo::chainparams::Network::Regtest);
+    let metrics = elo::metrics::Metrics::new(&chain);
     let (_connection, version) = runtime
         .block_on(elo::net::handshake(
             &elo::net::Destination::Address(elo::net::PeerAddress::new(bitcoind.peer).unwrap()),
             &mut chain,
+            &metrics,
         ))
         .unwrap();
 
@@ -591,7 +593,7 @@ fn announcement_before_the_answer_to_our_getheaders_keeps_the_connection() {
 }
 
 #[test]
-fn metrics_of_elo_have_its_tip_its_step_and_each_reconnect() {
+fn metrics_of_elo_have_its_tip_its_step_each_reconnect_and_the_bytes_of_each_command() {
     let bitcoind = Bitcoind::start();
     bitcoind.cli(&["generatetodescriptor", "2001", "raw(51)"]);
     let best = bitcoind.cli(&["getbestblockhash"]);
@@ -617,6 +619,36 @@ fn metrics_of_elo_have_its_tip_its_step_and_each_reconnect() {
         assert!(metrics.contains(&line), "{line}: {metrics}");
     }
     assert!(metrics.contains("elo_reconnects_total 0\n"), "{metrics}");
+
+    settle(&bitcoind, &elo);
+    let metrics = scrape(address);
+    for (direction, field) in [
+        ("received", "bytessent_per_msg"),
+        ("sent", "bytesrecv_per_msg"),
+    ] {
+        let mut expected = [0; COMMANDS.len() + 1];
+        for (command, bytes) in per_message_bytes(&bitcoind, field) {
+            let index = COMMANDS
+                .iter()
+                .position(|known| *known == command)
+                .unwrap_or(COMMANDS.len());
+            expected[index] += bytes;
+        }
+        for (command, bytes) in COMMANDS.iter().chain(&["other"]).zip(expected) {
+            let line =
+                format!("elo_peer_{direction}_bytes_total{{command=\"{command}\"}} {bytes}\n");
+            assert!(metrics.contains(&line), "{line}: {metrics}");
+        }
+    }
+    for line in [
+        "elo_peer_received_messages_total{command=\"version\"} 1\n",
+        "elo_peer_received_messages_total{command=\"verack\"} 1\n",
+        "elo_peer_sent_messages_total{command=\"version\"} 1\n",
+        "elo_peer_sent_messages_total{command=\"verack\"} 1\n",
+        "elo_peer_sent_messages_total{command=\"sendheaders\"} 1\n",
+    ] {
+        assert!(metrics.contains(line), "{line}: {metrics}");
+    }
 
     bitcoind.cli(&["-named", "disconnectnode", "nodeid=0"]);
     elo.event("end", END_TIMEOUT);
@@ -701,6 +733,31 @@ fn pong_from(bitcoind: &Bitcoind, elo: &Elo, ends: usize) {
     }
     let all = elo.events("end");
     assert_eq!(all.len(), ends, "elo ended the connection: {all:?}");
+}
+
+const COMMANDS: [&str; 10] = [
+    "version",
+    "verack",
+    "ping",
+    "pong",
+    "getheaders",
+    "headers",
+    "wtxidrelay",
+    "sendaddrv2",
+    "sendheaders",
+    "inv",
+];
+
+fn per_message_bytes(bitcoind: &Bitcoind, field: &str) -> Vec<(String, u64)> {
+    let peer_info = bitcoind.cli(&["getpeerinfo"]);
+    object_text(&peer_info, field)
+        .split(',')
+        .map(|pair| {
+            let (message, bytes) = pair.split_once(':').unwrap();
+            let message = message.trim().trim_matches('"');
+            (message.to_owned(), bytes.trim().parse().unwrap())
+        })
+        .collect()
 }
 
 fn message_bytes(bitcoind: &Bitcoind, field: &str, message: &str) -> u64 {

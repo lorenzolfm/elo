@@ -255,7 +255,7 @@ async fn dial(
     chain: &mut elo::chain::Chain,
     metrics: &elo::metrics::Metrics,
 ) -> Result<End, std::io::Error> {
-    let (connection, version) = match elo::net::handshake(destination, chain).await {
+    let (connection, version) = match elo::net::handshake(destination, chain, metrics).await {
         Ok(handshake) => handshake,
         Err(error) => return Ok(End::Handshake(error)),
     };
