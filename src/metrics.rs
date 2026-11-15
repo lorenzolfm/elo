@@ -86,72 +86,64 @@ impl Metrics {
 
     fn text(&self) -> String {
         let tip = self.tip.get();
-        let mut text = Text::default();
+        let mut text = Text::new();
         text.family(
             "elo_header_tip_height",
             "gauge",
             "The height of the tip of the header chain.",
-        );
-        text.sample("elo_header_tip_height", "", tip.height());
+        )
+        .sample(tip.height());
         text.family(
             "elo_header_tip_work",
             "gauge",
             "The work of the header chain up to its tip: the expected number of hashes.",
-        );
-        text.sample("elo_header_tip_work", "", tip.work().decimal());
-        text.family(
+        )
+        .sample(tip.work().decimal());
+        let mut family = text.family(
             "elo_peer_state",
             "gauge",
             "The step of the connection to the peer: 1 for the step it is in, 0 for each other.",
         );
         let peer = self.peer.get();
         for state in PeerState::ALL {
-            text.sample(
-                "elo_peer_state",
-                format_args!("state=\"{}\"", state.name()),
-                u8::from(state == peer),
-            );
+            family.sample_labelled("state", state.name(), u8::from(state == peer));
         }
         text.family(
             "elo_reconnects_total",
             "counter",
             "The connections that ended, and that elo dials again after a wait.",
-        );
-        text.sample("elo_reconnects_total", "", self.reconnects.get());
+        )
+        .sample(self.reconnects.get());
         text.end()
     }
 }
 
-#[derive(Default)]
 struct Text {
     text: String,
 }
 
+struct Family<'a> {
+    text: &'a mut String,
+    name: &'static str,
+}
+
 impl Text {
-    fn family(&mut self, name: &'static str, kind: &'static str, help: &'static str) {
+    fn new() -> Text {
+        Text {
+            text: String::with_capacity(BODY_LENGTH_MAX),
+        }
+    }
+
+    fn family(&mut self, name: &'static str, kind: &'static str, help: &'static str) -> Family<'_> {
         assert!(name.starts_with("elo_"), "{name}");
-        assert!(
-            name.bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
-            "{name}"
-        );
+        assert!(name.bytes().all(name_byte), "{name}");
         assert!(!help.contains(['\\', '\n']), "{name}");
         let written = write!(self.text, "# HELP {name} {help}\n# TYPE {name} {kind}\n");
         assert!(written.is_ok(), "{name}");
-    }
-
-    fn sample(
-        &mut self,
-        name: &'static str,
-        labels: impl std::fmt::Display,
-        value: impl std::fmt::Display,
-    ) {
-        let mut labels_text = labels.to_string();
-        if !labels_text.is_empty() {
-            labels_text = format!("{{{labels_text}}}");
+        Family {
+            text: &mut self.text,
+            name,
         }
-        let written = writeln!(self.text, "{name}{labels_text} {value}");
-        assert!(written.is_ok(), "{name}");
     }
 
     fn end(self) -> String {
@@ -159,6 +151,32 @@ impl Text {
         assert!(self.text.len() <= BODY_LENGTH_MAX, "{}", self.text.len());
         self.text
     }
+}
+
+impl Family<'_> {
+    fn sample(&mut self, value: impl std::fmt::Display) {
+        let name = self.name;
+        let written = writeln!(self.text, "{name} {value}");
+        assert!(written.is_ok(), "{name}");
+    }
+
+    fn sample_labelled(
+        &mut self,
+        label: &'static str,
+        label_value: &'static str,
+        value: impl std::fmt::Display,
+    ) {
+        let name = self.name;
+        assert!(!label.is_empty(), "{name}");
+        assert!(label.bytes().all(name_byte), "{name}");
+        assert!(!label_value.contains(['"', '\\', '\n']), "{name}");
+        let written = writeln!(self.text, "{name}{{{label}=\"{label_value}\"}} {value}");
+        assert!(written.is_ok(), "{name}");
+    }
+}
+
+fn name_byte(byte: u8) -> bool {
+    byte.is_ascii_lowercase() || byte == b'_'
 }
 
 #[cfg(test)]
@@ -320,8 +338,36 @@ elo_header_tip_work 2
     fn longest_text_is_below_the_maximum() {
         let text = metrics().text();
         let one_digit_values_length = 3;
-        let longest_values_length = usize::MAX.to_string().len() + 78 + u64::MAX.to_string().len();
+        let work_max_decimal_length = 78;
+        let longest_values_length =
+            usize::MAX.to_string().len() + work_max_decimal_length + u64::MAX.to_string().len();
         let longest = text.len() - one_digit_values_length + longest_values_length;
         assert!(longest <= super::BODY_LENGTH_MAX, "{longest}");
+    }
+
+    #[test]
+    fn label_of_other_bytes_or_a_label_value_with_a_quote_a_backslash_or_a_newline_is_a_bug() {
+        for (label, label_value) in [
+            ("b", "a\"b"),
+            ("b", "a\\b"),
+            ("b", "a\nb"),
+            ("", "c"),
+            ("B", "c"),
+            ("b-c", "c"),
+        ] {
+            let sampled = std::panic::catch_unwind(|| {
+                let mut text = super::Text::new();
+                text.family("elo_a", "gauge", "A.")
+                    .sample_labelled(label, label_value, 0);
+            });
+            assert!(sampled.is_err(), "{label:?} {label_value:?}");
+        }
+        let mut text = super::Text::new();
+        text.family("elo_a", "gauge", "A.")
+            .sample_labelled("b", "c_d", 0);
+        assert_eq!(
+            text.end(),
+            "# HELP elo_a A.\n# TYPE elo_a gauge\nelo_a{b=\"c_d\"} 0\n"
+        );
     }
 }
