@@ -77,13 +77,14 @@ async fn read_head(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result<V
         if read == 0 {
             return Err(HeadError::Closed);
         }
+        let search_start = filled.saturating_sub(HEAD_END.len());
         filled += read;
         assert!(filled <= HEAD_LENGTH_MAX);
-        let found = buffer[..filled]
+        let found = buffer[search_start..filled]
             .windows(HEAD_END.len())
             .position(|window| window == HEAD_END);
         if let Some(position) = found {
-            buffer.truncate(position + HEAD_END.len());
+            buffer.truncate(search_start + position + HEAD_END.len());
             return Ok(buffer);
         }
         if filled == HEAD_LENGTH_MAX {
