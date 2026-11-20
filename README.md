@@ -235,4 +235,6 @@ nix build --rebuild .#elo .#elo.cargoArtifacts    # builds both again, and fails
 
 `--rebuild` compares with an earlier build, so run the first command once.
 
-CI runs this check on every pull request.
+CI runs this check on every pull request. CI pulls from a Nix cache of the homelab over Tailscale,
+and pushes what it built there, so its first build can come from another machine. A pull request
+from a fork builds without the cache.
