@@ -117,13 +117,20 @@
           ];
         });
 
-        cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+        reproducibleDeps = args:
+          craneLib.buildDepsOnly (args
+            // {
+              preBuild = "touch --date=@2 Cargo.lock";
+              preInstall = "rm target/.rustc_info.json";
+            });
+
+        cargoArtifacts = reproducibleDeps commonArgs;
 
         devArgs =
           commonArgs
           // {
             CARGO_PROFILE = "dev";
-            cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {CARGO_PROFILE = "dev";});
+            cargoArtifacts = reproducibleDeps (commonArgs // {CARGO_PROFILE = "dev";});
           };
 
         elo = craneLib.buildPackage (commonArgs

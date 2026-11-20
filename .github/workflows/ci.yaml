@@ -18,6 +18,9 @@ jobs:
     name: ${{ matrix.gate }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -35,12 +38,42 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
+      - &install-nix
+        uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
+        with:
+          extra_nix_config: |
+            connect-timeout = 5
+            fallback = true
+            ${{ !github.event.pull_request.head.repo.fork && 'extra-substituters = https://attic.tail174781.ts.net/main' || '' }}
+            ${{ !github.event.pull_request.head.repo.fork && 'extra-trusted-public-keys = main:4Zt9CH+9bGa5vSsFCdxOmqGjhItSREekmxJaB9wmgYY=' || '' }}
+
+      - &tailscale
+        id: tailscale
+        if: ${{ !github.event.pull_request.head.repo.fork }}
+        continue-on-error: true
+        uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c
+        with:
+          oauth-client-id: T7sitKkkpw11CNTRL-kUbvjC29cy11CNTRL
+          audience: api.tailscale.com/T7sitKkkpw11CNTRL-kUbvjC29cy11CNTRL
+          tags: tag:ci
+          ping: attic.tail174781.ts.net
 
       - run: nix build --print-build-logs ".#${{ matrix.gate }}"
 
       - if: matrix.gate == 'elo'
         run: nix build --print-build-logs --rebuild .#elo .#elo.cargoArtifacts
+
+      - if: ${{ !cancelled() && steps.tailscale.outcome == 'success' }}
+        env:
+          ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+        run: |
+          if [[ -z $ATTIC_TOKEN ]]; then
+            echo "No ATTIC_TOKEN secret, so nothing is pushed."
+            exit 0
+          fi
+          attic="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#attic-client)/bin/attic"
+          "$attic" login homelab https://attic.tail174781.ts.net "$ATTIC_TOKEN"
+          nix path-info --all | grep -v '\.drv$' | "$attic" push homelab:main --stdin
 
   mutants:
     name: mutants
@@ -67,13 +100,16 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
+      id-token: write
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
-      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
+      - *install-nix
+
+      - *tailscale
 
       - run: nix build --print-build-logs .#elo-fuzz-image
 
@@ -103,13 +139,16 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
+      id-token: write
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
 
-      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
+      - *install-nix
+
+      - *tailscale
 
       - run: nix build --print-build-logs .#elo-image
 
