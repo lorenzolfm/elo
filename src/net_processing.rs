@@ -442,7 +442,7 @@ impl Download {
                 Some(LowWork::Presync(presync.height()))
             }
             Download::Redownload(redownload) => {
-                assert!(chain.tip().height() <= redownload.height());
+                assert_eq!(chain.tip().height(), redownload.released_height());
                 Some(LowWork::Redownload(redownload.height()))
             }
             Download::BranchPresync(sync) => {
@@ -451,9 +451,10 @@ impl Download {
             }
             Download::BranchRedownload(sync) => {
                 assert!(sync.start.height() < chain.tip().height());
-                let height = sync.redownload.height();
-                assert!(sync.start.height().saturating_add(sync.released.len()) <= height);
-                Some(LowWork::Redownload(height))
+                let released_height = sync.redownload.released_height();
+                let released_count = released_height.saturating_sub(sync.start.height());
+                assert_eq!(released_count, sync.released.len());
+                Some(LowWork::Redownload(sync.redownload.height()))
             }
             Download::Genesis(_) | Download::Chain | Download::Branch(_) => None,
         }
