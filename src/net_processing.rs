@@ -378,6 +378,12 @@ enum Download {
     BranchRedownload(Box<BranchRedownload>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Progress {
+    pub(crate) chain_height: usize,
+    pub(crate) presync_height: Option<usize>,
+}
+
 #[derive(Debug)]
 struct BranchPresync {
     start: crate::chain::SyncStart,
@@ -416,6 +422,18 @@ impl Download {
         locator
     }
 
+    fn presync_height(&self) -> Option<usize> {
+        match self {
+            Download::Presync(presync) => Some(presync.height()),
+            Download::BranchPresync(sync) => Some(sync.presync.height()),
+            Download::Genesis(_)
+            | Download::Chain
+            | Download::Redownload(_)
+            | Download::Branch(_)
+            | Download::BranchRedownload(_) => None,
+        }
+    }
+
     fn is_answered_by(
         &self,
         chain: &crate::chain::Chain,
@@ -436,6 +454,19 @@ impl Download {
 }
 
 impl<'a> Peer<'a> {
+    pub(crate) fn progress(&self) -> Progress {
+        let presync_height = match &self.sync {
+            SyncState::Due(download) | SyncState::Outstanding { download, .. } => {
+                download.presync_height()
+            }
+            SyncState::Synced => None,
+        };
+        Progress {
+            chain_height: self.chain.tip().height(),
+            presync_height,
+        }
+    }
+
     pub(crate) fn receive(
         self,
         message: &crate::transport::Message,
@@ -3571,6 +3602,71 @@ mod tests {
             panic!("{received:?}");
         };
         assert_eq!(tip, tip_after(&headers));
+    }
+
+    fn progress(chain_height: usize, presync_height: Option<usize>) -> super::Progress {
+        super::Progress {
+            chain_height,
+            presync_height,
+        }
+    }
+
+    #[test]
+    fn progress_of_a_low_work_sync_is_the_height_of_its_first_download_then_of_the_chain() {
+        let mut chain = regtest();
+        let start = std::time::Instant::now();
+        let headers = crate::fixtures::headers_on_genesis(12_002);
+        let work_min = tip_after(&headers[..11_000]).work();
+        let mut peer = asked_with(&mut chain, work_min, start);
+        assert_eq!(peer.progress(), progress(0, None));
+        let expected = [
+            progress(0, Some(2_000)),
+            progress(0, Some(4_000)),
+            progress(0, Some(6_000)),
+            progress(0, Some(8_000)),
+            progress(0, Some(10_000)),
+            progress(0, None),
+            progress(0, None),
+            progress(0, None),
+            progress(0, None),
+            progress(983, None),
+            progress(2_983, None),
+            progress(12_000, None),
+        ];
+        let batches = headers[..12_000].chunks(2_000).cycle();
+        for (index, (batch, expected)) in batches.zip(expected).enumerate() {
+            (peer, _) = batch_then_tick(peer, batch, start);
+            assert_eq!(peer.progress(), expected, "batch {index}");
+        }
+        let received = peer.receive(&headers_message(&headers[12_000..]), crate::fixtures::CLOCK);
+        let Ok((peer, super::Received::Synced(_))) = received else {
+            panic!("{received:?}");
+        };
+        assert_eq!(peer.progress(), progress(12_002, None));
+    }
+
+    #[test]
+    fn progress_of_a_low_work_sync_of_a_branch_has_the_height_of_its_first_download_and_of_our_chain()
+     {
+        let start = std::time::Instant::now();
+        let headers = crate::fixtures::headers_on_genesis(2_200);
+        let branch = crate::fixtures::branch_on(&headers[49], 2_300);
+        let mut chain = regtest();
+        for batch in crate::protocol::Headers::batches(headers.clone()) {
+            chain.extend(batch, crate::fixtures::CLOCK).unwrap();
+        }
+        let mut peer = asked(&mut chain, start, 7);
+        for (batch, expected) in [
+            (
+                &[&headers[..50], &branch[..1_950]].concat()[..],
+                progress(2_200, None),
+            ),
+            (&branch[..2_000], progress(2_200, Some(2_050))),
+            (&branch[2_000..], progress(2_200, None)),
+        ] {
+            (peer, _) = batch_then_tick(peer, batch, start);
+            assert_eq!(peer.progress(), expected, "{}", batch.len());
+        }
     }
 
     #[test]

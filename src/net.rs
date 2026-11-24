@@ -616,6 +616,7 @@ async fn run_exchange<'a>(
     let (peer, received) = peer
         .receive(message, clock())
         .map_err(RunError::NetProcessing)?;
+    socket.metrics.progress(peer.progress());
     match received {
         crate::net_processing::Received::NoReply => {
             assert_ne!(message.msg_type(), crate::protocol::PING);

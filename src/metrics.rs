@@ -20,6 +20,7 @@ const COMMAND_LABELS_COUNT: usize = COMMAND_OTHER_INDEX + 1;
 #[derive(Debug)]
 pub struct Metrics {
     tip: std::cell::Cell<crate::chain::Tip>,
+    progress: std::cell::Cell<crate::net_processing::Progress>,
     peer: std::cell::Cell<PeerState>,
     reconnects: std::cell::Cell<u64>,
     received: Traffic,
@@ -60,6 +61,10 @@ impl Metrics {
     pub fn new(chain: &crate::chain::Chain) -> Metrics {
         Metrics {
             tip: std::cell::Cell::new(chain.tip()),
+            progress: std::cell::Cell::new(crate::net_processing::Progress {
+                chain_height: chain.tip().height(),
+                presync_height: None,
+            }),
             peer: std::cell::Cell::new(PeerState::Dial),
             reconnects: std::cell::Cell::new(0),
             received: Traffic::new(),
@@ -74,6 +79,11 @@ impl Metrics {
     pub fn tip(&self, tip: &crate::chain::Tip) {
         assert!(tip.work() >= self.tip.get().work());
         self.tip.set(*tip);
+    }
+
+    pub(crate) fn progress(&self, progress: crate::net_processing::Progress) {
+        assert_ne!(progress.presync_height, Some(0));
+        self.progress.set(progress);
     }
 
     pub fn peer(&self, state: PeerState) {
@@ -142,15 +152,28 @@ impl Metrics {
         text.family(
             "elo_header_tip_height",
             Kind::Gauge,
-            "The height of the tip of the header chain.",
+            "The height of the tip of the header chain at the end of the last sync, or at the last new tip after it.",
         )
         .sample(tip.height());
         text.family(
             "elo_header_tip_work",
             Kind::Gauge,
-            "The work of the header chain up to its tip: the expected number of hashes.",
+            "The work of the header chain up to that tip: the expected number of hashes.",
         )
         .sample(tip.work().decimal());
+        let progress = self.progress.get();
+        text.family(
+            "elo_header_chain_height",
+            Kind::Gauge,
+            "The height of the tip of the header chain after the last message from the peer, also in a sync.",
+        )
+        .sample(progress.chain_height);
+        text.family(
+            "elo_header_presync_height",
+            Kind::Gauge,
+            "The height of the last header that the first download of a low-work sync checked and did not put in the chain: 0 out of that download.",
+        )
+        .sample(progress.presync_height.unwrap_or(0));
         let mut family = text.family(
             "elo_peer_state",
             Kind::Gauge,
@@ -367,12 +390,18 @@ fn name_byte(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     const EXPECTED_START: &str = "\
-# HELP elo_header_tip_height The height of the tip of the header chain.
+# HELP elo_header_tip_height The height of the tip of the header chain at the end of the last sync, or at the last new tip after it.
 # TYPE elo_header_tip_height gauge
 elo_header_tip_height 0
-# HELP elo_header_tip_work The work of the header chain up to its tip: the expected number of hashes.
+# HELP elo_header_tip_work The work of the header chain up to that tip: the expected number of hashes.
 # TYPE elo_header_tip_work gauge
 elo_header_tip_work 2
+# HELP elo_header_chain_height The height of the tip of the header chain after the last message from the peer, also in a sync.
+# TYPE elo_header_chain_height gauge
+elo_header_chain_height 0
+# HELP elo_header_presync_height The height of the last header that the first download of a low-work sync checked and did not put in the chain: 0 out of that download.
+# TYPE elo_header_presync_height gauge
+elo_header_presync_height 0
 # HELP elo_peer_state The step of the connection to the peer: 1 for the step it is in, 0 for each other.
 # TYPE elo_peer_state gauge
 ";
@@ -520,6 +549,40 @@ elo_header_tip_work 2
             let reconnects_line = format!("elo_reconnects_total {reconnects}\n");
             assert!(text.contains(&reconnects_line), "{state:?}: {text}");
         }
+    }
+
+    #[test]
+    fn text_has_the_height_of_the_chain_and_of_the_presync_of_the_last_progress_apart_from_the_tip()
+    {
+        let metrics = metrics();
+        for (chain_height, presync_height, expected_presync_height) in [
+            (0, Some(2_000), 2_000),
+            (12_000, None, 0),
+            (2_200, Some(2_050), 2_050),
+            (7, None, 0),
+        ] {
+            metrics.progress(crate::net_processing::Progress {
+                chain_height,
+                presync_height,
+            });
+            let text = metrics.text();
+            for line in [
+                String::from("elo_header_tip_height 0\n"),
+                format!("elo_header_chain_height {chain_height}\n"),
+                format!("elo_header_presync_height {expected_presync_height}\n"),
+            ] {
+                assert!(text.contains(&line), "{line}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "left: Some(0)")]
+    fn presync_height_of_0_is_a_bug() {
+        metrics().progress(crate::net_processing::Progress {
+            chain_height: 0,
+            presync_height: Some(0),
+        });
     }
 
     #[test]

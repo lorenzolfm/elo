@@ -181,6 +181,10 @@ impl Presync {
         self.last.hash
     }
 
+    pub(crate) fn height(&self) -> usize {
+        self.last.height
+    }
+
     pub(crate) fn receive(
         mut self,
         headers: crate::protocol::Headers,
