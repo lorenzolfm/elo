@@ -422,10 +422,16 @@ impl Download {
         locator
     }
 
-    fn presync_height(&self) -> Option<usize> {
+    fn presync_height(&self, chain: &crate::chain::Chain) -> Option<usize> {
         match self {
-            Download::Presync(presync) => Some(presync.height()),
-            Download::BranchPresync(sync) => Some(sync.presync.height()),
+            Download::Presync(presync) => {
+                assert_eq!(chain.tip().height(), 0);
+                Some(presync.height())
+            }
+            Download::BranchPresync(sync) => {
+                assert!(sync.start.height() < chain.tip().height());
+                Some(sync.presync.height())
+            }
             Download::Genesis(_)
             | Download::Chain
             | Download::Redownload(_)
@@ -457,7 +463,7 @@ impl<'a> Peer<'a> {
     pub(crate) fn progress(&self) -> Progress {
         let presync_height = match &self.sync {
             SyncState::Due(download) | SyncState::Outstanding { download, .. } => {
-                download.presync_height()
+                download.presync_height(self.chain)
             }
             SyncState::Synced => None,
         };
@@ -1430,7 +1436,7 @@ pub(crate) mod fuzz {
         message: &crate::transport::Message,
         clock: u64,
     ) -> Result<super::Peer<'a>, super::PeerError> {
-        match (peer.receive(message, clock), model.receive(message)) {
+        let received = match (peer.receive(message, clock), model.receive(message)) {
             (Ok((peer, super::Received::NoReply)), Ok(ReceivedExpected::NoReply)) => Ok(peer),
             (Ok((peer, super::Received::Pong(nonce))), Ok(ReceivedExpected::Pong(expected))) => {
                 assert_eq!(nonce, expected);
@@ -1447,7 +1453,10 @@ pub(crate) mod fuzz {
                 Err(error)
             }
             (received, expected) => panic!("the peer gave {received:?}, not {expected:?}"),
-        }
+        };
+        received.inspect(|peer| {
+            peer.progress();
+        })
     }
 
     fn branch_tip_check(peer: &super::Peer<'_>, model: &PeerModel) {

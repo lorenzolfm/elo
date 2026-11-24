@@ -78,6 +78,7 @@ impl Metrics {
 
     pub fn tip(&self, tip: &crate::chain::Tip) {
         assert!(tip.work() >= self.tip.get().work());
+        assert_eq!(tip.height(), self.progress.get().chain_height);
         self.tip.set(*tip);
     }
 
@@ -95,6 +96,10 @@ impl Metrics {
             PeerState::Wait => {
                 assert_ne!(before, PeerState::Wait);
                 self.reconnects.set(self.reconnects.get().saturating_add(1));
+                self.progress.set(crate::net_processing::Progress {
+                    presync_height: None,
+                    ..self.progress.get()
+                });
             }
         }
         self.peer.set(state);
@@ -165,13 +170,13 @@ impl Metrics {
         text.family(
             "elo_header_chain_height",
             Kind::Gauge,
-            "The height of the tip of the header chain after the last message from the peer, also in a sync.",
+            "The height of the header chain after the last message from the peer, also in a sync.",
         )
         .sample(progress.chain_height);
         text.family(
             "elo_header_presync_height",
             Kind::Gauge,
-            "The height of the last header that the first download of a low-work sync checked and did not put in the chain: 0 out of that download.",
+            "The height of the last header that the first download of a low-work sync checked and did not put in the chain: 0 when no such download runs.",
         )
         .sample(progress.presync_height.unwrap_or(0));
         let mut family = text.family(
@@ -396,10 +401,10 @@ elo_header_tip_height 0
 # HELP elo_header_tip_work The work of the header chain up to that tip: the expected number of hashes.
 # TYPE elo_header_tip_work gauge
 elo_header_tip_work 2
-# HELP elo_header_chain_height The height of the tip of the header chain after the last message from the peer, also in a sync.
+# HELP elo_header_chain_height The height of the header chain after the last message from the peer, also in a sync.
 # TYPE elo_header_chain_height gauge
 elo_header_chain_height 0
-# HELP elo_header_presync_height The height of the last header that the first download of a low-work sync checked and did not put in the chain: 0 out of that download.
+# HELP elo_header_presync_height The height of the last header that the first download of a low-work sync checked and did not put in the chain: 0 when no such download runs.
 # TYPE elo_header_presync_height gauge
 elo_header_presync_height 0
 # HELP elo_peer_state The step of the connection to the peer: 1 for the step it is in, 0 for each other.
@@ -530,6 +535,10 @@ elo_header_presync_height 0
             crate::fixtures::CLOCK,
         );
         assert_eq!(extended, Ok(()));
+        metrics.progress(crate::net_processing::Progress {
+            chain_height: 3,
+            presync_height: None,
+        });
         metrics.tip(&chain.tip());
         for (state, expected, reconnects) in [
             (super::PeerState::Wait, states(0, 0, 0, 1), 1),
@@ -583,6 +592,37 @@ elo_header_presync_height 0
             chain_height: 0,
             presync_height: Some(0),
         });
+    }
+
+    #[test]
+    fn wait_sets_the_presync_height_to_0_and_keeps_the_chain_height() {
+        let metrics = metrics_in(super::PeerState::Sync);
+        metrics.progress(crate::net_processing::Progress {
+            chain_height: 7,
+            presync_height: Some(2_000),
+        });
+        metrics.peer(super::PeerState::Wait);
+        let text = metrics.text();
+        for line in [
+            "elo_header_chain_height 7\n",
+            "elo_header_presync_height 0\n",
+        ] {
+            assert!(text.contains(line), "{line}: {text}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "left: 3")]
+    fn tip_at_another_height_than_the_chain_of_the_last_progress_is_a_bug() {
+        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        let metrics = super::Metrics::new(&chain);
+        let headers = crate::fixtures::headers_on_genesis(3);
+        let extended = chain.extend(
+            crate::fixtures::headers_batch(&headers),
+            crate::fixtures::CLOCK,
+        );
+        assert_eq!(extended, Ok(()));
+        metrics.tip(&chain.tip());
     }
 
     #[test]

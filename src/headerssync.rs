@@ -182,6 +182,7 @@ impl Presync {
     }
 
     pub(crate) fn height(&self) -> usize {
+        assert!(self.last.height > self.start.height);
         self.last.height
     }
 
