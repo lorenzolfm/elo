@@ -272,7 +272,6 @@ async fn dial(
     };
     metrics.peer(elo::metrics::PeerState::Synced);
     loop {
-        metrics.tip(&tip);
         log(&elo::logging::Event::Tip {
             peer: address,
             tip: &tip,

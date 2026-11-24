@@ -181,6 +181,11 @@ impl Presync {
         self.last.hash
     }
 
+    pub(crate) fn height(&self) -> std::num::NonZeroUsize {
+        assert!(self.last.height > self.start.height);
+        std::num::NonZeroUsize::MIN.saturating_add(self.last.height - 1)
+    }
+
     pub(crate) fn receive(
         mut self,
         headers: crate::protocol::Headers,

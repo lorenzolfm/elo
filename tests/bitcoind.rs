@@ -593,7 +593,7 @@ fn announcement_before_the_answer_to_our_getheaders_keeps_the_connection() {
 }
 
 #[test]
-fn metrics_of_elo_have_its_tip_its_step_each_reconnect_and_the_bytes_of_each_command() {
+fn metrics_of_elo_have_its_tip_its_chain_its_step_each_reconnect_and_the_bytes_of_each_command() {
     let bitcoind = Bitcoind::start();
     bitcoind.cli(&["generatetodescriptor", "2001", "raw(51)"]);
     let best = bitcoind.cli(&["getbestblockhash"]);
@@ -614,6 +614,8 @@ fn metrics_of_elo_have_its_tip_its_step_each_reconnect_and_the_bytes_of_each_com
     for line in [
         String::from("elo_header_tip_height 2001\n"),
         format!("elo_header_tip_work {chain_work}\n"),
+        String::from("elo_header_chain_height 2001\n"),
+        String::from("elo_header_presync_height 0\n"),
         String::from("elo_peer_state{state=\"synced\"} 1\n"),
     ] {
         assert!(metrics.contains(&line), "{line}: {metrics}");
