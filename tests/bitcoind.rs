@@ -24,6 +24,33 @@ impl Drop for TempDir {
 
 struct Process(std::process::Child);
 
+impl Process {
+    fn signal(&self, name: &str) {
+        let status = std::process::Command::new("kill")
+            .arg("-s")
+            .arg(name)
+            .arg(self.0.id().to_string())
+            .status()
+            .unwrap();
+        assert!(status.success(), "kill -s {name}: {status}");
+    }
+
+    fn exit_code(&mut self) -> Option<i32> {
+        let deadline = std::time::Instant::now() + STOP_TIMEOUT;
+        loop {
+            if let Some(status) = self.0.try_wait().unwrap() {
+                return status.code();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "elo did not exit within {} s",
+                STOP_TIMEOUT.as_secs()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
 impl Drop for Process {
     fn drop(&mut self) {
         if let Err(error) = self.0.kill() {
@@ -169,7 +196,52 @@ fn stdout_error_after_the_handshake_exits_with_1() {
         end.starts_with("level=error event=exit reason=\"stdout: "),
         "{end}"
     );
-    assert_eq!(elo.0.wait().unwrap().code(), Some(1));
+    assert_eq!(elo.exit_code(), Some(1));
+}
+
+#[test]
+fn stdout_error_at_a_signal_writes_the_stop_line_to_stderr_and_exits_with_0() {
+    let bitcoind = Bitcoind::start();
+    let (reader, writer) = std::io::pipe().unwrap();
+    let mut elo = Process(
+        std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
+            .arg("regtest")
+            .arg(bitcoind.peer.to_string())
+            .stdout(writer)
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stderr = lines(elo.0.stderr.take().unwrap());
+    let (tip_sender, tip_receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut stdout = std::io::BufRead::lines(std::io::BufReader::new(reader));
+        let tip = stdout.any(|line| event_name(&line.unwrap()) == Some("tip"));
+        drop(stdout);
+        tip_sender.send(tip).unwrap();
+    });
+    let tip = tip_receiver
+        .recv_timeout(SYNC_TIMEOUT)
+        .expect("elo logged no tip");
+    assert!(tip, "elo closed stdout before a tip");
+    assert_eq!(
+        stderr.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty),
+        "elo wrote to stderr or exited before the signal"
+    );
+
+    elo.signal("TERM");
+
+    assert_eq!(
+        stderr.recv_timeout(END_TIMEOUT).as_deref(),
+        Ok("level=info event=stop signal=SIGTERM")
+    );
+    assert_eq!(elo.exit_code(), Some(0));
+    assert_eq!(
+        stderr.recv_timeout(END_TIMEOUT),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+        "elo wrote more to stderr after the stop line"
+    );
 }
 
 #[test]
@@ -281,8 +353,8 @@ fn signal_in_a_connection_exits_with_0() {
     for signal in ["TERM", "INT"] {
         let mut elo = Elo::start(&bitcoind);
         elo.event("tip", SYNC_TIMEOUT);
-        elo.signal(signal);
-        assert_eq!(elo.exit_code(), Some(0), "SIG{signal}");
+        elo.process.signal(signal);
+        assert_eq!(elo.process.exit_code(), Some(0), "SIG{signal}");
         assert_eq!(
             elo.event("stop", END_TIMEOUT),
             format!("level=info event=stop signal=SIG{signal}")
@@ -299,8 +371,8 @@ fn signal_in_the_wait_before_a_dial_exits_with_0() {
     bitcoind.cli(&["-named", "disconnectnode", "nodeid=0"]);
     let end = elo.event("end", END_TIMEOUT);
     assert!(end.ends_with(" wait_ms=5000"), "{end}");
-    elo.signal("TERM");
-    assert_eq!(elo.exit_code(), Some(0));
+    elo.process.signal("TERM");
+    assert_eq!(elo.process.exit_code(), Some(0));
     assert_eq!(
         elo.event("stop", END_TIMEOUT),
         "level=info event=stop signal=SIGTERM"
@@ -661,7 +733,7 @@ fn metrics_address_in_use_exits_with_1() {
         exit.starts_with("level=error event=exit reason=\"metrics: "),
         "{exit}"
     );
-    assert_eq!(elo.exit_code(), Some(1));
+    assert_eq!(elo.process.exit_code(), Some(1));
 }
 
 fn scrape(address: std::net::SocketAddr) -> String {
@@ -874,31 +946,6 @@ impl Elo {
             .filter(|line| event_name(line) == Some(name))
             .cloned()
             .collect()
-    }
-
-    fn signal(&self, name: &str) {
-        let status = std::process::Command::new("kill")
-            .arg("-s")
-            .arg(name)
-            .arg(self.process.0.id().to_string())
-            .status()
-            .unwrap();
-        assert!(status.success(), "kill -s {name}: {status}");
-    }
-
-    fn exit_code(&mut self) -> Option<i32> {
-        let deadline = std::time::Instant::now() + STOP_TIMEOUT;
-        loop {
-            if let Some(status) = self.process.0.try_wait().unwrap() {
-                return status.code();
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "elo did not exit within {} s",
-                STOP_TIMEOUT.as_secs()
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
     }
 }
 
