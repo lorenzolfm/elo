@@ -8,10 +8,7 @@ const RECONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn main() -> std::process::ExitCode {
     std::panic::set_hook(Box::new(|info| {
-        let event = elo::logging::Event::Panic { reason: info };
-        if log(&event).is_err() {
-            let _ = event.write(&mut std::io::stderr().lock());
-        }
+        log_or_stderr(&elo::logging::Event::Panic { reason: info });
     }));
 
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
@@ -128,16 +125,19 @@ async fn node(
 }
 
 fn stop(signal: Signal) -> std::process::ExitCode {
-    let _ = log(&elo::logging::Event::Stop { signal: &signal });
+    log_or_stderr(&elo::logging::Event::Stop { signal: &signal });
     std::process::ExitCode::SUCCESS
 }
 
 fn exit(reason: &dyn std::fmt::Display) -> std::process::ExitCode {
-    let event = elo::logging::Event::Exit { reason };
-    if log(&event).is_err() {
+    log_or_stderr(&elo::logging::Event::Exit { reason });
+    std::process::ExitCode::FAILURE
+}
+
+fn log_or_stderr(event: &elo::logging::Event<'_>) {
+    if log(event).is_err() {
         let _ = event.write(&mut std::io::stderr().lock());
     }
-    std::process::ExitCode::FAILURE
 }
 
 fn exit_stdout(error: std::io::Error) -> std::process::ExitCode {

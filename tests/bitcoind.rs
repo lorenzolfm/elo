@@ -173,6 +173,52 @@ fn stdout_error_after_the_handshake_exits_with_1() {
 }
 
 #[test]
+fn stdout_error_at_a_signal_writes_the_stop_line_to_stderr_and_exits_with_0() {
+    let bitcoind = Bitcoind::start();
+    let (reader, writer) = std::io::pipe().unwrap();
+    let mut elo = Process(
+        std::process::Command::new(env!("CARGO_BIN_EXE_elo"))
+            .arg("regtest")
+            .arg(bitcoind.peer.to_string())
+            .stdout(writer)
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stderr = lines(elo.0.stderr.take().unwrap());
+    let (closed, stdout_closed) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufRead::lines(std::io::BufReader::new(reader)) {
+            if event_name(&line.unwrap()) == Some("tip") {
+                break;
+            }
+        }
+        closed.send(()).unwrap();
+    });
+    stdout_closed
+        .recv_timeout(SYNC_TIMEOUT)
+        .expect("elo logged no tip");
+    assert!(
+        stderr.try_recv().is_err(),
+        "elo wrote to stderr before the signal"
+    );
+
+    let status = std::process::Command::new("kill")
+        .arg("-s")
+        .arg("TERM")
+        .arg(elo.0.id().to_string())
+        .status()
+        .unwrap();
+    assert!(status.success(), "kill -s TERM: {status}");
+
+    assert_eq!(
+        stderr.recv_timeout(END_TIMEOUT).as_deref(),
+        Ok("level=info event=stop signal=SIGTERM")
+    );
+    assert_eq!(elo.0.wait().unwrap().code(), Some(0));
+}
+
+#[test]
 fn ping_from_bitcoind_gets_a_pong() {
     let bitcoind = Bitcoind::start();
     let mut elo = Process(
