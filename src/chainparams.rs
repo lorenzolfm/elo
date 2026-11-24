@@ -151,6 +151,14 @@ impl Network {
         }
     }
 
+    pub(crate) const fn segwit_height(self) -> usize {
+        match self {
+            Network::Mainnet => 481_824,
+            Network::Testnet4 | Network::Signet => 1,
+            Network::Regtest => 0,
+        }
+    }
+
     pub(crate) const fn genesis(self) -> crate::block::BlockHeader {
         let prev = bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]);
         match self {

@@ -8,6 +8,8 @@ pub enum Error {
     NonCanonicalCompactSize,
     CompactSizeTooLarge(u64),
     StringTooLong { length: usize, length_max: usize },
+    SuperfluousWitness,
+    TransactionFlags(u8),
 }
 
 impl std::fmt::Display for Error {
@@ -20,6 +22,12 @@ impl std::fmt::Display for Error {
             }
             Error::StringTooLong { length, length_max } => {
                 write!(f, "string of {length} bytes is longer than {length_max}")
+            }
+            Error::SuperfluousWitness => {
+                write!(f, "a transaction has the witness flag, but no witness")
+            }
+            Error::TransactionFlags(flags) => {
+                write!(f, "a transaction has the unknown flags {flags:#04x}")
             }
         }
     }
@@ -134,6 +142,13 @@ pub(crate) fn read_compact_size(input: &mut &[u8]) -> Result<usize, Error> {
 pub(crate) fn write_string(out: &mut Vec<u8>, bytes: &[u8]) {
     write_compact_size(out, bytes.len());
     out.extend_from_slice(bytes);
+}
+
+pub(crate) fn read_bytes<'a>(input: &mut &'a [u8]) -> Result<&'a [u8], Error> {
+    let length = read_compact_size(input)?;
+    let (bytes, rest) = input.split_at_checked(length).ok_or(Error::UnexpectedEnd)?;
+    *input = rest;
+    Ok(bytes)
 }
 
 pub(crate) fn read_limited_string(input: &mut &[u8], length_max: usize) -> Result<Vec<u8>, Error> {
