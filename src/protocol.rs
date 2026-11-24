@@ -20,16 +20,26 @@ pub(crate) const MESSAGE_TYPE_SIZE: usize = 12;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MessageType([u8; MESSAGE_TYPE_SIZE]);
 
-pub(crate) const VERSION: MessageType = MessageType::from_name("version");
-pub(crate) const VERACK: MessageType = MessageType::from_name("verack");
-pub(crate) const PING: MessageType = MessageType::from_name("ping");
-pub(crate) const PONG: MessageType = MessageType::from_name("pong");
-pub(crate) const GETHEADERS: MessageType = MessageType::from_name("getheaders");
-pub(crate) const HEADERS: MessageType = MessageType::from_name("headers");
-pub(crate) const WTXIDRELAY: MessageType = MessageType::from_name("wtxidrelay");
-pub(crate) const SENDADDRV2: MessageType = MessageType::from_name("sendaddrv2");
-pub(crate) const SENDHEADERS: MessageType = MessageType::from_name("sendheaders");
-pub(crate) const INV: MessageType = MessageType::from_name("inv");
+macro_rules! message_types {
+    ($($constant:ident = $name:literal,)*) => {
+        $(pub(crate) const $constant: MessageType = MessageType::from_name($name);)*
+
+        pub(crate) const MESSAGE_TYPES: &[(MessageType, &str)] = &[$(($constant, $name)),*];
+    };
+}
+
+message_types! {
+    VERSION = "version",
+    VERACK = "verack",
+    PING = "ping",
+    PONG = "pong",
+    GETHEADERS = "getheaders",
+    HEADERS = "headers",
+    WTXIDRELAY = "wtxidrelay",
+    SENDADDRV2 = "sendaddrv2",
+    SENDHEADERS = "sendheaders",
+    INV = "inv",
+}
 
 impl MessageType {
     const fn from_name(name: &str) -> Self {

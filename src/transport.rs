@@ -7,7 +7,7 @@ pub(crate) const MESSAGE_HEADER_SIZE: usize = crate::chainparams::MAGIC_SIZE
     + size_of::<u32>()
     + CHECKSUM_SIZE;
 
-const PAYLOAD_LENGTH_MAX: u32 = 4_000_000;
+pub(crate) const PAYLOAD_LENGTH_MAX: u32 = 4_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -133,6 +133,7 @@ pub(crate) fn encode(
     assert_eq!(decode_header(network, written), Ok(header));
 
     frame.extend_from_slice(payload);
+    assert_eq!(frame.len(), MESSAGE_HEADER_SIZE + payload.len());
     frame
 }
 
