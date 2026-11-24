@@ -214,7 +214,7 @@ impl<'a> Handshake<'a> {
     pub(crate) fn progress(&self) -> Progress {
         Progress {
             tip: self.chain.tip(),
-            presync_height: None,
+            low_work_download: None,
         }
     }
 
@@ -388,7 +388,13 @@ enum Download {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Progress {
     pub(crate) tip: crate::chain::Tip,
-    pub(crate) presync_height: Option<std::num::NonZeroUsize>,
+    pub(crate) low_work_download: Option<LowWorkDownload>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LowWorkDownload {
+    Presync(std::num::NonZeroUsize),
+    Redownload(usize),
 }
 
 #[derive(Debug)]
@@ -429,21 +435,26 @@ impl Download {
         locator
     }
 
-    fn presync_height(&self, chain: &crate::chain::Chain) -> Option<std::num::NonZeroUsize> {
+    fn low_work_download(&self, chain: &crate::chain::Chain) -> Option<LowWorkDownload> {
         match self {
             Download::Presync(presync) => {
                 assert_eq!(chain.tip().height(), 0);
-                Some(presync.height())
+                Some(LowWorkDownload::Presync(presync.height()))
+            }
+            Download::Redownload(redownload) => {
+                assert_eq!(chain.tip().height(), redownload.released_height());
+                Some(LowWorkDownload::Redownload(redownload.height()))
             }
             Download::BranchPresync(sync) => {
                 assert!(sync.start.height() < chain.tip().height());
-                Some(sync.presync.height())
+                Some(LowWorkDownload::Presync(sync.presync.height()))
             }
-            Download::Genesis(_)
-            | Download::Chain
-            | Download::Redownload(_)
-            | Download::Branch(_)
-            | Download::BranchRedownload(_) => None,
+            Download::BranchRedownload(sync) => {
+                assert!(sync.start.height() < chain.tip().height());
+                assert_eq!(sync.redownload.released_count(), sync.released.len());
+                Some(LowWorkDownload::Redownload(sync.redownload.height()))
+            }
+            Download::Genesis(_) | Download::Chain | Download::Branch(_) => None,
         }
     }
 
@@ -468,15 +479,15 @@ impl Download {
 
 impl<'a> Peer<'a> {
     pub(crate) fn progress(&self) -> Progress {
-        let presync_height = match &self.sync {
+        let low_work_download = match &self.sync {
             SyncState::Due(download) | SyncState::Outstanding { download, .. } => {
-                download.presync_height(self.chain)
+                download.low_work_download(self.chain)
             }
             SyncState::Synced => None,
         };
         Progress {
             tip: self.chain.tip(),
-            presync_height,
+            low_work_download,
         }
     }
 
@@ -946,6 +957,8 @@ fn branch_presync_next(
             Download::BranchPresync(Box::new(BranchPresync { start, presync }))
         }
         crate::headerssync::PresyncStep::Redownload(redownload) => {
+            assert_eq!(redownload.height(), start.height());
+            assert_eq!(redownload.last_hash(), start.hash());
             Download::BranchRedownload(Box::new(BranchRedownload {
                 start,
                 redownload,
@@ -3198,7 +3211,7 @@ mod tests {
             let work_min = tip_after(&crate::fixtures::headers_on_genesis(work_min_count)).work();
             let progress = start_with(&mut chain, work_min).progress();
             assert_eq!(progress.tip, expected, "{work_min_count}");
-            assert_eq!(progress.presync_height, None, "{work_min_count}");
+            assert_eq!(progress.low_work_download, None, "{work_min_count}");
         }
     }
 
@@ -3339,6 +3352,12 @@ mod tests {
                 let (next, get_headers) = batch_then_tick(peer, batch, start);
                 assert_eq!(get_headers, get_headers_after(&branch[first + 1_999]));
                 peer = next;
+                let expected = if download == 0 {
+                    presync(first + 2_000)
+                } else {
+                    redownload(first + 2_000)
+                };
+                assert_eq!(heights(&peer), (9_500, expected), "{download}, {first}");
             }
             if download == 0 {
                 let (next, get_headers) = batch_then_tick(peer, &branch[8_000..], start);
@@ -3638,14 +3657,22 @@ mod tests {
         assert_eq!(tip, tip_after(&headers));
     }
 
-    fn heights(peer: &super::Peer<'_>) -> (usize, Option<usize>) {
+    fn heights(peer: &super::Peer<'_>) -> (usize, Option<super::LowWorkDownload>) {
         let progress = peer.progress();
-        let presync_height = progress.presync_height.map(std::num::NonZeroUsize::get);
-        (progress.tip.height(), presync_height)
+        (progress.tip.height(), progress.low_work_download)
+    }
+
+    fn presync(height: usize) -> Option<super::LowWorkDownload> {
+        let height = std::num::NonZeroUsize::new(height).unwrap();
+        Some(super::LowWorkDownload::Presync(height))
+    }
+
+    fn redownload(height: usize) -> Option<super::LowWorkDownload> {
+        Some(super::LowWorkDownload::Redownload(height))
     }
 
     #[test]
-    fn progress_of_a_low_work_sync_is_the_height_of_its_first_download_then_of_the_chain() {
+    fn progress_of_a_low_work_sync_is_the_height_of_each_download_then_of_the_chain() {
         let mut chain = regtest();
         let start = std::time::Instant::now();
         let headers = crate::fixtures::headers_on_genesis(12_002);
@@ -3653,17 +3680,17 @@ mod tests {
         let mut peer = asked_with(&mut chain, work_min, start);
         assert_eq!(heights(&peer), (0, None));
         let expected = [
-            (0, Some(2_000)),
-            (0, Some(4_000)),
-            (0, Some(6_000)),
-            (0, Some(8_000)),
-            (0, Some(10_000)),
-            (0, None),
-            (0, None),
-            (0, None),
-            (0, None),
-            (983, None),
-            (2_983, None),
+            (0, presync(2_000)),
+            (0, presync(4_000)),
+            (0, presync(6_000)),
+            (0, presync(8_000)),
+            (0, presync(10_000)),
+            (0, redownload(0)),
+            (0, redownload(2_000)),
+            (0, redownload(4_000)),
+            (0, redownload(6_000)),
+            (983, redownload(8_000)),
+            (2_983, redownload(10_000)),
             (12_000, None),
         ];
         let batches = headers[..12_000].chunks(2_000).cycle();
@@ -3680,8 +3707,7 @@ mod tests {
     }
 
     #[test]
-    fn progress_of_a_low_work_sync_of_a_branch_has_the_height_of_its_first_download_and_of_our_chain()
-     {
+    fn progress_of_a_low_work_sync_of_a_branch_has_the_height_of_each_download_and_of_our_chain() {
         let start = std::time::Instant::now();
         let headers = crate::fixtures::headers_on_genesis(2_200);
         let branch = crate::fixtures::branch_on(&headers[49], 2_300);
@@ -3695,12 +3721,19 @@ mod tests {
                 &[&headers[..50], &branch[..1_950]].concat()[..],
                 (2_200, None),
             ),
-            (&branch[..2_000], (2_200, Some(2_050))),
-            (&branch[2_000..], (2_200, None)),
+            (&branch[..2_000], (2_200, presync(2_050))),
+            (&branch[2_000..], (2_200, redownload(50))),
+            (&branch[..2_000], (2_200, redownload(2_050))),
         ] {
             (peer, _) = batch_then_tick(peer, batch, start);
             assert_eq!(heights(&peer), expected, "{}", batch.len());
         }
+        let received = peer.receive(&headers_message(&branch[2_000..]), crate::fixtures::CLOCK);
+        let Ok((peer, super::Received::Synced(tip))) = received else {
+            panic!("{received:?}");
+        };
+        assert_eq!(heights(&peer), (2_350, None));
+        assert_eq!(peer.progress().tip, tip);
     }
 
     #[test]

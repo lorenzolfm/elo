@@ -229,6 +229,21 @@ impl Redownload {
         self.last.hash
     }
 
+    pub(crate) fn height(&self) -> usize {
+        assert!(self.last.height >= self.commitments.start_height);
+        self.last.height
+    }
+
+    pub(crate) fn released_height(&self) -> usize {
+        assert!(self.buffer.len() <= self.network.redownload_buffer_size());
+        assert!(self.commitments.start_height + self.buffer.len() <= self.last.height);
+        self.last.height - self.buffer.len()
+    }
+
+    pub(crate) fn released_count(&self) -> usize {
+        self.released_height() - self.commitments.start_height
+    }
+
     pub(crate) fn receive(
         mut self,
         headers: crate::protocol::Headers,
