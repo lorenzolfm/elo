@@ -123,7 +123,7 @@ impl Metrics {
             tip: std::cell::Cell::new(chain.tip()),
             progress: std::cell::Cell::new(crate::net_processing::Progress {
                 tip: chain.tip(),
-                low_work: None,
+                low_work_download: None,
             }),
             peer: std::cell::Cell::new(PeerState::Dial),
             reconnects: std::cell::Cell::new(0),
@@ -168,7 +168,7 @@ impl Metrics {
         self.reconnects.set(self.reconnects.get().saturating_add(1));
         self.progress.set(crate::net_processing::Progress {
             tip: chain.tip(),
-            low_work: None,
+            low_work_download: None,
         });
     }
 
@@ -225,9 +225,9 @@ impl Metrics {
         text.family(TIP_WORK).sample(tip.work().decimal());
         let progress = self.progress.get();
         text.family(CHAIN_HEIGHT).sample(progress.tip.height());
-        let (presync_height, redownload_height) = match progress.low_work {
-            Some(crate::net_processing::LowWork::Presync(height)) => (height.get(), 0),
-            Some(crate::net_processing::LowWork::Redownload(height)) => (0, height),
+        let (presync_height, redownload_height) = match progress.low_work_download {
+            Some(crate::net_processing::LowWorkDownload::Presync(height)) => (height.get(), 0),
+            Some(crate::net_processing::LowWorkDownload::Redownload(height)) => (0, height),
             None => (0, 0),
         };
         text.family(PRESYNC_HEIGHT).sample(presync_height);
@@ -564,21 +564,21 @@ elo_header_redownload_height 0
 
     fn progress(
         height: usize,
-        low_work: Option<crate::net_processing::LowWork>,
+        low_work_download: Option<crate::net_processing::LowWorkDownload>,
     ) -> crate::net_processing::Progress {
         crate::net_processing::Progress {
             tip: tip_at(height),
-            low_work,
+            low_work_download,
         }
     }
 
-    fn presync(height: usize) -> Option<crate::net_processing::LowWork> {
+    fn presync(height: usize) -> Option<crate::net_processing::LowWorkDownload> {
         let height = std::num::NonZeroUsize::new(height).unwrap();
-        Some(crate::net_processing::LowWork::Presync(height))
+        Some(crate::net_processing::LowWorkDownload::Presync(height))
     }
 
-    fn redownload(height: usize) -> Option<crate::net_processing::LowWork> {
-        Some(crate::net_processing::LowWork::Redownload(height))
+    fn redownload(height: usize) -> Option<crate::net_processing::LowWorkDownload> {
+        Some(crate::net_processing::LowWorkDownload::Redownload(height))
     }
 
     fn metrics_in(state: super::PeerState) -> super::Metrics {
@@ -675,7 +675,12 @@ elo_header_redownload_height 0
     fn text_has_the_height_of_the_chain_and_of_each_download_of_the_last_progress_apart_from_the_tip()
      {
         let metrics = metrics();
-        for (chain_height, low_work, expected_presync_height, expected_redownload_height) in [
+        for (
+            chain_height,
+            low_work_download,
+            expected_presync_height,
+            expected_redownload_height,
+        ) in [
             (0, presync(2_000), 2_000, 0),
             (0, redownload(0), 0, 0),
             (983, redownload(8_000), 0, 8_000),
@@ -684,7 +689,7 @@ elo_header_redownload_height 0
             (5, redownload(2_050), 0, 2_050),
             (7, None, 0, 0),
         ] {
-            metrics.progress(progress(chain_height, low_work));
+            metrics.progress(progress(chain_height, low_work_download));
             let text = metrics.text();
             for line in [
                 String::from("elo_header_tip_height 0\n"),
@@ -699,9 +704,9 @@ elo_header_redownload_height 0
 
     #[test]
     fn peer_wait_sets_the_height_of_each_download_to_0_and_the_chain_height_to_the_chain() {
-        for low_work in [presync(2_000), redownload(2_000)] {
+        for low_work_download in [presync(2_000), redownload(2_000)] {
             let metrics = metrics_in(super::PeerState::Sync);
-            metrics.progress(progress(7, low_work));
+            metrics.progress(progress(7, low_work_download));
             metrics.peer_wait(&chain_at(9));
             let text = metrics.text();
             for line in [
@@ -709,7 +714,7 @@ elo_header_redownload_height 0
                 "elo_header_presync_height 0\n",
                 "elo_header_redownload_height 0\n",
             ] {
-                assert!(text.contains(line), "{low_work:?}, {line}: {text}");
+                assert!(text.contains(line), "{low_work_download:?}, {line}: {text}");
             }
         }
     }

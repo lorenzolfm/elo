@@ -214,7 +214,7 @@ impl<'a> Handshake<'a> {
     pub(crate) fn progress(&self) -> Progress {
         Progress {
             tip: self.chain.tip(),
-            low_work: None,
+            low_work_download: None,
         }
     }
 
@@ -388,11 +388,11 @@ enum Download {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Progress {
     pub(crate) tip: crate::chain::Tip,
-    pub(crate) low_work: Option<LowWork>,
+    pub(crate) low_work_download: Option<LowWorkDownload>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LowWork {
+pub(crate) enum LowWorkDownload {
     Presync(std::num::NonZeroUsize),
     Redownload(usize),
 }
@@ -435,26 +435,26 @@ impl Download {
         locator
     }
 
-    fn low_work(&self, chain: &crate::chain::Chain) -> Option<LowWork> {
+    fn low_work_download(&self, chain: &crate::chain::Chain) -> Option<LowWorkDownload> {
         match self {
             Download::Presync(presync) => {
                 assert_eq!(chain.tip().height(), 0);
-                Some(LowWork::Presync(presync.height()))
+                Some(LowWorkDownload::Presync(presync.height()))
             }
             Download::Redownload(redownload) => {
                 assert_eq!(chain.tip().height(), redownload.released_height());
-                Some(LowWork::Redownload(redownload.height()))
+                Some(LowWorkDownload::Redownload(redownload.height()))
             }
             Download::BranchPresync(sync) => {
                 assert!(sync.start.height() < chain.tip().height());
-                Some(LowWork::Presync(sync.presync.height()))
+                Some(LowWorkDownload::Presync(sync.presync.height()))
             }
             Download::BranchRedownload(sync) => {
                 assert!(sync.start.height() < chain.tip().height());
                 let released_height = sync.redownload.released_height();
                 let released_count = released_height.saturating_sub(sync.start.height());
                 assert_eq!(released_count, sync.released.len());
-                Some(LowWork::Redownload(sync.redownload.height()))
+                Some(LowWorkDownload::Redownload(sync.redownload.height()))
             }
             Download::Genesis(_) | Download::Chain | Download::Branch(_) => None,
         }
@@ -481,15 +481,15 @@ impl Download {
 
 impl<'a> Peer<'a> {
     pub(crate) fn progress(&self) -> Progress {
-        let low_work = match &self.sync {
+        let low_work_download = match &self.sync {
             SyncState::Due(download) | SyncState::Outstanding { download, .. } => {
-                download.low_work(self.chain)
+                download.low_work_download(self.chain)
             }
             SyncState::Synced => None,
         };
         Progress {
             tip: self.chain.tip(),
-            low_work,
+            low_work_download,
         }
     }
 
@@ -3211,7 +3211,7 @@ mod tests {
             let work_min = tip_after(&crate::fixtures::headers_on_genesis(work_min_count)).work();
             let progress = start_with(&mut chain, work_min).progress();
             assert_eq!(progress.tip, expected, "{work_min_count}");
-            assert_eq!(progress.low_work, None, "{work_min_count}");
+            assert_eq!(progress.low_work_download, None, "{work_min_count}");
         }
     }
 
@@ -3651,18 +3651,18 @@ mod tests {
         assert_eq!(tip, tip_after(&headers));
     }
 
-    fn heights(peer: &super::Peer<'_>) -> (usize, Option<super::LowWork>) {
+    fn heights(peer: &super::Peer<'_>) -> (usize, Option<super::LowWorkDownload>) {
         let progress = peer.progress();
-        (progress.tip.height(), progress.low_work)
+        (progress.tip.height(), progress.low_work_download)
     }
 
-    fn presync(height: usize) -> Option<super::LowWork> {
+    fn presync(height: usize) -> Option<super::LowWorkDownload> {
         let height = std::num::NonZeroUsize::new(height).unwrap();
-        Some(super::LowWork::Presync(height))
+        Some(super::LowWorkDownload::Presync(height))
     }
 
-    fn redownload(height: usize) -> Option<super::LowWork> {
-        Some(super::LowWork::Redownload(height))
+    fn redownload(height: usize) -> Option<super::LowWorkDownload> {
+        Some(super::LowWorkDownload::Redownload(height))
     }
 
     #[test]
