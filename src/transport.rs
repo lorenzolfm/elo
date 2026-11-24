@@ -133,6 +133,7 @@ pub(crate) fn encode(
     assert_eq!(decode_header(network, written), Ok(header));
 
     frame.extend_from_slice(payload);
+    assert_eq!(frame.len(), MESSAGE_HEADER_SIZE + payload.len());
     frame
 }
 

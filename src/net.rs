@@ -702,10 +702,6 @@ impl<'a> Socket<'a> {
         payload: &[u8],
     ) -> Result<(), std::io::Error> {
         let frame = crate::transport::encode(self.network, msg_type, payload);
-        assert_eq!(
-            frame.len(),
-            crate::transport::MESSAGE_HEADER_SIZE + payload.len()
-        );
         self.stream.write_all(&frame).await?;
         self.metrics.sent(msg_type, payload.len());
         Ok(())
