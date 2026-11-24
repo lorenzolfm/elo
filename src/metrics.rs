@@ -83,7 +83,6 @@ impl Metrics {
     }
 
     pub(crate) fn progress(&self, progress: crate::net_processing::Progress) {
-        assert_ne!(progress.presync_height, Some(0));
         self.progress.set(progress);
     }
 
@@ -178,7 +177,11 @@ impl Metrics {
             Kind::Gauge,
             "The height of the last header that the first download of a low-work sync checked and did not put in the chain: 0 when no such download runs.",
         )
-        .sample(progress.presync_height.unwrap_or(0));
+        .sample(
+            progress
+                .presync_height
+                .map_or(0, std::num::NonZeroUsize::get),
+        );
         let mut family = text.family(
             "elo_peer_state",
             Kind::Gauge,
@@ -476,7 +479,8 @@ elo_header_presync_height 0
     fn progress(height: usize, presync_height: Option<usize>) -> crate::net_processing::Progress {
         crate::net_processing::Progress {
             tip: tip_at(height),
-            presync_height,
+            presync_height: presync_height
+                .map(|height| std::num::NonZeroUsize::new(height).unwrap()),
         }
     }
 
@@ -590,12 +594,6 @@ elo_header_presync_height 0
                 assert!(text.contains(&line), "{line}: {text}");
             }
         }
-    }
-
-    #[test]
-    #[should_panic(expected = "left: Some(0)")]
-    fn presync_height_of_0_is_a_bug() {
-        metrics().progress(progress(0, Some(0)));
     }
 
     #[test]

@@ -381,7 +381,7 @@ enum Download {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Progress {
     pub(crate) tip: crate::chain::Tip,
-    pub(crate) presync_height: Option<usize>,
+    pub(crate) presync_height: Option<std::num::NonZeroUsize>,
 }
 
 #[derive(Debug)]
@@ -422,7 +422,7 @@ impl Download {
         locator
     }
 
-    fn presync_height(&self, chain: &crate::chain::Chain) -> Option<usize> {
+    fn presync_height(&self, chain: &crate::chain::Chain) -> Option<std::num::NonZeroUsize> {
         match self {
             Download::Presync(presync) => {
                 assert_eq!(chain.tip().height(), 0);
@@ -3615,7 +3615,8 @@ mod tests {
 
     fn heights(peer: &super::Peer<'_>) -> (usize, Option<usize>) {
         let progress = peer.progress();
-        (progress.tip.height(), progress.presync_height)
+        let presync_height = progress.presync_height.map(std::num::NonZeroUsize::get);
+        (progress.tip.height(), presync_height)
     }
 
     #[test]
