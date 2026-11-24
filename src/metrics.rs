@@ -17,6 +17,61 @@ const COMMAND_OTHER_INDEX: usize = crate::protocol::MESSAGE_TYPES.len();
 
 const COMMAND_LABELS_COUNT: usize = COMMAND_OTHER_INDEX + 1;
 
+const TIP_HEIGHT: Definition = Definition::gauge(
+    "elo_header_tip_height",
+    "The height of the tip of the header chain at the end of the last sync, or at the last new tip after it.",
+);
+
+const TIP_WORK: Definition = Definition::gauge(
+    "elo_header_tip_work",
+    "The work of the header chain up to that tip: the expected number of hashes.",
+);
+
+const CHAIN_HEIGHT: Definition = Definition::gauge(
+    "elo_header_chain_height",
+    "The height of the header chain after the last message from the peer or the start of the last handshake, also in a sync.",
+);
+
+const PRESYNC_HEIGHT: Definition = Definition::gauge(
+    "elo_header_presync_height",
+    "The height of the last header that the first download of a low-work sync checked and did not put in the chain: 0 when no such download runs.",
+);
+
+const PEER_STATE: Definition = Definition::gauge(
+    "elo_peer_state",
+    "The step of the connection to the peer: 1 for the step it is in, 0 for each other.",
+);
+
+const RECONNECTS: Definition = Definition::counter(
+    "elo_reconnects_total",
+    "Each failed lookup, dial or handshake and each connection that ended, after which elo waits and dials again.",
+);
+
+const RECEIVED_MESSAGES: Definition = Definition::counter(
+    "elo_peer_received_messages_total",
+    "The messages from the peer that elo read whole and checked, by command: other for each command that elo does not know.",
+);
+
+const RECEIVED_BYTES: Definition = Definition::counter(
+    "elo_peer_received_bytes_total",
+    "The bytes of the messages from the peer, with their headers, by command.",
+);
+
+const SENT_MESSAGES: Definition = Definition::counter(
+    "elo_peer_sent_messages_total",
+    "The messages to the peer that elo wrote whole, by command.",
+);
+
+const SENT_BYTES: Definition = Definition::counter(
+    "elo_peer_sent_bytes_total",
+    "The bytes of the messages to the peer, with their headers, by command.",
+);
+
+const METRICS_FAILURES: Definition = Definition::counter(
+    "elo_metrics_failures_total",
+    "The connections to the metrics that failed: an accept error, a read or write error, no answer in time, or a newer connection in its place.",
+);
+
 #[derive(Debug)]
 pub struct Metrics {
     tip: std::cell::Cell<crate::chain::Tip>,
@@ -153,82 +208,33 @@ impl Metrics {
     fn text(&self) -> String {
         let tip = self.tip.get();
         let mut text = Text::new();
-        text.family(
-            "elo_header_tip_height",
-            Kind::Gauge,
-            "The height of the tip of the header chain at the end of the last sync, or at the last new tip after it.",
-        )
-        .sample(tip.height());
-        text.family(
-            "elo_header_tip_work",
-            Kind::Gauge,
-            "The work of the header chain up to that tip: the expected number of hashes.",
-        )
-        .sample(tip.work().decimal());
+        text.family(TIP_HEIGHT).sample(tip.height());
+        text.family(TIP_WORK).sample(tip.work().decimal());
         let progress = self.progress.get();
-        text.family(
-            "elo_header_chain_height",
-            Kind::Gauge,
-            "The height of the header chain after the last message from the peer or the start of the last handshake, also in a sync.",
-        )
-        .sample(progress.tip.height());
-        text.family(
-            "elo_header_presync_height",
-            Kind::Gauge,
-            "The height of the last header that the first download of a low-work sync checked and did not put in the chain: 0 when no such download runs.",
-        )
-        .sample(
+        text.family(CHAIN_HEIGHT).sample(progress.tip.height());
+        text.family(PRESYNC_HEIGHT).sample(
             progress
                 .presync_height
                 .map_or(0, std::num::NonZeroUsize::get),
         );
-        let mut family = text.family(
-            "elo_peer_state",
-            Kind::Gauge,
-            "The step of the connection to the peer: 1 for the step it is in, 0 for each other.",
-        );
+        let mut family = text.family(PEER_STATE);
         let peer = self.peer.get();
         for state in PeerState::ALL {
             family.sample_labelled("state", state.name(), u8::from(state == peer));
         }
-        text.family(
-            "elo_reconnects_total",
-            Kind::Counter,
-            "Each failed lookup, dial or handshake and each connection that ended, after which elo waits and dials again.",
-        )
-        .sample(self.reconnects.get());
-        for (name, help, counts) in [
-            (
-                "elo_peer_received_messages_total",
-                "The messages from the peer that elo read whole and checked, by command: other for each command that elo does not know.",
-                &self.received.messages,
-            ),
-            (
-                "elo_peer_received_bytes_total",
-                "The bytes of the messages from the peer, with their headers, by command.",
-                &self.received.bytes,
-            ),
-            (
-                "elo_peer_sent_messages_total",
-                "The messages to the peer that elo wrote whole, by command.",
-                &self.sent.messages,
-            ),
-            (
-                "elo_peer_sent_bytes_total",
-                "The bytes of the messages to the peer, with their headers, by command.",
-                &self.sent.bytes,
-            ),
+        text.family(RECONNECTS).sample(self.reconnects.get());
+        for (definition, counts) in [
+            (RECEIVED_MESSAGES, &self.received.messages),
+            (RECEIVED_BYTES, &self.received.bytes),
+            (SENT_MESSAGES, &self.sent.messages),
+            (SENT_BYTES, &self.sent.bytes),
         ] {
-            let mut family = text.family(name, Kind::Counter, help);
+            let mut family = text.family(definition);
             for (command, count) in command_names().zip(counts) {
                 family.sample_labelled("command", command, count.get());
             }
         }
-        let mut family = text.family(
-            "elo_metrics_failures_total",
-            Kind::Counter,
-            "The connections to the metrics that failed: an accept error, a read or write error, no answer in time, or a newer connection in its place.",
-        );
+        let mut family = text.family(METRICS_FAILURES);
         for (kind, failures) in [
             ("accept", &self.accept_failures),
             ("io", &self.io_failures),
@@ -295,6 +301,61 @@ impl Kind {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct Definition {
+    name: &'static str,
+    kind: Kind,
+    help: &'static str,
+}
+
+impl Definition {
+    const fn gauge(name: &'static str, help: &'static str) -> Definition {
+        assert!(!ends_with(name, "_total"));
+        Definition::new(name, Kind::Gauge, help)
+    }
+
+    const fn counter(name: &'static str, help: &'static str) -> Definition {
+        assert!(ends_with(name, "_total"));
+        Definition::new(name, Kind::Counter, help)
+    }
+
+    const fn new(name: &'static str, kind: Kind, help: &'static str) -> Definition {
+        assert!(starts_with(name, "elo_"));
+        let name_bytes = name.as_bytes();
+        let mut index = 0;
+        while index < name_bytes.len() {
+            assert!(name_byte(name_bytes[index]));
+            index += 1;
+        }
+        let help_bytes = help.as_bytes();
+        let mut index = 0;
+        while index < help_bytes.len() {
+            assert!(!matches!(help_bytes[index], b'\\' | b'\n'));
+            index += 1;
+        }
+        Definition { name, kind, help }
+    }
+}
+
+const fn starts_with(text: &str, start: &str) -> bool {
+    text.len() >= start.len() && bytes_at(text.as_bytes(), 0, start.as_bytes())
+}
+
+const fn ends_with(text: &str, end: &str) -> bool {
+    text.len() >= end.len() && bytes_at(text.as_bytes(), text.len() - end.len(), end.as_bytes())
+}
+
+const fn bytes_at(text: &[u8], at: usize, part: &[u8]) -> bool {
+    let mut index = 0;
+    while index < part.len() {
+        if text[at + index] != part[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
 trait Value: std::fmt::Display {
     const LENGTH_MAX: usize;
 }
@@ -335,15 +396,8 @@ impl Text {
         }
     }
 
-    fn family(&mut self, name: &'static str, kind: Kind, help: &'static str) -> Family<'_> {
-        assert!(name.starts_with("elo_"), "{name}");
-        assert!(name.bytes().all(name_byte), "{name}");
-        assert_eq!(
-            name.ends_with("_total"),
-            matches!(kind, Kind::Counter),
-            "{name}"
-        );
-        assert!(!help.contains(['\\', '\n']), "{name}");
+    fn family(&mut self, definition: Definition) -> Family<'_> {
+        let Definition { name, kind, help } = definition;
         let kind = kind.name();
         let written = write!(self.text, "# HELP {name} {help}\n# TYPE {name} {kind}\n");
         assert!(written.is_ok(), "{name}");
@@ -391,7 +445,7 @@ impl Family<'_> {
     }
 }
 
-fn name_byte(byte: u8) -> bool {
+const fn name_byte(byte: u8) -> bool {
     byte.is_ascii_lowercase() || byte == b'_'
 }
 
@@ -792,11 +846,10 @@ elo_header_presync_height 0
     fn text_whose_values_can_grow_past_the_maximum_is_a_bug() {
         let text = |samples| {
             let mut text = super::Text::new();
-            let mut family = text.family(
+            let mut family = text.family(super::Definition::gauge(
                 "elo_a",
-                super::Kind::Gauge,
                 "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            );
+            ));
             for _ in 0..samples {
                 family.sample(0_u64);
             }
@@ -819,13 +872,13 @@ elo_header_presync_height 0
         ] {
             let sampled = std::panic::catch_unwind(|| {
                 let mut text = super::Text::new();
-                text.family("elo_a", super::Kind::Gauge, "A.")
+                text.family(super::Definition::gauge("elo_a", "A."))
                     .sample_labelled(label, label_value, 0_u8);
             });
             assert!(sampled.is_err(), "{label:?} {label_value:?}");
         }
         let mut text = super::Text::new();
-        text.family("elo_a", super::Kind::Gauge, "A.")
+        text.family(super::Definition::gauge("elo_a", "A."))
             .sample_labelled("b", "c_d", 0_u8);
         assert_eq!(
             text.end(),
@@ -835,21 +888,44 @@ elo_header_presync_height 0
 
     #[test]
     fn counter_name_ends_with_total_and_a_gauge_name_does_not() {
-        for (name, kind) in [
-            ("elo_a", super::Kind::Counter),
-            ("elo_a_total", super::Kind::Gauge),
+        for (name, define) in [
+            ("elo_a", super::Definition::counter as fn(_, _) -> _),
+            ("elo_", super::Definition::counter),
+            ("elo_a_total", super::Definition::gauge),
         ] {
-            let written = std::panic::catch_unwind(|| {
-                super::Text::new().family(name, kind, "A.").sample(0_u8);
-            });
-            assert!(written.is_err(), "{name} {kind:?}");
+            let defined = std::panic::catch_unwind(|| define(name, "A."));
+            assert!(defined.is_err(), "{name}");
         }
         let mut text = super::Text::new();
-        text.family("elo_a_total", super::Kind::Counter, "A.")
+        text.family(super::Definition::counter("elo_a_total", "A."))
             .sample(0_u8);
         assert_eq!(
             text.end(),
             "# HELP elo_a_total A.\n# TYPE elo_a_total counter\nelo_a_total 0\n"
+        );
+    }
+
+    #[test]
+    fn definition_of_a_name_out_of_elo_or_of_other_bytes_or_of_a_help_with_a_backslash_or_a_newline_is_a_bug()
+     {
+        for (name, help) in [
+            ("elo", "A."),
+            ("eloa", "A."),
+            ("ole_a", "A."),
+            ("elo_A", "A."),
+            ("elo_a-b", "A."),
+            ("elo_a", "A\\."),
+            ("elo_a", "A\n."),
+        ] {
+            let defined = std::panic::catch_unwind(|| super::Definition::gauge(name, help));
+            assert!(defined.is_err(), "{name:?} {help:?}");
+        }
+        let defined = super::Definition::gauge("elo_a_b", "A b.");
+        let mut text = super::Text::new();
+        text.family(defined).sample(0_u8);
+        assert_eq!(
+            text.end(),
+            "# HELP elo_a_b A b.\n# TYPE elo_a_b gauge\nelo_a_b 0\n"
         );
     }
 }
