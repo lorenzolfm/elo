@@ -380,7 +380,7 @@ enum Download {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Progress {
-    pub(crate) chain_height: usize,
+    pub(crate) tip: crate::chain::Tip,
     pub(crate) presync_height: Option<usize>,
 }
 
@@ -468,7 +468,7 @@ impl<'a> Peer<'a> {
             SyncState::Synced => None,
         };
         Progress {
-            chain_height: self.chain.tip().height(),
+            tip: self.chain.tip(),
             presync_height,
         }
     }
@@ -3613,11 +3613,9 @@ mod tests {
         assert_eq!(tip, tip_after(&headers));
     }
 
-    fn progress(chain_height: usize, presync_height: Option<usize>) -> super::Progress {
-        super::Progress {
-            chain_height,
-            presync_height,
-        }
+    fn heights(peer: &super::Peer<'_>) -> (usize, Option<usize>) {
+        let progress = peer.progress();
+        (progress.tip.height(), progress.presync_height)
     }
 
     #[test]
@@ -3627,31 +3625,32 @@ mod tests {
         let headers = crate::fixtures::headers_on_genesis(12_002);
         let work_min = tip_after(&headers[..11_000]).work();
         let mut peer = asked_with(&mut chain, work_min, start);
-        assert_eq!(peer.progress(), progress(0, None));
+        assert_eq!(heights(&peer), (0, None));
         let expected = [
-            progress(0, Some(2_000)),
-            progress(0, Some(4_000)),
-            progress(0, Some(6_000)),
-            progress(0, Some(8_000)),
-            progress(0, Some(10_000)),
-            progress(0, None),
-            progress(0, None),
-            progress(0, None),
-            progress(0, None),
-            progress(983, None),
-            progress(2_983, None),
-            progress(12_000, None),
+            (0, Some(2_000)),
+            (0, Some(4_000)),
+            (0, Some(6_000)),
+            (0, Some(8_000)),
+            (0, Some(10_000)),
+            (0, None),
+            (0, None),
+            (0, None),
+            (0, None),
+            (983, None),
+            (2_983, None),
+            (12_000, None),
         ];
         let batches = headers[..12_000].chunks(2_000).cycle();
         for (index, (batch, expected)) in batches.zip(expected).enumerate() {
             (peer, _) = batch_then_tick(peer, batch, start);
-            assert_eq!(peer.progress(), expected, "batch {index}");
+            assert_eq!(heights(&peer), expected, "batch {index}");
         }
         let received = peer.receive(&headers_message(&headers[12_000..]), crate::fixtures::CLOCK);
-        let Ok((peer, super::Received::Synced(_))) = received else {
+        let Ok((peer, super::Received::Synced(tip))) = received else {
             panic!("{received:?}");
         };
-        assert_eq!(peer.progress(), progress(12_002, None));
+        assert_eq!(heights(&peer), (12_002, None));
+        assert_eq!(peer.progress().tip, tip);
     }
 
     #[test]
@@ -3668,13 +3667,13 @@ mod tests {
         for (batch, expected) in [
             (
                 &[&headers[..50], &branch[..1_950]].concat()[..],
-                progress(2_200, None),
+                (2_200, None),
             ),
-            (&branch[..2_000], progress(2_200, Some(2_050))),
-            (&branch[2_000..], progress(2_200, None)),
+            (&branch[..2_000], (2_200, Some(2_050))),
+            (&branch[2_000..], (2_200, None)),
         ] {
             (peer, _) = batch_then_tick(peer, batch, start);
-            assert_eq!(peer.progress(), expected, "{}", batch.len());
+            assert_eq!(heights(&peer), expected, "{}", batch.len());
         }
     }
 

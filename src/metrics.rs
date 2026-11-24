@@ -62,7 +62,7 @@ impl Metrics {
         Metrics {
             tip: std::cell::Cell::new(chain.tip()),
             progress: std::cell::Cell::new(crate::net_processing::Progress {
-                chain_height: chain.tip().height(),
+                tip: chain.tip(),
                 presync_height: None,
             }),
             peer: std::cell::Cell::new(PeerState::Dial),
@@ -76,10 +76,10 @@ impl Metrics {
         }
     }
 
-    pub fn tip(&self, tip: &crate::chain::Tip) {
+    pub(crate) fn synced(&self) {
+        let tip = self.progress.get().tip;
         assert!(tip.work() >= self.tip.get().work());
-        assert_eq!(tip.height(), self.progress.get().chain_height);
-        self.tip.set(*tip);
+        self.tip.set(tip);
     }
 
     pub(crate) fn progress(&self, progress: crate::net_processing::Progress) {
@@ -172,7 +172,7 @@ impl Metrics {
             Kind::Gauge,
             "The height of the header chain after the last message from the peer, also in a sync.",
         )
-        .sample(progress.chain_height);
+        .sample(progress.tip.height());
         text.family(
             "elo_header_presync_height",
             Kind::Gauge,
@@ -460,6 +460,26 @@ elo_header_presync_height 0
         ))
     }
 
+    fn tip_at(height: usize) -> crate::chain::Tip {
+        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        if height > 0 {
+            let headers = crate::fixtures::headers_on_genesis(height);
+            let extended = chain.extend(
+                crate::fixtures::headers_batch(&headers),
+                crate::fixtures::CLOCK,
+            );
+            assert_eq!(extended, Ok(()));
+        }
+        chain.tip()
+    }
+
+    fn progress(height: usize, presync_height: Option<usize>) -> crate::net_processing::Progress {
+        crate::net_processing::Progress {
+            tip: tip_at(height),
+            presync_height,
+        }
+    }
+
     fn metrics_in(state: super::PeerState) -> super::Metrics {
         let metrics = metrics();
         let path: &[super::PeerState] = match state {
@@ -528,18 +548,8 @@ elo_header_presync_height 0
     #[test]
     fn text_has_the_last_tip_the_state_and_each_wait_as_a_reconnect() {
         let metrics = metrics();
-        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
-        let headers = crate::fixtures::headers_on_genesis(3);
-        let extended = chain.extend(
-            crate::fixtures::headers_batch(&headers),
-            crate::fixtures::CLOCK,
-        );
-        assert_eq!(extended, Ok(()));
-        metrics.progress(crate::net_processing::Progress {
-            chain_height: 3,
-            presync_height: None,
-        });
-        metrics.tip(&chain.tip());
+        metrics.progress(progress(3, None));
+        metrics.synced();
         for (state, expected, reconnects) in [
             (super::PeerState::Wait, states(0, 0, 0, 1), 1),
             (super::PeerState::Dial, states(1, 0, 0, 0), 1),
@@ -566,14 +576,11 @@ elo_header_presync_height 0
         let metrics = metrics();
         for (chain_height, presync_height, expected_presync_height) in [
             (0, Some(2_000), 2_000),
-            (12_000, None, 0),
-            (2_200, Some(2_050), 2_050),
+            (12, None, 0),
+            (5, Some(2_050), 2_050),
             (7, None, 0),
         ] {
-            metrics.progress(crate::net_processing::Progress {
-                chain_height,
-                presync_height,
-            });
+            metrics.progress(progress(chain_height, presync_height));
             let text = metrics.text();
             for line in [
                 String::from("elo_header_tip_height 0\n"),
@@ -588,19 +595,13 @@ elo_header_presync_height 0
     #[test]
     #[should_panic(expected = "left: Some(0)")]
     fn presync_height_of_0_is_a_bug() {
-        metrics().progress(crate::net_processing::Progress {
-            chain_height: 0,
-            presync_height: Some(0),
-        });
+        metrics().progress(progress(0, Some(0)));
     }
 
     #[test]
     fn wait_sets_the_presync_height_to_0_and_keeps_the_chain_height() {
         let metrics = metrics_in(super::PeerState::Sync);
-        metrics.progress(crate::net_processing::Progress {
-            chain_height: 7,
-            presync_height: Some(2_000),
-        });
+        metrics.progress(progress(7, Some(2_000)));
         metrics.peer(super::PeerState::Wait);
         let text = metrics.text();
         for line in [
@@ -609,20 +610,6 @@ elo_header_presync_height 0
         ] {
             assert!(text.contains(line), "{line}: {text}");
         }
-    }
-
-    #[test]
-    #[should_panic(expected = "left: 3")]
-    fn tip_at_another_height_than_the_chain_of_the_last_progress_is_a_bug() {
-        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
-        let metrics = super::Metrics::new(&chain);
-        let headers = crate::fixtures::headers_on_genesis(3);
-        let extended = chain.extend(
-            crate::fixtures::headers_batch(&headers),
-            crate::fixtures::CLOCK,
-        );
-        assert_eq!(extended, Ok(()));
-        metrics.tip(&chain.tip());
     }
 
     #[test]
@@ -759,18 +746,12 @@ elo_header_presync_height 0
 
     #[test]
     #[should_panic(expected = "tip.work() >= self.tip.get().work()")]
-    fn tip_with_less_work_than_the_last_is_a_bug() {
-        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
-        let genesis = chain.tip();
-        let headers = crate::fixtures::headers_on_genesis(1);
-        let extended = chain.extend(
-            crate::fixtures::headers_batch(&headers),
-            crate::fixtures::CLOCK,
-        );
-        assert_eq!(extended, Ok(()));
-        let metrics = super::Metrics::new(&chain);
-        metrics.tip(&chain.tip());
-        metrics.tip(&genesis);
+    fn synced_tip_with_less_work_than_the_last_is_a_bug() {
+        let metrics = metrics();
+        metrics.progress(progress(1, None));
+        metrics.synced();
+        metrics.progress(progress(0, None));
+        metrics.synced();
     }
 
     #[test]

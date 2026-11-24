@@ -630,6 +630,7 @@ async fn run_exchange<'a>(
         }
         crate::net_processing::Received::Synced(tip) => {
             assert_eq!(message.msg_type(), crate::protocol::HEADERS);
+            socket.metrics.synced();
             Ok((peer, Some(tip)))
         }
     }
