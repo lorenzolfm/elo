@@ -7,8 +7,10 @@ const EXIT_USAGE: u8 = 2;
 const RECONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn main() -> std::process::ExitCode {
-    std::panic::set_hook(Box::new(|info| {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
         log_or_stderr(&elo::logging::Event::Panic { reason: info });
+        default_hook(info);
     }));
 
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
