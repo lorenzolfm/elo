@@ -126,7 +126,7 @@ container. Port 0 takes a free port. elo logs the address in a `metrics` line be
 | --- | --- | --- |
 | `elo_header_tip_height` | gauge | The height of the tip of the header chain at the end of the last sync, or at the last new tip after it |
 | `elo_header_tip_work` | gauge | The work of the chain up to that tip, in decimal with all its digits. Prometheus keeps each value as a 64-bit float, so it rounds a work above 2^53 |
-| `elo_header_chain_height` | gauge | The height of the header chain after the last message from the peer, the start of the last handshake or the end of the last connection, also in a sync |
+| `elo_header_chain_height` | gauge | The height of the header chain after the last message from the peer, the start of the last handshake or the start of the last wait, also in a sync |
 | `elo_header_presync_height` | gauge | The height of the last header that the first download of a low-work sync checked. These headers are not in the chain yet. 0 when no such download runs |
 | `elo_peer_state` | gauge | 1 for the step of the connection, and 0 for each other. The `state` label is `dial`, `sync`, `synced` or `wait` |
 | `elo_reconnects_total` | counter | Each failed lookup, dial or handshake and each connection that ended, after which elo waits and dials again |
