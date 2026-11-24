@@ -812,13 +812,23 @@ impl Elo {
     }
 
     fn event(&self, name: &str, timeout: std::time::Duration) -> String {
-        let deadline = std::time::Instant::now() + timeout;
+        match self.event_by(name, std::time::Instant::now() + timeout) {
+            Some(line) => line,
+            None => panic!(
+                "elo logged no {name:?} event within {} s: {:?}",
+                timeout.as_secs(),
+                self.read.borrow()
+            ),
+        }
+    }
+
+    fn event_by(&self, name: &str, deadline: std::time::Instant) -> Option<String> {
         loop {
             let passed = self.passed.get();
             if let Some(line) = self.read.borrow().get(passed) {
                 self.passed.set(passed + 1);
                 if event_name(line) == Some(name) {
-                    return line.clone();
+                    return Some(line.clone());
                 }
                 continue;
             }
@@ -829,11 +839,7 @@ impl Elo {
                     let stderr = self.stderr.iter().collect::<Vec<_>>().join("\n");
                     panic!("elo exited: {:?} {stderr}", self.read.borrow())
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
-                    "elo logged no {name:?} event within {} s: {:?}",
-                    timeout.as_secs(),
-                    self.read.borrow()
-                ),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return None,
             }
         }
     }
@@ -842,19 +848,19 @@ impl Elo {
         let prefix = format!("level=info event=tip peer={peer} height={height} hash={hash} ");
         let deadline = std::time::Instant::now() + SYNC_TIMEOUT;
         loop {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            let tip = self.event("tip", left);
+            let Some(tip) = self.event_by("tip", deadline) else {
+                panic!(
+                    "elo logged no tip at {prefix} within {} s: {:?}",
+                    SYNC_TIMEOUT.as_secs(),
+                    self.read.borrow()
+                )
+            };
             if tip.starts_with(&prefix) {
                 return tip;
             }
             assert!(
                 tip_height(&tip) < height,
-                "elo logged a tip past {prefix}: {tip}"
-            );
-            assert!(
-                std::time::Instant::now() < deadline,
-                "elo logged no tip at {prefix} within {} s: {tip}",
-                SYNC_TIMEOUT.as_secs()
+                "elo logged a tip at or past {prefix}: {tip}"
             );
         }
     }
