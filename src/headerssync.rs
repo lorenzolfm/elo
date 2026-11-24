@@ -236,9 +236,8 @@ impl Redownload {
 
     pub(crate) fn released_height(&self) -> usize {
         assert!(self.buffer.len() <= self.network.redownload_buffer_size());
-        let released_height = self.last.height.saturating_sub(self.buffer.len());
-        assert!(released_height >= self.commitments.start_height);
-        released_height
+        assert!(self.commitments.start_height + self.buffer.len() <= self.last.height);
+        self.last.height - self.buffer.len()
     }
 
     pub(crate) fn receive(
