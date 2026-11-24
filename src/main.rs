@@ -111,7 +111,7 @@ async fn node(
         if !end.retries() {
             return exit(&end);
         }
-        metrics.peer(elo::metrics::PeerState::Wait);
+        metrics.wait(chain);
         let logged = log(&elo::logging::Event::End {
             destination: &destination,
             reason: &end,

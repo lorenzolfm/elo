@@ -126,7 +126,7 @@ container. Port 0 takes a free port. elo logs the address in a `metrics` line be
 | --- | --- | --- |
 | `elo_header_tip_height` | gauge | The height of the tip of the header chain at the end of the last sync, or at the last new tip after it |
 | `elo_header_tip_work` | gauge | The work of the chain up to that tip, in decimal with all its digits. Prometheus keeps each value as a 64-bit float, so it rounds a work above 2^53 |
-| `elo_header_chain_height` | gauge | The height of the header chain after the last message from the peer or the start of the last handshake, also in a sync |
+| `elo_header_chain_height` | gauge | The height of the header chain after the last message from the peer, the start of the last handshake or the end of the last connection, also in a sync |
 | `elo_header_presync_height` | gauge | The height of the last header that the first download of a low-work sync checked. These headers are not in the chain yet. 0 when no such download runs |
 | `elo_peer_state` | gauge | 1 for the step of the connection, and 0 for each other. The `state` label is `dial`, `sync`, `synced` or `wait` |
 | `elo_reconnects_total` | counter | Each failed lookup, dial or handshake and each connection that ended, after which elo waits and dials again |
@@ -152,9 +152,9 @@ so they show the progress of a long sync. On mainnet, a sync from genesis is a l
 presync height goes up until its headers have the minimum work, then goes to 0, and then the chain
 height goes up. The chain height goes down when elo takes a branch with more work and fewer
 headers. When a connection ends, the presync height goes to 0, because its download ends with the
-connection. The chain height keeps its value, because the chain stays. At the start of the next
-handshake, elo starts the chain again from genesis if it is below the minimum work, and then the
-chain height goes to 0.
+connection. The chain stays, and the chain height takes its height: this includes the headers that
+the chain took from a message that then failed. At the start of the next handshake, elo starts the
+chain again from genesis if it is below the minimum work, and then the chain height goes to 0.
 
 ## Build
 
