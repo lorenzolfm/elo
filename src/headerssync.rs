@@ -240,6 +240,10 @@ impl Redownload {
         self.last.height - self.buffer.len()
     }
 
+    pub(crate) fn released_count(&self) -> usize {
+        self.released_height() - self.commitments.start_height
+    }
+
     pub(crate) fn receive(
         mut self,
         headers: crate::protocol::Headers,

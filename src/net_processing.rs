@@ -451,9 +451,7 @@ impl Download {
             }
             Download::BranchRedownload(sync) => {
                 assert!(sync.start.height() < chain.tip().height());
-                let released_height = sync.redownload.released_height();
-                let released_count = released_height.saturating_sub(sync.start.height());
-                assert_eq!(released_count, sync.released.len());
+                assert_eq!(sync.redownload.released_count(), sync.released.len());
                 Some(LowWorkDownload::Redownload(sync.redownload.height()))
             }
             Download::Genesis(_) | Download::Chain | Download::Branch(_) => None,
@@ -959,6 +957,8 @@ fn branch_presync_next(
             Download::BranchPresync(Box::new(BranchPresync { start, presync }))
         }
         crate::headerssync::PresyncStep::Redownload(redownload) => {
+            assert_eq!(redownload.height(), start.height());
+            assert_eq!(redownload.last_hash(), start.hash());
             Download::BranchRedownload(Box::new(BranchRedownload {
                 start,
                 redownload,
