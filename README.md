@@ -114,7 +114,9 @@ alerts that match on them. `src/logging.rs` holds all of them. A value with a sp
 a control character is in quotes, with escapes. A value is at most 260 bytes, so a line is at most
 16 KiB, whatever the peer sends. When a write to stdout fails, elo writes the `exit` line to stderr
 only, because the write that failed can leave part of its line on stdout. When the write of a
-`stop`, `exit` or `panic` line fails, elo writes that line to stderr, and the exit code stays.
+`stop`, `exit` or `panic` line fails, elo writes that line to stderr, and the exit code stays. When
+stdout is closed before elo starts, Rust opens `/dev/null` in its place, so each line is lost and
+no write fails. Only the exit code then tells why elo ended.
 
 ## Metrics
 
