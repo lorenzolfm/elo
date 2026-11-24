@@ -42,6 +42,11 @@ const REDOWNLOAD_HEIGHT: Definition = Definition::gauge(
     "The height of the last header that the second download of a low-work sync checked, or the height where the sync starts before its first header: 0 when no such download runs.",
 );
 
+const LOW_WORK_DOWNLOAD: Definition = Definition::gauge(
+    "elo_header_low_work_download",
+    "The download of a low-work sync that runs: 1 for it, 0 for each other.",
+);
+
 const PEER_STATE: Definition = Definition::gauge(
     "elo_peer_state",
     "The step of the connection to the peer: 1 for the step it is in, 0 for each other.",
@@ -226,12 +231,25 @@ impl Metrics {
         let progress = self.progress.get();
         text.family(CHAIN_HEIGHT).sample(progress.tip.height());
         let (presync_height, redownload_height) = match progress.low_work_download {
-            Some(crate::net_processing::LowWorkDownload::Presync(height)) => (height.get(), 0),
-            Some(crate::net_processing::LowWorkDownload::Redownload(height)) => (0, height),
-            None => (0, 0),
+            Some(crate::net_processing::LowWorkDownload::Presync(height)) => {
+                (Some(height.get()), None)
+            }
+            Some(crate::net_processing::LowWorkDownload::Redownload(height)) => {
+                (None, Some(height))
+            }
+            None => (None, None),
         };
-        text.family(PRESYNC_HEIGHT).sample(presync_height);
-        text.family(REDOWNLOAD_HEIGHT).sample(redownload_height);
+        text.family(PRESYNC_HEIGHT)
+            .sample(presync_height.unwrap_or(0));
+        text.family(REDOWNLOAD_HEIGHT)
+            .sample(redownload_height.unwrap_or(0));
+        let mut family = text.family(LOW_WORK_DOWNLOAD);
+        for (download, height) in [
+            ("presync", presync_height),
+            ("redownload", redownload_height),
+        ] {
+            family.sample_labelled("download", download, u8::from(height.is_some()));
+        }
         let mut family = text.family(PEER_STATE);
         let peer = self.peer.get();
         for state in PeerState::ALL {
@@ -482,6 +500,10 @@ elo_header_presync_height 0
 # HELP elo_header_redownload_height The height of the last header that the second download of a low-work sync checked, or the height where the sync starts before its first header: 0 when no such download runs.
 # TYPE elo_header_redownload_height gauge
 elo_header_redownload_height 0
+# HELP elo_header_low_work_download The download of a low-work sync that runs: 1 for it, 0 for each other.
+# TYPE elo_header_low_work_download gauge
+elo_header_low_work_download{download=\"presync\"} 0
+elo_header_low_work_download{download=\"redownload\"} 0
 # HELP elo_peer_state The step of the connection to the peer: 1 for the step it is in, 0 for each other.
 # TYPE elo_peer_state gauge
 ";
@@ -680,14 +702,15 @@ elo_header_redownload_height 0
             low_work_download,
             expected_presync_height,
             expected_redownload_height,
+            (expected_presync, expected_redownload),
         ) in [
-            (0, presync(2_000), 2_000, 0),
-            (0, redownload(0), 0, 0),
-            (983, redownload(8_000), 0, 8_000),
-            (12, None, 0, 0),
-            (5, presync(2_050), 2_050, 0),
-            (5, redownload(2_050), 0, 2_050),
-            (7, None, 0, 0),
+            (0, presync(2_000), 2_000, 0, (1, 0)),
+            (0, redownload(0), 0, 0, (0, 1)),
+            (983, redownload(8_000), 0, 8_000, (0, 1)),
+            (12, None, 0, 0, (0, 0)),
+            (5, presync(2_050), 2_050, 0, (1, 0)),
+            (5, redownload(2_050), 0, 2_050, (0, 1)),
+            (7, None, 0, 0, (0, 0)),
         ] {
             metrics.progress(progress(chain_height, low_work_download));
             let text = metrics.text();
@@ -696,6 +719,12 @@ elo_header_redownload_height 0
                 format!("elo_header_chain_height {chain_height}\n"),
                 format!("elo_header_presync_height {expected_presync_height}\n"),
                 format!("elo_header_redownload_height {expected_redownload_height}\n"),
+                format!(
+                    "elo_header_low_work_download{{download=\"presync\"}} {expected_presync}\n"
+                ),
+                format!(
+                    "elo_header_low_work_download{{download=\"redownload\"}} {expected_redownload}\n"
+                ),
             ] {
                 assert!(text.contains(&line), "{line}: {text}");
             }
@@ -713,6 +742,8 @@ elo_header_redownload_height 0
                 "elo_header_chain_height 9\n",
                 "elo_header_presync_height 0\n",
                 "elo_header_redownload_height 0\n",
+                "elo_header_low_work_download{download=\"presync\"} 0\n",
+                "elo_header_low_work_download{download=\"redownload\"} 0\n",
             ] {
                 assert!(text.contains(line), "{low_work_download:?}, {line}: {text}");
             }

@@ -1319,6 +1319,10 @@ mod tests {
         assert!(text.contains("elo_header_chain_height 0\n"), "{text}");
         assert!(text.contains("elo_header_presync_height 0\n"), "{text}");
         assert!(text.contains("elo_header_redownload_height 0\n"), "{text}");
+        for download in ["presync", "redownload"] {
+            let line = format!("elo_header_low_work_download{{download=\"{download}\"}} 0\n");
+            assert!(text.contains(&line), "{line}: {text}");
+        }
     }
 
     #[test]
