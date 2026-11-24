@@ -677,6 +677,7 @@ fn metrics_of_elo_have_its_tip_its_chain_its_step_each_reconnect_and_the_bytes_o
         format!("elo_header_tip_work {chain_work}\n"),
         String::from("elo_header_chain_height 2001\n"),
         String::from("elo_header_presync_height 0\n"),
+        String::from("elo_header_redownload_height 0\n"),
         String::from("elo_peer_state{state=\"synced\"} 1\n"),
     ] {
         assert!(metrics.contains(&line), "{line}: {metrics}");

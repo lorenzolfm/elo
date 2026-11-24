@@ -1318,6 +1318,7 @@ mod tests {
         let text = scrape(&metrics);
         assert!(text.contains("elo_header_chain_height 0\n"), "{text}");
         assert!(text.contains("elo_header_presync_height 0\n"), "{text}");
+        assert!(text.contains("elo_header_redownload_height 0\n"), "{text}");
     }
 
     #[test]
