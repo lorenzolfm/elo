@@ -432,12 +432,7 @@ fn reorg_that_bitcoind_announces_with_an_inv_makes_elo_ask_for_the_headers() {
 
     bitcoind.cli(&["generatetodescriptor", "29", "raw(52)"]);
     let ours = bitcoind.cli(&["getbestblockhash"]);
-    let expected = format!(
-        "level=info event=tip peer={} height=30 hash={} ",
-        bitcoind.peer,
-        ours.trim_end()
-    );
-    elo.tip_at(&expected);
+    elo.tip_at(bitcoind.peer, 30, ours.trim_end());
 
     bitcoind.cli(&["reconsiderblock", second.trim_end()]);
     let tip = elo.event("tip", SYNC_TIMEOUT);
@@ -473,15 +468,17 @@ fn branch_that_bitcoind_sends_in_two_batches_takes_the_place_of_ours() {
     wait_for_send_headers(&bitcoind, &elo);
 
     bitcoind.cli(&["reconsiderblock", branch.trim_end()]);
-    let expected = format!(
-        "level=info event=tip peer={} height=2201 hash={} ",
-        bitcoind.peer,
-        best.trim_end()
-    );
-    let tip = elo.tip_at(&expected);
+    let tip = elo.tip_at(bitcoind.peer, 2201, best.trim_end());
     let chain_work = bitcoind.cli(&["getblockheader", best.trim_end()]);
     let chain_work = string_field(&chain_work, "chainwork");
-    assert_eq!(tip, format!("{expected}work={chain_work}"));
+    assert_eq!(
+        tip,
+        format!(
+            "level=info event=tip peer={} height=2201 hash={} work={chain_work}",
+            bitcoind.peer,
+            best.trim_end()
+        )
+    );
     let ends = elo.events("end");
     assert!(ends.is_empty(), "elo ended the connection: {ends:?}");
 }
@@ -504,7 +501,7 @@ fn branch_below_the_margin_takes_the_place_of_ours_after_a_low_work_sync() {
     wait_for_send_headers(&bitcoind, &elo);
 
     bitcoind.cli(&["reconsiderblock", branch.trim_end()]);
-    let tip = elo.event("tip", SYNC_TIMEOUT);
+    let tip = elo.tip_at(bitcoind.peer, 3101, best.trim_end());
     let chain_work = bitcoind.cli(&["getblockheader", best.trim_end()]);
     let chain_work = string_field(&chain_work, "chainwork");
     assert_eq!(
@@ -841,14 +838,24 @@ impl Elo {
         }
     }
 
-    fn tip_at(&self, start: &str) -> String {
+    fn tip_at(&self, peer: std::net::SocketAddr, height: u32, hash: &str) -> String {
+        let prefix = format!("level=info event=tip peer={peer} height={height} hash={hash} ");
         let deadline = std::time::Instant::now() + SYNC_TIMEOUT;
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             let tip = self.event("tip", left);
-            if tip.starts_with(start) {
+            if tip.starts_with(&prefix) {
                 return tip;
             }
+            assert!(
+                tip_height(&tip) < height,
+                "elo logged a tip past {prefix}: {tip}"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "elo logged no tip at {prefix} within {} s: {tip}",
+                SYNC_TIMEOUT.as_secs()
+            );
         }
     }
 
@@ -889,6 +896,17 @@ impl Elo {
 
 fn event_name(line: &str) -> Option<&str> {
     line.split(' ').nth(1)?.strip_prefix("event=")
+}
+
+fn tip_height(tip: &str) -> u32 {
+    let height = tip
+        .split(' ')
+        .nth(3)
+        .and_then(|field| field.strip_prefix("height="));
+    match height.map(str::parse) {
+        Some(Ok(height)) => height,
+        _ => panic!("no height in {tip}"),
+    }
 }
 
 fn lines(pipe: impl std::io::Read + Send + 'static) -> std::sync::mpsc::Receiver<String> {
