@@ -11,22 +11,9 @@ const SCRAPE_TIMEOUT_DEFAULT: std::time::Duration = std::time::Duration::from_se
 const _: () =
     assert!(crate::http::EXCHANGE_TIMEOUT.as_millis() < SCRAPE_TIMEOUT_DEFAULT.as_millis());
 
-const COMMANDS: [(crate::protocol::MessageType, &str); 10] = [
-    (crate::protocol::VERSION, "version"),
-    (crate::protocol::VERACK, "verack"),
-    (crate::protocol::PING, "ping"),
-    (crate::protocol::PONG, "pong"),
-    (crate::protocol::GETHEADERS, "getheaders"),
-    (crate::protocol::HEADERS, "headers"),
-    (crate::protocol::WTXIDRELAY, "wtxidrelay"),
-    (crate::protocol::SENDADDRV2, "sendaddrv2"),
-    (crate::protocol::SENDHEADERS, "sendheaders"),
-    (crate::protocol::INV, "inv"),
-];
-
 const COMMAND_OTHER: &str = "other";
 
-const COMMAND_OTHER_INDEX: usize = COMMANDS.len();
+const COMMAND_OTHER_INDEX: usize = crate::protocol::MESSAGE_TYPES.len();
 
 const COMMAND_LABELS_COUNT: usize = COMMAND_OTHER_INDEX + 1;
 
@@ -238,7 +225,7 @@ impl Traffic {
     }
 
     fn count(&self, msg_type: crate::protocol::MessageType, payload_length: usize) {
-        let index = COMMANDS
+        let index = crate::protocol::MESSAGE_TYPES
             .iter()
             .position(|(known, _)| *known == msg_type)
             .unwrap_or(COMMAND_OTHER_INDEX);
@@ -256,7 +243,7 @@ impl Traffic {
 }
 
 fn command_names() -> impl Iterator<Item = &'static str> {
-    COMMANDS
+    crate::protocol::MESSAGE_TYPES
         .iter()
         .map(|(_, name)| *name)
         .chain([COMMAND_OTHER])
@@ -623,15 +610,6 @@ elo_header_tip_work 2
                 .map(|family| traffic(family, expected[family]))
                 .collect();
             assert!(text.contains(&expected), "{msg_type:?}: {text}");
-        }
-    }
-
-    #[test]
-    fn name_of_each_known_command_is_its_message_type() {
-        let names: Vec<&str> = super::command_names().collect();
-        assert_eq!(names, COMMAND_NAMES);
-        for (msg_type, name) in super::COMMANDS {
-            assert_eq!(message_type(name), msg_type, "{name}");
         }
     }
 
