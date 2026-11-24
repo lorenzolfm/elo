@@ -138,19 +138,22 @@ fn exit(reason: &dyn std::fmt::Display) -> std::process::ExitCode {
 
 fn log_or_stderr(event: &elo::logging::Event<'_>) {
     if log(event).is_err() {
-        let _ = event.write(&mut std::io::stderr().lock());
+        write_stderr(event);
     }
 }
 
 fn exit_stdout(error: std::io::Error) -> std::process::ExitCode {
     let reason = format_args!("stdout: {error}");
-    let event = elo::logging::Event::Exit { reason: &reason };
-    let _ = event.write(&mut std::io::stderr().lock());
+    write_stderr(&elo::logging::Event::Exit { reason: &reason });
     std::process::ExitCode::FAILURE
 }
 
 fn log(event: &elo::logging::Event<'_>) -> Result<(), std::io::Error> {
     event.write(&mut std::io::stdout().lock())
+}
+
+fn write_stderr(event: &elo::logging::Event<'_>) {
+    let _ = event.write(&mut std::io::stderr().lock());
 }
 
 #[derive(Clone, Copy, Debug)]
