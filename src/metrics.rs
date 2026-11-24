@@ -169,7 +169,7 @@ impl Metrics {
         text.family(
             "elo_header_chain_height",
             Kind::Gauge,
-            "The height of the header chain after the last message from the peer, also in a sync.",
+            "The height of the header chain after the last message from the peer or the start of the last handshake, also in a sync.",
         )
         .sample(progress.tip.height());
         text.family(
@@ -404,7 +404,7 @@ elo_header_tip_height 0
 # HELP elo_header_tip_work The work of the header chain up to that tip: the expected number of hashes.
 # TYPE elo_header_tip_work gauge
 elo_header_tip_work 2
-# HELP elo_header_chain_height The height of the header chain after the last message from the peer, also in a sync.
+# HELP elo_header_chain_height The height of the header chain after the last message from the peer or the start of the last handshake, also in a sync.
 # TYPE elo_header_chain_height gauge
 elo_header_chain_height 0
 # HELP elo_header_presync_height The height of the last header that the first download of a low-work sync checked and did not put in the chain: 0 when no such download runs.

@@ -522,6 +522,7 @@ async fn handshake_stream_exchange<'a>(
         work_min,
         salt,
     );
+    metrics.progress(handshake.progress());
     socket
         .send_handshake_outbound(&outbound)
         .await
@@ -1258,6 +1259,65 @@ mod tests {
             ),
             "{result:?}"
         );
+    }
+
+    fn scrape(metrics: &crate::metrics::Metrics) -> String {
+        block_on(async {
+            let listener = crate::metrics::Metrics::listen("127.0.0.1:0".parse().unwrap()).unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut serve = std::pin::pin!(metrics.serve(listener));
+            let mut client = std::pin::pin!(async {
+                let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+                tokio::io::AsyncWriteExt::write_all(&mut client, b"GET /metrics HTTP/1.1\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut received = String::new();
+                tokio::io::AsyncReadExt::read_to_string(&mut client, &mut received)
+                    .await
+                    .unwrap();
+                received
+            });
+            std::future::poll_fn(|context| {
+                if let std::task::Poll::Ready(received) = client.as_mut().poll(context) {
+                    return std::task::Poll::Ready(received);
+                }
+                match serve.as_mut().poll(context) {
+                    std::task::Poll::Ready(never) => match never {},
+                    std::task::Poll::Pending => std::task::Poll::Pending,
+                }
+            })
+            .await
+        })
+    }
+
+    #[test]
+    fn handshake_on_a_chain_below_the_minimum_sets_the_chain_height_of_genesis_in_the_metrics() {
+        let network = crate::chainparams::Network::Mainnet;
+        let mut chain = crate::chain::Chain::new(network);
+        let block_1 = crate::fixtures::header(crate::fixtures::MAINNET_BLOCK_1);
+        let extended = chain.extend(
+            crate::fixtures::headers_batch(&[block_1]),
+            crate::fixtures::CLOCK,
+        );
+        assert_eq!(extended, Ok(()));
+        let metrics = crate::metrics::Metrics::new(&chain);
+        assert!(scrape(&metrics).contains("elo_header_chain_height 1\n"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+        let peer_thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            read_frame_on(&mut stream, network);
+        });
+
+        let result = block_on(super::handshake(&destination(peer), &mut chain, &metrics));
+        peer_thread.join().unwrap();
+        assert!(result.is_err(), "{result:?}");
+        let text = scrape(&metrics);
+        assert!(text.contains("elo_header_chain_height 0\n"), "{text}");
+        assert!(text.contains("elo_header_presync_height 0\n"), "{text}");
     }
 
     #[test]

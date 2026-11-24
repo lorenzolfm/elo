@@ -211,6 +211,13 @@ impl<'a> Handshake<'a> {
         )
     }
 
+    pub(crate) fn progress(&self) -> Progress {
+        Progress {
+            tip: self.chain.tip(),
+            presync_height: None,
+        }
+    }
+
     pub(crate) fn receive(
         self,
         message: &crate::transport::Message,
@@ -3175,6 +3182,24 @@ mod tests {
         let (_, get_headers) = first_get_headers(peer, std::time::Instant::now());
         assert_eq!(get_headers, get_headers_on(&[]));
         assert_eq!(chain.tip(), tip_after(&[]));
+    }
+
+    #[test]
+    fn progress_of_a_handshake_is_the_tip_of_the_chain_after_a_start_again_below_the_minimum() {
+        let headers = crate::fixtures::headers_on_genesis(3);
+        for (work_min_count, expected) in [(4, tip_after(&[])), (3, tip_after(&headers))] {
+            let mut chain = regtest();
+            chain
+                .extend(
+                    crate::fixtures::headers_batch(&headers),
+                    crate::fixtures::CLOCK,
+                )
+                .unwrap();
+            let work_min = tip_after(&crate::fixtures::headers_on_genesis(work_min_count)).work();
+            let progress = start_with(&mut chain, work_min).progress();
+            assert_eq!(progress.tip, expected, "{work_min_count}");
+            assert_eq!(progress.presync_height, None, "{work_min_count}");
+        }
     }
 
     #[test]
