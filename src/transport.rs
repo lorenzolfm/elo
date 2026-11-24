@@ -7,7 +7,7 @@ pub(crate) const MESSAGE_HEADER_SIZE: usize = crate::chainparams::MAGIC_SIZE
     + size_of::<u32>()
     + CHECKSUM_SIZE;
 
-const PAYLOAD_LENGTH_MAX: u32 = 4_000_000;
+pub(crate) const PAYLOAD_LENGTH_MAX: u32 = 4_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {

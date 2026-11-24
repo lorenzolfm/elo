@@ -26,7 +26,9 @@ const COMMANDS: [(crate::protocol::MessageType, &str); 10] = [
 
 const COMMAND_OTHER: &str = "other";
 
-const COMMANDS_COUNT: usize = COMMANDS.len() + 1;
+const COMMAND_OTHER_INDEX: usize = COMMANDS.len();
+
+const COMMAND_LABELS_COUNT: usize = COMMAND_OTHER_INDEX + 1;
 
 #[derive(Debug)]
 pub struct Metrics {
@@ -223,15 +225,15 @@ impl Metrics {
 
 #[derive(Debug)]
 struct Traffic {
-    messages: [std::cell::Cell<u64>; COMMANDS_COUNT],
-    bytes: [std::cell::Cell<u64>; COMMANDS_COUNT],
+    messages: [std::cell::Cell<u64>; COMMAND_LABELS_COUNT],
+    bytes: [std::cell::Cell<u64>; COMMAND_LABELS_COUNT],
 }
 
 impl Traffic {
     fn new() -> Traffic {
         Traffic {
-            messages: [const { std::cell::Cell::new(0) }; COMMANDS_COUNT],
-            bytes: [const { std::cell::Cell::new(0) }; COMMANDS_COUNT],
+            messages: [const { std::cell::Cell::new(0) }; COMMAND_LABELS_COUNT],
+            bytes: [const { std::cell::Cell::new(0) }; COMMAND_LABELS_COUNT],
         }
     }
 
@@ -239,9 +241,13 @@ impl Traffic {
         let index = COMMANDS
             .iter()
             .position(|(known, _)| *known == msg_type)
-            .unwrap_or(COMMANDS.len());
-        let length = crate::transport::MESSAGE_HEADER_SIZE.saturating_add(payload_length);
-        let length = u64::try_from(length).unwrap_or(u64::MAX);
+            .unwrap_or(COMMAND_OTHER_INDEX);
+        let payload_length = payload_length as u64;
+        assert!(
+            payload_length <= u64::from(crate::transport::PAYLOAD_LENGTH_MAX),
+            "{payload_length}"
+        );
+        let length = crate::transport::MESSAGE_HEADER_SIZE as u64 + payload_length;
         let messages = &self.messages[index];
         messages.set(messages.get().saturating_add(1));
         let bytes = &self.bytes[index];
