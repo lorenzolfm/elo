@@ -39,7 +39,7 @@ const PRESYNC_HEIGHT: Definition = Definition::gauge(
 
 const REDOWNLOAD_HEIGHT: Definition = Definition::gauge(
     "elo_header_redownload_height",
-    "The height of the last header that the second download of a low-work sync checked, or the height where the sync starts before its first header: 0 when no such download runs.",
+    "The height of the last header that the second download of a low-work sync checked, or the height where the sync starts before its first header: 0 when no such download runs, and elo_header_low_work_download tells that 0 from a start at height 0.",
 );
 
 const LOW_WORK_DOWNLOAD: Definition = Definition::gauge(
@@ -497,7 +497,7 @@ elo_header_chain_height 0
 # HELP elo_header_presync_height The height of the last header that the first download of a low-work sync checked and did not put in the chain: 0 when no such download runs.
 # TYPE elo_header_presync_height gauge
 elo_header_presync_height 0
-# HELP elo_header_redownload_height The height of the last header that the second download of a low-work sync checked, or the height where the sync starts before its first header: 0 when no such download runs.
+# HELP elo_header_redownload_height The height of the last header that the second download of a low-work sync checked, or the height where the sync starts before its first header: 0 when no such download runs, and elo_header_low_work_download tells that 0 from a start at height 0.
 # TYPE elo_header_redownload_height gauge
 elo_header_redownload_height 0
 # HELP elo_header_low_work_download The download of a low-work sync that runs: 1 for it, 0 for each other.
