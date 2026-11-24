@@ -110,10 +110,10 @@ level=info event=stop signal=SIGTERM
 | `panic` | `error` | `reason`: a bug, and elo exits with 101. The full text of the panic, and the backtrace with `RUST_BACKTRACE=1`, go to stderr after the line |
 
 The names of the events and of the fields are an interface, so a rename breaks the dashboards and
-alerts that match on them. `src/logging.rs` holds the one list of them. A value with a space, a `=`,
-a `"` or a control character is in quotes, with escapes. A value is at most 260 bytes, so a line is
-at most 16 KiB, whatever the peer sends. When a write to stdout fails, elo writes the `exit` line to
-stderr only, because the write that failed can leave part of its line on stdout. When the write of a
+alerts that match on them. `src/logging.rs` holds all of them. A value with a space, a `=`, a `"` or
+a control character is in quotes, with escapes. A value is at most 260 bytes, so a line is at most
+16 KiB, whatever the peer sends. When a write to stdout fails, elo writes the `exit` line to stderr
+only, because the write that failed can leave part of its line on stdout. When the write of a
 `stop`, `exit` or `panic` line fails, elo writes that line to stderr, and the exit code stays.
 
 ## Metrics

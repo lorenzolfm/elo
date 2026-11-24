@@ -9,7 +9,7 @@ const RECONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 fn main() -> std::process::ExitCode {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        log_or_stderr(&elo::logging::Event::Panic { reason: info });
+        last(&elo::logging::Last::Panic { reason: info });
         default_hook(info);
     }));
 
@@ -127,24 +127,17 @@ async fn node(
 }
 
 fn stop(signal: Signal) -> std::process::ExitCode {
-    log_or_stderr(&elo::logging::Event::Stop { signal: &signal });
+    last(&elo::logging::Last::Stop { signal: &signal });
     std::process::ExitCode::SUCCESS
 }
 
 fn exit(reason: &dyn std::fmt::Display) -> std::process::ExitCode {
-    log_or_stderr(&elo::logging::Event::Exit { reason });
+    last(&elo::logging::Last::Exit { reason });
     std::process::ExitCode::FAILURE
 }
 
-fn log_or_stderr(event: &elo::logging::Event<'_>) {
-    if log(event).is_err() {
-        write_stderr(event);
-    }
-}
-
 fn exit_stdout(error: std::io::Error) -> std::process::ExitCode {
-    let reason = format_args!("stdout: {error}");
-    write_stderr(&elo::logging::Event::Exit { reason: &reason });
+    last(&elo::logging::Last::Stdout { error: &error });
     std::process::ExitCode::FAILURE
 }
 
@@ -152,8 +145,8 @@ fn log(event: &elo::logging::Event<'_>) -> Result<(), std::io::Error> {
     event.write(&mut std::io::stdout().lock())
 }
 
-fn write_stderr(event: &elo::logging::Event<'_>) {
-    let _ = event.write(&mut std::io::stderr().lock());
+fn last(event: &elo::logging::Last<'_>) {
+    event.write(&mut std::io::stdout().lock(), &mut std::io::stderr().lock());
 }
 
 #[derive(Clone, Copy, Debug)]

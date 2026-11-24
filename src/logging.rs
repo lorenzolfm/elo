@@ -37,21 +37,23 @@ pub enum Event<'a> {
         reason: &'a dyn std::fmt::Display,
         wait: std::time::Duration,
     },
-    Exit {
-        reason: &'a dyn std::fmt::Display,
-    },
-    Stop {
-        signal: &'a dyn std::fmt::Display,
-    },
-    Panic {
-        reason: &'a dyn std::fmt::Display,
-    },
+}
+
+pub enum Last<'a> {
+    Exit { reason: &'a dyn std::fmt::Display },
+    Stdout { error: &'a std::io::Error },
+    Stop { signal: &'a dyn std::fmt::Display },
+    Panic { reason: &'a dyn std::fmt::Display },
+}
+
+fn write_line(out: &mut impl std::io::Write, line: &str) -> Result<(), std::io::Error> {
+    out.write_all(line.as_bytes())?;
+    out.flush()
 }
 
 impl Event<'_> {
     pub fn write(&self, out: &mut impl std::io::Write) -> Result<(), std::io::Error> {
-        out.write_all(self.line().as_bytes())?;
-        out.flush()
+        write_line(out, &self.line())
     }
 
     fn name(&self) -> &'static str {
@@ -60,20 +62,13 @@ impl Event<'_> {
             Event::Tip { .. } => "tip",
             Event::Metrics { .. } => "metrics",
             Event::End { .. } => "end",
-            Event::Exit { .. } => "exit",
-            Event::Stop { .. } => "stop",
-            Event::Panic { .. } => "panic",
         }
     }
 
     fn level(&self) -> Level {
         match self {
-            Event::Version { .. }
-            | Event::Tip { .. }
-            | Event::Metrics { .. }
-            | Event::Stop { .. } => Level::Info,
+            Event::Version { .. } | Event::Tip { .. } | Event::Metrics { .. } => Level::Info,
             Event::End { .. } => Level::Warn,
-            Event::Exit { .. } | Event::Panic { .. } => Level::Error,
         }
     }
 
@@ -106,8 +101,46 @@ impl Event<'_> {
                 line.field("reason", reason);
                 line.field("wait_ms", wait.as_millis());
             }
-            Event::Exit { reason } | Event::Panic { reason } => line.field("reason", reason),
-            Event::Stop { signal } => line.field("signal", signal),
+        }
+        line.end()
+    }
+}
+
+impl Last<'_> {
+    pub fn write(&self, stdout: &mut impl std::io::Write, stderr: &mut impl std::io::Write) {
+        let line = self.line();
+        let to_stdout = match self {
+            Last::Exit { .. } | Last::Stop { .. } | Last::Panic { .. } => true,
+            Last::Stdout { .. } => false,
+        };
+        if !to_stdout || write_line(stdout, &line).is_err() {
+            let _ = write_line(stderr, &line);
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Last::Exit { .. } | Last::Stdout { .. } => "exit",
+            Last::Stop { .. } => "stop",
+            Last::Panic { .. } => "panic",
+        }
+    }
+
+    fn level(&self) -> Level {
+        match self {
+            Last::Stop { .. } => Level::Info,
+            Last::Exit { .. } | Last::Stdout { .. } | Last::Panic { .. } => Level::Error,
+        }
+    }
+
+    fn line(&self) -> String {
+        let mut line = Line::default();
+        line.field("level", self.level().name());
+        line.field("event", self.name());
+        match *self {
+            Last::Exit { reason } | Last::Panic { reason } => line.field("reason", reason),
+            Last::Stdout { error } => line.field("reason", format_args!("stdout: {error}")),
+            Last::Stop { signal } => line.field("signal", signal),
         }
         line.end()
     }
@@ -240,8 +273,16 @@ mod tests {
         String::from_utf8(out).unwrap()
     }
 
+    fn last_line(event: super::Last<'_>) -> String {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        event.write(&mut stdout, &mut stderr);
+        assert_eq!(stderr, b"");
+        String::from_utf8(stdout).unwrap()
+    }
+
     fn value(text: &str) -> String {
-        let line = line(super::Event::Exit { reason: &text });
+        let line = last_line(super::Last::Exit { reason: &text });
         let value = line
             .strip_prefix("level=error event=exit reason=")
             .and_then(|value| value.strip_suffix('\n'));
@@ -287,24 +328,28 @@ mod tests {
                 "level=warn event=end destination=127.0.0.1:18444 \
                  reason=\"the peer closed the connection\" wait_ms=5000",
             ),
+        ] {
+            assert_eq!(line(event), format!("{expected}\n"));
+        }
+        for (event, expected) in [
             (
-                super::Event::Exit {
-                    reason: &"stdout: Broken pipe (os error 32)",
+                super::Last::Exit {
+                    reason: &"runtime: out of memory",
                 },
-                "level=error event=exit reason=\"stdout: Broken pipe (os error 32)\"",
+                "level=error event=exit reason=\"runtime: out of memory\"",
             ),
             (
-                super::Event::Stop { signal: &"SIGTERM" },
+                super::Last::Stop { signal: &"SIGTERM" },
                 "level=info event=stop signal=SIGTERM",
             ),
             (
-                super::Event::Panic {
+                super::Last::Panic {
                     reason: &"panicked at src/main.rs:1:1:\nboom",
                 },
                 r#"level=error event=panic reason="panicked at src/main.rs:1:1:\nboom""#,
             ),
         ] {
-            assert_eq!(line(event), format!("{expected}\n"));
+            assert_eq!(last_line(event), format!("{expected}\n"));
         }
     }
 
@@ -342,7 +387,7 @@ mod tests {
         let first = "a".repeat(super::VALUE_LENGTH_MAX - 1);
         assert_eq!(value(&format!("{first}é")), format!("{first}..."));
 
-        let parts = line(super::Event::Exit {
+        let parts = last_line(super::Last::Exit {
             reason: &format_args!("{first}{}{}", 'é', 'b'),
         });
         assert_eq!(parts, format!("level=error event=exit reason={first}...\n"));
@@ -365,18 +410,57 @@ mod tests {
         assert_eq!(line.len(), super::LINE_LENGTH_MAX);
     }
 
+    struct Full;
+
+    impl std::io::Write for Full {
+        fn write(&mut self, _: &[u8]) -> Result<usize, std::io::Error> {
+            Err(std::io::Error::other("full"))
+        }
+        fn flush(&mut self) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn a_failed_write_is_an_error() {
-        struct Full;
-        impl std::io::Write for Full {
-            fn write(&mut self, _: &[u8]) -> Result<usize, std::io::Error> {
-                Err(std::io::Error::other("full"))
-            }
-            fn flush(&mut self) -> Result<(), std::io::Error> {
-                Ok(())
-            }
-        }
-        let event = super::Event::Stop { signal: &"SIGTERM" };
+        let event = super::Event::Metrics { address: PEER };
         assert!(event.write(&mut Full).is_err());
+    }
+
+    #[test]
+    fn a_last_line_goes_to_stderr_when_stdout_fails() {
+        for (event, expected) in [
+            (
+                super::Last::Exit {
+                    reason: &"runtime: out of memory",
+                },
+                "level=error event=exit reason=\"runtime: out of memory\"\n",
+            ),
+            (
+                super::Last::Stop { signal: &"SIGTERM" },
+                "level=info event=stop signal=SIGTERM\n",
+            ),
+            (
+                super::Last::Panic { reason: &"boom" },
+                "level=error event=panic reason=boom\n",
+            ),
+        ] {
+            let mut stderr = Vec::new();
+            event.write(&mut Full, &mut stderr);
+            assert_eq!(String::from_utf8(stderr).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn a_stdout_fault_goes_to_stderr_only() {
+        let error = std::io::Error::from_raw_os_error(32);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        super::Last::Stdout { error: &error }.write(&mut stdout, &mut stderr);
+        assert_eq!(stdout, b"");
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "level=error event=exit reason=\"stdout: Broken pipe (os error 32)\"\n"
+        );
     }
 }
