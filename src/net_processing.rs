@@ -3352,6 +3352,12 @@ mod tests {
                 let (next, get_headers) = batch_then_tick(peer, batch, start);
                 assert_eq!(get_headers, get_headers_after(&branch[first + 1_999]));
                 peer = next;
+                let expected = if download == 0 {
+                    presync(first + 2_000)
+                } else {
+                    redownload(first + 2_000)
+                };
+                assert_eq!(heights(&peer), (9_500, expected), "{download}, {first}");
             }
             if download == 0 {
                 let (next, get_headers) = batch_then_tick(peer, &branch[8_000..], start);
