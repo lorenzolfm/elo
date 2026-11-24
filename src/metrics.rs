@@ -29,7 +29,7 @@ const TIP_WORK: Definition = Definition::gauge(
 
 const CHAIN_HEIGHT: Definition = Definition::gauge(
     "elo_header_chain_height",
-    "The height of the header chain after the last message from the peer or the start of the last handshake, also in a sync.",
+    "The height of the header chain after the last message from the peer, the start of the last handshake or the start of the last wait, also in a sync.",
 );
 
 const PRESYNC_HEIGHT: Definition = Definition::gauge(
@@ -87,7 +87,7 @@ pub struct Metrics {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PeerState {
+enum PeerState {
     Dial,
     Sync,
     Synced,
@@ -141,22 +141,30 @@ impl Metrics {
         self.progress.set(progress);
     }
 
-    pub fn peer(&self, state: PeerState) {
-        let before = self.peer.get();
-        match state {
-            PeerState::Dial => assert_eq!(before, PeerState::Wait),
-            PeerState::Sync => assert_eq!(before, PeerState::Dial),
-            PeerState::Synced => assert_eq!(before, PeerState::Sync),
-            PeerState::Wait => {
-                assert_ne!(before, PeerState::Wait);
-                self.reconnects.set(self.reconnects.get().saturating_add(1));
-                self.progress.set(crate::net_processing::Progress {
-                    presync_height: None,
-                    ..self.progress.get()
-                });
-            }
-        }
-        self.peer.set(state);
+    pub fn peer_dial(&self) {
+        assert_eq!(self.peer.get(), PeerState::Wait);
+        self.peer.set(PeerState::Dial);
+    }
+
+    pub fn peer_sync(&self) {
+        assert_eq!(self.peer.get(), PeerState::Dial);
+        self.peer.set(PeerState::Sync);
+    }
+
+    pub fn peer_synced(&self) {
+        assert_eq!(self.peer.get(), PeerState::Sync);
+        self.peer.set(PeerState::Synced);
+    }
+
+    pub fn peer_wait(&self, chain: &crate::chain::Chain) {
+        assert_ne!(self.peer.get(), PeerState::Wait);
+        assert!(chain.tip().work() >= self.progress.get().tip.work());
+        self.peer.set(PeerState::Wait);
+        self.reconnects.set(self.reconnects.get().saturating_add(1));
+        self.progress.set(crate::net_processing::Progress {
+            tip: chain.tip(),
+            presync_height: None,
+        });
     }
 
     pub(crate) fn received(&self, msg_type: crate::protocol::MessageType, payload_length: usize) {
@@ -458,7 +466,7 @@ elo_header_tip_height 0
 # HELP elo_header_tip_work The work of the header chain up to that tip: the expected number of hashes.
 # TYPE elo_header_tip_work gauge
 elo_header_tip_work 2
-# HELP elo_header_chain_height The height of the header chain after the last message from the peer or the start of the last handshake, also in a sync.
+# HELP elo_header_chain_height The height of the header chain after the last message from the peer, the start of the last handshake or the start of the last wait, also in a sync.
 # TYPE elo_header_chain_height gauge
 elo_header_chain_height 0
 # HELP elo_header_presync_height The height of the last header that the first download of a low-work sync checked and did not put in the chain: 0 when no such download runs.
@@ -512,12 +520,10 @@ elo_header_presync_height 0
     ];
 
     fn metrics() -> super::Metrics {
-        super::Metrics::new(&crate::chain::Chain::new(
-            crate::chainparams::Network::Regtest,
-        ))
+        super::Metrics::new(&chain_at(0))
     }
 
-    fn tip_at(height: usize) -> crate::chain::Tip {
+    fn chain_at(height: usize) -> crate::chain::Chain {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
         if height > 0 {
             let headers = crate::fixtures::headers_on_genesis(height);
@@ -527,7 +533,23 @@ elo_header_presync_height 0
             );
             assert_eq!(extended, Ok(()));
         }
-        chain.tip()
+        chain
+    }
+
+    fn tip_at(height: usize) -> crate::chain::Tip {
+        chain_at(height).tip()
+    }
+
+    fn move_to(metrics: &super::Metrics, state: super::PeerState) {
+        match state {
+            super::PeerState::Dial => metrics.peer_dial(),
+            super::PeerState::Sync => metrics.peer_sync(),
+            super::PeerState::Synced => metrics.peer_synced(),
+            super::PeerState::Wait => {
+                let chain = chain_at(metrics.progress.get().tip.height());
+                metrics.peer_wait(&chain);
+            }
+        }
     }
 
     fn progress(height: usize, presync_height: Option<usize>) -> crate::net_processing::Progress {
@@ -546,8 +568,8 @@ elo_header_presync_height 0
             super::PeerState::Synced => &[super::PeerState::Sync, super::PeerState::Synced],
             super::PeerState::Wait => &[super::PeerState::Wait],
         };
-        for step in path {
-            metrics.peer(*step);
+        for state in path {
+            move_to(&metrics, *state);
         }
         assert_eq!(metrics.peer.get(), state);
         metrics
@@ -618,7 +640,7 @@ elo_header_presync_height 0
             (super::PeerState::Synced, states(0, 0, 1, 0), 2),
             (super::PeerState::Wait, states(0, 0, 0, 1), 3),
         ] {
-            metrics.peer(state);
+            move_to(&metrics, state);
             let text = metrics.text();
             assert!(text.contains("elo_header_tip_height 3\n"), "{text}");
             assert!(text.contains("elo_header_tip_work 8\n"), "{text}");
@@ -651,13 +673,13 @@ elo_header_presync_height 0
     }
 
     #[test]
-    fn wait_sets_the_presync_height_to_0_and_keeps_the_chain_height() {
+    fn peer_wait_sets_the_presync_height_to_0_and_the_chain_height_to_the_chain() {
         let metrics = metrics_in(super::PeerState::Sync);
         metrics.progress(progress(7, Some(2_000)));
-        metrics.peer(super::PeerState::Wait);
+        metrics.peer_wait(&chain_at(9));
         let text = metrics.text();
         for line in [
-            "elo_header_chain_height 7\n",
+            "elo_header_chain_height 9\n",
             "elo_header_presync_height 0\n",
         ] {
             assert!(text.contains(line), "{line}: {text}");
@@ -789,11 +811,19 @@ elo_header_presync_height 0
                 );
                 let metrics = metrics_in(before);
                 let moved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    metrics.peer(after);
+                    move_to(&metrics, after);
                 }));
                 assert_eq!(moved.is_ok(), allowed, "{before:?} -> {after:?}");
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "chain.tip().work() >= self.progress.get().tip.work()")]
+    fn peer_wait_with_a_chain_of_less_work_than_the_last_progress_is_a_bug() {
+        let metrics = metrics_in(super::PeerState::Sync);
+        metrics.progress(progress(2, None));
+        metrics.peer_wait(&chain_at(1));
     }
 
     #[test]

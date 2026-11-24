@@ -111,7 +111,7 @@ async fn node(
         if !end.retries() {
             return exit(&end);
         }
-        metrics.peer(elo::metrics::PeerState::Wait);
+        metrics.peer_wait(chain);
         let logged = log(&elo::logging::Event::End {
             destination: &destination,
             reason: &end,
@@ -123,7 +123,7 @@ async fn node(
         if let Err(signal) = signals.unless(tokio::time::sleep(RECONNECT_WAIT)).await {
             return stop(signal);
         }
-        metrics.peer(elo::metrics::PeerState::Dial);
+        metrics.peer_dial();
     }
 }
 
@@ -259,7 +259,7 @@ async fn dial(
         Ok(handshake) => handshake,
         Err(error) => return Ok(End::Handshake(error)),
     };
-    metrics.peer(elo::metrics::PeerState::Sync);
+    metrics.peer_sync();
     let address = connection.address();
     log(&elo::logging::Event::Version {
         peer: address,
@@ -270,7 +270,7 @@ async fn dial(
         Ok(sync) => sync,
         Err(error) => return Ok(End::Run(error)),
     };
-    metrics.peer(elo::metrics::PeerState::Synced);
+    metrics.peer_synced();
     loop {
         log(&elo::logging::Event::Tip {
             peer: address,
