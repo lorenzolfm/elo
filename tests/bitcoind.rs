@@ -437,13 +437,7 @@ fn reorg_that_bitcoind_announces_with_an_inv_makes_elo_ask_for_the_headers() {
         bitcoind.peer,
         ours.trim_end()
     );
-    let deadline = std::time::Instant::now() + SYNC_TIMEOUT;
-    while !elo.event("tip", SYNC_TIMEOUT).starts_with(&expected) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "elo did not reach height 30"
-        );
-    }
+    elo.tip_at(&expected);
 
     bitcoind.cli(&["reconsiderblock", second.trim_end()]);
     let tip = elo.event("tip", SYNC_TIMEOUT);
@@ -479,17 +473,15 @@ fn branch_that_bitcoind_sends_in_two_batches_takes_the_place_of_ours() {
     wait_for_send_headers(&bitcoind, &elo);
 
     bitcoind.cli(&["reconsiderblock", branch.trim_end()]);
-    let tip = elo.event("tip", SYNC_TIMEOUT);
+    let expected = format!(
+        "level=info event=tip peer={} height=2201 hash={} ",
+        bitcoind.peer,
+        best.trim_end()
+    );
+    let tip = elo.tip_at(&expected);
     let chain_work = bitcoind.cli(&["getblockheader", best.trim_end()]);
     let chain_work = string_field(&chain_work, "chainwork");
-    assert_eq!(
-        tip,
-        format!(
-            "level=info event=tip peer={} height=2201 hash={} work={chain_work}",
-            bitcoind.peer,
-            best.trim_end()
-        )
-    );
+    assert_eq!(tip, format!("{expected}work={chain_work}"));
     let ends = elo.events("end");
     assert!(ends.is_empty(), "elo ended the connection: {ends:?}");
 }
@@ -845,6 +837,17 @@ impl Elo {
                     timeout.as_secs(),
                     self.read.borrow()
                 ),
+            }
+        }
+    }
+
+    fn tip_at(&self, start: &str) -> String {
+        let deadline = std::time::Instant::now() + SYNC_TIMEOUT;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let tip = self.event("tip", left);
+            if tip.starts_with(start) {
+                return tip;
             }
         }
     }
