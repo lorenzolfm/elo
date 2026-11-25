@@ -19,6 +19,13 @@ pub struct Tip {
     work: crate::pow::Work,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Position {
+    network: crate::chainparams::Network,
+    height: usize,
+    hash: bitcoin_hashes::sha256d::Hash,
+}
+
 pub(crate) const LOCATOR_DENSE_COUNT: usize = 12;
 
 pub(crate) const BRANCH_TIP_HEADERS_BEHIND_MAX: usize = 144;
@@ -608,6 +615,18 @@ impl Chain {
         self.network
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "until net_processing downloads blocks")
+    )]
+    pub(crate) fn position(&self, height: usize) -> Option<Position> {
+        (height <= self.below_tip.len()).then(|| Position {
+            network: self.network,
+            height,
+            hash: self.header_at(height).hash(),
+        })
+    }
+
     pub(crate) fn tip(&self) -> Tip {
         Tip {
             height: self.below_tip.len(),
@@ -710,6 +729,34 @@ impl Tip {
 
     pub(crate) fn work(&self) -> crate::pow::Work {
         self.work
+    }
+}
+
+impl Position {
+    #[cfg(any(test, fuzzing))]
+    #[cfg_attr(false, mutants::skip)]
+    pub(crate) fn new(
+        network: crate::chainparams::Network,
+        height: usize,
+        hash: bitcoin_hashes::sha256d::Hash,
+    ) -> Position {
+        Position {
+            network,
+            height,
+            hash,
+        }
+    }
+
+    pub(crate) fn network(&self) -> crate::chainparams::Network {
+        self.network
+    }
+
+    pub(crate) fn height(&self) -> usize {
+        self.height
+    }
+
+    pub(crate) fn hash(&self) -> bitcoin_hashes::sha256d::Hash {
+        self.hash
     }
 }
 
@@ -858,6 +905,33 @@ pub(crate) mod fuzz {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn position_is_a_header_of_the_chain() {
+        let headers = crate::fixtures::headers_on_genesis(3);
+        let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
+        assert_eq!(
+            chain.extend(
+                crate::fixtures::headers_batch(&headers),
+                crate::fixtures::CLOCK
+            ),
+            Ok(())
+        );
+
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        let hashes = [genesis, headers[0], headers[1], headers[2]].map(|header| header.hash());
+        for (height, hash) in hashes.into_iter().enumerate() {
+            assert_eq!(
+                chain.position(height),
+                Some(super::Position {
+                    network: crate::chainparams::Network::Regtest,
+                    height,
+                    hash,
+                })
+            );
+        }
+        assert_eq!(chain.position(4), None);
+    }
+
     #[test]
     fn extend_puts_each_batch_on_the_tip() {
         let headers = crate::fixtures::headers_on_genesis(3);

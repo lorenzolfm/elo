@@ -128,12 +128,39 @@ impl Decode for TxOut {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Transaction {
     pub(crate) version: u32,
-    pub(crate) inputs: Vec<TxIn>,
-    pub(crate) outputs: Vec<TxOut>,
+    inputs: Vec<TxIn>,
+    outputs: Vec<TxOut>,
     pub(crate) lock_time: u32,
 }
 
 impl Transaction {
+    #[cfg(test)]
+    pub(crate) fn new(
+        version: u32,
+        inputs: Vec<TxIn>,
+        outputs: Vec<TxOut>,
+        lock_time: u32,
+    ) -> Option<Self> {
+        (!inputs.is_empty() || outputs.is_empty()).then_some(Self {
+            version,
+            inputs,
+            outputs,
+            lock_time,
+        })
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "until the checks of a block read the inputs")
+    )]
+    pub(crate) fn inputs(&self) -> &[TxIn] {
+        &self.inputs
+    }
+
+    pub(crate) fn outputs(&self) -> &[TxOut] {
+        &self.outputs
+    }
+
     pub(crate) fn txid(&self) -> bitcoin_hashes::sha256d::Hash {
         let mut bytes = Vec::new();
         self.encode_without_witness(&mut bytes);
@@ -164,9 +191,6 @@ impl Transaction {
     }
 
     fn encode_without_witness(&self, out: &mut Vec<u8>) {
-        if self.inputs.is_empty() {
-            assert!(self.outputs.is_empty());
-        }
         self.version.encode(out);
         write_vector(out, &self.inputs);
         write_vector(out, &self.outputs);
@@ -343,6 +367,27 @@ mod tests {
         assert_eq!(
             decode(&spend(0x03, &[0x00])),
             Err(crate::serialize::Error::SuperfluousWitness)
+        );
+    }
+
+    #[test]
+    fn outputs_need_an_input() {
+        let output = super::TxOut {
+            value: 0,
+            script_pubkey: Vec::new(),
+        };
+        assert_eq!(
+            super::Transaction::new(1, Vec::new(), vec![output], 0),
+            None
+        );
+        assert_eq!(
+            super::Transaction::new(1, Vec::new(), Vec::new(), 0),
+            Some(super::Transaction {
+                version: 1,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                lock_time: 0,
+            })
         );
     }
 

@@ -59,6 +59,9 @@ pub(crate) struct Block {
     pub(crate) transactions: Vec<crate::transaction::Transaction>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Unmutated(Block);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MutationError {
     MerkleRoot,
@@ -75,10 +78,10 @@ impl Block {
         expect(dead_code, reason = "until net_processing downloads blocks")
     )]
     pub(crate) fn check_mutation(
-        &self,
-        network: crate::chainparams::Network,
-        height: usize,
-    ) -> Result<(), MutationError> {
+        self,
+        position: crate::chain::Position,
+    ) -> Result<Unmutated, MutationError> {
+        assert_eq!(self.header.hash(), position.hash());
         let root = self.merkle_root();
         if root.hash != self.header.merkle_root {
             return Err(MutationError::MerkleRoot);
@@ -87,10 +90,10 @@ impl Block {
             return Err(MutationError::DuplicateTransactions);
         }
 
-        let Some((coinbase, coinbase_input)) = self
+        let Some((coinbase, coinbase_input, rest)) = self
             .transactions
-            .first()
-            .and_then(|first| Some((first, first.coinbase_input()?)))
+            .split_first()
+            .and_then(|(first, rest)| Some((first, first.coinbase_input()?, rest)))
         else {
             return if self
                 .transactions
@@ -99,11 +102,11 @@ impl Block {
             {
                 Err(MutationError::TransactionOf64Bytes)
             } else {
-                Ok(())
+                Ok(Unmutated(self))
             };
         };
 
-        let commitment = if height >= network.segwit_height() {
+        let commitment = if position.height() >= position.network().segwit_height() {
             witness_commitment(coinbase)
         } else {
             None
@@ -113,11 +116,11 @@ impl Block {
                 .witness
                 .reserved_value()
                 .ok_or(MutationError::WitnessReservedValue)?;
-            let witness_root = self.witness_merkle_root();
+            let witness_root = witness_merkle_root(rest);
             let committed =
                 bitcoin_hashes::sha256d::Hash::hash([witness_root, reserved_value].as_flattened());
             return if committed.as_byte_array() == commitment {
-                Ok(())
+                Ok(Unmutated(self))
             } else {
                 Err(MutationError::WitnessMerkleRoot)
             };
@@ -130,7 +133,7 @@ impl Block {
         {
             return Err(MutationError::UnexpectedWitness);
         }
-        Ok(())
+        Ok(Unmutated(self))
     }
 
     fn merkle_root(&self) -> crate::merkle::Root {
@@ -141,21 +144,18 @@ impl Block {
                 .collect(),
         )
     }
+}
 
-    fn witness_merkle_root(&self) -> [u8; 32] {
-        assert!(!self.transactions.is_empty());
-        let coinbase_wtxid = [0; 32];
-        let wtxids = self
-            .transactions
-            .iter()
-            .skip(1)
-            .map(|transaction| transaction.wtxid().to_byte_array());
-        crate::merkle::root(std::iter::once(coinbase_wtxid).chain(wtxids).collect()).hash
-    }
+fn witness_merkle_root(after_coinbase: &[crate::transaction::Transaction]) -> [u8; 32] {
+    let coinbase_wtxid = [0; 32];
+    let wtxids = after_coinbase
+        .iter()
+        .map(|transaction| transaction.wtxid().to_byte_array());
+    crate::merkle::root(std::iter::once(coinbase_wtxid).chain(wtxids).collect()).hash
 }
 
 fn witness_commitment(coinbase: &crate::transaction::Transaction) -> Option<&[u8; 32]> {
-    coinbase.outputs.iter().rev().find_map(|output| {
+    coinbase.outputs().iter().rev().find_map(|output| {
         output
             .script_pubkey
             .strip_prefix(&WITNESS_COMMITMENT_HEADER)?
@@ -246,10 +246,15 @@ pub(crate) mod fuzz {
         rooted.header.merkle_root = block.merkle_root().hash;
         for network in NETWORKS {
             for height in [0, network.segwit_height()] {
-                let rooted_result = rooted.check_mutation(network, height);
+                let check = |block: &super::Block| {
+                    let position =
+                        crate::chain::Position::new(network, height, block.header.hash());
+                    block.clone().check_mutation(position).map(|_| ())
+                };
+                let rooted_result = check(&rooted);
                 assert_ne!(rooted_result, Err(super::MutationError::MerkleRoot));
                 assert_eq!(
-                    block.check_mutation(network, height),
+                    check(&block),
                     if block.header.merkle_root == rooted.header.merkle_root {
                         rooted_result
                     } else {
@@ -295,6 +300,40 @@ mod tests {
 
     const REGTEST: crate::chainparams::Network = crate::chainparams::Network::Regtest;
 
+    fn check(
+        block: super::Block,
+        network: crate::chainparams::Network,
+        height: usize,
+    ) -> Result<(), super::MutationError> {
+        let position = crate::chain::Position::new(network, height, block.header.hash());
+        let unmutated = block.clone().check_mutation(position)?;
+        assert_eq!(unmutated, super::Unmutated(block));
+        Ok(())
+    }
+
+    fn changed(
+        transaction: &crate::transaction::Transaction,
+        change: impl FnOnce(&mut Vec<crate::transaction::TxIn>, &mut Vec<crate::transaction::TxOut>),
+    ) -> crate::transaction::Transaction {
+        let mut inputs = transaction.inputs().to_vec();
+        let mut outputs = transaction.outputs().to_vec();
+        change(&mut inputs, &mut outputs);
+        crate::transaction::Transaction::new(
+            transaction.version,
+            inputs,
+            outputs,
+            transaction.lock_time,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    #[should_panic]
+    fn position_of_another_block_is_refused() {
+        let position = crate::chain::Position::new(REGTEST, 0, REGTEST.genesis().hash());
+        let _ = block_103().check_mutation(position);
+    }
+
     #[test]
     fn block_round_trips_with_the_txids_and_hash_of_core() {
         let block = block_103();
@@ -337,10 +376,10 @@ mod tests {
 
     #[test]
     fn core_blocks_are_not_mutated() {
-        assert_eq!(block_103().check_mutation(REGTEST, 103), Ok(()));
+        assert_eq!(check(block_103(), REGTEST, 103), Ok(()));
         let genesis = crate::fixtures::block(crate::fixtures::REGTEST_GENESIS_BLOCK);
         assert_eq!(genesis.header, REGTEST.genesis());
-        assert_eq!(genesis.check_mutation(REGTEST, 0), Ok(()));
+        assert_eq!(check(genesis, REGTEST, 0), Ok(()));
     }
 
     #[test]
@@ -348,7 +387,7 @@ mod tests {
         let mut block = block_103();
         block.header.merkle_root[0] ^= 1;
         assert_eq!(
-            block.check_mutation(REGTEST, 103),
+            check(block, REGTEST, 103),
             Err(super::MutationError::MerkleRoot)
         );
     }
@@ -359,7 +398,7 @@ mod tests {
         let last = block.transactions[2].clone();
         block.transactions.push(last);
         assert_eq!(
-            block.check_mutation(REGTEST, 103),
+            check(block, REGTEST, 103),
             Err(super::MutationError::DuplicateTransactions)
         );
     }
@@ -367,9 +406,11 @@ mod tests {
     #[test]
     fn other_witness_is_bad_witness_merkle_match() {
         let mut block = block_103();
-        block.transactions[1].inputs[0].witness = witness(&[0x01, 0x01, 0xbb]);
+        block.transactions[1] = changed(&block.transactions[1], |inputs, _| {
+            inputs[0].witness = witness(&[0x01, 0x01, 0xbb]);
+        });
         assert_eq!(
-            block.check_mutation(REGTEST, 103),
+            check(block, REGTEST, 103),
             Err(super::MutationError::WitnessMerkleRoot)
         );
     }
@@ -380,9 +421,11 @@ mod tests {
         let two = [&[0x02, 0x20][..], &[0; 32], &[0x00]].concat();
         for coinbase_witness in [short, two] {
             let mut block = block_103();
-            block.transactions[0].inputs[0].witness = witness(&coinbase_witness);
+            block.transactions[0] = changed(&block.transactions[0], |inputs, _| {
+                inputs[0].witness = witness(&coinbase_witness);
+            });
             assert_eq!(
-                block.check_mutation(REGTEST, 103),
+                check(block, REGTEST, 103),
                 Err(super::MutationError::WitnessReservedValue)
             );
         }
@@ -391,13 +434,17 @@ mod tests {
     #[test]
     fn witness_with_no_commitment_is_unexpected_witness() {
         let mut block = block_103();
-        let commitment = block.transactions[0].outputs.pop().unwrap();
+        let mut commitment = None;
+        block.transactions[0] = changed(&block.transactions[0], |_, outputs| {
+            commitment = outputs.pop();
+        });
+        let commitment = commitment.unwrap();
         assert_eq!(
             commitment.script_pubkey[..6],
             super::WITNESS_COMMITMENT_HEADER
         );
         assert_eq!(
-            with_merkle_root(block).check_mutation(REGTEST, 103),
+            check(with_merkle_root(block), REGTEST, 103),
             Err(super::MutationError::UnexpectedWitness)
         );
     }
@@ -405,34 +452,38 @@ mod tests {
     #[test]
     fn commitment_is_the_last_output_that_has_its_header() {
         let mut block = block_103();
-        let mut other = block.transactions[0].outputs[1].clone();
+        let mut other = block.transactions[0].outputs()[1].clone();
         other.script_pubkey[6] ^= 1;
-        block.transactions[0].outputs.push(other.clone());
+        block.transactions[0] = changed(&block.transactions[0], |_, outputs| {
+            outputs.push(other.clone());
+        });
         assert_eq!(
-            with_merkle_root(block.clone()).check_mutation(REGTEST, 103),
+            check(with_merkle_root(block.clone()), REGTEST, 103),
             Err(super::MutationError::WitnessMerkleRoot)
         );
 
         other.script_pubkey.truncate(37);
-        *block.transactions[0].outputs.last_mut().unwrap() = other;
-        assert_eq!(with_merkle_root(block).check_mutation(REGTEST, 103), Ok(()));
+        block.transactions[0] = changed(&block.transactions[0], |_, outputs| {
+            *outputs.last_mut().unwrap() = other;
+        });
+        assert_eq!(check(with_merkle_root(block), REGTEST, 103), Ok(()));
     }
 
     #[test]
     fn witness_before_segwit_is_unexpected_witness() {
         let mainnet = crate::chainparams::Network::Mainnet;
-        assert_eq!(block_103().check_mutation(mainnet, 481_824), Ok(()));
+        assert_eq!(check(block_103(), mainnet, 481_824), Ok(()));
         assert_eq!(
-            block_103().check_mutation(mainnet, 481_823),
+            check(block_103(), mainnet, 481_823),
             Err(super::MutationError::UnexpectedWitness)
         );
     }
 
     fn transaction_of(size: usize) -> crate::transaction::Transaction {
         let size_empty_script = 60;
-        let transaction = crate::transaction::Transaction {
-            version: 1,
-            inputs: vec![crate::transaction::TxIn {
+        let transaction = crate::transaction::Transaction::new(
+            1,
+            vec![crate::transaction::TxIn {
                 previous_output: crate::transaction::OutPoint {
                     txid: bitcoin_hashes::sha256d::Hash::from_byte_array([0xaa; 32]),
                     vout: 0,
@@ -441,12 +492,13 @@ mod tests {
                 sequence: 0,
                 witness: crate::transaction::Witness::default(),
             }],
-            outputs: vec![crate::transaction::TxOut {
+            vec![crate::transaction::TxOut {
                 value: 0,
                 script_pubkey: vec![0x51; size - size_empty_script],
             }],
-            lock_time: 0,
-        };
+            0,
+        )
+        .unwrap();
         assert_eq!(transaction.size_without_witness(), size);
         transaction
     }
@@ -460,17 +512,17 @@ mod tests {
             })
         };
         assert_eq!(
-            block(64).check_mutation(REGTEST, 1),
+            check(block(64), REGTEST, 1),
             Err(super::MutationError::TransactionOf64Bytes)
         );
-        assert_eq!(block(65).check_mutation(REGTEST, 1), Ok(()));
+        assert_eq!(check(block(65), REGTEST, 1), Ok(()));
     }
 
     #[test]
     fn coinbase_first_and_a_transaction_of_64_bytes_is_not_mutated() {
         let mut block = crate::fixtures::block(crate::fixtures::REGTEST_GENESIS_BLOCK);
         block.transactions.push(transaction_of(64));
-        assert_eq!(with_merkle_root(block).check_mutation(REGTEST, 1), Ok(()));
+        assert_eq!(check(with_merkle_root(block), REGTEST, 1), Ok(()));
     }
 
     #[test]
@@ -482,7 +534,7 @@ mod tests {
             },
             transactions: Vec::new(),
         };
-        assert_eq!(block.check_mutation(REGTEST, 1), Ok(()));
+        assert_eq!(check(block, REGTEST, 1), Ok(()));
     }
 
     #[test]
