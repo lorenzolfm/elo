@@ -62,8 +62,18 @@ pub(crate) struct Block {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Unmutated(Block);
 
+impl Unmutated {
+    pub(crate) fn transactions_count(&self) -> usize {
+        self.0.transactions.len()
+    }
+}
+
+const _: () = assert!(size_of::<crate::transaction::Transaction>() <= 64);
+const _: () = assert!(size_of::<crate::transaction::TxIn>() <= 96);
+const _: () = assert!(size_of::<crate::transaction::TxOut>() <= 32);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MutationError {
+pub enum MutationError {
     MerkleRoot,
     DuplicateTransactions,
     TransactionOf64Bytes,
@@ -73,10 +83,6 @@ pub(crate) enum MutationError {
 }
 
 impl Block {
-    #[cfg_attr(
-        not(any(test, fuzzing)),
-        expect(dead_code, reason = "until net_processing downloads blocks")
-    )]
     pub(crate) fn check_mutation(
         self,
         position: crate::chain::Position,
@@ -376,10 +382,22 @@ mod tests {
 
     #[test]
     fn core_blocks_are_not_mutated() {
-        assert_eq!(check(block_103(), REGTEST, 103), Ok(()));
+        let block = block_103();
+        let position = crate::chain::Position::new(REGTEST, 103, block.header.hash());
+        assert_eq!(
+            block.check_mutation(position).unwrap().transactions_count(),
+            3
+        );
         let genesis = crate::fixtures::block(crate::fixtures::REGTEST_GENESIS_BLOCK);
         assert_eq!(genesis.header, REGTEST.genesis());
-        assert_eq!(check(genesis, REGTEST, 0), Ok(()));
+        let position = crate::chain::Position::new(REGTEST, 0, genesis.header.hash());
+        assert_eq!(
+            genesis
+                .check_mutation(position)
+                .unwrap()
+                .transactions_count(),
+            1
+        );
     }
 
     #[test]

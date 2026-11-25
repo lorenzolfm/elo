@@ -29,6 +29,11 @@ pub enum Event<'a> {
         peer: std::net::SocketAddr,
         tip: &'a crate::chain::Tip,
     },
+    Block {
+        peer: std::net::SocketAddr,
+        position: &'a crate::chain::Position,
+        transactions: usize,
+    },
     Metrics {
         address: std::net::SocketAddr,
     },
@@ -60,6 +65,7 @@ impl Event<'_> {
         match self {
             Event::Version { .. } => "version",
             Event::Tip { .. } => "tip",
+            Event::Block { .. } => "block",
             Event::Metrics { .. } => "metrics",
             Event::End { .. } => "end",
         }
@@ -67,7 +73,10 @@ impl Event<'_> {
 
     fn level(&self) -> Level {
         match self {
-            Event::Version { .. } | Event::Tip { .. } | Event::Metrics { .. } => Level::Info,
+            Event::Version { .. }
+            | Event::Tip { .. }
+            | Event::Block { .. }
+            | Event::Metrics { .. } => Level::Info,
             Event::End { .. } => Level::Warn,
         }
     }
@@ -90,6 +99,16 @@ impl Event<'_> {
                 line.field("height", tip.height());
                 line.field("hash", tip.hash_display());
                 line.field("work", tip.work());
+            }
+            Event::Block {
+                peer,
+                position,
+                transactions,
+            } => {
+                line.field("peer", peer);
+                line.field("height", position.height());
+                line.field("hash", position.hash_display());
+                line.field("transactions", transactions);
             }
             Event::Metrics { address } => line.field("address", address),
             Event::End {
@@ -294,7 +313,9 @@ mod tests {
         let mut payload: &[u8] = &crate::fixtures::version_payload();
         let version: crate::protocol::Version =
             crate::serialize::Decode::decode(&mut payload).unwrap();
-        let tip = crate::chain::Chain::new(crate::chainparams::Network::Regtest).tip();
+        let chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        let tip = chain.tip();
+        let position = chain.position(0).unwrap();
         for (event, expected) in [
             (
                 super::Event::Version {
@@ -312,6 +333,16 @@ mod tests {
                 "level=info event=tip peer=127.0.0.1:18444 height=0 \
                  hash=0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206 \
                  work=0000000000000000000000000000000000000000000000000000000000000002",
+            ),
+            (
+                super::Event::Block {
+                    peer: PEER,
+                    position: &position,
+                    transactions: 3,
+                },
+                "level=info event=block peer=127.0.0.1:18444 height=0 \
+                 hash=0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206 \
+                 transactions=3",
             ),
             (
                 super::Event::Metrics { address: PEER },

@@ -16,11 +16,22 @@ const HEADERS_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
 
 const _: () = assert!(!HEADERS_TIMEOUT.is_zero());
 
+const BLOCKS_IN_FLIGHT_MAX: usize = 16;
+
+const _: () = assert!(BLOCKS_IN_FLIGHT_MAX >= 1);
+const _: () = assert!(BLOCKS_IN_FLIGHT_MAX <= crate::protocol::INV_COUNT_MAX);
+const _: () = assert!(size_of::<crate::chain::Position>() * BLOCKS_IN_FLIGHT_MAX <= 1024);
+
+const BLOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(10);
+
+const _: () = assert!(!BLOCK_TIMEOUT.is_zero());
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandshakeError {
     Version(crate::serialize::Error),
     Obsolete(i32),
     SelfConnection,
+    MissingServices(crate::protocol::ServiceFlags),
     TooManyMessages,
 }
 
@@ -36,6 +47,12 @@ impl std::fmt::Display for HandshakeError {
             }
             HandshakeError::SelfConnection => {
                 write!(f, "connected to self: their version has our nonce")
+            }
+            HandshakeError::MissingServices(services) => {
+                write!(
+                    f,
+                    "services {services:016x} do not include network and witness"
+                )
             }
             HandshakeError::TooManyMessages => {
                 write!(
@@ -64,6 +81,9 @@ pub enum PeerError {
     HeadersTimeout,
     ChainWorkTooLow,
     SecondLowWorkSync,
+    Block(crate::serialize::Error),
+    BlockMutation(crate::block::MutationError),
+    BlockTimeout,
     LateWtxidRelay,
     LateSendAddrV2,
 }
@@ -91,6 +111,11 @@ impl std::fmt::Display for PeerError {
             }
             PeerError::SecondLowWorkSync => {
                 write!(f, "a second low-work sync in one connection")
+            }
+            PeerError::Block(error) => write!(f, "block payload: {error}"),
+            PeerError::BlockMutation(error) => write!(f, "mutated block: {error}"),
+            PeerError::BlockTimeout => {
+                write!(f, "no block within {} s", BLOCK_TIMEOUT.as_secs())
             }
             PeerError::LateWtxidRelay => write!(f, "wtxidrelay after verack"),
             PeerError::LateSendAddrV2 => write!(f, "sendaddrv2 after verack"),
@@ -143,6 +168,7 @@ pub(crate) enum PeerOutbound {
     Pong(u64),
     SendHeaders,
     GetHeaders(crate::protocol::GetHeaders),
+    GetData(crate::protocol::GetData),
 }
 
 #[derive(Debug)]
@@ -150,6 +176,7 @@ pub(crate) struct TickOutbound {
     ping: Option<u64>,
     send_headers: bool,
     get_headers: Option<crate::protocol::GetHeaders>,
+    get_data: Option<crate::protocol::GetData>,
 }
 
 impl TickOutbound {
@@ -157,7 +184,11 @@ impl TickOutbound {
         let ping = self.ping.map(PeerOutbound::Ping);
         let send_headers = self.send_headers.then_some(PeerOutbound::SendHeaders);
         let get_headers = self.get_headers.map(PeerOutbound::GetHeaders);
-        ping.into_iter().chain(send_headers).chain(get_headers)
+        let get_data = self.get_data.map(PeerOutbound::GetData);
+        ping.into_iter()
+            .chain(send_headers)
+            .chain(get_headers)
+            .chain(get_data)
     }
 }
 
@@ -166,6 +197,10 @@ pub(crate) enum Received {
     NoReply,
     Pong(u64),
     Synced(crate::chain::Tip),
+    Block {
+        position: crate::chain::Position,
+        transactions: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -255,6 +290,11 @@ impl<'a> Handshake<'a> {
             State::AwaitingVerack(theirs) => {
                 assert!(theirs.version >= PROTOCOL_VERSION_MIN);
                 assert_ne!(theirs.nonce, self.nonce);
+                assert!(
+                    theirs
+                        .services
+                        .has(crate::protocol::ServiceFlags::NETWORK_WITNESS)
+                );
 
                 if message.msg_type() == crate::protocol::VERACK {
                     let (download, salt) = if self.chain.tip().work() < self.work_min {
@@ -266,6 +306,7 @@ impl<'a> Handshake<'a> {
                         ping: PingState::Unsent,
                         sync: SyncState::Due(download),
                         send_headers: SendHeadersState::Unsent,
+                        blocks: Blocks::new(),
                         chain: self.chain,
                         work_min: self.work_min,
                         salt,
@@ -323,6 +364,11 @@ fn receive_version(
         Err(HandshakeError::Obsolete(theirs.version))
     } else if theirs.nonce == nonce {
         Err(HandshakeError::SelfConnection)
+    } else if !theirs
+        .services
+        .has(crate::protocol::ServiceFlags::NETWORK_WITNESS)
+    {
+        Err(HandshakeError::MissingServices(theirs.services))
     } else {
         Ok(theirs)
     }
@@ -333,10 +379,31 @@ pub(crate) struct Peer<'a> {
     ping: PingState,
     sync: SyncState,
     send_headers: SendHeadersState,
+    blocks: Blocks,
     chain: &'a mut crate::chain::Chain,
     work_min: crate::pow::Work,
     salt: Option<crate::headerssync::Salt>,
     branch_tip: Option<crate::chain::BranchTip>,
+}
+
+#[derive(Debug)]
+struct Blocks {
+    next_height: std::num::NonZeroUsize,
+    in_flight: InFlight,
+}
+
+#[derive(Debug)]
+enum InFlight {
+    Empty,
+    Reset {
+        oldest: crate::chain::Position,
+        rest: Vec<crate::chain::Position>,
+    },
+    Waiting {
+        oldest: crate::chain::Position,
+        rest: Vec<crate::chain::Position>,
+        since: std::time::Instant,
+    },
 }
 
 #[derive(Debug)]
@@ -506,6 +573,8 @@ impl<'a> Peer<'a> {
             Ok((peer, Received::NoReply))
         } else if msg_type == crate::protocol::HEADERS {
             self.receive_headers(message, clock)
+        } else if msg_type == crate::protocol::BLOCK {
+            self.receive_block(message)
         } else if msg_type == crate::protocol::INV {
             let peer = self.receive_inv(message)?;
             Ok((peer, Received::NoReply))
@@ -553,6 +622,31 @@ impl<'a> Peer<'a> {
         }
     }
 
+    fn receive_block(
+        mut self,
+        message: &crate::transport::Message,
+    ) -> Result<(Peer<'a>, Received), PeerError> {
+        assert_eq!(message.msg_type(), crate::protocol::BLOCK);
+
+        let mut input = message.payload();
+        let block = crate::block::Block::decode(&mut input).map_err(PeerError::Block)?;
+        let Some(position) = self.blocks.take(block.header.hash()) else {
+            return Ok((self, Received::NoReply));
+        };
+        assert_eq!(self.chain.position(position.height()), Some(position));
+        let checked = block
+            .check_mutation(position)
+            .map_err(PeerError::BlockMutation)?;
+        let transactions = checked.transactions_count();
+        Ok((
+            self,
+            Received::Block {
+                position,
+                transactions,
+            },
+        ))
+    }
+
     fn receive_headers(
         mut self,
         message: &crate::transport::Message,
@@ -562,22 +656,14 @@ impl<'a> Peer<'a> {
 
         let mut input = message.payload();
         let headers = crate::protocol::Headers::decode(&mut input).map_err(PeerError::Headers)?;
-        let next = match self.sync {
+        let next = match std::mem::replace(&mut self.sync, SyncState::Synced) {
             SyncState::Outstanding {
                 download,
                 sent,
                 tip,
             } => {
                 assert_eq!(self.chain.tip().hash(), tip);
-                match receive_answer(
-                    self.chain,
-                    self.work_min,
-                    &mut self.salt,
-                    &mut self.branch_tip,
-                    download,
-                    headers,
-                    clock,
-                )? {
+                match self.receive_answer(download, headers, clock)? {
                     Answer::Next(next) => next,
                     Answer::Skipped(download) => {
                         self.sync = SyncState::Outstanding {
@@ -620,6 +706,7 @@ impl<'a> Peer<'a> {
             ping,
             sync,
             send_headers,
+            blocks,
             chain,
             work_min,
             salt,
@@ -627,23 +714,29 @@ impl<'a> Peer<'a> {
         } = self;
         let (ping, ping_nonce, ping_wake) = ping.tick(now, nonce)?;
         let (sync, get_headers, headers_wake) = sync.tick(now, chain, work_min)?;
+        let synced = matches!(sync, SyncState::Synced);
+        let (blocks, get_data, blocks_wake) = blocks.tick(now, chain, synced)?;
         let wake = headers_wake.map_or(ping_wake, |headers_wake| headers_wake.min(ping_wake));
-        let (send_headers, send_headers_due) = match (send_headers, &sync) {
-            (SendHeadersState::Unsent, SyncState::Synced) => (SendHeadersState::Sent, true),
+        let wake = blocks_wake.map_or(wake, |blocks_wake| blocks_wake.min(wake));
+        let (send_headers, send_headers_due) = match (send_headers, synced) {
+            (SendHeadersState::Unsent, true) => (SendHeadersState::Sent, true),
             (send_headers, _) => (send_headers, false),
         };
 
         assert!(!matches!(sync, SyncState::Due(_)));
+        assert!(!matches!(blocks.in_flight, InFlight::Reset { .. }));
         assert!(wake > now);
         let outbound = TickOutbound {
             ping: ping_nonce,
             send_headers: send_headers_due,
             get_headers,
+            get_data,
         };
         let peer = Peer {
             ping,
             sync,
             send_headers,
+            blocks,
             chain,
             work_min,
             salt,
@@ -651,6 +744,197 @@ impl<'a> Peer<'a> {
         };
         Ok((peer, outbound, wake))
     }
+}
+
+impl Blocks {
+    fn new() -> Blocks {
+        Blocks {
+            next_height: std::num::NonZeroUsize::MIN,
+            in_flight: InFlight::Empty,
+        }
+    }
+
+    fn take(&mut self, hash: bitcoin_hashes::sha256d::Hash) -> Option<crate::chain::Position> {
+        self.in_flight.take(hash)
+    }
+
+    fn reorg(&mut self, fork_height: usize) {
+        assert!(fork_height < usize::MAX);
+        let above_fork = std::num::NonZeroUsize::MIN.saturating_add(fork_height);
+        self.next_height = self.next_height.min(above_fork);
+        self.in_flight.reorg(fork_height);
+    }
+
+    fn tick(
+        mut self,
+        now: std::time::Instant,
+        chain: &crate::chain::Chain,
+        synced: bool,
+    ) -> Result<
+        (
+            Blocks,
+            Option<crate::protocol::GetData>,
+            Option<std::time::Instant>,
+        ),
+        PeerError,
+    > {
+        if let InFlight::Waiting { since, .. } = self.in_flight {
+            assert!(since <= now);
+            if now >= since + BLOCK_TIMEOUT {
+                return Err(PeerError::BlockTimeout);
+            }
+        }
+        assert!(self.next_height.get() <= chain.tip().height() + 1);
+        assert!(self.in_flight.len() <= BLOCKS_IN_FLIGHT_MAX);
+        let get_data = if synced {
+            let free = BLOCKS_IN_FLIGHT_MAX - self.in_flight.len();
+            let mut asked = Vec::with_capacity(free);
+            while asked.len() < free
+                && let Some(position) = chain.position(self.next_height.get())
+            {
+                asked.push(position);
+                self.next_height = self.next_height.saturating_add(1);
+            }
+            assert!(self.next_height.get() <= chain.tip().height() + 1);
+            let hashes: Vec<_> = asked.iter().map(crate::chain::Position::hash).collect();
+            let mut positions = asked.into_iter();
+            match positions.next() {
+                None => None,
+                Some(first) => {
+                    self.in_flight.push(first, positions, now);
+                    Some(crate::protocol::GetData::witness_blocks(hashes))
+                }
+            }
+        } else {
+            None
+        };
+        let wake = match self.in_flight {
+            InFlight::Empty => None,
+            InFlight::Reset { oldest, rest } => {
+                self.in_flight = InFlight::Waiting {
+                    oldest,
+                    rest,
+                    since: now,
+                };
+                Some(now + BLOCK_TIMEOUT)
+            }
+            InFlight::Waiting { since, .. } => Some(since + BLOCK_TIMEOUT),
+        };
+        Ok((self, get_data, wake))
+    }
+}
+
+impl InFlight {
+    fn len(&self) -> usize {
+        match self {
+            InFlight::Empty => 0,
+            InFlight::Reset { rest, .. } | InFlight::Waiting { rest, .. } => 1 + rest.len(),
+        }
+    }
+
+    fn push(
+        &mut self,
+        first: crate::chain::Position,
+        more: impl Iterator<Item = crate::chain::Position>,
+        now: std::time::Instant,
+    ) {
+        *self = match std::mem::replace(self, InFlight::Empty) {
+            InFlight::Empty => InFlight::Waiting {
+                oldest: first,
+                rest: more.collect(),
+                since: now,
+            },
+            InFlight::Reset { oldest, mut rest } => {
+                let last_height = rest.last().unwrap_or(&oldest).height();
+                assert!(first.height() > last_height);
+                rest.push(first);
+                rest.extend(more);
+                InFlight::Waiting {
+                    oldest,
+                    rest,
+                    since: now,
+                }
+            }
+            InFlight::Waiting {
+                oldest,
+                mut rest,
+                since,
+            } => {
+                let last_height = rest.last().unwrap_or(&oldest).height();
+                assert!(first.height() > last_height);
+                rest.push(first);
+                rest.extend(more);
+                InFlight::Waiting {
+                    oldest,
+                    rest,
+                    since,
+                }
+            }
+        };
+        assert!(self.len() <= BLOCKS_IN_FLIGHT_MAX);
+    }
+
+    fn take(&mut self, hash: bitcoin_hashes::sha256d::Hash) -> Option<crate::chain::Position> {
+        match std::mem::replace(self, InFlight::Empty) {
+            InFlight::Empty => None,
+            InFlight::Reset { oldest, rest } => take_from(self, oldest, rest, None, hash),
+            InFlight::Waiting {
+                oldest,
+                rest,
+                since,
+            } => take_from(self, oldest, rest, Some(since), hash),
+        }
+    }
+
+    fn reorg(&mut self, fork_height: usize) {
+        match self {
+            InFlight::Empty => {}
+            InFlight::Reset { oldest, rest } | InFlight::Waiting { oldest, rest, .. } => {
+                if oldest.height() > fork_height {
+                    assert!(
+                        rest.iter()
+                            .all(|position| position.height() > oldest.height())
+                    );
+                    *self = InFlight::Empty;
+                } else {
+                    rest.retain(|position| position.height() <= fork_height);
+                }
+            }
+        }
+    }
+}
+
+fn take_from(
+    slot: &mut InFlight,
+    oldest: crate::chain::Position,
+    mut rest: Vec<crate::chain::Position>,
+    since: Option<std::time::Instant>,
+    hash: bitcoin_hashes::sha256d::Hash,
+) -> Option<crate::chain::Position> {
+    if oldest.hash() == hash {
+        let mut rest = rest.into_iter();
+        *slot = match rest.next() {
+            Some(next_oldest) => InFlight::Reset {
+                oldest: next_oldest,
+                rest: rest.collect(),
+            },
+            None => InFlight::Empty,
+        };
+        return Some(oldest);
+    }
+    let found = rest
+        .iter()
+        .position(|position| position.hash() == hash)
+        .map(|index| rest.remove(index));
+    *slot = match since {
+        Some(since) => InFlight::Waiting {
+            oldest,
+            rest,
+            since,
+        },
+        None => InFlight::Reset { oldest, rest },
+    };
+    found
 }
 
 impl PingState {
@@ -729,92 +1013,136 @@ impl SyncState {
     }
 }
 
-fn receive_answer(
-    chain: &mut crate::chain::Chain,
-    work_min: crate::pow::Work,
-    salt: &mut Option<crate::headerssync::Salt>,
-    branch_tip: &mut Option<crate::chain::BranchTip>,
-    download: Download,
-    headers: crate::protocol::Headers,
-    clock: u64,
-) -> Result<Answer, PeerError> {
-    if !download.is_answered_by(chain, &headers) {
-        return Ok(Answer::Skipped(download));
+impl Peer<'_> {
+    fn receive_answer(
+        &mut self,
+        download: Download,
+        headers: crate::protocol::Headers,
+        clock: u64,
+    ) -> Result<Answer, PeerError> {
+        if !download.is_answered_by(self.chain, &headers) {
+            return Ok(Answer::Skipped(download));
+        }
+        let full = headers.is_full();
+        let next = match download {
+            Download::Genesis(genesis_salt) => receive_on_genesis(
+                self.chain,
+                self.work_min,
+                &mut self.salt,
+                genesis_salt,
+                headers,
+                clock,
+            )?,
+            Download::Chain => {
+                let Some(extended) = self
+                    .chain
+                    .extend_on_locator(headers, clock, self.work_min)
+                    .map_err(PeerError::Extend)?
+                else {
+                    return Ok(Answer::Skipped(Download::Chain));
+                };
+                self.chain_next(extended, clock)?
+            }
+            Download::Branch(branch) => {
+                let extended = self
+                    .chain
+                    .extend_branch(*branch, headers, clock, self.work_min)
+                    .map_err(PeerError::Extend)?;
+                self.chain_next(extended, clock)?
+            }
+            Download::BranchPresync(sync) => {
+                let BranchPresync { start, presync } = *sync;
+                let step = presync.receive(headers).map_err(PeerError::HeadersSync)?;
+                Some(branch_presync_next(start, step))
+            }
+            Download::BranchRedownload(sync) => {
+                let BranchRedownload {
+                    start,
+                    redownload,
+                    mut released,
+                } = *sync;
+                match redownload
+                    .receive(headers)
+                    .map_err(PeerError::HeadersSync)?
+                {
+                    crate::headerssync::RedownloadStep::More(redownload, more) => {
+                        keep_released(self.chain.network(), &mut released, more);
+                        Some(Download::BranchRedownload(Box::new(BranchRedownload {
+                            start,
+                            redownload: *redownload,
+                            released,
+                        })))
+                    }
+                    crate::headerssync::RedownloadStep::Done(rest) => {
+                        keep_released(self.chain.network(), &mut released, rest);
+                        let extended = self
+                            .chain
+                            .extend_low_work_branch(start, released, full, clock, self.work_min)
+                            .map_err(PeerError::Extend)?;
+                        self.chain_next(extended, clock)?
+                    }
+                }
+            }
+            Download::Presync(presync) => {
+                let step = presync.receive(headers).map_err(PeerError::HeadersSync)?;
+                Some(presync_next(step))
+            }
+            Download::Redownload(redownload) => {
+                match redownload
+                    .receive(headers)
+                    .map_err(PeerError::HeadersSync)?
+                {
+                    crate::headerssync::RedownloadStep::More(redownload, released) => {
+                        extend_released(self.chain, released, clock)?;
+                        Some(Download::Redownload(redownload))
+                    }
+                    crate::headerssync::RedownloadStep::Done(released) => {
+                        extend_released(self.chain, released, clock)?;
+                        let next = Download::on_tip(self.chain, self.work_min);
+                        full.then_some(next)
+                    }
+                }
+            }
+        };
+        Ok(Answer::Next(next))
     }
-    let full = headers.is_full();
-    let next = match download {
-        Download::Genesis(genesis_salt) => {
-            receive_on_genesis(chain, work_min, salt, genesis_salt, headers, clock)?
-        }
-        Download::Chain => {
-            let Some(extended) = chain
-                .extend_on_locator(headers, clock, work_min)
-                .map_err(PeerError::Extend)?
-            else {
-                return Ok(Answer::Skipped(Download::Chain));
-            };
-            chain_next(chain, work_min, salt, branch_tip, extended, clock)?
-        }
-        Download::Branch(branch) => {
-            let extended = chain
-                .extend_branch(*branch, headers, clock, work_min)
-                .map_err(PeerError::Extend)?;
-            chain_next(chain, work_min, salt, branch_tip, extended, clock)?
-        }
-        Download::BranchPresync(sync) => {
-            let BranchPresync { start, presync } = *sync;
-            let step = presync.receive(headers).map_err(PeerError::HeadersSync)?;
-            Some(branch_presync_next(start, step))
-        }
-        Download::BranchRedownload(sync) => {
-            let BranchRedownload {
+
+    fn chain_next(
+        &mut self,
+        extended: crate::chain::Extended,
+        clock: u64,
+    ) -> Result<Option<Download>, PeerError> {
+        match extended {
+            crate::chain::Extended::Taken { full, fork_height } => {
+                self.blocks.reorg(fork_height);
+                let next = Download::on_tip(self.chain, self.work_min);
+                Ok(full.then_some(next))
+            }
+            crate::chain::Extended::Branch(branch) => {
+                assert!(self.chain.tip().work() >= self.work_min);
+                Ok(Some(Download::Branch(Box::new(branch))))
+            }
+            crate::chain::Extended::Kept => {
+                assert!(self.chain.tip().work() >= self.work_min);
+                Ok(None)
+            }
+            crate::chain::Extended::KeptOver(tip) => {
+                self.branch_tip = Some(tip);
+                Ok(None)
+            }
+            crate::chain::Extended::BelowMargin {
                 start,
-                redownload,
-                mut released,
-            } = *sync;
-            match redownload
-                .receive(headers)
-                .map_err(PeerError::HeadersSync)?
-            {
-                crate::headerssync::RedownloadStep::More(redownload, more) => {
-                    keep_released(chain.network(), &mut released, more);
-                    Some(Download::BranchRedownload(Box::new(BranchRedownload {
-                        start,
-                        redownload: *redownload,
-                        released,
-                    })))
-                }
-                crate::headerssync::RedownloadStep::Done(rest) => {
-                    keep_released(chain.network(), &mut released, rest);
-                    let extended = chain
-                        .extend_low_work_branch(start, released, full, clock, work_min)
-                        .map_err(PeerError::Extend)?;
-                    chain_next(chain, work_min, salt, branch_tip, extended, clock)?
-                }
+                branch_work_min,
+                headers,
+            } => {
+                assert!(self.chain.tip().work() >= self.work_min);
+                let salt = self.salt.take().ok_or(PeerError::SecondLowWorkSync)?;
+                let presync = crate::headerssync::Presync::new(start, branch_work_min, clock, salt);
+                let step = presync.receive(headers).map_err(PeerError::HeadersSync)?;
+                Ok(Some(branch_presync_next(start, step)))
             }
         }
-        Download::Presync(presync) => {
-            let step = presync.receive(headers).map_err(PeerError::HeadersSync)?;
-            Some(presync_next(step))
-        }
-        Download::Redownload(redownload) => {
-            match redownload
-                .receive(headers)
-                .map_err(PeerError::HeadersSync)?
-            {
-                crate::headerssync::RedownloadStep::More(redownload, released) => {
-                    extend_released(chain, released, clock)?;
-                    Some(Download::Redownload(redownload))
-                }
-                crate::headerssync::RedownloadStep::Done(released) => {
-                    extend_released(chain, released, clock)?;
-                    let next = Download::on_tip(chain, work_min);
-                    full.then_some(next)
-                }
-            }
-        }
-    };
-    Ok(Answer::Next(next))
+    }
 }
 
 fn receive_on_genesis(
@@ -839,45 +1167,6 @@ fn receive_on_genesis(
         Ok(None)
     } else {
         Err(PeerError::ChainWorkTooLow)
-    }
-}
-
-fn chain_next(
-    chain: &crate::chain::Chain,
-    work_min: crate::pow::Work,
-    salt: &mut Option<crate::headerssync::Salt>,
-    branch_tip: &mut Option<crate::chain::BranchTip>,
-    extended: crate::chain::Extended,
-    clock: u64,
-) -> Result<Option<Download>, PeerError> {
-    match extended {
-        crate::chain::Extended::Taken { full } => {
-            let next = Download::on_tip(chain, work_min);
-            Ok(full.then_some(next))
-        }
-        crate::chain::Extended::Branch(branch) => {
-            assert!(chain.tip().work() >= work_min);
-            Ok(Some(Download::Branch(Box::new(branch))))
-        }
-        crate::chain::Extended::Kept => {
-            assert!(chain.tip().work() >= work_min);
-            Ok(None)
-        }
-        crate::chain::Extended::KeptOver(tip) => {
-            *branch_tip = Some(tip);
-            Ok(None)
-        }
-        crate::chain::Extended::BelowMargin {
-            start,
-            branch_work_min,
-            headers,
-        } => {
-            assert!(chain.tip().work() >= work_min);
-            let salt = salt.take().ok_or(PeerError::SecondLowWorkSync)?;
-            let presync = crate::headerssync::Presync::new(start, branch_work_min, clock, salt);
-            let step = presync.receive(headers).map_err(PeerError::HeadersSync)?;
-            Ok(Some(branch_presync_next(start, step)))
-        }
     }
 }
 
@@ -992,6 +1281,8 @@ pub(crate) mod fuzz {
     const _: () = assert!(super::PING_INTERVAL.as_secs() == 120);
     const _: () = assert!(super::PING_TIMEOUT.as_secs() == 1200);
     const _: () = assert!(super::HEADERS_TIMEOUT.as_secs() == 120);
+    const _: () = assert!(super::BLOCKS_IN_FLIGHT_MAX == 16);
+    const _: () = assert!(super::BLOCK_TIMEOUT.as_secs() == 600);
 
     const HEADERS_FULL_COUNT: usize = 2000;
 
@@ -1034,10 +1325,18 @@ pub(crate) mod fuzz {
         crate::chainparams::Network::Regtest.genesis().time + seconds
     }
 
+    fn script_coinbase_bytes(tag: u32) -> [u8; 55] {
+        let mut bytes = [0; 55];
+        bytes[0..4].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[4] = 1;
+        bytes[37..41].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[41] = 4;
+        bytes[42..46].copy_from_slice(&tag.to_le_bytes());
+        bytes
+    }
+
     fn script_merkle_root(tag: u32) -> [u8; 32] {
-        let mut root = [0; 32];
-        root[..4].copy_from_slice(&tag.to_le_bytes());
-        root
+        bitcoin_hashes::sha256d::Hash::hash(&script_coinbase_bytes(tag)).to_byte_array()
     }
 
     const SCRIPT_KEYS: [u64; 2] = [0, 0];
@@ -1085,6 +1384,16 @@ pub(crate) mod fuzz {
         seed!("announce-full-after-sync", "PeerOpen { height: 2005, synced: true }"),
         seed!("announce-full-after-sync-headers-timeout", "PeerRefused(HeadersTimeout)"),
         seed!("announce-on-locator-then-branch", "PeerOpen { height: 7, synced: true }"),
+        seed!("block-download-all", "PeerOpen { height: 2, synced: true }"),
+        seed!("block-download-cap-and-top-up", "PeerOpen { height: 18, synced: true }"),
+        seed!("block-download-oldest-resets-timeout", "PeerOpen { height: 2, synced: true }"),
+        seed!("block-download-out-of-order", "PeerOpen { height: 2, synced: true }"),
+        seed!("block-download-out-of-order-timeout", "PeerRefused(BlockTimeout)"),
+        seed!("block-mutated-merkle-root", "PeerRefused(BlockMutation(MerkleRoot))"),
+        seed!("block-mutated-unexpected-witness", "PeerRefused(BlockMutation(UnexpectedWitness))"),
+        seed!("block-reorg-in-flight", "PeerOpen { height: 4, synced: true }"),
+        seed!("block-truncated-payload", "PeerRefused(Block(UnexpectedEnd))"),
+        seed!("block-unsolicited-skipped", "PeerOpen { height: 2, synced: true }"),
         seed!("fork-below-margin-after-our-headers", "PeerOpen { height: 2200, synced: false }"),
         seed!("fork-below-margin-of-the-minimum", "PeerRefused(SecondLowWorkSync)"),
         seed!("fork-below-margin-short-kept", "PeerOpen { height: 2200, synced: true }"),
@@ -1111,6 +1420,7 @@ pub(crate) mod fuzz {
         seed!("handshake-16th-is-version", "HandshakeRefused(TooManyMessages)"),
         seed!("handshake-bytes-after-relay", "PeerOpen { height: 0, synced: false }"),
         seed!("handshake-empty-version", "HandshakeRefused(Version(UnexpectedEnd))"),
+        seed!("handshake-missing-services", "HandshakeRefused(MissingServices(ServiceFlags(0)))"),
         seed!("handshake-no-message-kinds", "PeerOpen { height: 0, synced: false }"),
         seed!("handshake-no-messages", "HandshakeOpen"),
         seed!("handshake-no-relay", "PeerOpen { height: 0, synced: false }"),
@@ -1145,7 +1455,7 @@ pub(crate) mod fuzz {
         seed!("inv-block-in-sync", "PeerOpen { height: 2, synced: true }"),
         seed!("inv-other-after-sync", "PeerOpen { height: 2, synced: true }"),
         seed!("inv-short-payload", "PeerRefused(Inv(Payload(UnexpectedEnd)))"),
-        seed!("mix-long", "PeerRefused(PingTimeout)"),
+        seed!("mix-long", "PeerRefused(BlockTimeout)"),
         seed!("network-mainnet", "PeerRefused(Extend(ProofOfWork))"),
         seed!("network-signet", "PeerRefused(Extend(ProofOfWork))"),
         seed!("network-testnet4", "PeerRefused(Extend(ProofOfWork))"),
@@ -1218,6 +1528,7 @@ pub(crate) mod fuzz {
             unread: data,
             headers_written_count: 0,
             written_on: std::collections::HashMap::new(),
+            header_by_hash: std::collections::HashMap::new(),
             branch_last: 0,
         };
         let (network, work_min, work_min_model) = script_network_work_min(script.byte());
@@ -1316,6 +1627,7 @@ pub(crate) mod fuzz {
             ping_nonce: 0,
             last: (bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]), 0),
             locator_below: Vec::new(),
+            in_flight: Vec::new(),
         };
         let mut model = HandshakeModel {
             nonce,
@@ -1372,6 +1684,7 @@ pub(crate) mod fuzz {
                 ping_nonce: model.ping_nonce,
                 last: model.download_last(),
                 locator_below: model.locator_below(),
+                in_flight: model.in_flight_hashes(),
             };
             if let Some(message) = script.message(&base) {
                 peer = match peer_receive(peer, &mut model, &message, clock) {
@@ -1421,6 +1734,14 @@ pub(crate) mod fuzz {
                         other => panic!("{other:?}, not a getheaders"),
                     }
                 }
+                if let Some(hashes) = expected.get_data {
+                    match outbounds.next() {
+                        Some(super::PeerOutbound::GetData(get_data)) => {
+                            peer_get_data_check(get_data, &hashes);
+                        }
+                        other => panic!("{other:?}, not a getdata"),
+                    }
+                }
                 let extra = outbounds.next();
                 assert!(extra.is_none(), "{extra:?}");
                 Ok((peer, wake))
@@ -1431,6 +1752,22 @@ pub(crate) mod fuzz {
             }
             (ticked, expected) => panic!("the tick gave {ticked:?}, not {expected:?}"),
         }
+    }
+
+    fn peer_get_data_check(
+        get_data: crate::protocol::GetData,
+        hashes: &[bitcoin_hashes::sha256d::Hash],
+    ) {
+        let mut encoded = Vec::new();
+        get_data.encode(&mut encoded);
+
+        let mut expected = Vec::new();
+        crate::serialize::write_compact_size(&mut expected, hashes.len());
+        for hash in hashes {
+            expected.extend_from_slice(&0x4000_0002_u32.to_le_bytes());
+            expected.extend_from_slice(hash.as_byte_array());
+        }
+        assert_eq!(encoded, expected);
     }
 
     fn peer_get_headers_check(
@@ -1466,6 +1803,25 @@ pub(crate) mod fuzz {
                 assert_eq!(tip.hash(), model.tip());
                 assert_eq!(tip.height(), model.height());
                 assert_eq!(tip.work().to_string(), format!("{:064x}", model.work()));
+                Ok(peer)
+            }
+            (
+                Ok((
+                    peer,
+                    super::Received::Block {
+                        position,
+                        transactions,
+                    },
+                )),
+                Ok(ReceivedExpected::Block {
+                    height,
+                    hash,
+                    transactions: expected_transactions,
+                }),
+            ) => {
+                assert_eq!(position.height(), height);
+                assert_eq!(position.hash(), hash);
+                assert_eq!(transactions, expected_transactions);
                 Ok(peer)
             }
             (Err(error), Err(expected)) => {
@@ -1508,6 +1864,10 @@ pub(crate) mod fuzz {
         headers_written_count: usize,
         written_on:
             std::collections::HashMap<bitcoin_hashes::sha256d::Hash, crate::block::BlockHeader>,
+        header_by_hash: std::collections::HashMap<
+            bitcoin_hashes::sha256d::Hash,
+            (crate::block::BlockHeader, u32),
+        >,
         branch_last: u32,
     }
 
@@ -1532,7 +1892,7 @@ pub(crate) mod fuzz {
                 0 => return None,
                 1 => (
                     crate::protocol::VERSION,
-                    self.version_payload(base.our_nonce),
+                    self.version_payload(base.our_nonce, kind / 8),
                 ),
                 2 => (crate::protocol::VERACK, Vec::new()),
                 3 => (crate::protocol::PING, self.nonce().to_le_bytes().to_vec()),
@@ -1544,7 +1904,10 @@ pub(crate) mod fuzz {
                     };
                     (crate::protocol::HEADERS, payload)
                 }
-                6 => (crate::protocol::WTXIDRELAY, Vec::new()),
+                6 => match usize::from(kind / 8).checked_sub(1) {
+                    None => (crate::protocol::WTXIDRELAY, Vec::new()),
+                    Some(slot) => (crate::protocol::BLOCK, self.block_payload(base, slot)),
+                },
                 _ => (crate::protocol::INV, self.inv_payload()),
             };
             let length = payload
@@ -1554,12 +1917,49 @@ pub(crate) mod fuzz {
             Some(message_read(msg_type, &payload))
         }
 
-        fn version_payload(&mut self, our_nonce: u64) -> Vec<u8> {
+        fn version_payload(&mut self, our_nonce: u64, services_selector: u8) -> Vec<u8> {
             let their_nonce = our_nonce.wrapping_add(u64::from(self.byte()));
             let mut theirs = super::our_version(PEER_ADDRESS, 0, their_nonce);
             theirs.version = super::PROTOCOL_VERSION_MIN + i32::from(self.signed_byte());
+            theirs.services = match services_selector.checked_sub(1) {
+                None => crate::protocol::ServiceFlags::NETWORK_WITNESS,
+                Some(bits) => crate::protocol::ServiceFlags::from_bits(u64::from(bits)),
+            };
             let mut payload = Vec::new();
             theirs.encode(&mut payload);
+            payload
+        }
+
+        fn block_payload(&mut self, base: &MessageBase, slot: usize) -> Vec<u8> {
+            let mode = self.byte();
+            let (header, tag) = if mode & 1 == 0
+                && !base.in_flight.is_empty()
+                && let Some(entry) = self
+                    .header_by_hash
+                    .get(&base.in_flight[slot % base.in_flight.len()])
+            {
+                *entry
+            } else {
+                (FRAME_NETWORK.genesis(), 0)
+            };
+            let mut payload = Vec::new();
+            header.encode(&mut payload);
+            payload.push(1);
+            let mut tx = script_coinbase_bytes(tag);
+            match (mode >> 1) % 3 {
+                0 => payload.extend_from_slice(&tx),
+                1 => {
+                    tx[42] ^= 1;
+                    payload.extend_from_slice(&tx);
+                }
+                _ => {
+                    payload.extend_from_slice(&tx[..4]);
+                    payload.extend_from_slice(&[0x00, 0x01]);
+                    payload.extend_from_slice(&tx[4..51]);
+                    payload.extend_from_slice(&[0x01, 0x01, 0xaa]);
+                    payload.extend_from_slice(&tx[51..]);
+                }
+            }
             payload
         }
 
@@ -1617,7 +2017,10 @@ pub(crate) mod fuzz {
                         _ => {
                             let header = script_header_mined(prev, height, self.branch_last);
                             self.written_on.insert(prev, header);
+                            self.header_by_hash
+                                .insert(header.hash(), (header, self.branch_last));
                             assert!(self.written_on.len() <= self.headers_written_count);
+                            assert!(self.header_by_hash.len() <= self.headers_written_count);
                             header
                         }
                     }
@@ -1663,6 +2066,7 @@ pub(crate) mod fuzz {
         ping_nonce: u64,
         last: (bitcoin_hashes::sha256d::Hash, usize),
         locator_below: Vec<(bitcoin_hashes::sha256d::Hash, usize)>,
+        in_flight: Vec<bitcoin_hashes::sha256d::Hash>,
     }
 
     impl MessageBase {
@@ -1742,6 +2146,12 @@ pub(crate) mod fuzz {
                     if theirs.nonce == self.nonce {
                         return Err(super::HandshakeError::SelfConnection);
                     }
+                    if !theirs
+                        .services
+                        .has(crate::protocol::ServiceFlags::NETWORK_WITNESS)
+                    {
+                        return Err(super::HandshakeError::MissingServices(theirs.services));
+                    }
                     self.theirs = Some(theirs);
                     HandshakeExpected::Reply
                 }
@@ -1770,6 +2180,9 @@ pub(crate) mod fuzz {
         salt_left: bool,
         branch_tip: Option<(bitcoin_hashes::sha256d::Hash, u128, usize)>,
         download: DownloadModel,
+        next_block_height: usize,
+        blocks_in_flight: Vec<(usize, bitcoin_hashes::sha256d::Hash)>,
+        block_deadline: Option<std::time::Instant>,
     }
 
     enum DownloadModel {
@@ -1829,6 +2242,7 @@ pub(crate) mod fuzz {
         ping: bool,
         send_headers: bool,
         get_headers: bool,
+        get_data: Option<Vec<bitcoin_hashes::sha256d::Hash>>,
         wake: std::time::Instant,
     }
 
@@ -1837,6 +2251,11 @@ pub(crate) mod fuzz {
         NoReply,
         Pong(u64),
         Synced,
+        Block {
+            height: usize,
+            hash: bitcoin_hashes::sha256d::Hash,
+            transactions: usize,
+        },
     }
 
     impl PeerModel {
@@ -1857,7 +2276,17 @@ pub(crate) mod fuzz {
                 salt_left: true,
                 branch_tip: None,
                 download: DownloadModel::Chain,
+                next_block_height: 1,
+                blocks_in_flight: Vec::new(),
+                block_deadline: None,
             }
+        }
+
+        fn in_flight_hashes(&self) -> Vec<bitcoin_hashes::sha256d::Hash> {
+            self.blocks_in_flight
+                .iter()
+                .map(|(_, hash)| *hash)
+                .collect()
         }
 
         fn tip(&self) -> bitcoin_hashes::sha256d::Hash {
@@ -1945,9 +2374,30 @@ pub(crate) mod fuzz {
                 GetHeadersModel::Outstanding(_) => return Err(super::PeerError::HeadersTimeout),
                 GetHeadersModel::Ended => (false, None),
             };
+            if let Some(deadline) = self.block_deadline
+                && now >= deadline
+            {
+                return Err(super::PeerError::BlockTimeout);
+            }
 
-            let send_headers = self.send_headers == SendHeadersModel::Unsent
-                && matches!(self.get_headers, GetHeadersModel::Ended);
+            let synced = matches!(self.get_headers, GetHeadersModel::Ended);
+            let send_headers = self.send_headers == SendHeadersModel::Unsent && synced;
+
+            let mut asked = Vec::new();
+            if synced {
+                while self.blocks_in_flight.len() < super::BLOCKS_IN_FLIGHT_MAX
+                    && self.next_block_height <= self.height()
+                {
+                    let hash = self.chain[self.next_block_height];
+                    self.blocks_in_flight.push((self.next_block_height, hash));
+                    asked.push(hash);
+                    self.next_block_height += 1;
+                }
+            }
+            if !self.blocks_in_flight.is_empty() && self.block_deadline.is_none() {
+                self.block_deadline = Some(now + super::BLOCK_TIMEOUT);
+            }
+            let get_data = (!asked.is_empty()).then_some(asked);
 
             if ping {
                 self.ping_nonce = nonce;
@@ -1962,11 +2412,15 @@ pub(crate) mod fuzz {
             let wake = headers_deadline.map_or(self.ping_deadline, |deadline| {
                 deadline.min(self.ping_deadline)
             });
+            let wake = self
+                .block_deadline
+                .map_or(wake, |deadline| deadline.min(wake));
             assert!(now < wake);
             Ok(TickExpected {
                 ping,
                 send_headers,
                 get_headers,
+                get_data,
                 wake,
             })
         }
@@ -1992,6 +2446,30 @@ pub(crate) mod fuzz {
                 }
             } else if msg_type == crate::protocol::HEADERS {
                 self.receive_headers(message)
+            } else if msg_type == crate::protocol::BLOCK {
+                let block = crate::block::Block::decode(&mut message.payload())
+                    .map_err(super::PeerError::Block)?;
+                let hash = block.header.hash();
+                let Some(index) = self
+                    .blocks_in_flight
+                    .iter()
+                    .position(|(_, pending)| *pending == hash)
+                else {
+                    return Ok(ReceivedExpected::NoReply);
+                };
+                let (height, _) = self.blocks_in_flight.remove(index);
+                if index == 0 {
+                    self.block_deadline = None;
+                }
+                let position = crate::chain::Position::new(self.network, height, hash);
+                let checked = block
+                    .check_mutation(position)
+                    .map_err(super::PeerError::BlockMutation)?;
+                Ok(ReceivedExpected::Block {
+                    height,
+                    hash,
+                    transactions: checked.transactions_count(),
+                })
             } else if msg_type == crate::protocol::INV {
                 let has_block = message_inv_has_block(message).map_err(super::PeerError::Inv)?;
                 if has_block && matches!(self.get_headers, GetHeadersModel::Ended) {
@@ -2218,6 +2696,11 @@ pub(crate) mod fuzz {
             }
             self.chain.truncate(fork + 1);
             self.chain.extend(hashes);
+            self.next_block_height = self.next_block_height.min(fork + 1);
+            self.blocks_in_flight.retain(|(height, _)| *height <= fork);
+            if self.blocks_in_flight.is_empty() {
+                self.block_deadline = None;
+            }
             ExtendedModel::Taken
         }
 
@@ -2582,6 +3065,7 @@ mod tests {
                     ping: None,
                     send_headers: false,
                     get_headers: Some(get_headers),
+                    get_data: None,
                 },
                 _,
             )) => (peer, get_headers),
@@ -2673,6 +3157,7 @@ mod tests {
                     ping: Some(sent),
                     send_headers: false,
                     get_headers: Some(_),
+                    get_data: None,
                 },
                 _,
             )) if sent == nonce => peer,
@@ -2691,6 +3176,7 @@ mod tests {
                     ping: Some(_),
                     send_headers: false,
                     get_headers: Some(get_headers),
+                    get_data: None,
                 },
                 _,
             )) => (peer, get_headers),
@@ -2711,6 +3197,7 @@ mod tests {
                     ping: None,
                     send_headers: true,
                     get_headers: None,
+                    get_data: None,
                 },
                 _,
             )) => peer,
@@ -2736,6 +3223,7 @@ mod tests {
                     ping: None,
                     send_headers: false,
                     get_headers: None,
+                    get_data: None,
                 },
                 wake,
             )) => (peer, wake),
@@ -2974,6 +3462,7 @@ mod tests {
                 ping: Some(8),
                 send_headers: false,
                 get_headers: None,
+                get_data: None,
             },
             wake,
         )) = ticked
@@ -2993,7 +3482,8 @@ mod tests {
                     super::TickOutbound {
                         ping: Some(8),
                         send_headers: false,
-                        get_headers: None
+                        get_headers: None,
+                        get_data: None,
                     },
                     _
                 ))
@@ -3114,6 +3604,7 @@ mod tests {
                 ping: None,
                 send_headers: false,
                 get_headers: Some(get_headers),
+                get_data: None,
             },
             wake,
         )) = ticked
@@ -3904,7 +4395,29 @@ mod tests {
             peer = next;
         }
         let later = start + std::time::Duration::from_mins(10);
-        let (_, wake) = idle(peer, later);
+        let ticked = peer.tick(later, 0);
+        let Ok((
+            _,
+            super::TickOutbound {
+                ping: None,
+                send_headers: false,
+                get_headers: None,
+                get_data: Some(get_data),
+            },
+            wake,
+        )) = ticked
+        else {
+            panic!("{ticked:?}");
+        };
+        assert_eq!(
+            get_data,
+            crate::protocol::GetData::witness_blocks(
+                headers
+                    .iter()
+                    .map(crate::block::BlockHeader::hash)
+                    .collect()
+            )
+        );
         assert_eq!(wake, start + super::PING_TIMEOUT);
     }
 
@@ -3921,6 +4434,7 @@ mod tests {
                     ping: None,
                     send_headers: true,
                     get_headers: None,
+                    get_data: Some(_),
                 },
                 _,
             )) => peer,
@@ -3935,6 +4449,7 @@ mod tests {
                     ping: None,
                     send_headers: false,
                     get_headers: Some(get_headers),
+                    get_data: None,
                 },
                 wake,
             )) => {
@@ -4088,5 +4603,323 @@ mod tests {
             peer.tick(timeout, 8).err(),
             Some(super::PeerError::HeadersTimeout)
         );
+    }
+
+    fn coinbase_block(header: crate::block::BlockHeader, tag: u32) -> crate::block::Block {
+        let tx = crate::transaction::Transaction::new(
+            1,
+            vec![crate::transaction::TxIn {
+                previous_output: crate::transaction::OutPoint {
+                    txid: bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]),
+                    vout: u32::MAX,
+                },
+                script_sig: tag.to_le_bytes().to_vec(),
+                sequence: 0,
+                witness: crate::transaction::Witness::default(),
+            }],
+            Vec::new(),
+            0,
+        )
+        .unwrap();
+        let header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
+            merkle_root: tx.txid().to_byte_array(),
+            ..header
+        });
+        crate::block::Block {
+            header,
+            transactions: vec![tx],
+        }
+    }
+
+    fn blocks_on(
+        below: &crate::block::BlockHeader,
+        count: usize,
+        tag: u32,
+    ) -> Vec<crate::block::Block> {
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        let mut prev = *below;
+        let mut blocks = Vec::with_capacity(count);
+        for _ in 0..count {
+            let block = coinbase_block(
+                crate::block::BlockHeader {
+                    version: crate::fixtures::HEADER_VERSION,
+                    prev: prev.hash(),
+                    time: prev.time + 1,
+                    ..genesis
+                },
+                tag,
+            );
+            prev = block.header;
+            blocks.push(block);
+        }
+        blocks
+    }
+
+    fn block_message(block: &crate::block::Block) -> crate::transport::Message {
+        let mut payload = Vec::new();
+        crate::serialize::Encode::encode(block, &mut payload);
+        block_payload_message(&payload)
+    }
+
+    fn block_payload_message(payload: &[u8]) -> crate::transport::Message {
+        message(&crate::transport::encode(
+            crate::chainparams::Network::Regtest,
+            crate::protocol::BLOCK,
+            payload,
+        ))
+    }
+
+    fn get_data_for(blocks: &[crate::block::Block]) -> crate::protocol::GetData {
+        crate::protocol::GetData::witness_blocks(
+            blocks.iter().map(|block| block.header.hash()).collect(),
+        )
+    }
+
+    fn tick_get_data(
+        peer: super::Peer<'_>,
+        now: std::time::Instant,
+    ) -> (
+        super::Peer<'_>,
+        crate::protocol::GetData,
+        std::time::Instant,
+    ) {
+        match peer.tick(now, 0) {
+            Ok((
+                peer,
+                super::TickOutbound {
+                    ping: None,
+                    get_headers: None,
+                    get_data: Some(get_data),
+                    ..
+                },
+                wake,
+            )) => (peer, get_data, wake),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn receive_block<'a>(
+        peer: super::Peer<'a>,
+        block: &crate::block::Block,
+    ) -> (super::Peer<'a>, crate::chain::Position, usize) {
+        match peer.receive(&block_message(block), crate::fixtures::CLOCK) {
+            Ok((
+                peer,
+                super::Received::Block {
+                    position,
+                    transactions,
+                },
+            )) => (peer, position, transactions),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn their_version_must_include_network_and_witness_services() {
+        for (bits, ok) in [
+            (0_u64, false),
+            (1, false),
+            (8, false),
+            (0x0408, false),
+            (0x0009, true),
+            (0x0c09, true),
+        ] {
+            let mut chain = regtest();
+            let message = version_message(|payload| {
+                payload[size_of::<i32>()..size_of::<i32>() + size_of::<u64>()]
+                    .copy_from_slice(&bits.to_le_bytes());
+            });
+            let result = start(&mut chain).receive(&message);
+            if ok {
+                reply(result);
+            } else {
+                assert_eq!(
+                    result.err(),
+                    Some(super::HandshakeError::MissingServices(
+                        crate::protocol::ServiceFlags::from_bits(bits)
+                    )),
+                    "{bits:#x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn after_sync_getdata_asks_from_height_1_up_to_blocks_in_flight_max_and_tops_up() {
+        let mut chain = regtest();
+        let start = std::time::Instant::now();
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        let blocks = blocks_on(&genesis, super::BLOCKS_IN_FLIGHT_MAX + 2, 0);
+        let headers: Vec<_> = blocks.iter().map(|block| block.header).collect();
+        let peer = synced(asked(&mut chain, start, 7), &headers);
+
+        let (peer, get_data, wake) = tick_get_data(peer, start);
+        assert_eq!(
+            get_data,
+            get_data_for(&blocks[..super::BLOCKS_IN_FLIGHT_MAX])
+        );
+        assert_eq!(wake, start + super::BLOCK_TIMEOUT);
+        let (peer, wake) = idle(peer, start);
+        assert_eq!(wake, start + super::BLOCK_TIMEOUT);
+
+        let (peer, position, transactions) = receive_block(peer, &blocks[0]);
+        assert_eq!(position.height(), 1);
+        assert_eq!(position.hash(), blocks[0].header.hash());
+        assert_eq!(transactions, 1);
+
+        let later = start + std::time::Duration::from_mins(1);
+        let (peer, get_data, wake) = tick_get_data(peer, later);
+        assert_eq!(
+            get_data,
+            get_data_for(&blocks[super::BLOCKS_IN_FLIGHT_MAX..super::BLOCKS_IN_FLIGHT_MAX + 1])
+        );
+        assert_eq!(wake, later + super::BLOCK_TIMEOUT);
+
+        let (peer, position, _) = receive_block(peer, &blocks[1]);
+        assert_eq!(position.height(), 2);
+        let (peer, get_data, _) = tick_get_data(peer, later);
+        assert_eq!(
+            get_data,
+            get_data_for(&blocks[super::BLOCKS_IN_FLIGHT_MAX + 1..])
+        );
+
+        let mut peer = peer;
+        for (index, block) in blocks[2..].iter().enumerate() {
+            let (next, position, _) = receive_block(peer, block);
+            assert_eq!(position.height(), index + 3);
+            peer = next;
+        }
+        let (_, wake) = idle(peer, later);
+        assert_eq!(wake, start + super::PING_TIMEOUT);
+    }
+
+    #[test]
+    fn out_of_order_block_keeps_the_oldest_timeout_and_oldest_resets_it() {
+        let mut chain = regtest();
+        let start = std::time::Instant::now();
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        let blocks = blocks_on(&genesis, 2, 0);
+        let headers: Vec<_> = blocks.iter().map(|block| block.header).collect();
+        let peer = synced(asked(&mut chain, start, 7), &headers);
+        let (peer, _, _) = tick_get_data(peer, start);
+
+        let (peer, position, _) = receive_block(peer, &blocks[1]);
+        assert_eq!(position.height(), 2);
+        let before = start + super::BLOCK_TIMEOUT - NANOSECOND;
+        let (peer, wake) = idle(peer, before);
+        assert_eq!(wake, start + super::BLOCK_TIMEOUT);
+        assert_eq!(
+            peer.tick(start + super::BLOCK_TIMEOUT, 0).err(),
+            Some(super::PeerError::BlockTimeout)
+        );
+
+        let mut chain = regtest();
+        let peer = synced(asked(&mut chain, start, 7), &headers);
+        let (peer, _, _) = tick_get_data(peer, start);
+        let (peer, position, _) = receive_block(peer, &blocks[0]);
+        assert_eq!(position.height(), 1);
+        let mid = start + std::time::Duration::from_mins(5);
+        let (peer, wake) = idle(peer, mid);
+        assert_eq!(wake, mid + super::BLOCK_TIMEOUT);
+        let (peer, wake) = idle(peer, start + super::BLOCK_TIMEOUT);
+        assert_eq!(wake, mid + super::BLOCK_TIMEOUT);
+        assert_eq!(
+            peer.tick(mid + super::BLOCK_TIMEOUT, 0).err(),
+            Some(super::PeerError::BlockTimeout)
+        );
+    }
+
+    #[test]
+    fn unsolicited_block_is_skipped_and_malformed_or_mutated_block_ends_the_connection() {
+        let mut chain = regtest();
+        let start = std::time::Instant::now();
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        let blocks = blocks_on(&genesis, 2, 0);
+        let headers: Vec<_> = blocks.iter().map(|block| block.header).collect();
+        let peer = asked(&mut chain, start, 7);
+        let peer = accept(peer, &block_message(&blocks[0]));
+        let peer = synced(peer, &headers[..1]);
+        let (peer, _, _) = tick_get_data(peer, start);
+
+        let peer = accept(peer, &block_message(&blocks[1]));
+        let genesis_block = crate::fixtures::block(crate::fixtures::REGTEST_GENESIS_BLOCK);
+        let peer = accept(peer, &block_message(&genesis_block));
+
+        let mut mutated = blocks[0].clone();
+        mutated.transactions.clear();
+        assert_eq!(
+            peer.receive(&block_message(&mutated), crate::fixtures::CLOCK)
+                .err(),
+            Some(super::PeerError::BlockMutation(
+                crate::block::MutationError::MerkleRoot
+            ))
+        );
+
+        let mut chain = regtest();
+        let peer = synced(asked(&mut chain, start, 7), &headers[..1]);
+        assert_eq!(
+            peer.receive(&block_payload_message(&[0; 10]), crate::fixtures::CLOCK)
+                .err(),
+            Some(super::PeerError::Block(
+                crate::serialize::Error::UnexpectedEnd
+            ))
+        );
+    }
+
+    #[test]
+    fn reorg_drops_stale_in_flight_blocks_and_requests_the_new_branch() {
+        let mut chain = regtest();
+        let start = std::time::Instant::now();
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        let first = blocks_on(&genesis, 3, 0);
+        let first_headers: Vec<_> = first.iter().map(|block| block.header).collect();
+        let peer = synced(asked(&mut chain, start, 7), &first_headers);
+        let (peer, get_data, _) = tick_get_data(peer, start);
+        assert_eq!(get_data, get_data_for(&first));
+
+        let branch = blocks_on(&first[0].header, 3, 1);
+        let branch_headers: Vec<_> = branch.iter().map(|block| block.header).collect();
+        let (peer, _) = batch_then_tick(peer, &branch_headers, start);
+        let peer = synced(peer, &branch_headers);
+
+        let peer = accept(peer, &block_message(&first[1]));
+        let (peer, get_data, wake) = tick_get_data(peer, start + std::time::Duration::from_mins(2));
+        assert_eq!(get_data, get_data_for(&branch));
+        assert_eq!(wake, start + super::BLOCK_TIMEOUT);
+
+        let (peer, position, _) = receive_block(peer, &first[0]);
+        assert_eq!(position.height(), 1);
+        assert_eq!(position.hash(), first[0].header.hash());
+        let mut peer = peer;
+        for (index, block) in branch.iter().enumerate() {
+            let (next, position, _) = receive_block(peer, block);
+            assert_eq!(position.height(), index + 2);
+            assert_eq!(position.hash(), block.header.hash());
+            peer = next;
+        }
+        let (_, wake) = idle(peer, start + std::time::Duration::from_mins(2));
+        assert_eq!(wake, start + super::PING_TIMEOUT);
+    }
+
+    #[test]
+    fn reorg_below_oldest_in_flight_clears_the_block_timeout() {
+        let mut chain = regtest();
+        let start = std::time::Instant::now();
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        let first = blocks_on(&genesis, 2, 0);
+        let first_headers: Vec<_> = first.iter().map(|block| block.header).collect();
+        let peer = synced(asked(&mut chain, start, 7), &first_headers);
+        let (peer, _, _) = tick_get_data(peer, start);
+
+        let branch = blocks_on(&genesis, 3, 1);
+        let branch_headers: Vec<_> = branch.iter().map(|block| block.header).collect();
+        let (peer, _) = batch_then_tick(peer, &branch_headers, start);
+        let peer = synced(peer, &branch_headers);
+
+        let later = start + std::time::Duration::from_mins(5);
+        let (peer, get_data, wake) = tick_get_data(peer, later);
+        assert_eq!(get_data, get_data_for(&branch));
+        assert_eq!(wake, later + super::BLOCK_TIMEOUT);
+        let _ = accept(peer, &block_message(&first[0]));
     }
 }

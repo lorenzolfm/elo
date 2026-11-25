@@ -355,6 +355,15 @@ pub struct Synced<'a> {
     tip: crate::chain::Tip,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    Tip(crate::chain::Tip),
+    Block {
+        position: crate::chain::Position,
+        transactions: usize,
+    },
+}
+
 #[derive(Debug)]
 struct Socket<'a> {
     stream: tokio::net::TcpStream,
@@ -567,14 +576,17 @@ impl<'a> Connection<'a> {
         loop {
             match run_turn(&mut socket, peer).await? {
                 (next, None) => peer = next,
-                (peer, Some(tip)) => return Ok((Synced { socket, peer, tip }, tip)),
+                (peer, Some(Event::Tip(tip))) => return Ok((Synced { socket, peer, tip }, tip)),
+                (_, Some(Event::Block { .. })) => {
+                    panic!("a block was accepted before the header sync ended")
+                }
             }
         }
     }
 }
 
 impl<'a> Synced<'a> {
-    pub async fn next_tip(self) -> Result<(Synced<'a>, crate::chain::Tip), RunError> {
+    pub async fn next(self) -> Result<(Synced<'a>, Event), RunError> {
         let Synced {
             mut socket,
             mut peer,
@@ -583,10 +595,20 @@ impl<'a> Synced<'a> {
         loop {
             match run_turn(&mut socket, peer).await? {
                 (next, None) => peer = next,
-                (next, Some(tip)) if tip == previous => peer = next,
-                (peer, Some(tip)) => {
+                (next, Some(Event::Tip(tip))) if tip == previous => peer = next,
+                (peer, Some(Event::Tip(tip))) => {
                     assert!(tip.work() >= previous.work());
-                    return Ok((Synced { socket, peer, tip }, tip));
+                    return Ok((Synced { socket, peer, tip }, Event::Tip(tip)));
+                }
+                (peer, Some(event @ Event::Block { .. })) => {
+                    return Ok((
+                        Synced {
+                            socket,
+                            peer,
+                            tip: previous,
+                        },
+                        event,
+                    ));
                 }
             }
         }
@@ -596,7 +618,7 @@ impl<'a> Synced<'a> {
 async fn run_turn<'a>(
     socket: &mut Socket<'_>,
     peer: crate::net_processing::Peer<'a>,
-) -> Result<(crate::net_processing::Peer<'a>, Option<crate::chain::Tip>), RunError> {
+) -> Result<(crate::net_processing::Peer<'a>, Option<Event>), RunError> {
     let now = tokio::time::Instant::now().into_std();
     let (peer, tick_outbound, wake) = peer.tick(now, nonce()).map_err(RunError::NetProcessing)?;
     for outbound in tick_outbound.into_outbounds() {
@@ -613,7 +635,7 @@ async fn run_exchange<'a>(
     socket: &mut Socket<'_>,
     peer: crate::net_processing::Peer<'a>,
     message: &crate::transport::Message,
-) -> Result<(crate::net_processing::Peer<'a>, Option<crate::chain::Tip>), RunError> {
+) -> Result<(crate::net_processing::Peer<'a>, Option<Event>), RunError> {
     let (peer, received) = peer
         .receive(message, clock())
         .map_err(RunError::NetProcessing)?;
@@ -632,7 +654,20 @@ async fn run_exchange<'a>(
         crate::net_processing::Received::Synced(tip) => {
             assert_eq!(message.msg_type(), crate::protocol::HEADERS);
             socket.metrics.synced();
-            Ok((peer, Some(tip)))
+            Ok((peer, Some(Event::Tip(tip))))
+        }
+        crate::net_processing::Received::Block {
+            position,
+            transactions,
+        } => {
+            assert_eq!(message.msg_type(), crate::protocol::BLOCK);
+            Ok((
+                peer,
+                Some(Event::Block {
+                    position,
+                    transactions,
+                }),
+            ))
         }
     }
 }
@@ -694,6 +729,11 @@ impl<'a> Socket<'a> {
                 let mut payload = Vec::new();
                 get_headers.encode(&mut payload);
                 (crate::protocol::GETHEADERS, payload)
+            }
+            crate::net_processing::PeerOutbound::GetData(get_data) => {
+                let mut payload = Vec::new();
+                get_data.encode(&mut payload);
+                (crate::protocol::GETDATA, payload)
             }
         };
         self.send(msg_type, &payload).await
@@ -930,7 +970,7 @@ pub(crate) mod fuzz {
 
 #[cfg(test)]
 mod tests {
-    use crate::serialize::Decode;
+    use crate::serialize::{Decode, Encode};
     use std::io::{Read, Write};
 
     fn block_on<F: Future>(future: F) -> F::Output {
@@ -1326,6 +1366,114 @@ mod tests {
     }
 
     #[test]
+    fn silent_peer_after_our_getdata_is_block_timeout_and_a_valid_block_is_an_event() {
+        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        let metrics = crate::metrics::Metrics::new(&chain);
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        let coinbase = crate::transaction::Transaction::new(
+            1,
+            vec![crate::transaction::TxIn {
+                previous_output: crate::transaction::OutPoint {
+                    txid: bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]),
+                    vout: u32::MAX,
+                },
+                script_sig: Vec::new(),
+                sequence: 0,
+                witness: crate::transaction::Witness::default(),
+            }],
+            Vec::new(),
+            0,
+        )
+        .unwrap();
+        let header_1 = crate::pow::mined_for_regtest(crate::block::BlockHeader {
+            version: crate::fixtures::HEADER_VERSION,
+            prev: genesis.hash(),
+            merkle_root: coinbase.txid().to_byte_array(),
+            time: genesis.time + 1,
+            ..genesis
+        });
+        let header_2 = crate::pow::mined_for_regtest(crate::block::BlockHeader {
+            prev: header_1.hash(),
+            time: header_1.time + 1,
+            ..header_1
+        });
+        let block_1 = crate::block::Block {
+            header: header_1,
+            transactions: vec![coinbase],
+        };
+        let mut block_1_payload = Vec::new();
+        crate::serialize::Encode::encode(&block_1, &mut block_1_payload);
+        let headers_frame = crate::transport::encode(
+            crate::chainparams::Network::Regtest,
+            crate::protocol::HEADERS,
+            &crate::fixtures::headers_payload_with(&[header_1, header_2]),
+        );
+        let block_1_frame = crate::transport::encode(
+            crate::chainparams::Network::Regtest,
+            crate::protocol::BLOCK,
+            &block_1_payload,
+        );
+        let expected_getdata = {
+            let mut payload = Vec::new();
+            crate::protocol::GetData::witness_blocks(vec![header_1.hash(), header_2.hash()])
+                .encode(&mut payload);
+            crate::transport::encode(
+                crate::chainparams::Network::Regtest,
+                crate::protocol::GETDATA,
+                &payload,
+            )
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+        let peer_thread = std::thread::spawn(move || {
+            let mut stream = accept_handshake(&listener);
+            assert_ping(&read_message(&mut stream));
+            read_first_get_headers(&mut stream);
+            stream.write_all(&headers_frame).unwrap();
+            read_send_headers(&mut stream);
+            let getdata = read_frame(&mut stream);
+            stream.write_all(&block_1_frame).unwrap();
+            let mut rest = Vec::new();
+            stream.read_to_end(&mut rest).unwrap();
+            (getdata, rest)
+        });
+
+        let (event, error, elapsed) = block_on(async {
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain, &metrics)
+                .await
+                .unwrap();
+            let (synced, _tip) = connection.sync().await.unwrap();
+            let (synced, event) = synced.next().await.unwrap();
+            tokio::time::pause();
+            let start = tokio::time::Instant::now();
+            let error = synced.next().await.unwrap_err();
+            (event, error, start.elapsed())
+        });
+        let (getdata, rest) = peer_thread.join().unwrap();
+        assert_eq!(getdata, expected_getdata);
+        assert!(rest.is_empty(), "{rest:?}");
+        assert_eq!(
+            event,
+            super::Event::Block {
+                position: chain.position(1).unwrap(),
+                transactions: 1,
+            }
+        );
+        assert!(
+            matches!(
+                error,
+                super::RunError::NetProcessing(crate::net_processing::PeerError::BlockTimeout)
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            elapsed.as_secs(),
+            std::time::Duration::from_mins(10).as_secs()
+        );
+    }
+
+    #[test]
     fn silent_peer_after_the_sync_is_ping_timeout() {
         let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
         let metrics = crate::metrics::Metrics::new(&chain);
@@ -1349,7 +1497,7 @@ mod tests {
             let start = tokio::time::Instant::now();
             let (synced, _tip) = connection.sync().await.unwrap();
             tokio::time::pause();
-            let error = synced.next_tip().await.unwrap_err();
+            let error = synced.next().await.unwrap_err();
             (error, start.elapsed())
         });
         let (ping, rest) = peer_thread.join().unwrap();
@@ -1399,7 +1547,9 @@ mod tests {
                 .await
                 .unwrap();
             let (synced, synced_tip) = connection.sync().await.unwrap();
-            let (_synced, next_tip) = synced.next_tip().await.unwrap();
+            let (_synced, super::Event::Tip(next_tip)) = synced.next().await.unwrap() else {
+                panic!("not a tip");
+            };
             (synced_tip, next_tip)
         });
         let rest = peer_thread.join().unwrap();
@@ -1440,7 +1590,7 @@ mod tests {
             let start = tokio::time::Instant::now();
             let (synced, _tip) = connection.sync().await.unwrap();
             tokio::time::pause();
-            let error = synced.next_tip().await.unwrap_err();
+            let error = synced.next().await.unwrap_err();
             (error, start.elapsed())
         });
         let (first, second, rest) = peer_thread.join().unwrap();

@@ -1,7 +1,8 @@
 # elo
 
 A Bitcoin node daemon. Work in progress: the binary dials one peer, does the
-v1 `version`/`verack` handshake and logs the peer's `version`. Then it syncs
+v1 `version`/`verack` handshake (requiring `NODE_NETWORK` and `NODE_WITNESS`)
+and logs the peer's `version`. Then it syncs
 the header chain from genesis to the peer's tip and logs the tip: its height,
 its hash and its work. The work is the sum of the work of each header, in 64
 hex digits. The chain is in memory, and elo checks only that each header
@@ -19,7 +20,12 @@ only a salted bit of one header in each run of about 600. The second time, each
 of those headers must match its bit, and a header goes on the chain when about
 15,000 headers are above it, or when the chain reaches the minimum. After the
 sync, elo stays connected and answers each `ping` with a `pong`. It also sends
-`sendheaders`, so the peer announces each new header with a `headers`. elo puts
+`sendheaders`, so the peer announces each new header with a `headers`, and asks
+the peer for each block from height 1 with `getdata` (`MSG_WITNESS_BLOCK`), at
+most 16 in flight at once. On each `block` that it asked for, elo checks that
+its transactions match the merkle root and witness commitment of its header,
+logs the `block` and drops it. Unsolicited blocks are skipped, and a mutated
+block or no block within 10 min ends the connection. elo puts
 those headers on its tip, as a batch of a sync, and logs the `tip` when it
 moves. After a reorg, the headers of an announcement are not on the tip of elo.
 Then elo asks for the headers again, with the hashes of its tip and of the 11
@@ -103,6 +109,7 @@ level=info event=stop signal=SIGTERM
 | --- | --- | --- |
 | `version` | `info` | `peer` `version` `services` `user_agent` `start_height` `relay` |
 | `tip` | `info` | `peer` `height` `hash` `work` |
+| `block` | `info` | `peer` `height` `hash` `transactions`: a requested block passed the mutation checks and was dropped |
 | `metrics` | `info` | `address`: elo serves its metrics there |
 | `end` | `warn` | `destination` `reason` `wait_ms`: elo dials again after `wait_ms`. `destination` is what the dial looked up or dialed: the peer of the command line, also a name, or the seed, such as `seed.bitcoin.sipa.be.:8333`. `peer` is always the address of a connection |
 | `exit` | `error` | `reason`: a fault of this host, and elo exits with 1 |
@@ -135,7 +142,7 @@ container. Port 0 takes a free port. elo logs the address in a `metrics` line be
 | `elo_header_low_work_download` | gauge | 1 for the download of a low-work sync that runs, and 0 for each other. The `download` label is `presync` or `redownload`. Both are 0 when no such download runs |
 | `elo_peer_state` | gauge | 1 for the step of the connection, and 0 for each other. The `state` label is `dial`, `sync`, `synced` or `wait` |
 | `elo_reconnects_total` | counter | Each failed lookup, dial or handshake and each connection that ended, after which elo waits and dials again |
-| `elo_peer_received_messages_total` | counter | The messages from the peer, for each command. The `command` label is `version`, `verack`, `ping`, `pong`, `getheaders`, `headers`, `wtxidrelay`, `sendaddrv2`, `sendheaders`, `inv`, or `other` for each other command |
+| `elo_peer_received_messages_total` | counter | The messages from the peer, for each command. The `command` label is `version`, `verack`, `ping`, `pong`, `getheaders`, `headers`, `wtxidrelay`, `sendaddrv2`, `sendheaders`, `inv`, `getdata`, `block`, or `other` for each other command |
 | `elo_peer_received_bytes_total` | counter | The bytes of the messages from the peer, with their headers, for each command |
 | `elo_peer_sent_messages_total` | counter | The messages to the peer, for each command |
 | `elo_peer_sent_bytes_total` | counter | The bytes of the messages to the peer, with their headers, for each command |

@@ -739,6 +739,49 @@ fn metrics_address_in_use_exits_with_1() {
     assert_eq!(elo.process.exit_code(), Some(1));
 }
 
+#[test]
+fn blocks_from_bitcoind_are_downloaded_checked_and_logged() {
+    let bitcoind = Bitcoind::start();
+    bitcoind.cli(&["generatetodescriptor", "3", "raw(51)"]);
+    let hashes: Vec<String> = (1..=3)
+        .map(|height| {
+            bitcoind
+                .cli(&["getblockhash", &height.to_string()])
+                .trim_end()
+                .to_owned()
+        })
+        .collect();
+    let elo = Elo::start(&bitcoind);
+    elo.event("tip", SYNC_TIMEOUT);
+
+    for (index, hash) in hashes.iter().enumerate() {
+        let block = elo.event("block", SYNC_TIMEOUT);
+        assert_eq!(
+            block,
+            format!(
+                "level=info event=block peer={} height={} hash={hash} transactions=1",
+                bitcoind.peer,
+                index + 1
+            )
+        );
+    }
+
+    wait_for_send_headers(&bitcoind, &elo);
+    bitcoind.cli(&["generatetodescriptor", "1", "raw(51)"]);
+    let fourth = bitcoind.cli(&["getbestblockhash"]);
+    let block = elo.event("block", SYNC_TIMEOUT);
+    assert_eq!(
+        block,
+        format!(
+            "level=info event=block peer={} height=4 hash={} transactions=1",
+            bitcoind.peer,
+            fourth.trim_end()
+        )
+    );
+    let ends = elo.events("end");
+    assert!(ends.is_empty(), "elo ended the connection: {ends:?}");
+}
+
 fn scrape(address: std::net::SocketAddr) -> String {
     let mut stream = std::net::TcpStream::connect(address).unwrap();
     std::io::Write::write_all(
@@ -776,11 +819,13 @@ fn settle(bitcoind: &Bitcoind, elo: &Elo) {
     }
 }
 
-fn relay_bytes(bitcoind: &Bitcoind) -> [u64; 3] {
+fn relay_bytes(bitcoind: &Bitcoind) -> [u64; 5] {
     [
         message_bytes(bitcoind, "bytesrecv_per_msg", "getheaders"),
         message_bytes(bitcoind, "bytessent_per_msg", "headers"),
         message_bytes(bitcoind, "bytessent_per_msg", "inv"),
+        message_bytes(bitcoind, "bytesrecv_per_msg", "getdata"),
+        message_bytes(bitcoind, "bytessent_per_msg", "block"),
     ]
 }
 
@@ -801,7 +846,7 @@ fn pong_from(bitcoind: &Bitcoind, elo: &Elo, ends: usize) {
     assert_eq!(all.len(), ends, "elo ended the connection: {all:?}");
 }
 
-const COMMANDS: [&str; 10] = [
+const COMMANDS: [&str; 12] = [
     "version",
     "verack",
     "ping",
@@ -812,6 +857,8 @@ const COMMANDS: [&str; 10] = [
     "sendaddrv2",
     "sendheaders",
     "inv",
+    "getdata",
+    "block",
 ];
 
 fn per_message_bytes(bitcoind: &Bitcoind, field: &str) -> Vec<(String, u64)> {

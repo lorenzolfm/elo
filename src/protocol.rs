@@ -10,6 +10,15 @@ pub(crate) const INV_COUNT_MAX: usize = 50_000;
 
 const INV_TYPE_BLOCK: u32 = 2;
 
+const INV_TYPE_WITNESS_BLOCK: u32 = 0x4000_0002;
+
+const _: () = assert!(INV_TYPE_WITNESS_BLOCK == INV_TYPE_BLOCK | (1 << 30));
+
+const INV_ENTRY_SIZE: usize = size_of::<u32>() + 32;
+
+const _: () =
+    assert!(3 + INV_COUNT_MAX * INV_ENTRY_SIZE <= crate::transport::PAYLOAD_LENGTH_MAX as usize);
+
 const USER_AGENT_LENGTH_MAX: usize = 256;
 
 const USER_AGENT_ELO: &str = concat!("/elo:", env!("CARGO_PKG_VERSION"), "/");
@@ -39,6 +48,8 @@ message_types! {
     SENDADDRV2 = "sendaddrv2",
     SENDHEADERS = "sendheaders",
     INV = "inv",
+    GETDATA = "getdata",
+    BLOCK = "block",
 }
 
 impl MessageType {
@@ -86,6 +97,16 @@ pub struct ServiceFlags(u64);
 impl ServiceFlags {
     pub(crate) const NONE: Self = Self(0);
     pub(crate) const NETWORK_WITNESS: Self = Self(0b1001);
+
+    pub(crate) const fn has(self, required: Self) -> bool {
+        self.0 & required.0 == required.0
+    }
+
+    #[cfg(any(test, fuzzing))]
+    #[cfg_attr(false, mutants::skip)]
+    pub(crate) const fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
 }
 
 impl std::fmt::LowerHex for ServiceFlags {
@@ -283,6 +304,31 @@ impl Encode for GetHeaders {
         }
         let hash_stop = [0_u8; 32];
         hash_stop.encode(out);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GetData {
+    hashes: Vec<bitcoin_hashes::sha256d::Hash>,
+}
+
+impl GetData {
+    pub(crate) fn witness_blocks(hashes: Vec<bitcoin_hashes::sha256d::Hash>) -> GetData {
+        assert!(!hashes.is_empty());
+        assert!(hashes.len() <= INV_COUNT_MAX);
+        GetData { hashes }
+    }
+}
+
+impl Encode for GetData {
+    fn encode(&self, out: &mut Vec<u8>) {
+        assert!(!self.hashes.is_empty());
+        assert!(self.hashes.len() <= INV_COUNT_MAX);
+        crate::serialize::write_compact_size(out, self.hashes.len());
+        for hash in &self.hashes {
+            INV_TYPE_WITNESS_BLOCK.encode(out);
+            hash.encode(out);
+        }
     }
 }
 
@@ -590,6 +636,42 @@ mod tests {
             ),
             crate::fixtures::hex(crate::fixtures::GETHEADERS_FRAME)
         );
+    }
+
+    #[test]
+    fn get_data_encodes_to_core_bytes() {
+        let get_data = super::GetData::witness_blocks(vec![
+            crate::fixtures::hash_from_display_hex(crate::fixtures::BLOCK_1_HASH),
+            crate::fixtures::hash_from_display_hex(crate::fixtures::BLOCK_2_HASH),
+        ]);
+        let mut payload = Vec::new();
+        get_data.encode(&mut payload);
+        assert_eq!(
+            crate::transport::encode(
+                crate::chainparams::Network::Regtest,
+                super::GETDATA,
+                &payload
+            ),
+            crate::fixtures::hex(crate::fixtures::GETDATA_FRAME)
+        );
+    }
+
+    #[test]
+    fn service_flags_has_requires_each_bit() {
+        for (flags, has) in [
+            (super::ServiceFlags::NONE, false),
+            (super::ServiceFlags(0b0001), false),
+            (super::ServiceFlags(0b1000), false),
+            (super::ServiceFlags(0x0408), false),
+            (super::ServiceFlags::NETWORK_WITNESS, true),
+            (super::ServiceFlags(0x0c09), true),
+        ] {
+            assert_eq!(
+                flags.has(super::ServiceFlags::NETWORK_WITNESS),
+                has,
+                "{flags:016x}"
+            );
+        }
     }
 
     #[test]
