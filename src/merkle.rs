@@ -6,23 +6,21 @@ pub(crate) struct Root {
 
 pub(crate) fn root(mut hashes: Vec<[u8; 32]>) -> Root {
     let mut mutated = false;
-    while let [.., last] = *hashes
-        && hashes.len() > 1
-    {
+    while hashes.len() > 1 {
+        let count = hashes.len();
         let (pairs, _) = hashes.as_chunks::<2>();
         mutated |= pairs.iter().any(|[left, right]| left == right);
-        if hashes.len() % 2 == 1 {
-            hashes.push(last);
+        if count % 2 == 1 {
+            hashes.extend_from_within(count - 1..);
         }
-        let (pairs, rest) = hashes.as_chunks::<2>();
+        let (blocks, rest) = hashes.as_flattened().as_chunks::<64>();
         assert!(rest.is_empty());
-        hashes = pairs
-            .iter()
-            .map(|[left, right]| {
-                bitcoin_hashes::sha256d::Hash::hash(&[*left, *right].concat()).to_byte_array()
-            })
-            .collect();
+        let mut parents = vec![[0; 32]; blocks.len()];
+        bitcoin_hashes::sha256d::Hash::hash_64_many(&mut parents, blocks);
+        hashes = parents;
+        assert_eq!(hashes.len(), count.div_ceil(2));
     }
+    assert!(hashes.len() <= 1);
     Root {
         hash: hashes.first().copied().unwrap_or([0; 32]),
         mutated,
@@ -32,7 +30,7 @@ pub(crate) fn root(mut hashes: Vec<[u8; 32]>) -> Root {
 #[cfg(test)]
 mod tests {
     fn parent(left: [u8; 32], right: [u8; 32]) -> [u8; 32] {
-        bitcoin_hashes::sha256d::Hash::hash(&[left, right].concat()).to_byte_array()
+        bitcoin_hashes::sha256d::Hash::hash([left, right].as_flattened()).to_byte_array()
     }
 
     #[test]

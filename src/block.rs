@@ -103,16 +103,19 @@ impl Block {
             };
         };
 
-        if height >= network.segwit_height()
-            && let Some(commitment) = witness_commitment(coinbase)
-        {
+        let commitment = if height >= network.segwit_height() {
+            witness_commitment(coinbase)
+        } else {
+            None
+        };
+        if let Some(commitment) = commitment {
             let reserved_value = coinbase_input
                 .witness
                 .reserved_value()
                 .ok_or(MutationError::WitnessReservedValue)?;
             let witness_root = self.witness_merkle_root();
             let committed =
-                bitcoin_hashes::sha256d::Hash::hash(&[witness_root, reserved_value].concat());
+                bitcoin_hashes::sha256d::Hash::hash([witness_root, reserved_value].as_flattened());
             return if committed.as_byte_array() == commitment {
                 Ok(())
             } else {
@@ -140,6 +143,7 @@ impl Block {
     }
 
     fn witness_merkle_root(&self) -> [u8; 32] {
+        assert!(!self.transactions.is_empty());
         let coinbase_wtxid = [0; 32];
         let wtxids = self
             .transactions
@@ -162,24 +166,15 @@ fn witness_commitment(coinbase: &crate::transaction::Transaction) -> Option<&[u8
 impl Encode for Block {
     fn encode(&self, out: &mut Vec<u8>) {
         self.header.encode(out);
-        crate::serialize::write_compact_size(out, self.transactions.len());
-        for transaction in &self.transactions {
-            transaction.encode(out);
-        }
+        crate::transaction::write_vector(out, &self.transactions);
     }
 }
 
 impl Decode for Block {
     fn decode(input: &mut &[u8]) -> Result<Self, crate::serialize::Error> {
-        let header = BlockHeader::decode(input)?;
-        let count = crate::serialize::read_compact_size(input)?;
-        let mut transactions = Vec::new();
-        for _ in 0..count {
-            transactions.push(crate::transaction::Transaction::decode(input)?);
-        }
         Ok(Self {
-            header,
-            transactions,
+            header: BlockHeader::decode(input)?,
+            transactions: crate::transaction::read_vector(input)?,
         })
     }
 }
@@ -251,10 +246,15 @@ pub(crate) mod fuzz {
         rooted.header.merkle_root = block.merkle_root().hash;
         for network in NETWORKS {
             for height in [0, network.segwit_height()] {
-                let _ = block.check_mutation(network, height);
-                assert_ne!(
-                    rooted.check_mutation(network, height),
-                    Err(super::MutationError::MerkleRoot)
+                let rooted_result = rooted.check_mutation(network, height);
+                assert_ne!(rooted_result, Err(super::MutationError::MerkleRoot));
+                assert_eq!(
+                    block.check_mutation(network, height),
+                    if block.header.merkle_root == rooted.header.merkle_root {
+                        rooted_result
+                    } else {
+                        Err(super::MutationError::MerkleRoot)
+                    }
                 );
             }
         }
