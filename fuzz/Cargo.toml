@@ -40,6 +40,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "block"
+path = "fuzz_targets/block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "machines"
 path = "fuzz_targets/machines.rs"
 test = false
