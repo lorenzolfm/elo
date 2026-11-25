@@ -355,6 +355,39 @@ mod tests {
         assert_eq!(transaction.lock_time, 5);
     }
 
+    fn smallest<T>(item: T)
+    where
+        T: Decode + Encode + super::SizeMin + PartialEq + std::fmt::Debug,
+    {
+        let mut bytes = vec![0x01];
+        item.encode(&mut bytes);
+        assert_eq!(bytes.len(), 1 + T::SIZE_MIN);
+        assert_eq!(super::read_vector(&mut &bytes[..]), Ok(vec![item]));
+    }
+
+    #[test]
+    fn size_min_is_the_size_of_the_smallest_item() {
+        smallest(super::TxIn {
+            previous_output: super::OutPoint {
+                txid: bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]),
+                vout: 0,
+            },
+            script_sig: Vec::new(),
+            sequence: 0,
+            witness: super::Witness::default(),
+        });
+        smallest(super::TxOut {
+            value: 0,
+            script_pubkey: Vec::new(),
+        });
+        smallest(super::Transaction {
+            version: 1,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            lock_time: 0,
+        });
+    }
+
     #[test]
     fn witness_stack_needs_every_item() {
         assert_eq!(
