@@ -795,14 +795,6 @@ impl Position {
             Position::Block(block) => block.hash,
         }
     }
-
-    pub(crate) fn block(self) -> Option<BlockPosition> {
-        match self {
-            #[cfg(any(test, fuzzing))]
-            Position::Genesis { .. } => None,
-            Position::Block(block) => Some(block),
-        }
-    }
 }
 
 impl BlockPosition {
@@ -1022,7 +1014,6 @@ mod tests {
             assert_eq!(chain.block_position(height), Some(expected));
             assert_eq!(expected.prev_median_time_past(), prev_median_time_past);
             assert_eq!(expected.position(), super::Position::Block(expected));
-            assert_eq!(expected.position().block(), Some(expected));
         }
         assert_eq!(
             chain.block_position(std::num::NonZeroUsize::new(14).unwrap()),
@@ -1031,7 +1022,6 @@ mod tests {
         let genesis_position =
             super::Position::genesis(crate::chainparams::Network::Regtest, genesis.hash());
         assert_eq!(genesis_position.height(), 0);
-        assert_eq!(genesis_position.block(), None);
         assert_eq!(genesis_position.hash(), genesis.hash());
     }
 

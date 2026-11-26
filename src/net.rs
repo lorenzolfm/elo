@@ -1433,7 +1433,10 @@ mod tests {
         });
         let block_1 = crate::block::Block {
             header: header_1,
-            transactions: vec![coinbase],
+            transactions: Some(crate::block::Transactions {
+                first: coinbase,
+                rest: Vec::new(),
+            }),
         };
         let mut block_1_payload = Vec::new();
         crate::serialize::Encode::encode(&block_1, &mut block_1_payload);

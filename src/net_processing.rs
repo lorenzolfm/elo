@@ -1843,23 +1843,12 @@ pub(crate) mod fuzz {
         crate::chainparams::Network::Regtest.genesis().time + seconds
     }
 
-    fn script_bip34_height(height: usize) -> Vec<u8> {
-        assert!((1..=SCRIPT_HEADERS_COUNT_MAX).contains(&height));
-        if height <= 16 {
-            vec![0x50 + u8::try_from(height).expect("height is at most 16")]
-        } else if height <= 127 {
-            vec![1, u8::try_from(height).expect("height is at most 127")]
-        } else {
-            let bytes = u16::try_from(height)
-                .expect("SCRIPT_HEADERS_COUNT_MAX fits in u16")
-                .to_le_bytes();
-            assert_eq!(bytes[1] & 0x80, 0);
-            vec![2, bytes[0], bytes[1]]
-        }
-    }
-
     fn script_coinbase_bytes(height: usize, tag: u32, valid: bool) -> Vec<u8> {
-        let mut script_sig = script_bip34_height(height);
+        assert!((1..=SCRIPT_HEADERS_COUNT_MAX).contains(&height));
+        let height = std::num::NonZeroUsize::new(height).expect("height is at least 1");
+        let mut script_sig = crate::block::encode_bip34_height(height)
+            .as_slice()
+            .to_vec();
         script_sig.extend_from_slice(&tag.to_le_bytes());
         let mut bytes = Vec::with_capacity(67);
         bytes.extend_from_slice(&1_u32.to_le_bytes());
@@ -5330,9 +5319,10 @@ mod tests {
     }
 
     fn coinbase_script(height: usize, tag: u32) -> Vec<u8> {
-        let (bytes, length) =
-            crate::block::encode_bip34_height(std::num::NonZeroUsize::new(height).unwrap());
-        let mut script_sig = bytes[..length].to_vec();
+        let height = std::num::NonZeroUsize::new(height).unwrap();
+        let mut script_sig = crate::block::encode_bip34_height(height)
+            .as_slice()
+            .to_vec();
         script_sig.extend_from_slice(&tag.to_le_bytes());
         script_sig
     }
@@ -5366,7 +5356,10 @@ mod tests {
         });
         crate::block::Block {
             header,
-            transactions: vec![tx],
+            transactions: Some(crate::block::Transactions {
+                first: tx,
+                rest: Vec::new(),
+            }),
         }
     }
 
@@ -5586,7 +5579,7 @@ mod tests {
         let peer = accept(peer, &block_message(&genesis_block));
 
         let mut mutated = blocks[0].clone();
-        mutated.transactions.clear();
+        mutated.transactions = None;
         assert_eq!(
             peer.receive(&block_message(&mutated), crate::fixtures::CLOCK)
                 .err(),
@@ -5656,7 +5649,10 @@ mod tests {
         });
         let invalid_block = crate::block::Block {
             header: invalid_header,
-            transactions: vec![invalid_tx],
+            transactions: Some(crate::block::Transactions {
+                first: invalid_tx,
+                rest: Vec::new(),
+            }),
         };
         let peer = synced(asked(&mut chain, start, 7), &[invalid_header]);
         let (peer, _, _) = tick_get_data(peer, start);
