@@ -264,20 +264,31 @@ async fn dial(
         version: &version,
     })?;
 
-    let (mut synced, mut tip) = match connection.sync().await {
+    let (mut synced, tip) = match connection.sync().await {
         Ok(sync) => sync,
         Err(error) => return Ok(End::Run(error)),
     };
     metrics.peer_synced();
+    log(&elo::logging::Event::Tip {
+        peer: address,
+        tip: &tip,
+    })?;
     loop {
-        log(&elo::logging::Event::Tip {
-            peer: address,
-            tip: &tip,
-        })?;
-        (synced, tip) = match synced.next_tip().await {
+        let event;
+        (synced, event) = match synced.next().await {
             Ok(next) => next,
             Err(error) => return Ok(End::Run(error)),
         };
+        match event {
+            elo::net::Event::Tip(tip) => log(&elo::logging::Event::Tip {
+                peer: address,
+                tip: &tip,
+            })?,
+            elo::net::Event::Block(block) => log(&elo::logging::Event::Block {
+                peer: address,
+                block: &block,
+            })?,
+        }
     }
 }
 

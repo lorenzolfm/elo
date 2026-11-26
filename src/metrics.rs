@@ -537,7 +537,7 @@ elo_header_low_work_download{download=\"redownload\"} 0
 ",
     ];
 
-    const COMMAND_NAMES: [&str; 11] = [
+    const COMMAND_NAMES: [&str; 13] = [
         "version",
         "verack",
         "ping",
@@ -548,6 +548,8 @@ elo_header_low_work_download{download=\"redownload\"} 0
         "sendaddrv2",
         "sendheaders",
         "inv",
+        "getdata",
+        "block",
         "other",
     ];
 
@@ -627,7 +629,7 @@ elo_header_low_work_download{download=\"redownload\"} 0
         )
     }
 
-    fn traffic(family: usize, counts: [u64; 11]) -> String {
+    fn traffic(family: usize, counts: [u64; 13]) -> String {
         let name = [
             "elo_peer_received_messages_total",
             "elo_peer_received_bytes_total",
@@ -659,10 +661,10 @@ elo_header_low_work_download{download=\"redownload\"} 0
         let expected = format!(
             "{EXPECTED_START}{}{EXPECTED_END}elo_reconnects_total 0\n{}{}{}{}{EXPECTED_FAILURES_HEAD}{}",
             states(1, 0, 0, 0),
-            traffic(0, [0; 11]),
-            traffic(1, [0; 11]),
-            traffic(2, [0; 11]),
-            traffic(3, [0; 11]),
+            traffic(0, [0; 13]),
+            traffic(1, [0; 13]),
+            traffic(2, [0; 13]),
+            traffic(3, [0; 13]),
             failures(0, 0, 0, 0)
         );
         assert_eq!(metrics().text(), expected);
@@ -754,14 +756,14 @@ elo_header_low_work_download{download=\"redownload\"} 0
     fn text_has_each_message_and_its_bytes_with_the_header_by_its_command_and_other_for_an_unknown_one()
      {
         let metrics = metrics();
-        let none = [0; 11];
+        let none = [0; 13];
         for (step, received, expected) in [
             (
                 (crate::protocol::VERSION, 102),
                 true,
                 [
-                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                    [126, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [126, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                     none,
                     none,
                 ],
@@ -770,8 +772,8 @@ elo_header_low_work_download{download=\"redownload\"} 0
                 (message_type("sendcmpct"), 9),
                 true,
                 [
-                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-                    [126, 0, 0, 0, 0, 0, 0, 0, 0, 0, 33],
+                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                    [126, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 33],
                     none,
                     none,
                 ],
@@ -780,8 +782,8 @@ elo_header_low_work_download{download=\"redownload\"} 0
                 (message_type("feefilter"), 8),
                 true,
                 [
-                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
-                    [126, 0, 0, 0, 0, 0, 0, 0, 0, 0, 65],
+                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+                    [126, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 65],
                     none,
                     none,
                 ],
@@ -790,8 +792,8 @@ elo_header_low_work_download{download=\"redownload\"} 0
                 (crate::protocol::INV, 37),
                 true,
                 [
-                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2],
-                    [126, 0, 0, 0, 0, 0, 0, 0, 0, 61, 65],
+                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 2],
+                    [126, 0, 0, 0, 0, 0, 0, 0, 0, 61, 0, 0, 65],
                     none,
                     none,
                 ],
@@ -800,30 +802,30 @@ elo_header_low_work_download{download=\"redownload\"} 0
                 (crate::protocol::VERSION, 0),
                 false,
                 [
-                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2],
-                    [126, 0, 0, 0, 0, 0, 0, 0, 0, 61, 65],
-                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                    [24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 2],
+                    [126, 0, 0, 0, 0, 0, 0, 0, 0, 61, 0, 0, 65],
+                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
                 ],
             ),
             (
                 (crate::protocol::GETHEADERS, 1029),
                 false,
                 [
-                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2],
-                    [126, 0, 0, 0, 0, 0, 0, 0, 0, 61, 65],
-                    [1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-                    [24, 0, 0, 0, 1053, 0, 0, 0, 0, 0, 0],
+                    [1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 2],
+                    [126, 0, 0, 0, 0, 0, 0, 0, 0, 61, 0, 0, 65],
+                    [1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [24, 0, 0, 0, 1053, 0, 0, 0, 0, 0, 0, 0, 0],
                 ],
             ),
             (
                 (crate::protocol::VERSION, 102),
                 true,
                 [
-                    [2, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2],
-                    [252, 0, 0, 0, 0, 0, 0, 0, 0, 61, 65],
-                    [1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0],
-                    [24, 0, 0, 0, 1053, 0, 0, 0, 0, 0, 0],
+                    [2, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 2],
+                    [252, 0, 0, 0, 0, 0, 0, 0, 0, 61, 0, 0, 65],
+                    [1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+                    [24, 0, 0, 0, 1053, 0, 0, 0, 0, 0, 0, 0, 0],
                 ],
             ),
         ] {

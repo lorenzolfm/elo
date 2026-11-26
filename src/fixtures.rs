@@ -256,6 +256,13 @@ pub(crate) const GETHEADERS_FRAME: &str = concat!(
     "0000000000000000000000000000000000000000000000000000000000000000",
 );
 
+pub(crate) const GETDATA_FRAME: &str = concat!(
+    "fabfb5da676574646174610000000000490000005e7030bd",
+    "02",
+    "020000406fd9534f8c89df2b57a96335562c10ee824530e786527a906ad55f589b0b6541",
+    "020000406a45839817b3def3918553b1653c27c2fb7050bbe80a1f85350cde35beecd429",
+);
+
 pub(crate) fn version_payload() -> Vec<u8> {
     hex(VERSION_FRAME).split_off(crate::transport::MESSAGE_HEADER_SIZE)
 }

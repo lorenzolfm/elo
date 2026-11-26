@@ -570,10 +570,12 @@ fn branch_below_the_margin_takes_the_place_of_ours_after_a_low_work_sync() {
     let tip = elo.event("tip", SYNC_TIMEOUT);
     let expected = format!("level=info event=tip peer={} height=3001 ", bitcoind.peer);
     assert!(tip.starts_with(&expected), "{tip}");
-    wait_for_send_headers(&bitcoind, &elo);
 
+    bitcoind.cli(&["-named", "disconnectnode", "nodeid=0"]);
+    elo.event("end", END_TIMEOUT);
     bitcoind.cli(&["reconsiderblock", branch.trim_end()]);
-    let tip = elo.tip_at(bitcoind.peer, 3101, best.trim_end());
+
+    let tip = elo.event("tip", RECONNECT_TIMEOUT);
     let chain_work = bitcoind.cli(&["getblockheader", best.trim_end()]);
     let chain_work = string_field(&chain_work, "chainwork");
     assert_eq!(
@@ -585,7 +587,7 @@ fn branch_below_the_margin_takes_the_place_of_ours_after_a_low_work_sync() {
         )
     );
     let ends = elo.events("end");
-    assert!(ends.is_empty(), "elo ended the connection: {ends:?}");
+    assert_eq!(ends.len(), 1, "elo ended the connection again: {ends:?}");
 }
 
 #[test]
@@ -601,9 +603,13 @@ fn announcement_on_a_branch_that_lost_to_ours_after_a_low_work_sync_gets_no_geth
     let expected = format!("level=info event=tip peer={} height=3001 ", bitcoind.peer);
     assert!(ours.starts_with(&expected), "{ours}");
 
+    bitcoind.cli(&["-named", "disconnectnode", "nodeid=0"]);
+    elo.event("end", END_TIMEOUT);
     bitcoind.cli(&["invalidateblock", second.trim_end()]);
-    settle(&bitcoind, &elo);
-    assert_eq!(elo.events("tip"), [ours]);
+
+    assert_eq!(elo.event("tip", RECONNECT_TIMEOUT), ours);
+    settle(&bitcoind, &elo, 1);
+    assert_eq!(elo.events("tip"), [ours.clone(), ours]);
 
     let get_headers = message_bytes(&bitcoind, "bytesrecv_per_msg", "getheaders");
     let headers_sent = message_bytes(&bitcoind, "bytessent_per_msg", "headers");
@@ -616,8 +622,8 @@ fn announcement_on_a_branch_that_lost_to_ours_after_a_low_work_sync_gets_no_geth
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    pong_from(&bitcoind, &elo, 0);
-    pong_from(&bitcoind, &elo, 0);
+    pong_from(&bitcoind, &elo, 1);
+    pong_from(&bitcoind, &elo, 1);
     assert_eq!(
         message_bytes(&bitcoind, "bytesrecv_per_msg", "getheaders"),
         get_headers
@@ -638,7 +644,7 @@ fn announcement_before_the_answer_to_our_getheaders_keeps_the_connection() {
         let script = format!("raw({:x})", 0x53 + round % 2);
         bitcoind.cli(&["generatetodescriptor", "2", &script]);
     }
-    settle(&bitcoind, &elo);
+    settle(&bitcoind, &elo, 0);
 
     let best = bitcoind.cli(&["getbestblockhash"]);
     let tips = elo.events("tip");
@@ -686,7 +692,7 @@ fn metrics_of_elo_have_its_tip_its_chain_its_step_each_reconnect_and_the_bytes_o
     }
     assert!(metrics.contains("elo_reconnects_total 0\n"), "{metrics}");
 
-    settle(&bitcoind, &elo);
+    settle(&bitcoind, &elo, 0);
     let metrics = scrape(address);
     for (direction, field) in [
         ("received", "bytessent_per_msg"),
@@ -739,6 +745,49 @@ fn metrics_address_in_use_exits_with_1() {
     assert_eq!(elo.process.exit_code(), Some(1));
 }
 
+#[test]
+fn blocks_from_bitcoind_are_downloaded_checked_and_logged() {
+    let bitcoind = Bitcoind::start();
+    bitcoind.cli(&["generatetodescriptor", "3", "raw(51)"]);
+    let hashes: Vec<String> = (1..=3)
+        .map(|height| {
+            bitcoind
+                .cli(&["getblockhash", &height.to_string()])
+                .trim_end()
+                .to_owned()
+        })
+        .collect();
+    let elo = Elo::start(&bitcoind);
+    elo.event("tip", SYNC_TIMEOUT);
+
+    for (index, hash) in hashes.iter().enumerate() {
+        let block = elo.event("block", SYNC_TIMEOUT);
+        assert_eq!(
+            block,
+            format!(
+                "level=info event=block peer={} height={} hash={hash} transactions=1",
+                bitcoind.peer,
+                index + 1
+            )
+        );
+    }
+
+    wait_for_send_headers(&bitcoind, &elo);
+    bitcoind.cli(&["generatetodescriptor", "1", "raw(51)"]);
+    let fourth = bitcoind.cli(&["getbestblockhash"]);
+    let block = elo.event("block", SYNC_TIMEOUT);
+    assert_eq!(
+        block,
+        format!(
+            "level=info event=block peer={} height=4 hash={} transactions=1",
+            bitcoind.peer,
+            fourth.trim_end()
+        )
+    );
+    let ends = elo.events("end");
+    assert!(ends.is_empty(), "elo ended the connection: {ends:?}");
+}
+
 fn scrape(address: std::net::SocketAddr) -> String {
     let mut stream = std::net::TcpStream::connect(address).unwrap();
     std::io::Write::write_all(
@@ -760,12 +809,12 @@ fn scrape(address: std::net::SocketAddr) -> String {
     body.to_owned()
 }
 
-fn settle(bitcoind: &Bitcoind, elo: &Elo) {
+fn settle(bitcoind: &Bitcoind, elo: &Elo, ends: usize) {
     let start = std::time::Instant::now();
     loop {
         let before = relay_bytes(bitcoind);
-        pong_from(bitcoind, elo, 0);
-        pong_from(bitcoind, elo, 0);
+        pong_from(bitcoind, elo, ends);
+        pong_from(bitcoind, elo, ends);
         if relay_bytes(bitcoind) == before {
             return;
         }
@@ -776,11 +825,13 @@ fn settle(bitcoind: &Bitcoind, elo: &Elo) {
     }
 }
 
-fn relay_bytes(bitcoind: &Bitcoind) -> [u64; 3] {
+fn relay_bytes(bitcoind: &Bitcoind) -> [u64; 5] {
     [
         message_bytes(bitcoind, "bytesrecv_per_msg", "getheaders"),
         message_bytes(bitcoind, "bytessent_per_msg", "headers"),
         message_bytes(bitcoind, "bytessent_per_msg", "inv"),
+        message_bytes(bitcoind, "bytesrecv_per_msg", "getdata"),
+        message_bytes(bitcoind, "bytessent_per_msg", "block"),
     ]
 }
 
@@ -801,7 +852,7 @@ fn pong_from(bitcoind: &Bitcoind, elo: &Elo, ends: usize) {
     assert_eq!(all.len(), ends, "elo ended the connection: {all:?}");
 }
 
-const COMMANDS: [&str; 10] = [
+const COMMANDS: [&str; 12] = [
     "version",
     "verack",
     "ping",
@@ -812,6 +863,8 @@ const COMMANDS: [&str; 10] = [
     "sendaddrv2",
     "sendheaders",
     "inv",
+    "getdata",
+    "block",
 ];
 
 fn per_message_bytes(bitcoind: &Bitcoind, field: &str) -> Vec<(String, u64)> {
