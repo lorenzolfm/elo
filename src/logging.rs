@@ -361,7 +361,7 @@ mod tests {
             .unwrap()
             .check()
             .unwrap();
-        let block = chain.connect_block(checked).unwrap();
+        let block = chain.connect_block(&checked).unwrap();
         let block_expected = format!(
             "level=info event=block peer=127.0.0.1:18444 height=1 hash={} transactions=1",
             block.hash_display()

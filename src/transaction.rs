@@ -95,6 +95,7 @@ const _: () = assert!(TX_LEGACY_SIGOPS_MAX.is_multiple_of(MULTISIG_PUBKEYS_COUNT
 const _: () = assert!(TX_LEGACY_SIGOPS_MAX / MULTISIG_PUBKEYS_COUNT_MAX == BLOCK_BASE_SIZE_MAX);
 
 const _: () = assert!(usize::BITS >= u32::BITS);
+const _: () = assert!(TX_OUTPUTS_COUNT_MAX < u32::MAX as usize);
 const _: () = assert!(TX_INPUTS_COUNT_MAX * TxIn::SIZE_MIN <= BLOCK_BASE_SIZE_MAX);
 const _: () = assert!((TX_INPUTS_COUNT_MAX + 1) * TxIn::SIZE_MIN > BLOCK_BASE_SIZE_MAX);
 const _: () = assert!(TX_OUTPUTS_COUNT_MAX * TxOut::SIZE_MIN <= BLOCK_BASE_SIZE_MAX);
@@ -161,6 +162,129 @@ pub(crate) struct OutPoint {
 impl OutPoint {
     pub(crate) fn is_null(&self) -> bool {
         self.txid.as_byte_array() == &[0; 32] && self.vout == u32::MAX
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct NonNullOutPoint(OutPoint);
+
+impl NonNullOutPoint {
+    pub(crate) fn new(outpoint: OutPoint) -> Option<NonNullOutPoint> {
+        (!outpoint.is_null()).then_some(NonNullOutPoint(outpoint))
+    }
+
+    pub(crate) fn from_txid_vout(
+        txid: bitcoin_hashes::sha256d::Hash,
+        vout: u32,
+    ) -> NonNullOutPoint {
+        assert!(usize::try_from(vout).expect("u32 fits in usize") < TX_OUTPUTS_COUNT_MAX);
+        let outpoint = OutPoint { txid, vout };
+        assert!(!outpoint.is_null());
+        NonNullOutPoint(outpoint)
+    }
+
+    #[cfg(fuzzing)]
+    #[cfg_attr(false, mutants::skip)]
+    pub(crate) fn outpoint(self) -> OutPoint {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Amount(i64);
+
+impl Amount {
+    pub(crate) const ZERO: Amount = Amount(0);
+
+    pub(crate) fn from_satoshis(value: i64) -> Result<Amount, TransactionError> {
+        if value < 0 {
+            return Err(TransactionError::OutputNegative);
+        }
+        if value > MONEY_MAX {
+            return Err(TransactionError::OutputTooLarge);
+        }
+        Ok(Amount(value))
+    }
+
+    pub(crate) fn checked_add(self, other: Amount) -> Option<Amount> {
+        let sum = self.0 + other.0;
+        (sum <= MONEY_MAX).then_some(Amount(sum))
+    }
+
+    pub(crate) fn checked_sub(self, other: Amount) -> Option<Amount> {
+        (self.0 >= other.0).then_some(Amount(self.0 - other.0))
+    }
+
+    #[cfg(any(test, fuzzing))]
+    pub(crate) fn satoshis(self) -> i64 {
+        assert!(self.0 >= 0);
+        assert!(self.0 <= MONEY_MAX);
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SpendableScript(Vec<u8>);
+
+fn is_unspendable_script(script_pubkey: &[u8]) -> bool {
+    script_pubkey.first() == Some(&OP_RETURN) || script_pubkey.len() > SCRIPT_SIZE_MAX
+}
+
+impl SpendableScript {
+    pub(crate) fn new(script_pubkey: Vec<u8>) -> Option<SpendableScript> {
+        (!is_unspendable_script(&script_pubkey)).then_some(SpendableScript(script_pubkey))
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        assert!(!is_unspendable_script(&self.0));
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SpendableOutput {
+    value: Amount,
+    script_pubkey: SpendableScript,
+}
+
+impl SpendableOutput {
+    #[cfg(test)]
+    pub(crate) fn new(value: Amount, script_pubkey: SpendableScript) -> SpendableOutput {
+        SpendableOutput {
+            value,
+            script_pubkey,
+        }
+    }
+
+    pub(crate) fn value(&self) -> Amount {
+        self.value
+    }
+
+    pub(crate) fn script_pubkey(&self) -> &SpendableScript {
+        &self.script_pubkey
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CheckedOutput {
+    Spendable(SpendableOutput),
+    Unspendable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CheckedOutputs {
+    first: CheckedOutput,
+    rest: Vec<CheckedOutput>,
+}
+
+impl CheckedOutputs {
+    pub(crate) fn len(&self) -> std::num::NonZeroUsize {
+        assert!(self.rest.len() < TX_OUTPUTS_COUNT_MAX);
+        std::num::NonZeroUsize::MIN.saturating_add(self.rest.len())
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &CheckedOutput> {
+        std::iter::once(&self.first).chain(&self.rest)
     }
 }
 
@@ -282,23 +406,45 @@ pub(crate) enum RelativeLockTime {
     Seconds(u64),
 }
 
-impl TxIn {
-    pub(crate) fn relative_lock_time(&self) -> RelativeLockTime {
-        if self.sequence & SEQUENCE_LOCK_TIME_DISABLE_FLAG != 0 {
-            return RelativeLockTime::Disabled;
-        }
-        let value = u16::try_from(self.sequence & SEQUENCE_LOCK_TIME_MASK)
-            .expect("sequence locktime mask fits in u16");
-        if self.sequence & SEQUENCE_LOCK_TIME_TYPE_FLAG != 0 {
-            let seconds = u64::from(value) << SEQUENCE_LOCK_TIME_GRANULARITY_BITS;
-            assert!(seconds.is_multiple_of(1 << SEQUENCE_LOCK_TIME_GRANULARITY_BITS));
-            assert!(seconds <= u64::from(u16::MAX) << SEQUENCE_LOCK_TIME_GRANULARITY_BITS);
-            RelativeLockTime::Seconds(seconds)
-        } else {
-            RelativeLockTime::Blocks(value)
-        }
+fn sequence_relative_lock_time(sequence: u32) -> RelativeLockTime {
+    if sequence & SEQUENCE_LOCK_TIME_DISABLE_FLAG != 0 {
+        return RelativeLockTime::Disabled;
+    }
+    let value = u16::try_from(sequence & SEQUENCE_LOCK_TIME_MASK)
+        .expect("sequence locktime mask fits in u16");
+    if sequence & SEQUENCE_LOCK_TIME_TYPE_FLAG != 0 {
+        let seconds = u64::from(value) << SEQUENCE_LOCK_TIME_GRANULARITY_BITS;
+        assert!(seconds.is_multiple_of(1 << SEQUENCE_LOCK_TIME_GRANULARITY_BITS));
+        assert!(seconds <= u64::from(u16::MAX) << SEQUENCE_LOCK_TIME_GRANULARITY_BITS);
+        RelativeLockTime::Seconds(seconds)
+    } else {
+        RelativeLockTime::Blocks(value)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RegularTxIn {
+    previous_output: NonNullOutPoint,
+    script_sig: Vec<u8>,
+    sequence: u32,
+    witness: Witness,
+}
+
+impl RegularTxIn {
+    pub(crate) fn previous_output(&self) -> NonNullOutPoint {
+        self.previous_output
     }
 
+    pub(crate) fn relative_lock_time(&self) -> RelativeLockTime {
+        sequence_relative_lock_time(self.sequence)
+    }
+
+    pub(crate) fn p2sh_and_witness_sigop_cost(&self, previous_script: &SpendableScript) -> usize {
+        script_p2sh_and_witness_sigop_cost(&self.script_sig, &self.witness, previous_script)
+    }
+}
+
+impl TxIn {
     fn encoded_size(&self) -> usize {
         let size = 32
             + size_of::<u32>()
@@ -339,11 +485,6 @@ pub(crate) struct TxOut {
 }
 
 impl TxOut {
-    pub(crate) fn is_unspendable(&self) -> bool {
-        assert!(self.script_pubkey.len() <= BLOCK_BASE_SIZE_MAX);
-        self.script_pubkey.first() == Some(&OP_RETURN) || self.script_pubkey.len() > SCRIPT_SIZE_MAX
-    }
-
     fn encoded_size(&self) -> usize {
         let size = size_of::<i64>()
             + crate::serialize::compact_size_length(self.script_pubkey.len())
@@ -420,11 +561,33 @@ pub(crate) struct HashedTransaction {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CheckedTransaction {
-    transaction: Transaction,
+pub(crate) struct CheckedCoinbase {
+    script_sig: Vec<u8>,
+    outputs: CheckedOutputs,
     txid: bitcoin_hashes::sha256d::Hash,
-    value_out: i64,
+    value_out: Amount,
     legacy_sigop_count: usize,
+    lock_time: LockTime,
+    sequence: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CheckedRegularTransaction {
+    version: u32,
+    first_input: RegularTxIn,
+    rest_inputs: Vec<RegularTxIn>,
+    outputs: CheckedOutputs,
+    txid: bitcoin_hashes::sha256d::Hash,
+    value_out: Amount,
+    legacy_sigop_count: usize,
+    lock_time: LockTime,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CheckedTransaction {
+    Coinbase(CheckedCoinbase),
+    Regular(CheckedRegularTransaction),
 }
 
 impl Transaction {
@@ -555,55 +718,79 @@ impl Transaction {
     }
 
     #[cfg(test)]
-    pub(crate) fn check(&self) -> Result<CheckedTransaction, TransactionError> {
+    fn check(&self) -> Result<CheckedTransaction, TransactionError> {
         let mut seen = std::collections::HashSet::new();
-        HashedTransaction::new(self.clone()).into_checked_with_seen(&mut seen)
+        self.clone().into_checked_with_seen(&mut seen)
     }
 
     #[cfg(test)]
-    pub(crate) fn into_checked_with_seen(
+    fn into_checked_with_seen(
         self,
         seen: &mut std::collections::HashSet<OutPoint>,
     ) -> Result<CheckedTransaction, TransactionError> {
-        HashedTransaction::new(self).into_checked_with_seen(seen)
+        let is_coinbase = self.coinbase_input().is_some();
+        let hashed = HashedTransaction::new(self);
+        if is_coinbase {
+            hashed
+                .into_checked_coinbase()
+                .map(CheckedTransaction::Coinbase)
+        } else {
+            hashed
+                .into_checked_regular(seen)
+                .map(CheckedTransaction::Regular)
+        }
     }
 
-    fn into_checked_with_txid_and_seen(
+    fn into_checked_coinbase_with_txid(
+        self,
+        txid: bitcoin_hashes::sha256d::Hash,
+    ) -> Result<CheckedCoinbase, TransactionError> {
+        assert!(self.coinbase_input().is_some());
+        let size_without_witness = self.size_without_witness();
+        let lock_time = self.lock_time();
+        let Transfers::NonEmpty { inputs, outputs } = self.transfers else {
+            panic!("coinbase transaction has one input");
+        };
+        let (outputs, value_out, legacy_sigop_count) =
+            check_outputs_and_sigops(size_without_witness, inputs.as_slice(), outputs)?;
+        let mut inputs_iter = inputs.0.into_iter();
+        let coinbase = inputs_iter.next().expect("non-empty inputs");
+        assert!(inputs_iter.next().is_none());
+        assert!(coinbase.previous_output.is_null());
+        let script_length = coinbase.script_sig.len();
+        if script_length < COINBASE_SCRIPT_SIZE_MIN {
+            return Err(TransactionError::CoinbaseScriptSize);
+        }
+        if script_length > COINBASE_SCRIPT_SIZE_MAX {
+            return Err(TransactionError::CoinbaseScriptSize);
+        }
+        Ok(CheckedCoinbase {
+            script_sig: coinbase.script_sig,
+            outputs,
+            txid,
+            value_out,
+            legacy_sigop_count,
+            lock_time,
+            sequence: coinbase.sequence,
+        })
+    }
+
+    fn into_checked_regular_with_txid_and_seen(
         self,
         txid: bitcoin_hashes::sha256d::Hash,
         seen: &mut std::collections::HashSet<OutPoint>,
-    ) -> Result<CheckedTransaction, TransactionError> {
-        let Transfers::NonEmpty { inputs, outputs } = &self.transfers else {
+    ) -> Result<CheckedRegularTransaction, TransactionError> {
+        assert!(self.coinbase_input().is_none());
+        let size_without_witness = self.size_without_witness();
+        let lock_time = self.lock_time();
+        let version = self.version;
+        let Transfers::NonEmpty { inputs, outputs } = self.transfers else {
             return Err(TransactionError::InputsEmpty);
         };
-        if outputs.is_empty() {
-            return Err(TransactionError::OutputsEmpty);
-        }
-        if self.size_without_witness() > BLOCK_BASE_SIZE_MAX {
-            return Err(TransactionError::BaseSizeTooLarge);
-        }
+        let (outputs, value_out, legacy_sigop_count) =
+            check_outputs_and_sigops(size_without_witness, inputs.as_slice(), outputs)?;
+
         let inputs_slice = inputs.as_slice();
-        assert!(inputs_slice.len() <= TX_INPUTS_COUNT_MAX);
-        assert!(outputs.len() <= TX_OUTPUTS_COUNT_MAX);
-
-        let mut total: i64 = 0;
-        for output in outputs {
-            if output.value < 0 {
-                return Err(TransactionError::OutputNegative);
-            }
-            if output.value > MONEY_MAX {
-                return Err(TransactionError::OutputTooLarge);
-            }
-            assert!(total >= 0);
-            assert!(total <= MONEY_MAX);
-            total += output.value;
-            if total > MONEY_MAX {
-                return Err(TransactionError::OutputsTotalTooLarge);
-            }
-        }
-        assert!(total >= 0);
-        assert!(total <= MONEY_MAX);
-
         match inputs.split_first() {
             (_, []) => {}
             (first, [second]) => {
@@ -622,28 +809,31 @@ impl Transaction {
             }
         }
 
-        if let Some(coinbase) = self.coinbase_input() {
-            let script_length = coinbase.script_sig.len();
-            if script_length < COINBASE_SCRIPT_SIZE_MIN {
-                return Err(TransactionError::CoinbaseScriptSize);
-            }
-            if script_length > COINBASE_SCRIPT_SIZE_MAX {
-                return Err(TransactionError::CoinbaseScriptSize);
-            }
-        } else if inputs_slice
-            .iter()
-            .any(|input| input.previous_output.is_null())
-        {
-            return Err(TransactionError::NullOutPoint);
+        let convert = |input: TxIn| -> Result<RegularTxIn, TransactionError> {
+            let previous_output = NonNullOutPoint::new(input.previous_output)
+                .ok_or(TransactionError::NullOutPoint)?;
+            Ok(RegularTxIn {
+                previous_output,
+                script_sig: input.script_sig,
+                sequence: input.sequence,
+                witness: input.witness,
+            })
+        };
+        let mut inputs_iter = inputs.0.into_iter();
+        let first_input = convert(inputs_iter.next().expect("non-empty inputs"))?;
+        let mut rest_inputs = Vec::with_capacity(inputs_iter.len());
+        for input in inputs_iter {
+            rest_inputs.push(convert(input)?);
         }
-
-        let legacy_sigop_count = legacy_sigop_count(inputs_slice, outputs);
-        assert!(legacy_sigop_count <= TX_LEGACY_SIGOPS_MAX);
-        Ok(CheckedTransaction {
-            transaction: self,
+        Ok(CheckedRegularTransaction {
+            version,
+            first_input,
+            rest_inputs,
+            outputs,
             txid,
-            value_out: total,
+            value_out,
             legacy_sigop_count,
+            lock_time,
         })
     }
 
@@ -663,6 +853,45 @@ impl Transaction {
     }
 }
 
+fn check_outputs_and_sigops(
+    size_without_witness: usize,
+    inputs: &[TxIn],
+    outputs: Vec<TxOut>,
+) -> Result<(CheckedOutputs, Amount, usize), TransactionError> {
+    if outputs.is_empty() {
+        return Err(TransactionError::OutputsEmpty);
+    }
+    if size_without_witness > BLOCK_BASE_SIZE_MAX {
+        return Err(TransactionError::BaseSizeTooLarge);
+    }
+    assert!(inputs.len() <= TX_INPUTS_COUNT_MAX);
+    assert!(outputs.len() <= TX_OUTPUTS_COUNT_MAX);
+    let sigops = legacy_sigop_count(inputs, &outputs);
+    assert!(sigops <= TX_LEGACY_SIGOPS_MAX);
+
+    let mut total = Amount::ZERO;
+    let mut check_one = |output: TxOut| -> Result<CheckedOutput, TransactionError> {
+        let value = Amount::from_satoshis(output.value)?;
+        total = total
+            .checked_add(value)
+            .ok_or(TransactionError::OutputsTotalTooLarge)?;
+        Ok(match SpendableScript::new(output.script_pubkey) {
+            Some(script_pubkey) => CheckedOutput::Spendable(SpendableOutput {
+                value,
+                script_pubkey,
+            }),
+            None => CheckedOutput::Unspendable,
+        })
+    };
+    let mut iter = outputs.into_iter();
+    let first = check_one(iter.next().expect("outputs is non-empty"))?;
+    let mut rest = Vec::with_capacity(iter.len());
+    for output in iter {
+        rest.push(check_one(output)?);
+    }
+    Ok((CheckedOutputs { first, rest }, total, sigops))
+}
+
 impl HashedTransaction {
     pub(crate) fn new(transaction: Transaction) -> HashedTransaction {
         let txid = transaction.txid();
@@ -677,41 +906,45 @@ impl HashedTransaction {
         &self.transaction
     }
 
-    pub(crate) fn into_checked_with_seen(
+    pub(crate) fn into_checked_coinbase(self) -> Result<CheckedCoinbase, TransactionError> {
+        self.transaction.into_checked_coinbase_with_txid(self.txid)
+    }
+
+    pub(crate) fn into_checked_regular(
         self,
         seen: &mut std::collections::HashSet<OutPoint>,
-    ) -> Result<CheckedTransaction, TransactionError> {
+    ) -> Result<CheckedRegularTransaction, TransactionError> {
         self.transaction
-            .into_checked_with_txid_and_seen(self.txid, seen)
+            .into_checked_regular_with_txid_and_seen(self.txid, seen)
     }
 }
 
-impl CheckedTransaction {
-    pub(crate) fn version(&self) -> u32 {
-        self.transaction.version
+fn is_lock_time_final(lock_time: LockTime, height: usize, time: u32) -> bool {
+    match lock_time {
+        LockTime::Unlocked => true,
+        LockTime::Height(lock_height) => {
+            usize::try_from(lock_height.get()).expect("u32 fits in usize") < height
+        }
+        LockTime::Time(lock_time) => lock_time < time,
+    }
+}
+
+impl CheckedCoinbase {
+    pub(crate) fn script_sig(&self) -> &[u8] {
+        assert!(self.script_sig.len() >= COINBASE_SCRIPT_SIZE_MIN);
+        assert!(self.script_sig.len() <= COINBASE_SCRIPT_SIZE_MAX);
+        &self.script_sig
     }
 
-    pub(crate) fn inputs(&self) -> &[TxIn] {
-        let inputs = self.transaction.inputs_slice();
-        assert!(!inputs.is_empty());
-        assert!(inputs.len() <= TX_INPUTS_COUNT_MAX);
-        inputs
-    }
-
-    pub(crate) fn outputs(&self) -> &[TxOut] {
-        let outputs = self.transaction.outputs();
-        assert!(!outputs.is_empty());
-        assert!(outputs.len() <= TX_OUTPUTS_COUNT_MAX);
-        outputs
+    pub(crate) fn outputs(&self) -> &CheckedOutputs {
+        &self.outputs
     }
 
     pub(crate) fn txid(&self) -> bitcoin_hashes::sha256d::Hash {
         self.txid
     }
 
-    pub(crate) fn value_out(&self) -> i64 {
-        assert!(self.value_out >= 0);
-        assert!(self.value_out <= MONEY_MAX);
+    pub(crate) fn value_out(&self) -> Amount {
         self.value_out
     }
 
@@ -720,24 +953,69 @@ impl CheckedTransaction {
         self.legacy_sigop_count
     }
 
-    #[cfg(test)]
-    pub(crate) fn transaction(&self) -> &Transaction {
-        &self.transaction
+    pub(crate) fn is_final(&self, height: usize, time: u32) -> bool {
+        is_lock_time_final(self.lock_time, height, time) || self.sequence == SEQUENCE_FINAL
+    }
+}
+
+impl CheckedRegularTransaction {
+    pub(crate) fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub(crate) fn inputs_count(&self) -> std::num::NonZeroUsize {
+        assert!(self.rest_inputs.len() < TX_INPUTS_COUNT_MAX);
+        std::num::NonZeroUsize::MIN.saturating_add(self.rest_inputs.len())
+    }
+
+    pub(crate) fn inputs(&self) -> impl Iterator<Item = &RegularTxIn> {
+        std::iter::once(&self.first_input).chain(&self.rest_inputs)
+    }
+
+    pub(crate) fn outputs(&self) -> &CheckedOutputs {
+        &self.outputs
+    }
+
+    pub(crate) fn txid(&self) -> bitcoin_hashes::sha256d::Hash {
+        self.txid
+    }
+
+    pub(crate) fn value_out(&self) -> Amount {
+        self.value_out
+    }
+
+    pub(crate) fn legacy_sigop_count(&self) -> usize {
+        assert!(self.legacy_sigop_count <= TX_LEGACY_SIGOPS_MAX);
+        self.legacy_sigop_count
     }
 
     pub(crate) fn is_final(&self, height: usize, time: u32) -> bool {
-        let inputs = self.inputs();
-        let satisfied = match self.transaction.lock_time() {
-            LockTime::Unlocked => return true,
-            LockTime::Height(lock_height) => {
-                usize::try_from(lock_height.get()).expect("u32 fits in usize") < height
-            }
-            LockTime::Time(lock_time) => lock_time < time,
-        };
-        if satisfied {
-            return true;
+        is_lock_time_final(self.lock_time, height, time)
+            || self.inputs().all(|input| input.sequence == SEQUENCE_FINAL)
+    }
+}
+
+#[cfg(test)]
+impl CheckedTransaction {
+    fn txid(&self) -> bitcoin_hashes::sha256d::Hash {
+        match self {
+            CheckedTransaction::Coinbase(coinbase) => coinbase.txid(),
+            CheckedTransaction::Regular(regular) => regular.txid(),
         }
-        inputs.iter().all(|input| input.sequence == SEQUENCE_FINAL)
+    }
+
+    fn legacy_sigop_count(&self) -> usize {
+        match self {
+            CheckedTransaction::Coinbase(coinbase) => coinbase.legacy_sigop_count(),
+            CheckedTransaction::Regular(regular) => regular.legacy_sigop_count(),
+        }
+    }
+
+    fn is_final(&self, height: usize, time: u32) -> bool {
+        match self {
+            CheckedTransaction::Coinbase(coinbase) => coinbase.is_final(height, time),
+            CheckedTransaction::Regular(regular) => regular.is_final(height, time),
+        }
     }
 }
 
@@ -764,20 +1042,22 @@ fn legacy_sigop_count(inputs: &[TxIn], outputs: &[TxOut]) -> usize {
     count
 }
 
-pub(crate) fn input_p2sh_and_witness_sigop_cost(input: &TxIn, previous_output: &TxOut) -> usize {
-    assert!(input.script_sig.len() <= BLOCK_BASE_SIZE_MAX);
-    assert!(previous_output.value >= 0);
-    assert!(previous_output.value <= MONEY_MAX);
-    assert!(!previous_output.is_unspendable());
-    let cost = if is_p2sh(&previous_output.script_pubkey) {
-        let Some(redeem_script) = last_push_data(&input.script_sig) else {
+fn script_p2sh_and_witness_sigop_cost(
+    script_sig: &[u8],
+    witness: &Witness,
+    previous_script: &SpendableScript,
+) -> usize {
+    assert!(script_sig.len() <= BLOCK_BASE_SIZE_MAX);
+    let previous_script = previous_script.as_slice();
+    let cost = if is_p2sh(previous_script) {
+        let Some(redeem_script) = last_push_data(script_sig) else {
             return 0;
         };
         script_sigop_count(redeem_script, SigOpMode::Accurate)
             .saturating_mul(WITNESS_SCALE_FACTOR)
-            .saturating_add(witness_v0_sigops(redeem_script, &input.witness))
+            .saturating_add(witness_v0_sigops(redeem_script, witness))
     } else {
-        witness_v0_sigops(&previous_output.script_pubkey, &input.witness)
+        witness_v0_sigops(previous_script, witness)
     };
     assert!(cost <= BLOCK_WEIGHT_MAX.saturating_mul(MULTISIG_PUBKEYS_COUNT_MAX));
     cost
@@ -1503,6 +1783,22 @@ mod tests {
             .unwrap()
             .is_final(0, 500_000_000)
         );
+        let coinbase_with = |lock_time: u32, sequence: u32| {
+            transaction(
+                vec![tx_in(outpoint(0, u32::MAX), vec![0x51, 0x00], sequence)],
+                vec![tx_out(0, Vec::new())],
+                lock_time,
+            )
+        };
+        assert!(coinbase_with(0, 0).check().unwrap().is_final(0, 0));
+        assert!(coinbase_with(99, 0).check().unwrap().is_final(100, 0));
+        assert!(!coinbase_with(100, 0).check().unwrap().is_final(100, 0));
+        assert!(
+            coinbase_with(100, super::SEQUENCE_FINAL)
+                .check()
+                .unwrap()
+                .is_final(100, 0)
+        );
     }
 
     #[test]
@@ -1620,12 +1916,37 @@ mod tests {
 
     #[test]
     fn unspendable_outputs_are_op_return_or_above_script_size_max() {
-        assert!(!tx_out(0, Vec::new()).is_unspendable());
-        assert!(tx_out(0, vec![super::OP_RETURN]).is_unspendable());
-        assert!(tx_out(0, vec![super::OP_RETURN, 0x01, 0xaa]).is_unspendable());
-        assert!(!tx_out(0, vec![super::OP_1, super::OP_RETURN]).is_unspendable());
-        assert!(!tx_out(0, vec![super::OP_1; super::SCRIPT_SIZE_MAX]).is_unspendable());
-        assert!(tx_out(0, vec![super::OP_1; super::SCRIPT_SIZE_MAX + 1]).is_unspendable());
+        assert!(super::SpendableScript::new(Vec::new()).is_some());
+        assert!(super::SpendableScript::new(vec![super::OP_RETURN]).is_none());
+        assert!(super::SpendableScript::new(vec![super::OP_RETURN, 0x01, 0xaa]).is_none());
+        assert!(super::SpendableScript::new(vec![super::OP_1, super::OP_RETURN]).is_some());
+        assert!(super::SpendableScript::new(vec![super::OP_1; super::SCRIPT_SIZE_MAX]).is_some());
+        assert!(
+            super::SpendableScript::new(vec![super::OP_1; super::SCRIPT_SIZE_MAX + 1]).is_none()
+        );
+        assert_eq!(super::Amount::from_satoshis(0).unwrap().satoshis(), 0);
+        assert_eq!(
+            super::Amount::from_satoshis(super::MONEY_MAX)
+                .unwrap()
+                .satoshis(),
+            super::MONEY_MAX
+        );
+        assert_eq!(
+            super::Amount::from_satoshis(-1),
+            Err(super::TransactionError::OutputNegative)
+        );
+        assert_eq!(
+            super::Amount::from_satoshis(super::MONEY_MAX + 1),
+            Err(super::TransactionError::OutputTooLarge)
+        );
+        let max = super::Amount::from_satoshis(super::MONEY_MAX).unwrap();
+        let one = super::Amount::from_satoshis(1).unwrap();
+        assert_eq!(max.checked_add(super::Amount::ZERO), Some(max));
+        assert_eq!(max.checked_add(one), None);
+        assert_eq!(one.checked_sub(one), Some(super::Amount::ZERO));
+        assert_eq!(super::Amount::ZERO.checked_sub(one), None);
+        assert!(super::NonNullOutPoint::new(outpoint(0, u32::MAX)).is_none());
+        assert!(super::NonNullOutPoint::new(outpoint(1, 0)).is_some());
     }
 
     #[test]
@@ -1655,9 +1976,14 @@ mod tests {
             super::Witness::decode(&mut bytes.as_slice()).unwrap()
         };
         let cost = |script_sig: Vec<u8>, witness: super::Witness, script_pubkey: Vec<u8>| {
-            let mut input = tx_in(outpoint(1, 0), script_sig, super::SEQUENCE_FINAL);
-            input.witness = witness;
-            super::input_p2sh_and_witness_sigop_cost(&input, &tx_out(0, script_pubkey))
+            let input = super::RegularTxIn {
+                previous_output: super::NonNullOutPoint::new(outpoint(1, 0)).unwrap(),
+                script_sig,
+                sequence: super::SEQUENCE_FINAL,
+                witness,
+            };
+            let script = super::SpendableScript::new(script_pubkey).unwrap();
+            input.p2sh_and_witness_sigop_cost(&script)
         };
 
         assert_eq!(

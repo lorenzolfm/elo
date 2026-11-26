@@ -194,8 +194,8 @@ struct Unmutated {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Checked {
     header: BlockHeader,
-    coinbase: crate::transaction::CheckedTransaction,
-    rest: Vec<crate::transaction::CheckedTransaction>,
+    coinbase: crate::transaction::CheckedCoinbase,
+    rest: Vec<crate::transaction::CheckedRegularTransaction>,
 }
 
 impl Checked {
@@ -203,11 +203,11 @@ impl Checked {
         self.header
     }
 
-    fn coinbase(&self) -> &crate::transaction::CheckedTransaction {
+    fn coinbase(&self) -> &crate::transaction::CheckedCoinbase {
         &self.coinbase
     }
 
-    fn rest(&self) -> &[crate::transaction::CheckedTransaction] {
+    fn rest(&self) -> &[crate::transaction::CheckedRegularTransaction] {
         assert!(self.rest.len() < BLOCK_TRANSACTIONS_COUNT_MAX);
         &self.rest
     }
@@ -298,11 +298,11 @@ impl CheckedBlock {
         self.checked.header()
     }
 
-    pub(crate) fn coinbase(&self) -> &crate::transaction::CheckedTransaction {
+    pub(crate) fn coinbase(&self) -> &crate::transaction::CheckedCoinbase {
         self.checked.coinbase()
     }
 
-    pub(crate) fn rest(&self) -> &[crate::transaction::CheckedTransaction] {
+    pub(crate) fn rest(&self) -> &[crate::transaction::CheckedRegularTransaction] {
         self.checked.rest()
     }
 
@@ -583,14 +583,14 @@ impl Unmutated {
         let mut seen_outpoints = std::collections::HashSet::new();
         let coinbase = transactions
             .first
-            .into_checked_with_seen(&mut seen_outpoints)
+            .into_checked_coinbase()
             .map_err(BlockError::Transaction)?;
         let mut sigops = coinbase.legacy_sigop_count();
         let mut all_final = coinbase.is_final(height, lock_time_cutoff);
         let mut rest = Vec::with_capacity(transactions.rest.len());
         for transaction in transactions.rest {
             let checked = transaction
-                .into_checked_with_seen(&mut seen_outpoints)
+                .into_checked_regular(&mut seen_outpoints)
                 .map_err(BlockError::Transaction)?;
             sigops = sigops.saturating_add(checked.legacy_sigop_count());
             if !checked.is_final(height, lock_time_cutoff) {
@@ -606,11 +606,7 @@ impl Unmutated {
         }
         if let Some(bip34_height) = bip34_height {
             let expected = encode_bip34_height(bip34_height);
-            assert_eq!(coinbase.inputs().len(), 1);
-            if !coinbase.inputs()[0]
-                .script_sig
-                .starts_with(expected.as_slice())
-            {
+            if !coinbase.script_sig().starts_with(expected.as_slice()) {
                 return Err(BlockError::CoinbaseHeight);
             }
         }
@@ -973,14 +969,15 @@ mod tests {
             .check()?;
         let expected = block.transactions.unwrap();
         assert_eq!(checked.header(), block.header);
-        assert_eq!(checked.coinbase().transaction(), &expected.first);
         assert_eq!(checked.coinbase().txid(), expected.first.txid());
-        let rest: Vec<_> = checked
-            .rest()
-            .iter()
-            .map(|transaction| transaction.transaction().clone())
-            .collect();
-        assert_eq!(rest, expected.rest);
+        assert_eq!(
+            checked.coinbase().script_sig(),
+            expected.first.inputs()[0].script_sig.as_slice()
+        );
+        assert_eq!(
+            checked.coinbase().outputs().len().get(),
+            expected.first.outputs().len()
+        );
         let rest_txids: Vec<_> = checked.rest().iter().map(|tx| tx.txid()).collect();
         let expected_txids: Vec<_> = expected.rest.iter().map(|tx| tx.txid()).collect();
         assert_eq!(rest_txids, expected_txids);

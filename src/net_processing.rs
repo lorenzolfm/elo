@@ -291,9 +291,7 @@ impl<'a> Handshake<'a> {
         assert_eq!(crate::protocol::Version::decode(&mut input), Ok(ours));
         assert!(input.is_empty());
 
-        if chain.tip().work() < work_min {
-            chain.restart();
-        }
+        chain.restart_if_below(work_min);
         if chain.tip().work() < work_min {
             assert_eq!(chain.tip().height(), 0);
         }
@@ -472,21 +470,19 @@ struct SyncedChain<'a> {
 
 #[derive(Debug)]
 struct Blocks {
-    next_height: std::num::NonZeroUsize,
     window: Option<BlockWindow>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct BlocksReorg {
-    fork_height: usize,
-    connected_height: usize,
+#[derive(Debug)]
+enum WindowSlot {
+    InFlight(crate::chain::BlockPosition),
+    Buffered(Box<crate::block::CheckedBlock>),
 }
 
 #[derive(Debug)]
 struct BlockWindow {
     oldest: crate::chain::BlockPosition,
-    rest: Vec<crate::chain::BlockPosition>,
-    buffered: Vec<crate::block::CheckedBlock>,
+    above: std::collections::VecDeque<WindowSlot>,
     timer: BlockTimer,
 }
 
@@ -681,8 +677,10 @@ impl InitialDownload {
 
 impl<'a> SyncedChain<'a> {
     fn new(chain: &'a mut crate::chain::Chain) -> SyncedChain<'a> {
-        let blocks = Blocks::from_connected(chain.connected_height());
-        SyncedChain { chain, blocks }
+        SyncedChain {
+            chain,
+            blocks: Blocks::new(),
+        }
     }
 
     fn chain(&self) -> &crate::chain::Chain {
@@ -718,22 +716,22 @@ impl<'a> SyncedChain<'a> {
             return Ok(None);
         }
         assert_eq!(height, expected);
-        let first = self.chain.connect_block(block)?;
-        let drained = self.blocks.take_oldest(position);
-        assert!(drained.len() < BLOCKS_WINDOW_MAX);
-        let mut rest = Vec::with_capacity(drained.len());
-        for next in drained {
+        let first = self.chain.connect_block(&block)?;
+        let mut rest = Vec::with_capacity(self.blocks.contiguous_buffered(position).count());
+        for next in self.blocks.contiguous_buffered(position) {
             assert_eq!(next.height().get(), self.chain.connected_height() + 1);
             match self.chain.connect_block(next) {
                 Ok(connected) => rest.push(connected),
                 Err(error) => {
                     self.chain.disconnect_to(connected_before);
                     assert_eq!(self.chain.connected_height(), connected_before);
+                    self.blocks.assert_window(connected_before);
                     return Err(error);
                 }
             }
         }
         assert!(rest.len() < BLOCKS_WINDOW_MAX);
+        self.blocks.commit_oldest(position, rest.len());
         self.blocks.assert_window(self.chain.connected_height());
         Ok(Some(ConnectedBlocks { first, rest }))
     }
@@ -840,10 +838,7 @@ impl ChainStore for SyncedChain<'_> {
         if let Some(crate::chain::Extended::Reorged { fork_height, .. }) = extended {
             let connected_height = self.chain.connected_height();
             assert!(connected_height <= fork_height);
-            self.blocks.reorg(BlocksReorg {
-                fork_height,
-                connected_height,
-            });
+            self.blocks.reorg(fork_height, connected_height);
         }
         Ok(extended)
     }
@@ -859,10 +854,7 @@ impl ChainStore for SyncedChain<'_> {
         if let crate::chain::Extended::Reorged { fork_height, .. } = extended {
             let connected_height = self.chain.connected_height();
             assert!(connected_height <= fork_height);
-            self.blocks.reorg(BlocksReorg {
-                fork_height,
-                connected_height,
-            });
+            self.blocks.reorg(fork_height, connected_height);
         }
         Ok(extended)
     }
@@ -881,10 +873,7 @@ impl ChainStore for SyncedChain<'_> {
         if let crate::chain::Extended::Reorged { fork_height, .. } = extended {
             let connected_height = self.chain.connected_height();
             assert!(connected_height <= fork_height);
-            self.blocks.reorg(BlocksReorg {
-                fork_height,
-                connected_height,
-            });
+            self.blocks.reorg(fork_height, connected_height);
         }
         Ok(extended)
     }
@@ -1330,12 +1319,8 @@ impl<'a> SyncedPeer<'a> {
 }
 
 impl Blocks {
-    fn from_connected(connected_height: usize) -> Blocks {
-        assert!(connected_height < usize::MAX);
-        Blocks {
-            next_height: std::num::NonZeroUsize::MIN.saturating_add(connected_height),
-            window: None,
-        }
+    fn new() -> Blocks {
+        Blocks { window: None }
     }
 
     fn unresolved_len(&self) -> usize {
@@ -1344,15 +1329,22 @@ impl Blocks {
         len
     }
 
-    #[cfg_attr(false, mutants::skip)]
-    fn assert_window(&self, connected_height: usize) {
-        assert!(self.next_height.get() > connected_height);
-        assert_eq!(
-            self.next_height.get() - (connected_height + 1),
-            self.unresolved_len()
-        );
+    fn next_height(&self, connected_height: usize) -> std::num::NonZeroUsize {
+        let unresolved = self.unresolved_len();
+        assert!(connected_height <= usize::MAX - 1 - unresolved);
+        let next = std::num::NonZeroUsize::MIN.saturating_add(connected_height + unresolved);
         if let Some(window) = &self.window {
             assert_eq!(window.oldest.height().get(), connected_height + 1);
+            assert_eq!(next.get(), window.oldest.height().get() + unresolved);
+        }
+        next
+    }
+
+    #[cfg_attr(false, mutants::skip)]
+    fn assert_window(&self, connected_height: usize) {
+        if let Some(window) = &self.window {
+            assert_eq!(window.oldest.height().get(), connected_height + 1);
+            assert!(window.unresolved_len() <= BLOCKS_WINDOW_MAX);
         }
     }
 
@@ -1360,41 +1352,40 @@ impl Blocks {
         &self,
         header: crate::block::BlockHeader,
     ) -> Option<crate::block::MatchedHeader> {
-        let matched = self.window.as_ref()?.match_header(header)?;
-        assert!(matched.position().height() < self.next_height);
-        Some(matched)
+        self.window.as_ref()?.match_header(header)
     }
 
-    fn take_oldest(
-        &mut self,
-        position: crate::chain::BlockPosition,
-    ) -> Vec<crate::block::CheckedBlock> {
-        assert!(position.height() < self.next_height);
+    fn contiguous_buffered(
+        &self,
+        expected: crate::chain::BlockPosition,
+    ) -> impl Iterator<Item = &crate::block::CheckedBlock> {
+        self.window
+            .as_ref()
+            .expect("oldest block is in window")
+            .contiguous_buffered(expected)
+    }
+
+    fn commit_oldest(&mut self, position: crate::chain::BlockPosition, drained_count: usize) {
         let window = self.window.take().expect("oldest block is in window");
-        let (next, drained) = window.take_oldest(position);
-        self.window = next;
-        drained
+        self.window = window.commit_oldest(position, drained_count);
     }
 
     fn buffer(&mut self, block: crate::block::CheckedBlock) {
-        assert!(block.height() < self.next_height);
         self.window
             .as_mut()
             .expect("oldest block is still in flight")
             .buffer(block);
     }
 
-    fn reorg(&mut self, reorg: BlocksReorg) {
-        assert!(reorg.fork_height < usize::MAX);
-        assert!(reorg.connected_height <= reorg.fork_height);
-        let above_fork = std::num::NonZeroUsize::MIN.saturating_add(reorg.fork_height);
-        self.next_height = self.next_height.min(above_fork);
+    fn reorg(&mut self, fork_height: usize, connected_height: usize) {
+        assert!(fork_height < usize::MAX);
+        assert!(connected_height <= fork_height);
         self.window = self
             .window
             .take()
-            .and_then(|window| window.reorg(reorg.fork_height));
-        assert!(self.next_height.get() <= reorg.fork_height + 1);
-        self.assert_window(reorg.connected_height);
+            .and_then(|window| window.reorg(fork_height));
+        assert!(self.next_height(connected_height).get() <= fork_height + 1);
+        self.assert_window(connected_height);
     }
 
     fn tick_waiting(
@@ -1403,7 +1394,7 @@ impl Blocks {
         chain: &crate::chain::Chain,
     ) -> Result<Option<std::time::Instant>, PeerError> {
         let connected = chain.connected_height();
-        assert!(self.next_height.get() <= chain.tip().height() + 1);
+        assert!(self.next_height(connected).get() <= chain.tip().height() + 1);
         self.assert_window(connected);
         match &mut self.window {
             None => Ok(None),
@@ -1417,15 +1408,17 @@ impl Blocks {
         chain: &crate::chain::Chain,
     ) -> Result<(Option<crate::protocol::GetData>, Option<std::time::Instant>), PeerError> {
         let mut wake = self.tick_waiting(now, chain)?;
+        let connected = chain.connected_height();
         let free = BLOCKS_WINDOW_MAX - self.unresolved_len();
+        let mut next_height = self.next_height(connected);
         let mut asked = Vec::with_capacity(free);
         while asked.len() < free
-            && let Some(position) = chain.block_position(self.next_height)
+            && let Some(position) = chain.block_position(next_height)
         {
             asked.push(position);
-            self.next_height = self.next_height.saturating_add(1);
+            next_height = next_height.saturating_add(1);
         }
-        assert!(self.next_height.get() <= chain.tip().height() + 1);
+        assert!(next_height.get() <= chain.tip().height() + 1);
         let mut positions = asked.into_iter();
         let Some(first) = positions.next() else {
             return Ok((None, wake));
@@ -1445,7 +1438,8 @@ impl Blocks {
             }
             Some(window) => window.push(first, rest_positions),
         }
-        self.assert_window(chain.connected_height());
+        assert_eq!(self.next_height(connected), next_height);
+        self.assert_window(connected);
         Ok((Some(get_data), wake))
     }
 }
@@ -1457,21 +1451,20 @@ impl BlockWindow {
         now: std::time::Instant,
     ) -> BlockWindow {
         assert!(rest.len() < BLOCKS_WINDOW_MAX);
-        let mut prev_height = oldest.height();
-        for position in &rest {
-            assert!(position.height() > prev_height);
-            prev_height = position.height();
+        let mut above = std::collections::VecDeque::with_capacity(rest.len());
+        for (offset, position) in rest.into_iter().enumerate() {
+            assert_eq!(position.height().get(), oldest.height().get() + 1 + offset);
+            above.push_back(WindowSlot::InFlight(position));
         }
         BlockWindow {
             oldest,
-            rest,
-            buffered: Vec::new(),
+            above,
             timer: BlockTimer::Waiting(now),
         }
     }
 
     fn unresolved_len(&self) -> usize {
-        1 + self.rest.len() + self.buffered.len()
+        1 + self.above.len()
     }
 
     fn tick(&mut self, now: std::time::Instant) -> Result<std::time::Instant, PeerError> {
@@ -1496,12 +1489,13 @@ impl BlockWindow {
         assert!(matches!(self.timer, BlockTimer::Waiting(_)));
         let len_before = self.unresolved_len();
         assert!(len_before < BLOCKS_WINDOW_MAX);
-        let mut prev_height = self.rest.last().unwrap_or(&self.oldest).height();
         for position in std::iter::once(first).chain(more) {
-            assert!(position.height() > prev_height);
+            assert_eq!(
+                position.height().get(),
+                self.oldest.height().get() + 1 + self.above.len()
+            );
             assert!(self.unresolved_len() < BLOCKS_WINDOW_MAX);
-            prev_height = position.height();
-            self.rest.push(position);
+            self.above.push_back(WindowSlot::InFlight(position));
         }
         assert!(self.unresolved_len() > len_before);
         assert!(self.unresolved_len() <= BLOCKS_WINDOW_MAX);
@@ -1512,137 +1506,84 @@ impl BlockWindow {
         header: crate::block::BlockHeader,
     ) -> Option<crate::block::MatchedHeader> {
         assert!(self.unresolved_len() <= BLOCKS_WINDOW_MAX);
-        assert!(
-            self.rest
-                .iter()
-                .all(|position| position.height() > self.oldest.height())
-        );
-        assert!(
-            self.buffered
-                .iter()
-                .all(|block| block.height() > self.oldest.height())
-        );
         let hash = header.hash();
         if let Some(matched) = crate::block::MatchedHeader::new(self.oldest, header) {
-            assert!(self.rest.iter().all(|position| position.hash() != hash));
             return Some(matched);
         }
-        self.rest
-            .iter()
-            .find(|position| position.hash() == hash)
-            .map(|position| {
-                crate::block::MatchedHeader::new(*position, header).expect("matched hash in rest")
-            })
+        self.above.iter().find_map(|slot| match slot {
+            WindowSlot::InFlight(position) if position.hash() == hash => Some(
+                crate::block::MatchedHeader::new(*position, header).expect("matched hash in above"),
+            ),
+            WindowSlot::InFlight(_) | WindowSlot::Buffered(_) => None,
+        })
     }
 
     fn buffer(&mut self, block: crate::block::CheckedBlock) {
         let len_before = self.unresolved_len();
         let position = block.position();
-        let height = position.height();
-        assert!(height > self.oldest.height());
-        let rest_index = self
-            .rest
-            .iter()
-            .position(|candidate| *candidate == position)
-            .expect("buffered block was in flight");
-        self.rest.remove(rest_index);
-        assert!(
-            self.rest
-                .iter()
-                .all(|candidate| candidate.hash() != position.hash())
-        );
-        let insert_index = match self
-            .buffered
-            .binary_search_by_key(&height, crate::block::CheckedBlock::height)
-        {
-            Ok(_) => panic!("duplicate buffered block at height {height}"),
-            Err(index) => index,
-        };
-        self.buffered.insert(insert_index, block);
-        assert!(self.buffered.len() < BLOCKS_WINDOW_MAX);
+        let offset = position
+            .height()
+            .get()
+            .checked_sub(self.oldest.height().get() + 1)
+            .expect("buffered block is above oldest");
+        let slot = self
+            .above
+            .get_mut(offset)
+            .expect("buffered block is within window");
+        assert!(matches!(
+            slot,
+            WindowSlot::InFlight(in_flight) if *in_flight == position
+        ));
+        *slot = WindowSlot::Buffered(Box::new(block));
         assert_eq!(self.unresolved_len(), len_before);
     }
 
-    fn take_oldest(
+    fn contiguous_buffered(
+        &self,
+        expected: crate::chain::BlockPosition,
+    ) -> impl Iterator<Item = &crate::block::CheckedBlock> {
+        assert_eq!(self.oldest, expected);
+        self.above.iter().map_while(|slot| match slot {
+            WindowSlot::Buffered(block) => Some(block.as_ref()),
+            WindowSlot::InFlight(_) => None,
+        })
+    }
+
+    fn commit_oldest(
         mut self,
         expected: crate::chain::BlockPosition,
-    ) -> (Option<BlockWindow>, Vec<crate::block::CheckedBlock>) {
+        expected_drained: usize,
+    ) -> Option<BlockWindow> {
         assert_eq!(self.oldest, expected);
         assert!(self.unresolved_len() <= BLOCKS_WINDOW_MAX);
-        assert!(
-            self.rest
-                .iter()
-                .all(|position| position.height() > self.oldest.height())
-        );
-        assert!(
-            self.buffered
-                .iter()
-                .all(|block| block.height() > self.oldest.height())
-        );
         let len_before = self.unresolved_len();
-        let mut next_height = self.oldest.height().saturating_add(1);
-        let mut drain_count: usize = 0;
-        while self
-            .buffered
-            .get(drain_count)
-            .is_some_and(|block| block.height() == next_height)
-        {
-            drain_count += 1;
-            next_height = next_height.saturating_add(1);
-        }
-        assert!(drain_count < BLOCKS_WINDOW_MAX);
-        let drained: Vec<_> = self.buffered.drain(..drain_count).collect();
-        let next = if self.rest.is_empty() {
-            assert!(self.buffered.is_empty());
-            None
-        } else {
-            let oldest = self.rest.remove(0);
-            assert_eq!(oldest.height(), next_height);
-            assert!(
-                self.buffered
-                    .iter()
-                    .all(|block| block.height() > oldest.height())
-            );
-            Some(BlockWindow {
-                oldest,
-                rest: self.rest,
-                buffered: self.buffered,
-                timer: BlockTimer::Reset,
-            })
+        let mut drained_count: usize = 0;
+        let next = loop {
+            match self.above.pop_front() {
+                Some(WindowSlot::Buffered(_)) => drained_count += 1,
+                Some(WindowSlot::InFlight(oldest)) => {
+                    break Some(BlockWindow {
+                        oldest,
+                        above: self.above,
+                        timer: BlockTimer::Reset,
+                    });
+                }
+                None => break None,
+            }
         };
+        assert_eq!(drained_count, expected_drained);
         assert_eq!(
-            next.as_ref().map_or(0, BlockWindow::unresolved_len) + 1 + drained.len(),
+            next.as_ref().map_or(0, BlockWindow::unresolved_len) + 1 + drained_count,
             len_before
         );
-        (next, drained)
+        next
     }
 
     fn reorg(mut self, fork_height: usize) -> Option<BlockWindow> {
         assert!(self.unresolved_len() <= BLOCKS_WINDOW_MAX);
-        assert!(
-            self.rest
-                .iter()
-                .all(|position| position.height() > self.oldest.height())
-        );
-        if self.oldest.height().get() <= fork_height {
-            self.rest
-                .retain(|position| position.height().get() <= fork_height);
-            self.buffered
-                .retain(|block| block.height().get() <= fork_height);
-            assert!(
-                self.rest
-                    .iter()
-                    .all(|position| position.height().get() <= fork_height)
-            );
-            assert!(
-                self.buffered
-                    .iter()
-                    .all(|block| block.height().get() <= fork_height)
-            );
-            Some(self)
-        } else {
-            None
-        }
+        let keep_above = fork_height.checked_sub(self.oldest.height().get())?;
+        self.above.truncate(keep_above);
+        Some(self)
     }
 }
 
@@ -6257,5 +6198,35 @@ mod tests {
             ))
         );
         assert_eq!(chain.connected_height(), 0);
+
+        let mut chain = regtest();
+        chain
+            .extend(
+                crate::fixtures::headers_batch(&[good_1.header, bad_2.header]),
+                crate::fixtures::CLOCK,
+            )
+            .unwrap();
+        let mut synced_chain = super::SyncedChain::new(&mut chain);
+        let _ = synced_chain.tick_request(start).unwrap();
+        let decode_checked = |synced_chain: &super::SyncedChain<'_>,
+                              block: &crate::block::Block| {
+            let mut body = Vec::new();
+            crate::serialize::Encode::encode(block, &mut body);
+            let mut input = body.as_slice();
+            let header = crate::block::BlockHeader::decode(&mut input).unwrap();
+            let matched = synced_chain.match_block(header).unwrap();
+            matched.decode_body(&mut input).unwrap().check().unwrap()
+        };
+        let checked_2 = decode_checked(&synced_chain, &bad_2);
+        assert!(synced_chain.accept_block(checked_2).unwrap().is_none());
+        let checked_1 = decode_checked(&synced_chain, &good_1);
+        assert_eq!(
+            synced_chain.accept_block(checked_1).err(),
+            Some(crate::utxo::ConnectError::CoinbaseAmount)
+        );
+        assert_eq!(synced_chain.chain().connected_height(), 0);
+        assert!(synced_chain.match_block(good_1.header).is_some());
+        assert!(synced_chain.match_block(bad_2.header).is_none());
+        assert!(synced_chain.tick_waiting(start).unwrap().is_some());
     }
 }

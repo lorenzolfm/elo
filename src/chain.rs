@@ -6,7 +6,6 @@ pub(crate) const TIME_AHEAD_SECONDS_MAX: u64 = 2 * 60 * 60;
 
 #[derive(Debug)]
 pub struct Chain {
-    network: crate::chainparams::Network,
     below_tip: Vec<crate::block::BlockHeader>,
     tip: crate::block::BlockHeader,
     work: crate::pow::Work,
@@ -141,7 +140,6 @@ impl Chain {
             panic!("the genesis of {network:?} has no proof of work");
         };
         Chain {
-            network,
             below_tip: Vec::new(),
             tip: genesis,
             work,
@@ -149,9 +147,11 @@ impl Chain {
         }
     }
 
-    pub(crate) fn restart(&mut self) {
-        assert_eq!(self.utxo.height(), 0);
-        *self = Chain::new(self.network);
+    pub(crate) fn restart_if_below(&mut self, work_min: crate::pow::Work) {
+        if self.work < work_min {
+            assert_eq!(self.utxo.height(), 0);
+            *self = Chain::new(self.network());
+        }
     }
 
     pub(crate) fn extend(
@@ -439,7 +439,7 @@ impl Chain {
             batch: &[],
         };
         SyncStart {
-            network: self.network,
+            network: self.network(),
             height,
             hash: header.hash(),
             bits: header.bits,
@@ -490,7 +490,7 @@ impl Chain {
                     return Err(ExtendError::NotContinuous);
                 }
                 let (hash, work) =
-                    crate::pow::proven(header, self.network).ok_or(ExtendError::ProofOfWork)?;
+                    crate::pow::proven(header, self.network()).ok_or(ExtendError::ProofOfWork)?;
                 Ok((hash, work_max.saturating_add(work)))
             },
         )?;
@@ -521,7 +521,7 @@ impl Chain {
             .map(|height| self.header_at(height).hash())
             .collect();
         assert!(locator.len() <= crate::protocol::LOCATOR_HASHES_COUNT_MAX);
-        assert_eq!(locator.last(), Some(&self.network.genesis().hash()));
+        assert_eq!(locator.last(), Some(&self.network().genesis().hash()));
         locator
     }
 
@@ -532,6 +532,7 @@ impl Chain {
         from: usize,
         time_max: u64,
     ) -> Result<(bitcoin_hashes::sha256d::Hash, crate::pow::Work), ExtendError> {
+        let network = self.network();
         let base = self.header_at(base_height);
         let below_base = &self.below_tip[..base_height];
         assert!(from < headers.len());
@@ -546,7 +547,7 @@ impl Chain {
                 return Err(ExtendError::NotContinuous);
             }
             let (hash, header_work) =
-                crate::pow::proven(header, self.network).ok_or(ExtendError::ProofOfWork)?;
+                crate::pow::proven(header, network).ok_or(ExtendError::ProofOfWork)?;
             prev = hash;
             work = work.saturating_add(header_work);
             let ancestors = Ancestors {
@@ -554,20 +555,19 @@ impl Chain {
                 tip: base,
                 batch: &headers[..index],
             };
-            if crate::pow::required_bits(self.network, ancestors, header.time) != Some(header.bits)
-            {
+            if crate::pow::required_bits(network, ancestors, header.time) != Some(header.bits) {
                 return Err(ExtendError::WrongBits);
             }
             if header.time <= ancestors.median_time_past() {
                 return Err(ExtendError::TimeTooOld);
             }
-            if header.time < crate::pow::timewarp_time_min(self.network, ancestors) {
+            if header.time < crate::pow::timewarp_time_min(network, ancestors) {
                 return Err(ExtendError::TimeTimewarpAttack);
             }
             if u64::from(header.time) > time_max {
                 return Err(ExtendError::TimeTooNew);
             }
-            if header.version < self.network.version_min(ancestors.height_above()) {
+            if header.version < network.version_min(ancestors.height_above()) {
                 return Err(ExtendError::VersionTooLow);
             }
         }
@@ -580,7 +580,7 @@ impl Chain {
     }
 
     fn stored_work(&self, header: &crate::block::BlockHeader) -> crate::pow::Work {
-        match crate::pow::work(header.bits, self.network) {
+        match crate::pow::work(header.bits, self.network()) {
             Some(work) => work,
             None => panic!("a header of the chain has bits with no target"),
         }
@@ -592,31 +592,31 @@ impl Chain {
         time_max: u64,
         work: crate::pow::Work,
     ) {
+        let network = self.network();
         assert!(!headers.is_empty());
         assert!(work > self.work);
         let mut stored_work = Some(self.work);
         self.work = work;
-        let genesis_time = self.network.genesis().time;
+        let genesis_time = network.genesis().time;
         for header in headers {
             self.below_tip
                 .push(std::mem::replace(&mut self.tip, header));
             stored_work = stored_work
-                .zip(crate::pow::work(self.tip.bits, self.network))
+                .zip(crate::pow::work(self.tip.bits, network))
                 .map(|(sum, header_work)| sum.saturating_add(header_work));
             assert!(self.tip.time > genesis_time);
             assert!(u64::from(self.tip.time) <= time_max);
-            assert!(self.tip.version >= self.network.version_min(self.below_tip.len()));
+            assert!(self.tip.version >= network.version_min(self.below_tip.len()));
             assert!(
-                self.tip.time
-                    >= crate::pow::timewarp_time_min(self.network, self.ancestors_of_tip())
+                self.tip.time >= crate::pow::timewarp_time_min(network, self.ancestors_of_tip())
             );
         }
         assert_eq!(stored_work, Some(self.work));
         let ancestors = self.ancestors_of_tip();
         assert_eq!(self.tip.prev, ancestors.tip.hash());
-        assert!(crate::pow::proven(&self.tip, self.network).is_some());
+        assert!(crate::pow::proven(&self.tip, network).is_some());
         assert_eq!(
-            crate::pow::required_bits(self.network, ancestors, self.tip.time),
+            crate::pow::required_bits(network, ancestors, self.tip.time),
             Some(self.tip.bits)
         );
         assert!(self.tip.time > ancestors.median_time_past());
@@ -633,7 +633,7 @@ impl Chain {
     }
 
     pub(crate) fn network(&self) -> crate::chainparams::Network {
-        self.network
+        self.utxo.network()
     }
 
     pub(crate) fn block_position(&self, height: std::num::NonZeroUsize) -> Option<BlockPosition> {
@@ -644,7 +644,7 @@ impl Chain {
                 median_time_past_at(&self.below_tip, &self.tip, block_height - 1);
             assert!(header.time > prev_median_time_past);
             Some(BlockPosition {
-                network: self.network,
+                network: self.network(),
                 height,
                 hash: header.hash(),
                 prev_median_time_past,
@@ -663,7 +663,7 @@ impl Chain {
 
     pub(crate) fn connect_block(
         &mut self,
-        block: crate::block::CheckedBlock,
+        block: &crate::block::CheckedBlock,
     ) -> Result<crate::utxo::ConnectedBlock, crate::utxo::ConnectError> {
         let position = block.position();
         let height = position.height();
@@ -1374,7 +1374,6 @@ mod tests {
             below_tip[*height] = *header;
         }
         super::Chain {
-            network,
             below_tip,
             tip,
             work: super::Chain::new(network).work,
@@ -2406,7 +2405,11 @@ mod tests {
         );
         assert_eq!(chain.branch_tip_current(tip), None);
         let mut chain = regtest_with(&headers[..3]);
-        chain.restart();
+        chain.restart_if_below(chain.tip().work());
+        assert_eq!(chain.branch_tip_current(tip), Some(tip));
+        chain.restart_if_below(crate::pow::chain_work_min(
+            crate::chainparams::Network::Mainnet,
+        ));
         assert_eq!(chain.branch_tip_current(tip), None);
     }
 
@@ -2513,7 +2516,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-            let connected = chain.connect_block(checked).unwrap();
+            let connected = chain.connect_block(&checked).unwrap();
             assert_eq!(connected.height().get(), index + 1);
         }
         assert_eq!(chain.connected_height(), 101);
@@ -2590,7 +2593,7 @@ mod tests {
                     .unwrap(),
             )
             .unwrap();
-            chain.connect_block(checked).unwrap();
+            chain.connect_block(&checked).unwrap();
         }
         assert_eq!(chain.connected_height(), 102);
 
@@ -2606,7 +2609,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            chain.connect_block(checked_bad),
+            chain.connect_block(&checked_bad),
             Err(crate::utxo::ConnectError::MissingInputs)
         );
         assert_eq!(chain.connected_height(), 102);
@@ -2630,7 +2633,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        chain.connect_block(checked_good).unwrap();
+        chain.connect_block(&checked_good).unwrap();
         assert_eq!(chain.connected_height(), 103);
     }
 }
