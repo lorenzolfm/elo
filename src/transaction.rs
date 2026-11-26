@@ -33,9 +33,9 @@ pub(crate) const SEQUENCE_LOCKTIME_DISABLE_FLAG: u32 = 1 << 31;
 
 pub(crate) const SEQUENCE_LOCKTIME_TYPE_FLAG: u32 = 1 << 22;
 
-pub(crate) const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000_ffff;
+const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000_ffff;
 
-pub(crate) const SEQUENCE_LOCKTIME_GRANULARITY: u32 = 9;
+const SEQUENCE_LOCKTIME_GRANULARITY: u32 = 9;
 
 const MULTISIG_PUBKEYS_COUNT_MAX: usize = 20;
 
@@ -256,7 +256,27 @@ pub(crate) struct TxIn {
     pub(crate) witness: Witness,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RelativeLockTime {
+    Disabled,
+    Blocks(u16),
+    Seconds(u64),
+}
+
 impl TxIn {
+    pub(crate) fn relative_lock_time(&self) -> RelativeLockTime {
+        if self.sequence & SEQUENCE_LOCKTIME_DISABLE_FLAG != 0 {
+            return RelativeLockTime::Disabled;
+        }
+        let value = u16::try_from(self.sequence & SEQUENCE_LOCKTIME_MASK)
+            .expect("sequence locktime mask fits in u16");
+        if self.sequence & SEQUENCE_LOCKTIME_TYPE_FLAG != 0 {
+            RelativeLockTime::Seconds(u64::from(value) << SEQUENCE_LOCKTIME_GRANULARITY)
+        } else {
+            RelativeLockTime::Blocks(value)
+        }
+    }
+
     fn encoded_size(&self) -> usize {
         let size = 32
             + size_of::<u32>()
@@ -616,10 +636,6 @@ impl CheckedTransaction {
         assert!(!outputs.is_empty());
         assert!(outputs.len() <= TX_OUTPUTS_COUNT_MAX);
         outputs
-    }
-
-    pub(crate) fn coinbase_input(&self) -> Option<&TxIn> {
-        self.transaction.coinbase_input()
     }
 
     pub(crate) fn txid(&self) -> bitcoin_hashes::sha256d::Hash {

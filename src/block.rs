@@ -144,15 +144,15 @@ pub(crate) struct Checked {
 }
 
 impl Checked {
-    pub(crate) fn header(&self) -> BlockHeader {
+    fn header(&self) -> BlockHeader {
         self.header
     }
 
-    pub(crate) fn coinbase(&self) -> &crate::transaction::CheckedTransaction {
+    fn coinbase(&self) -> &crate::transaction::CheckedTransaction {
         &self.coinbase
     }
 
-    pub(crate) fn rest(&self) -> &[crate::transaction::CheckedTransaction] {
+    fn rest(&self) -> &[crate::transaction::CheckedTransaction] {
         &self.rest
     }
 
@@ -463,9 +463,9 @@ impl Unmutated {
         }
         assert!(transactions.len() <= BLOCK_TRANSACTIONS_COUNT_MAX);
         let witness_bytes = transactions.witness_bytes();
-        if transactions.first.coinbase_input().is_none() {
+        let Some(coinbase_input) = transactions.first.coinbase_input() else {
             return Err(BlockError::CoinbaseMissing);
-        }
+        };
         if transactions
             .rest
             .iter()
@@ -490,6 +490,11 @@ impl Unmutated {
             #[cfg(any(test, fuzzing))]
             crate::chain::Position::Genesis { .. } => (0, self.block.header.time, None),
         };
+        let bip34_ok = bip34_height.is_none_or(|height| {
+            coinbase_input
+                .script_sig
+                .starts_with(encode_bip34_height(height).as_slice())
+        });
 
         let mut seen_outpoints = std::collections::HashSet::new();
         let coinbase = transactions
@@ -515,12 +520,8 @@ impl Unmutated {
         if !all_final {
             return Err(BlockError::NonFinalTransaction);
         }
-        if let Some(height) = bip34_height {
-            let expected = encode_bip34_height(height);
-            let coinbase_input = coinbase.coinbase_input().expect("checked coinbase");
-            if !coinbase_input.script_sig.starts_with(expected.as_slice()) {
-                return Err(BlockError::CoinbaseHeight);
-            }
+        if !bip34_ok {
+            return Err(BlockError::CoinbaseHeight);
         }
         if weight_from_base(base_size, witness_bytes) > crate::transaction::BLOCK_WEIGHT_MAX {
             return Err(BlockError::WeightTooLarge);

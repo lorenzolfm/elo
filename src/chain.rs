@@ -371,13 +371,7 @@ impl Chain {
             )));
         }
 
-        while self.utxo.height() > fork_height {
-            let height = self.utxo.height();
-            let block_hash = self.header_at(height).hash();
-            let prev_hash = self.header_at(height - 1).hash();
-            self.utxo.disconnect_tip(block_hash, prev_hash);
-        }
-        assert!(self.utxo.height() <= fork_height);
+        self.disconnect_to(fork_height);
         assert_eq!(
             self.utxo.best_block(),
             self.header_at(self.utxo.height()).hash()
@@ -582,13 +576,7 @@ impl Chain {
     }
 
     fn header_at(&self, height: usize) -> &crate::block::BlockHeader {
-        match self.below_tip.get(height) {
-            Some(header) => header,
-            None => {
-                assert_eq!(height, self.below_tip.len());
-                &self.tip
-            }
-        }
+        header_at(&self.below_tip, &self.tip, height)
     }
 
     fn stored_work(&self, header: &crate::block::BlockHeader) -> crate::pow::Work {
@@ -692,6 +680,21 @@ impl Chain {
         Ok(connected)
     }
 
+    pub(crate) fn disconnect_to(&mut self, target_height: usize) {
+        assert!(target_height <= self.below_tip.len());
+        while self.utxo.height() > target_height {
+            let height = self.utxo.height();
+            let block_hash = self.header_at(height).hash();
+            let prev_hash = self.header_at(height - 1).hash();
+            self.utxo.disconnect_tip(block_hash, prev_hash);
+        }
+        assert!(self.utxo.height() <= target_height);
+        assert_eq!(
+            self.utxo.best_block(),
+            self.header_at(self.utxo.height()).hash()
+        );
+    }
+
     pub(crate) fn tip(&self) -> Tip {
         Tip {
             height: self.below_tip.len(),
@@ -701,18 +704,26 @@ impl Chain {
     }
 }
 
-fn median_time_past_at(
-    below_tip: &[crate::block::BlockHeader],
-    tip: &crate::block::BlockHeader,
+fn header_at<'a>(
+    below_tip: &'a [crate::block::BlockHeader],
+    tip: &'a crate::block::BlockHeader,
     height: usize,
-) -> u32 {
-    let header = match below_tip.get(height) {
+) -> &'a crate::block::BlockHeader {
+    match below_tip.get(height) {
         Some(header) => header,
         None => {
             assert_eq!(height, below_tip.len());
             tip
         }
-    };
+    }
+}
+
+fn median_time_past_at(
+    below_tip: &[crate::block::BlockHeader],
+    tip: &crate::block::BlockHeader,
+    height: usize,
+) -> u32 {
+    let header = header_at(below_tip, tip, height);
     let ancestors = Ancestors {
         below_tip: &below_tip[..height],
         tip: header,

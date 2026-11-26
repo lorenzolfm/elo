@@ -353,7 +353,7 @@ pub struct Synced<'a> {
     socket: Socket<'a>,
     peer: crate::net_processing::SyncedPeer<'a>,
     tip: crate::chain::Tip,
-    ready_blocks: std::collections::VecDeque<crate::utxo::ConnectedBlock>,
+    connected_blocks: std::collections::VecDeque<crate::utxo::ConnectedBlock>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -616,7 +616,7 @@ impl<'a> Connection<'a> {
                             socket,
                             peer: *synced,
                             tip,
-                            ready_blocks: std::collections::VecDeque::new(),
+                            connected_blocks: std::collections::VecDeque::new(),
                         },
                         tip,
                     ));
@@ -637,22 +637,22 @@ impl<'a> Synced<'a> {
             mut socket,
             mut peer,
             tip: previous,
-            mut ready_blocks,
+            mut connected_blocks,
         } = self;
-        if let Some(block) = ready_blocks.pop_front() {
+        if let Some(block) = connected_blocks.pop_front() {
             assert!(block.height().get() <= previous.height());
             return Ok((
                 Synced {
                     socket,
                     peer,
                     tip: previous,
-                    ready_blocks,
+                    connected_blocks,
                 },
                 Event::Block(block),
             ));
         }
         loop {
-            assert!(ready_blocks.is_empty());
+            assert!(connected_blocks.is_empty());
             match run_synced_turn(&mut socket, peer).await? {
                 (next, None) => peer = next,
                 (next, Some(SyncedTurnEvent::Tip(tip))) if tip == previous => peer = next,
@@ -663,7 +663,7 @@ impl<'a> Synced<'a> {
                             socket,
                             peer,
                             tip,
-                            ready_blocks,
+                            connected_blocks,
                         },
                         Event::Tip(tip),
                     ));
@@ -672,13 +672,13 @@ impl<'a> Synced<'a> {
                     let (first, rest) = blocks.into_parts();
                     assert!(first.height().get() <= previous.height());
                     assert!(rest.len() < crate::net_processing::BLOCKS_IN_FLIGHT_MAX);
-                    ready_blocks.extend(rest);
+                    connected_blocks.extend(rest);
                     return Ok((
                         Synced {
                             socket,
                             peer,
                             tip: previous,
-                            ready_blocks,
+                            connected_blocks,
                         },
                         Event::Block(first),
                     ));
