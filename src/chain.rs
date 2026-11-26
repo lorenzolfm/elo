@@ -6,10 +6,10 @@ pub(crate) const TIME_AHEAD_SECONDS_MAX: u64 = 2 * 60 * 60;
 
 #[derive(Debug)]
 pub struct Chain {
-    network: crate::chainparams::Network,
     below_tip: Vec<crate::block::BlockHeader>,
     tip: crate::block::BlockHeader,
     work: crate::pow::Work,
+    utxo: crate::utxo::UtxoSet,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,15 +140,18 @@ impl Chain {
             panic!("the genesis of {network:?} has no proof of work");
         };
         Chain {
-            network,
             below_tip: Vec::new(),
             tip: genesis,
             work,
+            utxo: crate::utxo::UtxoSet::new(network),
         }
     }
 
-    pub(crate) fn restart(&mut self) {
-        *self = Chain::new(self.network);
+    pub(crate) fn restart_if_below(&mut self, work_min: crate::pow::Work) {
+        if self.work < work_min {
+            assert_eq!(self.utxo.height(), 0);
+            *self = Chain::new(self.network());
+        }
     }
 
     pub(crate) fn extend(
@@ -368,6 +371,11 @@ impl Chain {
             )));
         }
 
+        self.disconnect_to(fork_height);
+        assert_eq!(
+            self.utxo.best_block(),
+            self.header_at(self.utxo.height()).hash()
+        );
         let count = headers.len();
         self.tip = self.below_tip[fork_height];
         self.below_tip.truncate(fork_height);
@@ -375,6 +383,10 @@ impl Chain {
         self.extend_store(headers, time_max, work_at_fork.saturating_add(work_branch));
         assert_eq!(self.tip.hash(), last_hash);
         assert_eq!(self.below_tip.len(), fork_height + count);
+        assert_eq!(
+            self.utxo.best_block(),
+            self.header_at(self.utxo.height()).hash()
+        );
         Ok(Extended::Reorged { full, fork_height })
     }
 
@@ -427,7 +439,7 @@ impl Chain {
             batch: &[],
         };
         SyncStart {
-            network: self.network,
+            network: self.network(),
             height,
             hash: header.hash(),
             bits: header.bits,
@@ -478,7 +490,7 @@ impl Chain {
                     return Err(ExtendError::NotContinuous);
                 }
                 let (hash, work) =
-                    crate::pow::proven(header, self.network).ok_or(ExtendError::ProofOfWork)?;
+                    crate::pow::proven(header, self.network()).ok_or(ExtendError::ProofOfWork)?;
                 Ok((hash, work_max.saturating_add(work)))
             },
         )?;
@@ -509,7 +521,7 @@ impl Chain {
             .map(|height| self.header_at(height).hash())
             .collect();
         assert!(locator.len() <= crate::protocol::LOCATOR_HASHES_COUNT_MAX);
-        assert_eq!(locator.last(), Some(&self.network.genesis().hash()));
+        assert_eq!(locator.last(), Some(&self.network().genesis().hash()));
         locator
     }
 
@@ -520,6 +532,7 @@ impl Chain {
         from: usize,
         time_max: u64,
     ) -> Result<(bitcoin_hashes::sha256d::Hash, crate::pow::Work), ExtendError> {
+        let network = self.network();
         let base = self.header_at(base_height);
         let below_base = &self.below_tip[..base_height];
         assert!(from < headers.len());
@@ -534,7 +547,7 @@ impl Chain {
                 return Err(ExtendError::NotContinuous);
             }
             let (hash, header_work) =
-                crate::pow::proven(header, self.network).ok_or(ExtendError::ProofOfWork)?;
+                crate::pow::proven(header, network).ok_or(ExtendError::ProofOfWork)?;
             prev = hash;
             work = work.saturating_add(header_work);
             let ancestors = Ancestors {
@@ -542,20 +555,19 @@ impl Chain {
                 tip: base,
                 batch: &headers[..index],
             };
-            if crate::pow::required_bits(self.network, ancestors, header.time) != Some(header.bits)
-            {
+            if crate::pow::required_bits(network, ancestors, header.time) != Some(header.bits) {
                 return Err(ExtendError::WrongBits);
             }
             if header.time <= ancestors.median_time_past() {
                 return Err(ExtendError::TimeTooOld);
             }
-            if header.time < crate::pow::timewarp_time_min(self.network, ancestors) {
+            if header.time < crate::pow::timewarp_time_min(network, ancestors) {
                 return Err(ExtendError::TimeTimewarpAttack);
             }
             if u64::from(header.time) > time_max {
                 return Err(ExtendError::TimeTooNew);
             }
-            if header.version < self.network.version_min(ancestors.height_above()) {
+            if header.version < network.version_min(ancestors.height_above()) {
                 return Err(ExtendError::VersionTooLow);
             }
         }
@@ -564,17 +576,11 @@ impl Chain {
     }
 
     fn header_at(&self, height: usize) -> &crate::block::BlockHeader {
-        match self.below_tip.get(height) {
-            Some(header) => header,
-            None => {
-                assert_eq!(height, self.below_tip.len());
-                &self.tip
-            }
-        }
+        header_at(&self.below_tip, &self.tip, height)
     }
 
     fn stored_work(&self, header: &crate::block::BlockHeader) -> crate::pow::Work {
-        match crate::pow::work(header.bits, self.network) {
+        match crate::pow::work(header.bits, self.network()) {
             Some(work) => work,
             None => panic!("a header of the chain has bits with no target"),
         }
@@ -586,31 +592,31 @@ impl Chain {
         time_max: u64,
         work: crate::pow::Work,
     ) {
+        let network = self.network();
         assert!(!headers.is_empty());
         assert!(work > self.work);
         let mut stored_work = Some(self.work);
         self.work = work;
-        let genesis_time = self.network.genesis().time;
+        let genesis_time = network.genesis().time;
         for header in headers {
             self.below_tip
                 .push(std::mem::replace(&mut self.tip, header));
             stored_work = stored_work
-                .zip(crate::pow::work(self.tip.bits, self.network))
+                .zip(crate::pow::work(self.tip.bits, network))
                 .map(|(sum, header_work)| sum.saturating_add(header_work));
             assert!(self.tip.time > genesis_time);
             assert!(u64::from(self.tip.time) <= time_max);
-            assert!(self.tip.version >= self.network.version_min(self.below_tip.len()));
+            assert!(self.tip.version >= network.version_min(self.below_tip.len()));
             assert!(
-                self.tip.time
-                    >= crate::pow::timewarp_time_min(self.network, self.ancestors_of_tip())
+                self.tip.time >= crate::pow::timewarp_time_min(network, self.ancestors_of_tip())
             );
         }
         assert_eq!(stored_work, Some(self.work));
         let ancestors = self.ancestors_of_tip();
         assert_eq!(self.tip.prev, ancestors.tip.hash());
-        assert!(crate::pow::proven(&self.tip, self.network).is_some());
+        assert!(crate::pow::proven(&self.tip, network).is_some());
         assert_eq!(
-            crate::pow::required_bits(self.network, ancestors, self.tip.time),
+            crate::pow::required_bits(network, ancestors, self.tip.time),
             Some(self.tip.bits)
         );
         assert!(self.tip.time > ancestors.median_time_past());
@@ -627,24 +633,18 @@ impl Chain {
     }
 
     pub(crate) fn network(&self) -> crate::chainparams::Network {
-        self.network
+        self.utxo.network()
     }
 
     pub(crate) fn block_position(&self, height: std::num::NonZeroUsize) -> Option<BlockPosition> {
         let block_height = height.get();
         if block_height <= self.below_tip.len() {
-            let prev_height = block_height - 1;
-            let prev_ancestors = Ancestors {
-                below_tip: &self.below_tip[..prev_height],
-                tip: self.header_at(prev_height),
-                batch: &[],
-            };
             let header = self.header_at(block_height);
-            let prev_median_time_past = prev_ancestors.median_time_past();
+            let prev_median_time_past =
+                median_time_past_at(&self.below_tip, &self.tip, block_height - 1);
             assert!(header.time > prev_median_time_past);
-            assert_eq!(prev_ancestors.height_above(), block_height);
             Some(BlockPosition {
-                network: self.network,
+                network: self.network(),
                 height,
                 hash: header.hash(),
                 prev_median_time_past,
@@ -654,6 +654,53 @@ impl Chain {
         }
     }
 
+    pub(crate) fn connected_height(&self) -> usize {
+        let height = self.utxo.height();
+        assert!(height <= self.below_tip.len());
+        assert_eq!(self.utxo.best_block(), self.header_at(height).hash());
+        height
+    }
+
+    pub(crate) fn connect_block(
+        &mut self,
+        block: &crate::block::CheckedBlock,
+    ) -> Result<crate::utxo::ConnectedBlock, crate::utxo::ConnectError> {
+        let position = block.position();
+        let height = position.height();
+        assert_eq!(height.get(), self.utxo.height() + 1);
+        assert_eq!(self.block_position(height), Some(position));
+        assert_eq!(block.header().prev, self.utxo.best_block());
+        let below_tip = &self.below_tip;
+        let tip = &self.tip;
+        let connected = self.utxo.connect_block(block, |ancestor_height| {
+            median_time_past_at(below_tip, tip, ancestor_height)
+        })?;
+        assert_eq!(self.utxo.height(), height.get());
+        assert_eq!(self.utxo.best_block(), position.hash());
+        Ok(connected)
+    }
+
+    pub(crate) fn disconnect_to(&mut self, target_height: usize) {
+        assert!(target_height <= self.below_tip.len());
+        let height_before = self.utxo.height();
+        let disconnect_count = height_before.saturating_sub(target_height);
+        for _ in 0..disconnect_count {
+            let height = self.utxo.height();
+            let block_hash = self.header_at(height).hash();
+            let prev_hash = self.header_at(height - 1).hash();
+            self.utxo.disconnect_tip(crate::utxo::DisconnectTip {
+                block_hash,
+                prev_hash,
+            });
+            assert_eq!(self.utxo.height(), height - 1);
+        }
+        assert_eq!(self.utxo.height(), height_before.min(target_height));
+        assert_eq!(
+            self.utxo.best_block(),
+            self.header_at(self.utxo.height()).hash()
+        );
+    }
+
     pub(crate) fn tip(&self) -> Tip {
         Tip {
             height: self.below_tip.len(),
@@ -661,6 +708,35 @@ impl Chain {
             work: self.work,
         }
     }
+}
+
+fn header_at<'a>(
+    below_tip: &'a [crate::block::BlockHeader],
+    tip: &'a crate::block::BlockHeader,
+    height: usize,
+) -> &'a crate::block::BlockHeader {
+    match below_tip.get(height) {
+        Some(header) => header,
+        None => {
+            assert_eq!(height, below_tip.len());
+            tip
+        }
+    }
+}
+
+fn median_time_past_at(
+    below_tip: &[crate::block::BlockHeader],
+    tip: &crate::block::BlockHeader,
+    height: usize,
+) -> u32 {
+    let header = header_at(below_tip, tip, height);
+    let ancestors = Ancestors {
+        below_tip: &below_tip[..height],
+        tip: header,
+        batch: &[],
+    };
+    assert_eq!(ancestors.height_above(), height + 1);
+    ancestors.median_time_past()
 }
 
 fn time_max(clock: u64) -> u64 {
@@ -816,6 +892,10 @@ impl BlockPosition {
 
     pub(crate) fn position(self) -> Position {
         Position::Block(self)
+    }
+
+    pub(crate) fn network(&self) -> crate::chainparams::Network {
+        self.network
     }
 
     pub(crate) fn height(&self) -> std::num::NonZeroUsize {
@@ -1294,10 +1374,10 @@ mod tests {
             below_tip[*height] = *header;
         }
         super::Chain {
-            network,
             below_tip,
             tip,
             work: super::Chain::new(network).work,
+            utxo: crate::utxo::UtxoSet::new(network),
         }
     }
 
@@ -2325,7 +2405,235 @@ mod tests {
         );
         assert_eq!(chain.branch_tip_current(tip), None);
         let mut chain = regtest_with(&headers[..3]);
-        chain.restart();
+        chain.restart_if_below(chain.tip().work());
+        assert_eq!(chain.branch_tip_current(tip), Some(tip));
+        chain.restart_if_below(crate::pow::chain_work_min(
+            crate::chainparams::Network::Mainnet,
+        ));
         assert_eq!(chain.branch_tip_current(tip), None);
+    }
+
+    #[test]
+    fn median_time_past_at_matches_genesis_middle_and_tip() {
+        let genesis = genesis();
+        let times: Vec<u32> = [
+            10, 20, 6000, 5000, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130,
+        ]
+        .into_iter()
+        .map(|offset| genesis.time + offset)
+        .collect();
+        let headers = mined_on(genesis, &times);
+        let chain = regtest_with(&headers);
+        assert_eq!(
+            super::median_time_past_at(&chain.below_tip, &chain.tip, 0),
+            genesis.time
+        );
+        assert_eq!(
+            super::median_time_past_at(&chain.below_tip, &chain.tip, 1),
+            genesis.time + 10
+        );
+        assert_eq!(
+            super::median_time_past_at(&chain.below_tip, &chain.tip, 3),
+            genesis.time + 20
+        );
+        assert_eq!(
+            super::median_time_past_at(&chain.below_tip, &chain.tip, 11),
+            genesis.time + 70
+        );
+        assert_eq!(
+            super::median_time_past_at(&chain.below_tip, &chain.tip, 14),
+            genesis.time + 90
+        );
+    }
+
+    #[test]
+    fn connect_block_and_reorg_disconnects_old_branch_utxos_and_connects_new_branch() {
+        let regtest = crate::chainparams::Network::Regtest;
+        let genesis = regtest.genesis();
+        let make_block = |height: usize,
+                          prev: crate::block::BlockHeader,
+                          tag: u32,
+                          rest: Vec<crate::transaction::Transaction>| {
+            let mut script_sig =
+                crate::block::encode_bip34_height(std::num::NonZeroUsize::new(height).unwrap())
+                    .as_slice()
+                    .to_vec();
+            script_sig.extend_from_slice(&tag.to_le_bytes());
+            let coinbase = crate::transaction::Transaction::new(
+                1,
+                vec![crate::transaction::TxIn {
+                    previous_output: crate::transaction::OutPoint {
+                        txid: bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]),
+                        vout: u32::MAX,
+                    },
+                    script_sig,
+                    sequence: u32::MAX,
+                    witness: crate::transaction::Witness::default(),
+                }],
+                vec![crate::transaction::TxOut {
+                    value: 5_000_000_000,
+                    script_pubkey: vec![0x51],
+                }],
+                0,
+            )
+            .unwrap();
+            let txids = std::iter::once(coinbase.txid().to_byte_array())
+                .chain(rest.iter().map(|tx| tx.txid().to_byte_array()))
+                .collect();
+            let header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
+                version: crate::fixtures::HEADER_VERSION,
+                prev: prev.hash(),
+                merkle_root: crate::merkle::root(txids).hash,
+                time: prev.time + 1,
+                ..genesis
+            });
+            crate::block::Block {
+                header,
+                transactions: Some(crate::block::Transactions {
+                    first: coinbase,
+                    rest,
+                }),
+            }
+        };
+
+        let block_1 = make_block(1, genesis, 1, Vec::new());
+        let mut branch_a = vec![block_1.clone()];
+        for height in 2..=101 {
+            let prev = branch_a.last().unwrap().header;
+            branch_a.push(make_block(height, prev, 10, Vec::new()));
+        }
+        let headers_a: Vec<_> = branch_a.iter().map(|block| block.header).collect();
+        let mut chain = regtest_with(&headers_a);
+        for (index, block) in branch_a.iter().enumerate() {
+            let position = chain
+                .block_position(std::num::NonZeroUsize::new(index + 1).unwrap())
+                .unwrap();
+            let checked = crate::block::CheckedBlock::from_checked(
+                position,
+                crate::block::PositionedBlock::new(block.clone(), position.position())
+                    .unwrap()
+                    .check()
+                    .unwrap(),
+            )
+            .unwrap();
+            let connected = chain.connect_block(&checked).unwrap();
+            assert_eq!(connected.height().get(), index + 1);
+        }
+        assert_eq!(chain.connected_height(), 101);
+        let old_block_2_cb = branch_a[1].transactions.as_ref().unwrap().first.txid();
+
+        let mut branch_b = Vec::new();
+        let mut prev = block_1.header;
+        for height in 2..=102 {
+            let block = make_block(height, prev, 20, Vec::new());
+            prev = block.header;
+            branch_b.push(block);
+        }
+        let new_block_2_cb = branch_b[0].transactions.as_ref().unwrap().first.txid();
+        let spend_old = crate::transaction::Transaction::new(
+            1,
+            vec![crate::transaction::TxIn {
+                previous_output: crate::transaction::OutPoint {
+                    txid: old_block_2_cb,
+                    vout: 0,
+                },
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+                witness: crate::transaction::Witness::default(),
+            }],
+            vec![crate::transaction::TxOut {
+                value: 5_000_000_000,
+                script_pubkey: vec![0x51],
+            }],
+            0,
+        )
+        .unwrap();
+        let spend_new = crate::transaction::Transaction::new(
+            1,
+            vec![crate::transaction::TxIn {
+                previous_output: crate::transaction::OutPoint {
+                    txid: new_block_2_cb,
+                    vout: 0,
+                },
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+                witness: crate::transaction::Witness::default(),
+            }],
+            vec![crate::transaction::TxOut {
+                value: 5_000_000_000,
+                script_pubkey: vec![0x51],
+            }],
+            0,
+        )
+        .unwrap();
+        let block_103_bad = make_block(103, prev, 21, vec![spend_old]);
+        let block_103_good = make_block(103, prev, 22, vec![spend_new]);
+
+        let headers_b: Vec<_> = std::iter::once(block_1.header)
+            .chain(branch_b.iter().map(|block| block.header))
+            .chain(std::iter::once(block_103_bad.header))
+            .collect();
+        assert_eq!(
+            on_locator(&mut chain, &headers_b),
+            Ok(super::Extended::Reorged {
+                full: false,
+                fork_height: 1,
+            })
+        );
+        assert_eq!(chain.connected_height(), 1);
+        for (offset, block) in branch_b.iter().enumerate() {
+            let position = chain
+                .block_position(std::num::NonZeroUsize::new(offset + 2).unwrap())
+                .unwrap();
+            let checked = crate::block::CheckedBlock::from_checked(
+                position,
+                crate::block::PositionedBlock::new(block.clone(), position.position())
+                    .unwrap()
+                    .check()
+                    .unwrap(),
+            )
+            .unwrap();
+            chain.connect_block(&checked).unwrap();
+        }
+        assert_eq!(chain.connected_height(), 102);
+
+        let pos_bad = chain
+            .block_position(std::num::NonZeroUsize::new(103).unwrap())
+            .unwrap();
+        let checked_bad = crate::block::CheckedBlock::from_checked(
+            pos_bad,
+            crate::block::PositionedBlock::new(block_103_bad, pos_bad.position())
+                .unwrap()
+                .check()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            chain.connect_block(&checked_bad),
+            Err(crate::utxo::ConnectError::MissingInputs)
+        );
+        assert_eq!(chain.connected_height(), 102);
+
+        let block_104_good = make_block(104, block_103_good.header, 23, Vec::new());
+        assert_eq!(
+            on_locator(&mut chain, &[block_103_good.header, block_104_good.header]),
+            Ok(super::Extended::Reorged {
+                full: false,
+                fork_height: 102,
+            })
+        );
+        let pos_good = chain
+            .block_position(std::num::NonZeroUsize::new(103).unwrap())
+            .unwrap();
+        let checked_good = crate::block::CheckedBlock::from_checked(
+            pos_good,
+            crate::block::PositionedBlock::new(block_103_good, pos_good.position())
+                .unwrap()
+                .check()
+                .unwrap(),
+        )
+        .unwrap();
+        chain.connect_block(&checked_good).unwrap();
+        assert_eq!(chain.connected_height(), 103);
     }
 }

@@ -846,6 +846,119 @@ fn blocks_across_bip34_heights_and_witness_spends_pass_all_checks() {
     assert!(ends.is_empty(), "elo ended the connection: {ends:?}");
 }
 
+#[test]
+fn halving_fees_bip68_and_live_reorg_connect_and_disconnect_blocks() {
+    let bitcoind = Bitcoind::start();
+    bitcoind.cli(&["generatetodescriptor", "150", "raw(51)"]);
+    let block_1_hash = bitcoind.cli(&["getblockhash", "1"]);
+    let block_1 = bitcoind.cli(&["getblock", block_1_hash.trim_end(), "1"]);
+    let cb_1_txid_le = reverse_hex(array_string(&block_1, "tx", 0));
+
+    let block_2_hash = bitcoind.cli(&["getblockhash", "2"]);
+    let block_2 = bitcoind.cli(&["getblock", block_2_hash.trim_end(), "1"]);
+    let cb_2_txid_le = reverse_hex(array_string(&block_2, "tx", 0));
+
+    let p2sh_op_true = "a914da1745e9b549bd0bfa1a569971c77eba30cd5a4b87";
+    let p2wsh_op_true = "00204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc33260";
+    let tx_1 = format!(
+        "0200000001{cb_1_txid_le}0000000000ffffffff\
+         03\
+         009435770000000017{p2sh_op_true}\
+         009435770000000022{p2wsh_op_true}\
+         0000000000000000066a04656c6f21\
+         00000000"
+    );
+    let tx_1_decoded = bitcoind.cli(&["decoderawtransaction", &tx_1]);
+    let tx_1_txid_le = reverse_hex(string_field(&tx_1_decoded, "txid"));
+
+    let tx_2 = format!(
+        "0200000001{tx_1_txid_le}0000000002015100000000\
+         01\
+         00b33f71000000000151\
+         00000000"
+    );
+    let block_151_json = bitcoind.cli(&[
+        "generateblock",
+        "raw(51)",
+        &format!("[\"{tx_1}\",\"{tx_2}\"]"),
+    ]);
+    let block_151_hash = string_field(&block_151_json, "hash");
+
+    let tx_3 = format!(
+        "02000000000101{tx_1_txid_le}010000000001000000\
+         01\
+         80a33a74000000000151\
+         010151\
+         00000000"
+    );
+    let block_152_json = bitcoind.cli(&["generateblock", "raw(51)", &format!("[\"{tx_3}\"]")]);
+    let block_152_hash = string_field(&block_152_json, "hash");
+
+    let elo = Elo::start(&bitcoind);
+    elo.event("tip", SYNC_TIMEOUT);
+    for height in 1..=150 {
+        let block = elo.event("block", SYNC_TIMEOUT);
+        assert!(
+            block.contains(&format!(" height={height} ")) && block.ends_with(" transactions=1"),
+            "{block}"
+        );
+    }
+    assert_eq!(
+        elo.event("block", SYNC_TIMEOUT),
+        format!(
+            "level=info event=block peer={} height=151 hash={block_151_hash} transactions=3",
+            bitcoind.peer
+        )
+    );
+    assert_eq!(
+        elo.event("block", SYNC_TIMEOUT),
+        format!(
+            "level=info event=block peer={} height=152 hash={block_152_hash} transactions=2",
+            bitcoind.peer
+        )
+    );
+
+    wait_for_send_headers(&bitcoind, &elo);
+    bitcoind.cli(&["invalidateblock", block_151_hash]);
+    let reorg_tx = format!(
+        "0200000001{cb_2_txid_le}0000000000ffffffff\
+         01\
+         00286bee000000000151\
+         00000000"
+    );
+    let reorg_151_json = bitcoind.cli(&["generateblock", "raw(51)", &format!("[\"{reorg_tx}\"]")]);
+    let reorg_151_hash = string_field(&reorg_151_json, "hash");
+    bitcoind.cli(&["generatetodescriptor", "2", "raw(51)"]);
+    let reorg_152_hash = bitcoind.cli(&["getblockhash", "152"]);
+    let reorg_153_hash = bitcoind.cli(&["getblockhash", "153"]);
+
+    assert_eq!(
+        elo.event("block", SYNC_TIMEOUT),
+        format!(
+            "level=info event=block peer={} height=151 hash={reorg_151_hash} transactions=2",
+            bitcoind.peer
+        )
+    );
+    assert_eq!(
+        elo.event("block", SYNC_TIMEOUT),
+        format!(
+            "level=info event=block peer={} height=152 hash={} transactions=1",
+            bitcoind.peer,
+            reorg_152_hash.trim_end()
+        )
+    );
+    assert_eq!(
+        elo.event("block", SYNC_TIMEOUT),
+        format!(
+            "level=info event=block peer={} height=153 hash={} transactions=1",
+            bitcoind.peer,
+            reorg_153_hash.trim_end()
+        )
+    );
+    let ends = elo.events("end");
+    assert!(ends.is_empty(), "elo ended the connection: {ends:?}");
+}
+
 fn array_string<'a>(object: &'a str, field: &str, index: usize) -> &'a str {
     let key = format!("\"{field}\": [");
     let (_, mut rest) = object.split_once(&key).unwrap();

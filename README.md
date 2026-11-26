@@ -24,9 +24,14 @@ sync, elo stays connected and answers each `ping` with a `pong`. It also sends
 the peer for each block from height 1 with `getdata` (`MSG_WITNESS_BLOCK`), at
 most 16 in flight at once. On each `block` that it asked for, elo checks that its transactions match the
 merkle root and witness commitment of its header, and checks the transaction,
-size, coinbase, sigop, finality, BIP34 height and weight rules. It then logs
-the `block` and drops it. Unsolicited blocks are skipped, and a mutated or
-invalid block or no block within 10 min ends the connection. elo puts
+size, coinbase, sigop, finality, BIP34 height and weight rules. It buffers
+out-of-order blocks up to the 16-block window and connects each block in order
+to its in-memory UTXO set, checking BIP30, input availability, coinbase
+maturity, value conservation, BIP68 relative lock-times, P2SH and witness
+sigops, and coinbase reward, while keeping undo data so a reorg disconnects
+blocks back to the fork. It does not check input scripts yet. It then logs
+the `block`. Unsolicited blocks are skipped, and a mutated,
+invalid or unconnectable block or no block within 10 min ends the connection. elo puts
 those headers on its tip, as a batch of a sync, and logs the `tip` when it
 moves. After a reorg, the headers of an announcement are not on the tip of elo.
 Then elo asks for the headers again, with the hashes of its tip and of the 11
@@ -110,7 +115,7 @@ level=info event=stop signal=SIGTERM
 | --- | --- | --- |
 | `version` | `info` | `peer` `version` `services` `user_agent` `start_height` `relay` |
 | `tip` | `info` | `peer` `height` `hash` `work` |
-| `block` | `info` | `peer` `height` `hash` `transactions`: a requested block passed the mutation and block checks and was dropped |
+| `block` | `info` | `peer` `height` `hash` `transactions`: a requested block passed all non-script checks and connected to the UTXO set |
 | `metrics` | `info` | `address`: elo serves its metrics there |
 | `end` | `warn` | `destination` `reason` `wait_ms`: elo dials again after `wait_ms`. `destination` is what the dial looked up or dialed: the peer of the command line, also a name, or the seed, such as `seed.bitcoin.sipa.be.:8333`. `peer` is always the address of a connection |
 | `exit` | `error` | `reason`: a fault of this host, and elo exits with 1 |

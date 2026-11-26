@@ -58,6 +58,28 @@ const BIP34_HEIGHT_MAINNET: std::num::NonZeroUsize =
 const CSV_HEIGHT_MAINNET: std::num::NonZeroUsize =
     std::num::NonZeroUsize::new(419_328).expect("not 0");
 
+const SUBSIDY_HALVING_INTERVAL_MAINNET: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::new(210_000).expect("not 0");
+const SUBSIDY_HALVING_INTERVAL_REGTEST: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::new(150).expect("not 0");
+
+const BIP30_REPEAT_91842_HEIGHT: usize = 91_842;
+const BIP30_REPEAT_91880_HEIGHT: usize = 91_880;
+
+const _: () = assert!(BIP30_REPEAT_91842_HEIGHT < BIP34_HEIGHT_MAINNET.get());
+const _: () = assert!(BIP30_REPEAT_91880_HEIGHT < BIP34_HEIGHT_MAINNET.get());
+const _: () = assert!(BIP30_REPEAT_91842_HEIGHT < BIP30_REPEAT_91880_HEIGHT);
+
+const BIP30_REPEAT_91842_HASH: [u8; 32] = [
+    0xec, 0xca, 0xe0, 0x00, 0xe3, 0xc8, 0xe4, 0xe0, 0x93, 0x93, 0x63, 0x60, 0x43, 0x1f, 0x3b, 0x76,
+    0x03, 0xc5, 0x63, 0xc1, 0xff, 0x61, 0x81, 0x39, 0x0a, 0x4d, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+const BIP30_REPEAT_91880_HASH: [u8; 32] = [
+    0x21, 0xd7, 0x7c, 0xcb, 0x4c, 0x08, 0x38, 0x6a, 0x04, 0xac, 0x01, 0x96, 0xae, 0x10, 0xf6, 0xa1,
+    0xd2, 0xc2, 0xa3, 0x77, 0x55, 0x8c, 0xa1, 0x90, 0xf1, 0x43, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
 const SEEDS_MAINNET: [&str; 8] = [
     "seed.bitcoin.sipa.be.",
     "dnsseed.bluematt.me.",
@@ -176,6 +198,35 @@ impl Network {
             Network::Testnet4 | Network::Signet => 1,
             Network::Regtest => 0,
         }
+    }
+
+    pub(crate) const fn subsidy_halving_interval(self) -> std::num::NonZeroUsize {
+        match self {
+            Network::Mainnet | Network::Testnet4 | Network::Signet => {
+                SUBSIDY_HALVING_INTERVAL_MAINNET
+            }
+            Network::Regtest => SUBSIDY_HALVING_INTERVAL_REGTEST,
+        }
+    }
+
+    pub(crate) fn is_bip30_repeat(
+        self,
+        height: std::num::NonZeroUsize,
+        hash: bitcoin_hashes::sha256d::Hash,
+    ) -> bool {
+        let is_repeat = match self {
+            Network::Mainnet => match height.get() {
+                BIP30_REPEAT_91842_HEIGHT => *hash.as_byte_array() == BIP30_REPEAT_91842_HASH,
+                BIP30_REPEAT_91880_HEIGHT => *hash.as_byte_array() == BIP30_REPEAT_91880_HASH,
+                _ => false,
+            },
+            Network::Testnet4 | Network::Signet | Network::Regtest => false,
+        };
+        if is_repeat {
+            assert_eq!(self, Network::Mainnet);
+            assert!(height < self.bip34_height());
+        }
+        is_repeat
     }
 
     pub(crate) const fn genesis(self) -> crate::block::BlockHeader {
@@ -312,6 +363,48 @@ mod tests {
             assert_eq!(network.bip34_height().get(), bip34, "{network:?}");
             assert_eq!(network.csv_height().get(), csv, "{network:?}");
             assert_eq!(network.segwit_height(), segwit, "{network:?}");
+        }
+    }
+
+    #[test]
+    fn subsidy_halving_intervals_and_bip30_exceptions_match_core() {
+        for (network, interval) in [
+            (super::Network::Mainnet, 210_000),
+            (super::Network::Testnet4, 210_000),
+            (super::Network::Signet, 210_000),
+            (super::Network::Regtest, 150),
+        ] {
+            assert_eq!(
+                network.subsidy_halving_interval().get(),
+                interval,
+                "{network:?}"
+            );
+        }
+
+        let block_91842 = crate::fixtures::hash_from_display_hex(
+            "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec",
+        );
+        let block_91880 = crate::fixtures::hash_from_display_hex(
+            "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721",
+        );
+        for (height, hash) in [(91_842, block_91842), (91_880, block_91880)] {
+            let nz = std::num::NonZeroUsize::new(height).unwrap();
+            assert!(super::Network::Mainnet.is_bip30_repeat(nz, hash));
+            assert!(
+                !super::Network::Mainnet
+                    .is_bip30_repeat(std::num::NonZeroUsize::new(height - 1).unwrap(), hash)
+            );
+            let mut wrong = hash.to_byte_array();
+            wrong[0] ^= 1;
+            let wrong = bitcoin_hashes::sha256d::Hash::from_byte_array(wrong);
+            assert!(!super::Network::Mainnet.is_bip30_repeat(nz, wrong));
+            for network in [
+                super::Network::Testnet4,
+                super::Network::Signet,
+                super::Network::Regtest,
+            ] {
+                assert!(!network.is_bip30_repeat(nz, hash), "{network:?}");
+            }
         }
     }
 }
