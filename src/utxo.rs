@@ -1,14 +1,14 @@
-const COINBASE_MATURITY: usize = 100;
+const COINBASE_MATURITY_BLOCKS: usize = 100;
 
-const INITIAL_SUBSIDY: i64 = 50 * crate::transaction::COIN;
+const BLOCK_SUBSIDY_INITIAL: i64 = 50 * crate::transaction::COIN;
 
 const SUBSIDY_HALVINGS_MAX: u32 = 64;
 
-const _: () = assert!(INITIAL_SUBSIDY == 5_000_000_000);
-const _: () = assert!(INITIAL_SUBSIDY <= crate::transaction::MONEY_MAX);
+const _: () = assert!(BLOCK_SUBSIDY_INITIAL == 5_000_000_000);
+const _: () = assert!(BLOCK_SUBSIDY_INITIAL <= crate::transaction::MONEY_MAX);
 
 const _: () = assert!(
-    INITIAL_SUBSIDY
+    BLOCK_SUBSIDY_INITIAL
         * 2
         * (crate::chainparams::Network::Mainnet
             .subsidy_halving_interval()
@@ -16,7 +16,7 @@ const _: () = assert!(
         <= crate::transaction::MONEY_MAX
 );
 const _: () = assert!(
-    INITIAL_SUBSIDY
+    BLOCK_SUBSIDY_INITIAL
         * 2
         * (crate::chainparams::Network::Regtest
             .subsidy_halving_interval()
@@ -47,7 +47,7 @@ impl std::fmt::Display for ConnectError {
             ConnectError::PrematureCoinbaseSpend => {
                 write!(
                     f,
-                    "a transaction spends a coinbase output before {COINBASE_MATURITY} confirmations"
+                    "a transaction spends a coinbase output before {COINBASE_MATURITY_BLOCKS} confirmations"
                 )
             }
             ConnectError::InputsBelowOutputs => {
@@ -98,6 +98,19 @@ impl ConnectedBlock {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DisconnectTip {
+    pub(crate) block_hash: bitcoin_hashes::sha256d::Hash,
+    pub(crate) prev_hash: bitcoin_hashes::sha256d::Hash,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UtxoSet {
+    network: crate::chainparams::Network,
+    coins: std::collections::HashMap<crate::transaction::OutPoint, Coin>,
+    undo: Vec<BlockUndo>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Coin {
     output: crate::transaction::TxOut,
@@ -114,162 +127,6 @@ struct BlockUndo {
     created: Vec<crate::transaction::OutPoint>,
     spent: Vec<(crate::transaction::OutPoint, Coin)>,
     overwritten: Vec<(crate::transaction::OutPoint, Coin)>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct UtxoSet {
-    network: crate::chainparams::Network,
-    coins: std::collections::HashMap<crate::transaction::OutPoint, Coin>,
-    undo: Vec<BlockUndo>,
-}
-
-enum OutputKind {
-    Coinbase { allow_overwrite: bool },
-    Regular,
-}
-
-enum OverlayEntry {
-    Added(Coin),
-    Spent,
-    Overwritten(Coin),
-}
-
-struct Overlay<'a> {
-    base: &'a std::collections::HashMap<crate::transaction::OutPoint, Coin>,
-    changes: std::collections::HashMap<crate::transaction::OutPoint, OverlayEntry>,
-}
-
-impl<'a> Overlay<'a> {
-    fn new(base: &'a std::collections::HashMap<crate::transaction::OutPoint, Coin>) -> Overlay<'a> {
-        Overlay {
-            base,
-            changes: std::collections::HashMap::new(),
-        }
-    }
-
-    fn get(&self, outpoint: &crate::transaction::OutPoint) -> Option<&Coin> {
-        match self.changes.get(outpoint) {
-            Some(OverlayEntry::Added(coin) | OverlayEntry::Overwritten(coin)) => Some(coin),
-            Some(OverlayEntry::Spent) => None,
-            None => self.base.get(outpoint),
-        }
-    }
-
-    fn spend(&mut self, outpoint: crate::transaction::OutPoint) {
-        match self.changes.remove(&outpoint) {
-            Some(OverlayEntry::Added(_)) => {}
-            Some(OverlayEntry::Overwritten(_)) => {
-                panic!("attempted to spend a coinbase output from the same block")
-            }
-            Some(OverlayEntry::Spent) => panic!("attempted to spend an already spent coin"),
-            None => {
-                assert!(self.base.contains_key(&outpoint));
-                self.changes.insert(outpoint, OverlayEntry::Spent);
-            }
-        }
-    }
-
-    fn add_outputs(
-        &mut self,
-        txid: bitcoin_hashes::sha256d::Hash,
-        outputs: &[crate::transaction::TxOut],
-        height: std::num::NonZeroUsize,
-        kind: OutputKind,
-    ) {
-        assert!(!outputs.is_empty());
-        let (is_coinbase, allow_overwrite) = match kind {
-            OutputKind::Coinbase { allow_overwrite } => (true, allow_overwrite),
-            OutputKind::Regular => (false, false),
-        };
-        for (index, output) in outputs.iter().enumerate() {
-            assert!(output.value >= 0);
-            assert!(output.value <= crate::transaction::MONEY_MAX);
-            if output.is_unspendable() {
-                continue;
-            }
-            let outpoint = crate::transaction::OutPoint {
-                txid,
-                vout: u32::try_from(index).expect("outputs count fits in u32"),
-            };
-            assert!(!self.changes.contains_key(&outpoint));
-            let coin = Coin {
-                output: output.clone(),
-                height,
-                is_coinbase,
-            };
-            let entry = if self.base.contains_key(&outpoint) {
-                assert!(allow_overwrite);
-                OverlayEntry::Overwritten(coin)
-            } else {
-                OverlayEntry::Added(coin)
-            };
-            self.changes.insert(outpoint, entry);
-        }
-    }
-
-    fn into_changes(self) -> std::collections::HashMap<crate::transaction::OutPoint, OverlayEntry> {
-        self.changes
-    }
-}
-
-fn has_unspent_output(
-    coins: &std::collections::HashMap<crate::transaction::OutPoint, Coin>,
-    txid: bitcoin_hashes::sha256d::Hash,
-    outputs_count: usize,
-) -> bool {
-    (0..outputs_count).any(|index| {
-        let outpoint = crate::transaction::OutPoint {
-            txid,
-            vout: u32::try_from(index).expect("outputs count fits in u32"),
-        };
-        coins.contains_key(&outpoint)
-    })
-}
-
-fn block_subsidy(network: crate::chainparams::Network, height: std::num::NonZeroUsize) -> i64 {
-    let halvings = height.get() / network.subsidy_halving_interval().get();
-    let subsidy = match u32::try_from(halvings) {
-        Ok(halvings) if halvings < SUBSIDY_HALVINGS_MAX => INITIAL_SUBSIDY >> halvings,
-        _ => 0,
-    };
-    assert!(subsidy >= 0);
-    assert!(subsidy <= INITIAL_SUBSIDY);
-    subsidy
-}
-
-fn check_sequence_locks(
-    transaction: &crate::transaction::CheckedTransaction,
-    spent_coins: &[&Coin],
-    block_height: std::num::NonZeroUsize,
-    prev_median_time_past: u32,
-    ancestor_median_time_past: &impl Fn(usize) -> u32,
-) -> Result<(), ConnectError> {
-    let inputs = transaction.inputs();
-    assert_eq!(inputs.len(), spent_coins.len());
-    if transaction.version() < 2 {
-        return Ok(());
-    }
-    let block_height = block_height.get();
-    let block_time = u64::from(prev_median_time_past);
-    for (input, coin) in inputs.iter().zip(spent_coins) {
-        let coin_height = coin.height.get();
-        assert!(coin_height <= block_height);
-        match input.relative_lock_time() {
-            crate::transaction::RelativeLockTime::Disabled => {}
-            crate::transaction::RelativeLockTime::Blocks(blocks) => {
-                if usize::from(blocks) > block_height - coin_height {
-                    return Err(ConnectError::NonFinalSequence);
-                }
-            }
-            crate::transaction::RelativeLockTime::Seconds(relative_seconds) => {
-                let coin_time = u64::from(ancestor_median_time_past(coin_height - 1));
-                if coin_time + relative_seconds > block_time {
-                    return Err(ConnectError::NonFinalSequence);
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 impl UtxoSet {
@@ -309,19 +166,18 @@ impl UtxoSet {
 
         let coinbase = block.coinbase();
         let rest = block.rest();
+        assert_eq!(coinbase.inputs().len(), 1);
+        assert!(coinbase.inputs()[0].previous_output.is_null());
         let coinbase_txid = coinbase.txid();
-        let rest_txids: Vec<_> = rest
-            .iter()
-            .map(crate::transaction::CheckedTransaction::txid)
-            .collect();
 
         let bip30_repeat = self.network.is_bip30_repeat(height, position.hash());
-        if !bip30_repeat && has_unspent_output(&self.coins, coinbase_txid, coinbase.outputs().len())
-        {
+        if bip30_repeat {
+            assert_eq!(self.network, crate::chainparams::Network::Mainnet);
+        } else if has_unspent_output(&self.coins, coinbase_txid, coinbase.outputs().len()) {
             return Err(ConnectError::DuplicateTxId);
         }
-        for (txid, transaction) in rest_txids.iter().copied().zip(rest) {
-            if has_unspent_output(&self.coins, txid, transaction.outputs().len()) {
+        for transaction in rest {
+            if has_unspent_output(&self.coins, transaction.txid(), transaction.outputs().len()) {
                 return Err(ConnectError::DuplicateTxId);
             }
         }
@@ -343,10 +199,11 @@ impl UtxoSet {
         );
 
         let mut fees: i64 = 0;
-        for (transaction, txid) in rest.iter().zip(rest_txids) {
+        for transaction in rest {
             let inputs = transaction.inputs();
             let mut spent_coins = Vec::with_capacity(inputs.len());
             for input in inputs {
+                assert!(!input.previous_output.is_null());
                 let coin = overlay
                     .get(&input.previous_output)
                     .ok_or(ConnectError::MissingInputs)?;
@@ -356,9 +213,13 @@ impl UtxoSet {
             let mut value_in: i64 = 0;
             for coin in &spent_coins {
                 assert!(coin.height <= height);
-                if coin.is_coinbase && height.get() - coin.height.get() < COINBASE_MATURITY {
-                    return Err(ConnectError::PrematureCoinbaseSpend);
+                if coin.is_coinbase {
+                    let age_blocks = height.get() - coin.height.get();
+                    if age_blocks < COINBASE_MATURITY_BLOCKS {
+                        return Err(ConnectError::PrematureCoinbaseSpend);
+                    }
                 }
+                assert!(!coin.output.is_unspendable());
                 assert!(coin.output.value >= 0);
                 assert!(coin.output.value <= crate::transaction::MONEY_MAX);
                 value_in += coin.output.value;
@@ -403,9 +264,16 @@ impl UtxoSet {
             for input in inputs {
                 overlay.spend(input.previous_output);
             }
-            overlay.add_outputs(txid, transaction.outputs(), height, OutputKind::Regular);
+            overlay.add_outputs(
+                transaction.txid(),
+                transaction.outputs(),
+                height,
+                OutputKind::Regular,
+            );
         }
 
+        assert!(sigops_cost <= crate::block::SIGOPS_COST_MAX);
+        assert!(fees >= 0);
         let block_reward = block_subsidy(self.network, height) + fees;
         assert!(block_reward >= 0);
         assert!(block_reward <= crate::transaction::MONEY_MAX);
@@ -414,10 +282,13 @@ impl UtxoSet {
         }
 
         let block_hash = position.hash();
+        let coins_len_before = self.coins.len();
+        let changes = overlay.into_changes();
+        let changes_len = changes.len();
         let mut created = Vec::new();
         let mut spent = Vec::new();
         let mut overwritten = Vec::new();
-        for (outpoint, entry) in overlay.into_changes() {
+        for (outpoint, entry) in changes {
             match entry {
                 OverlayEntry::Added(coin) => {
                     let previous = self.coins.insert(outpoint, coin);
@@ -440,6 +311,14 @@ impl UtxoSet {
                 }
             }
         }
+        assert_eq!(created.len() + spent.len() + overwritten.len(), changes_len);
+        if !bip30_repeat {
+            assert!(overwritten.is_empty());
+        }
+        assert_eq!(
+            self.coins.len() + spent.len(),
+            coins_len_before + created.len()
+        );
         self.undo.push(BlockUndo {
             block_hash,
             prev_hash,
@@ -456,30 +335,208 @@ impl UtxoSet {
         })
     }
 
-    pub(crate) fn disconnect_tip(
-        &mut self,
-        expected_block_hash: bitcoin_hashes::sha256d::Hash,
-        expected_prev_hash: bitcoin_hashes::sha256d::Hash,
-    ) {
+    pub(crate) fn disconnect_tip(&mut self, expected: DisconnectTip) {
+        let height_before = self.height();
+        let coins_len_before = self.coins.len();
         let undo = self.undo.pop().expect("connected block has undo");
-        assert_eq!(undo.block_hash, expected_block_hash);
-        assert_eq!(undo.prev_hash, expected_prev_hash);
+        assert_eq!(undo.block_hash, expected.block_hash);
+        assert_eq!(undo.prev_hash, expected.prev_hash);
 
+        let created_count = undo.created.len();
+        let spent_count = undo.spent.len();
+        let restored_height_max = self.height();
         for outpoint in undo.created {
             let removed = self.coins.remove(&outpoint);
             assert!(removed.is_some());
         }
         for (outpoint, coin) in undo.spent {
+            assert!(coin.height.get() <= restored_height_max);
+            assert!(!coin.output.is_unspendable());
+            assert!(coin.output.value >= 0);
+            assert!(coin.output.value <= crate::transaction::MONEY_MAX);
             let previous = self.coins.insert(outpoint, coin);
             assert!(previous.is_none());
         }
         for (outpoint, coin) in undo.overwritten {
+            assert!(coin.height.get() <= restored_height_max);
+            assert!(!coin.output.is_unspendable());
+            assert!(coin.output.value >= 0);
+            assert!(coin.output.value <= crate::transaction::MONEY_MAX);
             let previous = self.coins.insert(outpoint, coin);
             assert!(previous.is_some());
         }
 
-        assert_eq!(self.best_block(), expected_prev_hash);
+        assert_eq!(self.height(), height_before - 1);
+        assert_eq!(
+            self.coins.len() + created_count,
+            coins_len_before + spent_count
+        );
+        assert_eq!(self.best_block(), expected.prev_hash);
     }
+}
+
+enum OutputKind {
+    Coinbase { allow_overwrite: bool },
+    Regular,
+}
+
+enum OverlayEntry {
+    Added(Coin),
+    Spent,
+    Overwritten(Coin),
+}
+
+struct Overlay<'a> {
+    base: &'a std::collections::HashMap<crate::transaction::OutPoint, Coin>,
+    changes: std::collections::BTreeMap<crate::transaction::OutPoint, OverlayEntry>,
+}
+
+impl<'a> Overlay<'a> {
+    fn new(base: &'a std::collections::HashMap<crate::transaction::OutPoint, Coin>) -> Overlay<'a> {
+        Overlay {
+            base,
+            changes: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn get(&self, outpoint: &crate::transaction::OutPoint) -> Option<&Coin> {
+        let coin = match self.changes.get(outpoint) {
+            Some(OverlayEntry::Added(coin) | OverlayEntry::Overwritten(coin)) => Some(coin),
+            Some(OverlayEntry::Spent) => None,
+            None => self.base.get(outpoint),
+        };
+        if let Some(coin) = coin {
+            assert!(!coin.output.is_unspendable());
+            assert!(coin.output.value >= 0);
+            assert!(coin.output.value <= crate::transaction::MONEY_MAX);
+        }
+        coin
+    }
+
+    fn spend(&mut self, outpoint: crate::transaction::OutPoint) {
+        match self.changes.remove(&outpoint) {
+            Some(OverlayEntry::Added(_)) => {}
+            Some(OverlayEntry::Overwritten(_)) => {
+                panic!("attempted to spend a coinbase output from the same block")
+            }
+            Some(OverlayEntry::Spent) => panic!("attempted to spend an already spent coin"),
+            None => {
+                assert!(self.base.contains_key(&outpoint));
+                self.changes.insert(outpoint, OverlayEntry::Spent);
+            }
+        }
+    }
+
+    fn add_outputs(
+        &mut self,
+        txid: bitcoin_hashes::sha256d::Hash,
+        outputs: &[crate::transaction::TxOut],
+        height: std::num::NonZeroUsize,
+        kind: OutputKind,
+    ) {
+        assert!(!outputs.is_empty());
+        assert!(outputs.len() <= crate::transaction::TX_OUTPUTS_COUNT_MAX);
+        let (is_coinbase, allow_overwrite) = match kind {
+            OutputKind::Coinbase { allow_overwrite } => (true, allow_overwrite),
+            OutputKind::Regular => (false, false),
+        };
+        for (index, output) in outputs.iter().enumerate() {
+            assert!(output.value >= 0);
+            assert!(output.value <= crate::transaction::MONEY_MAX);
+            if output.is_unspendable() {
+                continue;
+            }
+            let outpoint = crate::transaction::OutPoint {
+                txid,
+                vout: u32::try_from(index).expect("outputs count fits in u32"),
+            };
+            assert!(!self.changes.contains_key(&outpoint));
+            let coin = Coin {
+                output: output.clone(),
+                height,
+                is_coinbase,
+            };
+            let entry = if self.base.contains_key(&outpoint) {
+                assert!(allow_overwrite);
+                OverlayEntry::Overwritten(coin)
+            } else {
+                OverlayEntry::Added(coin)
+            };
+            self.changes.insert(outpoint, entry);
+        }
+    }
+
+    fn into_changes(
+        self,
+    ) -> std::collections::BTreeMap<crate::transaction::OutPoint, OverlayEntry> {
+        self.changes
+    }
+}
+
+fn has_unspent_output(
+    coins: &std::collections::HashMap<crate::transaction::OutPoint, Coin>,
+    txid: bitcoin_hashes::sha256d::Hash,
+    outputs_count: usize,
+) -> bool {
+    assert!(outputs_count >= 1);
+    assert!(outputs_count <= crate::transaction::TX_OUTPUTS_COUNT_MAX);
+    (0..outputs_count).any(|index| {
+        let outpoint = crate::transaction::OutPoint {
+            txid,
+            vout: u32::try_from(index).expect("outputs count fits in u32"),
+        };
+        coins.contains_key(&outpoint)
+    })
+}
+
+fn block_subsidy(network: crate::chainparams::Network, height: std::num::NonZeroUsize) -> i64 {
+    let interval = network.subsidy_halving_interval().get();
+    let halvings = height.get() / interval;
+    assert!(height.get() - halvings * interval < interval);
+    let subsidy = match u32::try_from(halvings) {
+        Ok(halvings) if halvings < SUBSIDY_HALVINGS_MAX => BLOCK_SUBSIDY_INITIAL >> halvings,
+        _ => 0,
+    };
+    assert!(subsidy >= 0);
+    assert!(subsidy <= BLOCK_SUBSIDY_INITIAL);
+    subsidy
+}
+
+fn check_sequence_locks(
+    transaction: &crate::transaction::CheckedTransaction,
+    spent_coins: &[&Coin],
+    block_height: std::num::NonZeroUsize,
+    prev_median_time_past: u32,
+    ancestor_median_time_past: &impl Fn(usize) -> u32,
+) -> Result<(), ConnectError> {
+    let inputs = transaction.inputs();
+    assert_eq!(inputs.len(), spent_coins.len());
+    if transaction.version() < 2 {
+        return Ok(());
+    }
+    let block_height_value = block_height.get();
+    let prev_median_time_past_seconds = u64::from(prev_median_time_past);
+    for (input, coin) in inputs.iter().zip(spent_coins) {
+        let coin_height = coin.height.get();
+        assert!(coin_height <= block_height_value);
+        match input.relative_lock_time() {
+            crate::transaction::RelativeLockTime::Disabled => {}
+            crate::transaction::RelativeLockTime::Blocks(blocks) => {
+                if block_height_value - coin_height < usize::from(blocks) {
+                    return Err(ConnectError::NonFinalSequence);
+                }
+            }
+            crate::transaction::RelativeLockTime::Seconds(relative_seconds) => {
+                let coin_median_time_past_seconds =
+                    u64::from(ancestor_median_time_past(coin_height - 1));
+                if prev_median_time_past_seconds < coin_median_time_past_seconds + relative_seconds
+                {
+                    return Err(ConnectError::NonFinalSequence);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(fuzzing)]
@@ -489,7 +546,7 @@ pub(crate) mod fuzz {
 
     const STEPS_MAX: usize = 64;
 
-    const TXS_PER_BLOCK_MAX: usize = 4;
+    const TRANSACTIONS_PER_BLOCK_MAX: usize = 4;
 
     pub fn utxo(data: &[u8]) {
         let mut cursor = data;
@@ -502,7 +559,7 @@ pub(crate) mod fuzz {
         let genesis = network.genesis();
         let mut utxo = super::UtxoSet::new(network);
         let mut headers = vec![genesis];
-        let mut mtps = vec![genesis.time];
+        let mut median_times_past = vec![genesis.time];
         let mut snapshots: Vec<super::UtxoSet> = Vec::new();
         let mut tag: u32 = 0;
 
@@ -514,9 +571,12 @@ pub(crate) mod fuzz {
             if action.is_multiple_of(5) {
                 if let Some(expected) = snapshots.pop() {
                     let tip = headers.pop().expect("connected tip exists");
-                    mtps.pop().expect("connected mtp exists");
+                    median_times_past.pop().expect("connected mtp exists");
                     let prev = headers.last().expect("parent header exists");
-                    utxo.disconnect_tip(tip.hash(), prev.hash());
+                    utxo.disconnect_tip(super::DisconnectTip {
+                        block_hash: tip.hash(),
+                        prev_hash: prev.hash(),
+                    });
                     assert_eq!(utxo, expected);
                     assert_eq!(utxo.height(), headers.len() - 1);
                     assert_eq!(utxo.best_block(), prev.hash());
@@ -527,7 +587,7 @@ pub(crate) mod fuzz {
             let height_usize = utxo.height() + 1;
             let height = std::num::NonZeroUsize::new(height_usize).expect("height is nonzero");
             let prev = *headers.last().expect("genesis exists");
-            let prev_mtp = *mtps.last().expect("genesis mtp exists");
+            let prev_mtp = *median_times_past.last().expect("genesis mtp exists");
             let time_step = u32::from(next_byte(&mut cursor)) * 64 + 1;
             let Some(block_time) = prev_mtp.checked_add(time_step) else {
                 break;
@@ -538,14 +598,9 @@ pub(crate) mod fuzz {
                 .iter()
                 .map(|(outpoint, coin)| (*outpoint, coin.clone()))
                 .collect();
-            existing.sort_unstable_by(|(a, _), (b, _)| {
-                a.txid
-                    .as_byte_array()
-                    .cmp(b.txid.as_byte_array())
-                    .then_with(|| a.vout.cmp(&b.vout))
-            });
+            existing.sort_unstable_by_key(|(a, _)| *a);
 
-            let tx_count = usize::from(next_byte(&mut cursor)) % (TXS_PER_BLOCK_MAX + 1);
+            let tx_count = usize::from(next_byte(&mut cursor)) % (TRANSACTIONS_PER_BLOCK_MAX + 1);
             let mut rest = Vec::with_capacity(tx_count);
             let mut spent_in_block: std::collections::HashSet<crate::transaction::OutPoint> =
                 std::collections::HashSet::new();
@@ -598,10 +653,10 @@ pub(crate) mod fuzz {
                 let sequence_mode = next_byte(&mut cursor);
                 let sequence = match sequence_mode % 6 {
                     0 => u32::MAX,
-                    1 => crate::transaction::SEQUENCE_LOCKTIME_DISABLE_FLAG | 0xffff,
+                    1 => crate::transaction::SEQUENCE_LOCK_TIME_DISABLE_FLAG | 0xffff,
                     2 => u32::from(next_byte(&mut cursor) % 4),
                     3 => {
-                        crate::transaction::SEQUENCE_LOCKTIME_TYPE_FLAG
+                        crate::transaction::SEQUENCE_LOCK_TIME_TYPE_FLAG
                             | u32::from(next_byte(&mut cursor) % 4)
                     }
                     4 => 0x0001_0000 | u32::from(next_byte(&mut cursor) % 4),
@@ -779,7 +834,7 @@ pub(crate) mod fuzz {
             let checked_block = crate::block::CheckedBlock::from_checked(position, checked)
                 .expect("matching position");
             let before = utxo.clone();
-            match utxo.connect_block(checked_block, |h| mtps[h]) {
+            match utxo.connect_block(checked_block, |h| median_times_past[h]) {
                 Err(_) => {
                     assert_eq!(utxo, before);
                 }
@@ -789,14 +844,17 @@ pub(crate) mod fuzz {
                     assert_eq!(utxo.height(), height_usize);
                     assert_eq!(utxo.best_block(), header.hash());
                     let mut roundtrip = utxo.clone();
-                    roundtrip.disconnect_tip(header.hash(), prev.hash());
+                    roundtrip.disconnect_tip(super::DisconnectTip {
+                        block_hash: header.hash(),
+                        prev_hash: prev.hash(),
+                    });
                     assert_eq!(roundtrip, before);
                     let total: i64 = utxo.coins.values().map(|coin| coin.output.value).sum();
                     assert!(total >= 0);
                     assert!(total < crate::transaction::MONEY_MAX);
                     snapshots.push(before);
                     headers.push(header);
-                    mtps.push(median_time_past(&headers));
+                    median_times_past.push(median_time_past(&headers));
                 }
             }
         }
@@ -1353,7 +1411,10 @@ mod tests {
             txid: coinbase_txid,
             vout: 2,
         }));
-        utxo.disconnect_tip(block_hash, genesis.hash());
+        utxo.disconnect_tip(super::DisconnectTip {
+            block_hash,
+            prev_hash: genesis.hash(),
+        });
         assert_eq!(utxo, before);
     }
 
@@ -1549,7 +1610,10 @@ mod tests {
             txid: child.txid(),
             vout: 0,
         }));
-        utxo.disconnect_tip(valid_hash, genesis.hash());
+        utxo.disconnect_tip(super::DisconnectTip {
+            block_hash: valid_hash,
+            prev_hash: genesis.hash(),
+        });
         assert_eq!(utxo, snap);
     }
 
@@ -2103,7 +2167,10 @@ mod tests {
             .connect_block(checked_91842, |_| mtp_91841)
             .unwrap();
         assert_eq!(utxo_91842.coins[&cb_91842_outpoint].height, nonzero(91_842));
-        utxo_91842.disconnect_tip(block_91842.header.hash(), block_91842.header.prev);
+        utxo_91842.disconnect_tip(super::DisconnectTip {
+            block_hash: block_91842.header.hash(),
+            prev_hash: block_91842.header.prev,
+        });
         assert_eq!(utxo_91842, before_91842);
 
         let wrong_height_pos = crate::chain::BlockPosition::new(
@@ -2189,7 +2256,10 @@ mod tests {
             .unwrap();
         assert_eq!(utxo_91880.coins[&cb_91880_outpoint].height, nonzero(91_880));
         assert!(!utxo_91880.coins.contains_key(&spend_input));
-        utxo_91880.disconnect_tip(block_91880.header.hash(), block_91880.header.prev);
+        utxo_91880.disconnect_tip(super::DisconnectTip {
+            block_hash: block_91880.header.hash(),
+            prev_hash: block_91880.header.prev,
+        });
         assert_eq!(utxo_91880, before_91880);
 
         let mut utxo_91880_dup_rest = utxo_at(
@@ -2319,7 +2389,7 @@ mod tests {
                 2,
                 3,
                 2,
-                crate::transaction::SEQUENCE_LOCKTIME_DISABLE_FLAG | 100,
+                crate::transaction::SEQUENCE_LOCK_TIME_DISABLE_FLAG | 100,
                 &fixed_mtp
             ),
             Ok(())
@@ -2330,8 +2400,8 @@ mod tests {
                 2,
                 3,
                 2,
-                crate::transaction::SEQUENCE_LOCKTIME_DISABLE_FLAG
-                    | crate::transaction::SEQUENCE_LOCKTIME_TYPE_FLAG
+                crate::transaction::SEQUENCE_LOCK_TIME_DISABLE_FLAG
+                    | crate::transaction::SEQUENCE_LOCK_TIME_TYPE_FLAG
                     | 100,
                 &fixed_mtp
             ),
@@ -2411,7 +2481,7 @@ mod tests {
                     vout: 0,
                 },
                 script_sig: Vec::new(),
-                sequence: crate::transaction::SEQUENCE_LOCKTIME_TYPE_FLAG | 1,
+                sequence: crate::transaction::SEQUENCE_LOCK_TIME_TYPE_FLAG | 1,
                 witness: crate::transaction::Witness::default(),
             }],
             vec![crate::transaction::TxOut {
@@ -2429,7 +2499,7 @@ mod tests {
                     vout: 0,
                 },
                 script_sig: Vec::new(),
-                sequence: crate::transaction::SEQUENCE_LOCKTIME_TYPE_FLAG,
+                sequence: crate::transaction::SEQUENCE_LOCK_TIME_TYPE_FLAG,
                 witness: crate::transaction::Witness::default(),
             }],
             vec![crate::transaction::TxOut {
@@ -2483,7 +2553,7 @@ mod tests {
                 3,
                 5,
                 2,
-                crate::transaction::SEQUENCE_LOCKTIME_TYPE_FLAG | 1,
+                crate::transaction::SEQUENCE_LOCK_TIME_TYPE_FLAG | 1,
                 &step_mtp
             ),
             Ok(())
@@ -2494,7 +2564,7 @@ mod tests {
                 3,
                 6,
                 2,
-                crate::transaction::SEQUENCE_LOCKTIME_TYPE_FLAG | 1,
+                crate::transaction::SEQUENCE_LOCK_TIME_TYPE_FLAG | 1,
                 &step_mtp
             ),
             Err(super::ConnectError::NonFinalSequence)
@@ -2506,7 +2576,7 @@ mod tests {
                 1,
                 2,
                 2,
-                crate::transaction::SEQUENCE_LOCKTIME_TYPE_FLAG | 1,
+                crate::transaction::SEQUENCE_LOCK_TIME_TYPE_FLAG | 1,
                 &genesis_time_mtp
             ),
             Ok(())
@@ -2518,7 +2588,7 @@ mod tests {
                 1,
                 2,
                 2,
-                crate::transaction::SEQUENCE_LOCKTIME_TYPE_FLAG | 1,
+                crate::transaction::SEQUENCE_LOCK_TIME_TYPE_FLAG | 1,
                 &genesis_time_short
             ),
             Err(super::ConnectError::NonFinalSequence)
@@ -2678,11 +2748,132 @@ mod tests {
 
         assert_eq!(utxo.height(), 2);
         assert_eq!(utxo.best_block(), h2);
-        utxo.disconnect_tip(h2, h1);
+        utxo.disconnect_tip(super::DisconnectTip {
+            block_hash: h2,
+            prev_hash: h1,
+        });
         assert_eq!(utxo, snap_1);
-        utxo.disconnect_tip(h1, genesis.hash());
+        utxo.disconnect_tip(super::DisconnectTip {
+            block_hash: h1,
+            prev_hash: genesis.hash(),
+        });
         assert_eq!(utxo, snap_0);
         assert_eq!(utxo.height(), 0);
         assert_eq!(utxo.best_block(), genesis.hash());
+    }
+
+    #[test]
+    fn connect_block_produces_deterministic_undo_across_independent_sets() {
+        let regtest = crate::chainparams::Network::Regtest;
+        let genesis = regtest.genesis();
+        let prev_mtp = genesis.time;
+
+        let out_a = crate::transaction::OutPoint {
+            txid: bitcoin_hashes::sha256d::Hash::from_byte_array([0x11; 32]),
+            vout: 0,
+        };
+        let out_b = crate::transaction::OutPoint {
+            txid: bitcoin_hashes::sha256d::Hash::from_byte_array([0x22; 32]),
+            vout: 1,
+        };
+        let out_c = crate::transaction::OutPoint {
+            txid: bitcoin_hashes::sha256d::Hash::from_byte_array([0x33; 32]),
+            vout: 0,
+        };
+        let seed_coins = vec![
+            (
+                out_a,
+                super::Coin {
+                    output: crate::transaction::TxOut {
+                        value: 100,
+                        script_pubkey: vec![0x51],
+                    },
+                    height: nonzero(1),
+                    is_coinbase: false,
+                },
+            ),
+            (
+                out_b,
+                super::Coin {
+                    output: crate::transaction::TxOut {
+                        value: 200,
+                        script_pubkey: vec![0x51],
+                    },
+                    height: nonzero(1),
+                    is_coinbase: false,
+                },
+            ),
+            (
+                out_c,
+                super::Coin {
+                    output: crate::transaction::TxOut {
+                        value: 300,
+                        script_pubkey: vec![0x51],
+                    },
+                    height: nonzero(1),
+                    is_coinbase: false,
+                },
+            ),
+        ];
+        let spend = |input: crate::transaction::OutPoint, value_a: i64, value_b: i64| {
+            crate::transaction::Transaction::new(
+                1,
+                vec![crate::transaction::TxIn {
+                    previous_output: input,
+                    script_sig: Vec::new(),
+                    sequence: u32::MAX,
+                    witness: crate::transaction::Witness::default(),
+                }],
+                vec![
+                    crate::transaction::TxOut {
+                        value: value_a,
+                        script_pubkey: vec![0x51],
+                    },
+                    crate::transaction::TxOut {
+                        value: value_b,
+                        script_pubkey: vec![0x51],
+                    },
+                ],
+                0,
+            )
+            .unwrap()
+        };
+        let block = build_checked_block(
+            regtest,
+            2,
+            genesis.hash(),
+            prev_mtp,
+            coinbase_tx(
+                regtest,
+                2,
+                1,
+                vec![
+                    crate::transaction::TxOut {
+                        value: 10,
+                        script_pubkey: vec![0x51],
+                    },
+                    crate::transaction::TxOut {
+                        value: 20,
+                        script_pubkey: vec![0x51],
+                    },
+                ],
+            ),
+            vec![
+                spend(out_a, 40, 60),
+                spend(out_b, 80, 120),
+                spend(out_c, 150, 150),
+            ],
+        );
+
+        let mut first = utxo_at(regtest, 1, genesis.hash(), seed_coins.clone());
+        first.connect_block(block.clone(), |_| prev_mtp).unwrap();
+        let undo = first.undo.last().unwrap();
+        assert!(undo.created.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(undo.spent.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        for _ in 0..8 {
+            let mut other = utxo_at(regtest, 1, genesis.hash(), seed_coins.clone());
+            other.connect_block(block.clone(), |_| prev_mtp).unwrap();
+            assert_eq!(other, first);
+        }
     }
 }

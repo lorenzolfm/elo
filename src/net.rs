@@ -616,7 +616,9 @@ impl<'a> Connection<'a> {
                             socket,
                             peer: *synced,
                             tip,
-                            connected_blocks: std::collections::VecDeque::new(),
+                            connected_blocks: std::collections::VecDeque::with_capacity(
+                                crate::net_processing::BLOCKS_WINDOW_MAX - 1,
+                            ),
                         },
                         tip,
                     ));
@@ -640,6 +642,7 @@ impl<'a> Synced<'a> {
             mut connected_blocks,
         } = self;
         if let Some(block) = connected_blocks.pop_front() {
+            assert!(connected_blocks.len() < crate::net_processing::BLOCKS_WINDOW_MAX - 1);
             assert!(block.height().get() <= previous.height());
             return Ok((
                 Synced {
@@ -671,7 +674,10 @@ impl<'a> Synced<'a> {
                 (peer, Some(SyncedTurnEvent::Blocks(blocks))) => {
                     let (first, rest) = blocks.into_parts();
                     assert!(first.height().get() <= previous.height());
-                    assert!(rest.len() < crate::net_processing::BLOCKS_IN_FLIGHT_MAX);
+                    assert!(rest.len() < crate::net_processing::BLOCKS_WINDOW_MAX);
+                    if let Some(last) = rest.last() {
+                        assert!(last.height().get() <= previous.height());
+                    }
                     connected_blocks.extend(rest);
                     return Ok((
                         Synced {
@@ -700,6 +706,7 @@ async fn run_synced_turn<'a>(
 > {
     let now = tokio::time::Instant::now().into_std();
     let (peer, tick_outbound, wake) = peer.tick(now, nonce()).map_err(RunError::NetProcessing)?;
+    assert!(wake > now);
     for outbound in tick_outbound.into_outbounds() {
         run_send(socket, &outbound).await?;
     }

@@ -682,13 +682,19 @@ impl Chain {
 
     pub(crate) fn disconnect_to(&mut self, target_height: usize) {
         assert!(target_height <= self.below_tip.len());
-        while self.utxo.height() > target_height {
+        let height_before = self.utxo.height();
+        let disconnect_count = height_before.saturating_sub(target_height);
+        for _ in 0..disconnect_count {
             let height = self.utxo.height();
             let block_hash = self.header_at(height).hash();
             let prev_hash = self.header_at(height - 1).hash();
-            self.utxo.disconnect_tip(block_hash, prev_hash);
+            self.utxo.disconnect_tip(crate::utxo::DisconnectTip {
+                block_hash,
+                prev_hash,
+            });
+            assert_eq!(self.utxo.height(), height - 1);
         }
-        assert!(self.utxo.height() <= target_height);
+        assert_eq!(self.utxo.height(), height_before.min(target_height));
         assert_eq!(
             self.utxo.best_block(),
             self.header_at(self.utxo.height()).hash()

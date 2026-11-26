@@ -63,12 +63,19 @@ const SUBSIDY_HALVING_INTERVAL_MAINNET: std::num::NonZeroUsize =
 const SUBSIDY_HALVING_INTERVAL_REGTEST: std::num::NonZeroUsize =
     std::num::NonZeroUsize::new(150).expect("not 0");
 
-const BIP30_REPEAT_91842: [u8; 32] = [
+const BIP30_REPEAT_91842_HEIGHT: usize = 91_842;
+const BIP30_REPEAT_91880_HEIGHT: usize = 91_880;
+
+const _: () = assert!(BIP30_REPEAT_91842_HEIGHT < BIP34_HEIGHT_MAINNET.get());
+const _: () = assert!(BIP30_REPEAT_91880_HEIGHT < BIP34_HEIGHT_MAINNET.get());
+const _: () = assert!(BIP30_REPEAT_91842_HEIGHT < BIP30_REPEAT_91880_HEIGHT);
+
+const BIP30_REPEAT_91842_HASH: [u8; 32] = [
     0xec, 0xca, 0xe0, 0x00, 0xe3, 0xc8, 0xe4, 0xe0, 0x93, 0x93, 0x63, 0x60, 0x43, 0x1f, 0x3b, 0x76,
     0x03, 0xc5, 0x63, 0xc1, 0xff, 0x61, 0x81, 0x39, 0x0a, 0x4d, 0x0a, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
-const BIP30_REPEAT_91880: [u8; 32] = [
+const BIP30_REPEAT_91880_HASH: [u8; 32] = [
     0x21, 0xd7, 0x7c, 0xcb, 0x4c, 0x08, 0x38, 0x6a, 0x04, 0xac, 0x01, 0x96, 0xae, 0x10, 0xf6, 0xa1,
     0xd2, 0xc2, 0xa3, 0x77, 0x55, 0x8c, 0xa1, 0x90, 0xf1, 0x43, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
@@ -207,14 +214,19 @@ impl Network {
         height: std::num::NonZeroUsize,
         hash: bitcoin_hashes::sha256d::Hash,
     ) -> bool {
-        match self {
-            Network::Mainnet => {
-                let bytes = hash.as_byte_array();
-                (height.get() == 91_842 && *bytes == BIP30_REPEAT_91842)
-                    || (height.get() == 91_880 && *bytes == BIP30_REPEAT_91880)
-            }
+        let is_repeat = match self {
+            Network::Mainnet => match height.get() {
+                BIP30_REPEAT_91842_HEIGHT => *hash.as_byte_array() == BIP30_REPEAT_91842_HASH,
+                BIP30_REPEAT_91880_HEIGHT => *hash.as_byte_array() == BIP30_REPEAT_91880_HASH,
+                _ => false,
+            },
             Network::Testnet4 | Network::Signet | Network::Regtest => false,
+        };
+        if is_repeat {
+            assert_eq!(self, Network::Mainnet);
+            assert!(height < self.bip34_height());
         }
+        is_repeat
     }
 
     pub(crate) const fn genesis(self) -> crate::block::BlockHeader {

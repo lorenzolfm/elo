@@ -29,15 +29,23 @@ const LOCK_TIME_THRESHOLD: u32 = 500_000_000;
 
 const SEQUENCE_FINAL: u32 = u32::MAX;
 
-pub(crate) const SEQUENCE_LOCKTIME_DISABLE_FLAG: u32 = 1 << 31;
+pub(crate) const SEQUENCE_LOCK_TIME_DISABLE_FLAG: u32 = 1 << 31;
 
-pub(crate) const SEQUENCE_LOCKTIME_TYPE_FLAG: u32 = 1 << 22;
+pub(crate) const SEQUENCE_LOCK_TIME_TYPE_FLAG: u32 = 1 << 22;
 
-const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000_ffff;
+const SEQUENCE_LOCK_TIME_MASK: u32 = 0x0000_ffff;
 
-const SEQUENCE_LOCKTIME_GRANULARITY: u32 = 9;
+const SEQUENCE_LOCK_TIME_GRANULARITY_BITS: u32 = 9;
+
+const _: () = assert!(SEQUENCE_LOCK_TIME_MASK == u16::MAX as u32);
+const _: () = assert!((SEQUENCE_LOCK_TIME_DISABLE_FLAG & SEQUENCE_LOCK_TIME_TYPE_FLAG) == 0);
+const _: () = assert!((SEQUENCE_LOCK_TIME_DISABLE_FLAG & SEQUENCE_LOCK_TIME_MASK) == 0);
+const _: () = assert!((SEQUENCE_LOCK_TIME_TYPE_FLAG & SEQUENCE_LOCK_TIME_MASK) == 0);
+const _: () = assert!(SEQUENCE_LOCK_TIME_GRANULARITY_BITS < u32::BITS);
 
 const MULTISIG_PUBKEYS_COUNT_MAX: usize = 20;
+
+const OP_0: u8 = 0x00;
 
 pub(crate) const OP_PUSHDATA1: u8 = 0x4c;
 
@@ -45,7 +53,7 @@ const OP_PUSHDATA2: u8 = 0x4d;
 
 const OP_PUSHDATA4: u8 = 0x4e;
 
-const OP_1_OFFSET: u8 = 0x50;
+pub(crate) const OP_1_OFFSET: u8 = 0x50;
 
 const OP_1: u8 = 0x51;
 
@@ -69,13 +77,22 @@ const P2SH_SCRIPT_SIZE: usize = 23;
 
 const P2SH_HASH_SIZE: u8 = 20;
 
-const WITNESS_V0_KEYHASH_SIZE: usize = 20;
+const WITNESS_V0_KEYHASH_SIZE: u8 = 20;
 
-const WITNESS_V0_SCRIPTHASH_SIZE: usize = 32;
+const WITNESS_V0_SCRIPTHASH_SIZE: u8 = 32;
+
+const _: () = assert!(P2SH_SCRIPT_SIZE == 1 + 1 + P2SH_HASH_SIZE as usize + 1);
+const _: () = assert!(WITNESS_V0_KEYHASH_SIZE == 20);
+const _: () = assert!(WITNESS_V0_SCRIPTHASH_SIZE == 32);
 
 const TX_INPUTS_COUNT_MAX: usize = BLOCK_BASE_SIZE_MAX / TxIn::SIZE_MIN;
 
-const TX_OUTPUTS_COUNT_MAX: usize = BLOCK_BASE_SIZE_MAX / TxOut::SIZE_MIN;
+pub(crate) const TX_OUTPUTS_COUNT_MAX: usize = BLOCK_BASE_SIZE_MAX / TxOut::SIZE_MIN;
+
+const TX_LEGACY_SIGOPS_MAX: usize = BLOCK_BASE_SIZE_MAX * MULTISIG_PUBKEYS_COUNT_MAX;
+
+const _: () = assert!(TX_LEGACY_SIGOPS_MAX.is_multiple_of(MULTISIG_PUBKEYS_COUNT_MAX));
+const _: () = assert!(TX_LEGACY_SIGOPS_MAX / MULTISIG_PUBKEYS_COUNT_MAX == BLOCK_BASE_SIZE_MAX);
 
 const _: () = assert!(usize::BITS >= u32::BITS);
 const _: () = assert!(TX_INPUTS_COUNT_MAX * TxIn::SIZE_MIN <= BLOCK_BASE_SIZE_MAX);
@@ -135,14 +152,14 @@ impl std::fmt::Display for TransactionError {
 
 impl std::error::Error for TransactionError {}
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct OutPoint {
     pub(crate) txid: bitcoin_hashes::sha256d::Hash,
     pub(crate) vout: u32,
 }
 
 impl OutPoint {
-    fn is_null(&self) -> bool {
+    pub(crate) fn is_null(&self) -> bool {
         self.txid.as_byte_array() == &[0; 32] && self.vout == u32::MAX
     }
 }
@@ -198,6 +215,8 @@ impl Witness {
         let WitnessStack::NonEmpty { count, bytes } = &self.0 else {
             return None;
         };
+        assert!(bytes.len() >= count.get());
+        assert!(bytes.len() <= BLOCK_WEIGHT_MAX);
         let mut input = bytes.as_slice();
         let mut last: &[u8] = &[];
         for _ in 0..count.get() {
@@ -265,13 +284,16 @@ pub(crate) enum RelativeLockTime {
 
 impl TxIn {
     pub(crate) fn relative_lock_time(&self) -> RelativeLockTime {
-        if self.sequence & SEQUENCE_LOCKTIME_DISABLE_FLAG != 0 {
+        if self.sequence & SEQUENCE_LOCK_TIME_DISABLE_FLAG != 0 {
             return RelativeLockTime::Disabled;
         }
-        let value = u16::try_from(self.sequence & SEQUENCE_LOCKTIME_MASK)
+        let value = u16::try_from(self.sequence & SEQUENCE_LOCK_TIME_MASK)
             .expect("sequence locktime mask fits in u16");
-        if self.sequence & SEQUENCE_LOCKTIME_TYPE_FLAG != 0 {
-            RelativeLockTime::Seconds(u64::from(value) << SEQUENCE_LOCKTIME_GRANULARITY)
+        if self.sequence & SEQUENCE_LOCK_TIME_TYPE_FLAG != 0 {
+            let seconds = u64::from(value) << SEQUENCE_LOCK_TIME_GRANULARITY_BITS;
+            assert!(seconds.is_multiple_of(1 << SEQUENCE_LOCK_TIME_GRANULARITY_BITS));
+            assert!(seconds <= u64::from(u16::MAX) << SEQUENCE_LOCK_TIME_GRANULARITY_BITS);
+            RelativeLockTime::Seconds(seconds)
         } else {
             RelativeLockTime::Blocks(value)
         }
@@ -318,6 +340,7 @@ pub(crate) struct TxOut {
 
 impl TxOut {
     pub(crate) fn is_unspendable(&self) -> bool {
+        assert!(self.script_pubkey.len() <= BLOCK_BASE_SIZE_MAX);
         self.script_pubkey.first() == Some(&OP_RETURN) || self.script_pubkey.len() > SCRIPT_SIZE_MAX
     }
 
@@ -391,8 +414,15 @@ pub(crate) struct Transaction {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HashedTransaction {
+    transaction: Transaction,
+    txid: bitcoin_hashes::sha256d::Hash,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CheckedTransaction {
     transaction: Transaction,
+    txid: bitcoin_hashes::sha256d::Hash,
     value_out: i64,
     legacy_sigop_count: usize,
 }
@@ -527,11 +557,20 @@ impl Transaction {
     #[cfg(test)]
     pub(crate) fn check(&self) -> Result<CheckedTransaction, TransactionError> {
         let mut seen = std::collections::HashSet::new();
-        self.clone().into_checked_with_seen(&mut seen)
+        HashedTransaction::new(self.clone()).into_checked_with_seen(&mut seen)
     }
 
+    #[cfg(test)]
     pub(crate) fn into_checked_with_seen(
         self,
+        seen: &mut std::collections::HashSet<OutPoint>,
+    ) -> Result<CheckedTransaction, TransactionError> {
+        HashedTransaction::new(self).into_checked_with_seen(seen)
+    }
+
+    fn into_checked_with_txid_and_seen(
+        self,
+        txid: bitcoin_hashes::sha256d::Hash,
         seen: &mut std::collections::HashSet<OutPoint>,
     ) -> Result<CheckedTransaction, TransactionError> {
         let Transfers::NonEmpty { inputs, outputs } = &self.transfers else {
@@ -585,7 +624,10 @@ impl Transaction {
 
         if let Some(coinbase) = self.coinbase_input() {
             let script_length = coinbase.script_sig.len();
-            if !(COINBASE_SCRIPT_SIZE_MIN..=COINBASE_SCRIPT_SIZE_MAX).contains(&script_length) {
+            if script_length < COINBASE_SCRIPT_SIZE_MIN {
+                return Err(TransactionError::CoinbaseScriptSize);
+            }
+            if script_length > COINBASE_SCRIPT_SIZE_MAX {
                 return Err(TransactionError::CoinbaseScriptSize);
             }
         } else if inputs_slice
@@ -596,8 +638,10 @@ impl Transaction {
         }
 
         let legacy_sigop_count = legacy_sigop_count(inputs_slice, outputs);
+        assert!(legacy_sigop_count <= TX_LEGACY_SIGOPS_MAX);
         Ok(CheckedTransaction {
             transaction: self,
+            txid,
             value_out: total,
             legacy_sigop_count,
         })
@@ -616,6 +660,29 @@ impl Transaction {
             }
         }
         self.lock_time.encode(out);
+    }
+}
+
+impl HashedTransaction {
+    pub(crate) fn new(transaction: Transaction) -> HashedTransaction {
+        let txid = transaction.txid();
+        HashedTransaction { transaction, txid }
+    }
+
+    pub(crate) fn txid(&self) -> bitcoin_hashes::sha256d::Hash {
+        self.txid
+    }
+
+    pub(crate) fn transaction(&self) -> &Transaction {
+        &self.transaction
+    }
+
+    pub(crate) fn into_checked_with_seen(
+        self,
+        seen: &mut std::collections::HashSet<OutPoint>,
+    ) -> Result<CheckedTransaction, TransactionError> {
+        self.transaction
+            .into_checked_with_txid_and_seen(self.txid, seen)
     }
 }
 
@@ -639,7 +706,7 @@ impl CheckedTransaction {
     }
 
     pub(crate) fn txid(&self) -> bitcoin_hashes::sha256d::Hash {
-        self.transaction.txid()
+        self.txid
     }
 
     pub(crate) fn value_out(&self) -> i64 {
@@ -649,6 +716,7 @@ impl CheckedTransaction {
     }
 
     pub(crate) fn legacy_sigop_count(&self) -> usize {
+        assert!(self.legacy_sigop_count <= TX_LEGACY_SIGOPS_MAX);
         self.legacy_sigop_count
     }
 
@@ -673,6 +741,12 @@ impl CheckedTransaction {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SigOpMode {
+    Legacy,
+    Accurate,
+}
+
 fn legacy_sigop_count(inputs: &[TxIn], outputs: &[TxOut]) -> usize {
     assert!(inputs.len() <= TX_INPUTS_COUNT_MAX);
     assert!(outputs.len() <= TX_OUTPUTS_COUNT_MAX);
@@ -680,30 +754,37 @@ fn legacy_sigop_count(inputs: &[TxIn], outputs: &[TxOut]) -> usize {
     let mut script_bytes: usize = 0;
     for input in inputs {
         script_bytes = script_bytes.saturating_add(input.script_sig.len());
-        count = count.saturating_add(script_sigop_count(&input.script_sig, false));
+        count = count.saturating_add(script_sigop_count(&input.script_sig, SigOpMode::Legacy));
     }
     for output in outputs {
         script_bytes = script_bytes.saturating_add(output.script_pubkey.len());
-        count = count.saturating_add(script_sigop_count(&output.script_pubkey, false));
+        count = count.saturating_add(script_sigop_count(&output.script_pubkey, SigOpMode::Legacy));
     }
     assert!(count <= script_bytes.saturating_mul(MULTISIG_PUBKEYS_COUNT_MAX));
     count
 }
 
-pub(crate) fn input_p2sh_and_witness_sigop_cost(input: &TxIn, prevout: &TxOut) -> usize {
-    if is_p2sh(&prevout.script_pubkey) {
+pub(crate) fn input_p2sh_and_witness_sigop_cost(input: &TxIn, previous_output: &TxOut) -> usize {
+    assert!(input.script_sig.len() <= BLOCK_BASE_SIZE_MAX);
+    assert!(previous_output.value >= 0);
+    assert!(previous_output.value <= MONEY_MAX);
+    assert!(!previous_output.is_unspendable());
+    let cost = if is_p2sh(&previous_output.script_pubkey) {
         let Some(redeem_script) = last_push_data(&input.script_sig) else {
             return 0;
         };
-        script_sigop_count(redeem_script, true)
+        script_sigop_count(redeem_script, SigOpMode::Accurate)
             .saturating_mul(WITNESS_SCALE_FACTOR)
             .saturating_add(witness_v0_sigops(redeem_script, &input.witness))
     } else {
-        witness_v0_sigops(&prevout.script_pubkey, &input.witness)
-    }
+        witness_v0_sigops(&previous_output.script_pubkey, &input.witness)
+    };
+    assert!(cost <= BLOCK_WEIGHT_MAX.saturating_mul(MULTISIG_PUBKEYS_COUNT_MAX));
+    cost
 }
 
 fn is_p2sh(script: &[u8]) -> bool {
+    assert!(script.len() <= BLOCK_BASE_SIZE_MAX);
     script.len() == P2SH_SCRIPT_SIZE
         && script[0] == OP_HASH160
         && script[1] == P2SH_HASH_SIZE
@@ -711,16 +792,28 @@ fn is_p2sh(script: &[u8]) -> bool {
 }
 
 fn witness_v0_sigops(script: &[u8], witness: &Witness) -> usize {
-    match script {
-        [0x00, 20, program @ ..] if program.len() == WITNESS_V0_KEYHASH_SIZE => 1,
-        [0x00, 32, program @ ..] if program.len() == WITNESS_V0_SCRIPTHASH_SIZE => witness
-            .last_item()
-            .map_or(0, |witness_script| script_sigop_count(witness_script, true)),
+    assert!(script.len() <= BLOCK_BASE_SIZE_MAX);
+    let sigops = match script {
+        [OP_0, WITNESS_V0_KEYHASH_SIZE, program @ ..]
+            if program.len() == usize::from(WITNESS_V0_KEYHASH_SIZE) =>
+        {
+            1
+        }
+        [OP_0, WITNESS_V0_SCRIPTHASH_SIZE, program @ ..]
+            if program.len() == usize::from(WITNESS_V0_SCRIPTHASH_SIZE) =>
+        {
+            witness.last_item().map_or(0, |witness_script| {
+                script_sigop_count(witness_script, SigOpMode::Accurate)
+            })
+        }
         _ => 0,
-    }
+    };
+    assert!(sigops <= BLOCK_WEIGHT_MAX.saturating_mul(MULTISIG_PUBKEYS_COUNT_MAX));
+    sigops
 }
 
 fn last_push_data(mut script: &[u8]) -> Option<&[u8]> {
+    assert!(script.len() <= BLOCK_BASE_SIZE_MAX);
     let mut last: &[u8] = &[];
     while !script.is_empty() {
         let length_before = script.len();
@@ -735,6 +828,7 @@ fn last_push_data(mut script: &[u8]) -> Option<&[u8]> {
 }
 
 fn next_script_op<'a>(script: &mut &'a [u8]) -> Option<(u8, &'a [u8])> {
+    let length_before = script.len();
     let (&opcode, rest) = script.split_first()?;
     let (data, rest) = match opcode {
         0..OP_PUSHDATA1 => rest.split_at_checked(usize::from(opcode))?,
@@ -754,11 +848,14 @@ fn next_script_op<'a>(script: &mut &'a [u8]) -> Option<(u8, &'a [u8])> {
         }
         _ => (&[][..], rest),
     };
+    assert!(rest.len() < length_before);
+    assert!(data.len() < length_before);
     *script = rest;
     Some((opcode, data))
 }
 
-fn script_sigop_count(mut script: &[u8], accurate: bool) -> usize {
+fn script_sigop_count(mut script: &[u8], mode: SigOpMode) -> usize {
+    assert!(script.len() <= BLOCK_WEIGHT_MAX);
     let initial_length = script.len();
     let mut count: usize = 0;
     let mut last_opcode: Option<u8> = None;
@@ -773,8 +870,10 @@ fn script_sigop_count(mut script: &[u8], accurate: bool) -> usize {
                 count = count.saturating_add(1);
             }
             OP_CHECKMULTISIG | OP_CHECKMULTISIGVERIFY => {
-                let sigops = match last_opcode {
-                    Some(prev @ OP_1..=OP_16) if accurate => usize::from(prev - OP_1_OFFSET),
+                let sigops = match (mode, last_opcode) {
+                    (SigOpMode::Accurate, Some(previous_opcode @ OP_1..=OP_16)) => {
+                        usize::from(previous_opcode - OP_1_OFFSET)
+                    }
                     _ => MULTISIG_PUBKEYS_COUNT_MAX,
                 };
                 count = count.saturating_add(sigops);
@@ -1408,7 +1507,7 @@ mod tests {
 
     #[test]
     fn legacy_sigop_count_matches_core_inaccurate_script_scan() {
-        let count = |script: &[u8]| super::script_sigop_count(script, false);
+        let count = |script: &[u8]| super::script_sigop_count(script, super::SigOpMode::Legacy);
         assert_eq!(count(&[]), 0);
         assert_eq!(count(&[super::OP_CHECKSIG]), 1);
         assert_eq!(count(&[super::OP_CHECKSIGVERIFY]), 1);
@@ -1480,7 +1579,9 @@ mod tests {
             vec![tx_out(0, vec![super::OP_CHECKMULTISIG])],
             0,
         );
-        assert_eq!(tx.check().unwrap().legacy_sigop_count(), 21);
+        let checked = tx.check().unwrap();
+        assert_eq!(checked.legacy_sigop_count(), 21);
+        assert_eq!(checked.txid(), tx.txid());
     }
 
     #[test]
@@ -1529,34 +1630,15 @@ mod tests {
 
     #[test]
     fn accurate_p2sh_and_witness_sigop_cost_matches_core() {
-        assert_eq!(
-            super::script_sigop_count(&[super::OP_1, super::OP_CHECKMULTISIG], true),
-            1
-        );
-        assert_eq!(
-            super::script_sigop_count(&[super::OP_16, super::OP_CHECKMULTISIGVERIFY], true),
-            16
-        );
-        assert_eq!(
-            super::script_sigop_count(&[0x00, super::OP_CHECKMULTISIG], true),
-            20
-        );
-        assert_eq!(
-            super::script_sigop_count(&[0x50, super::OP_CHECKMULTISIG], true),
-            20
-        );
-        assert_eq!(
-            super::script_sigop_count(&[0x61, super::OP_CHECKMULTISIG], true),
-            20
-        );
-        assert_eq!(
-            super::script_sigop_count(&[super::OP_CHECKMULTISIG], true),
-            20
-        );
-        assert_eq!(
-            super::script_sigop_count(&[0x01, super::OP_1, super::OP_CHECKMULTISIG], true),
-            20
-        );
+        let accurate =
+            |script: &[u8]| super::script_sigop_count(script, super::SigOpMode::Accurate);
+        assert_eq!(accurate(&[super::OP_1, super::OP_CHECKMULTISIG]), 1);
+        assert_eq!(accurate(&[super::OP_16, super::OP_CHECKMULTISIGVERIFY]), 16);
+        assert_eq!(accurate(&[0x00, super::OP_CHECKMULTISIG]), 20);
+        assert_eq!(accurate(&[0x50, super::OP_CHECKMULTISIG]), 20);
+        assert_eq!(accurate(&[0x61, super::OP_CHECKMULTISIG]), 20);
+        assert_eq!(accurate(&[super::OP_CHECKMULTISIG]), 20);
+        assert_eq!(accurate(&[0x01, super::OP_1, super::OP_CHECKMULTISIG]), 20);
 
         let p2sh_script = || {
             let mut script = vec![super::OP_HASH160, super::P2SH_HASH_SIZE];
