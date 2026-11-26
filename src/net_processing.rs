@@ -16,7 +16,7 @@ const HEADERS_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
 
 const _: () = assert!(!HEADERS_TIMEOUT.is_zero());
 
-const BLOCKS_IN_FLIGHT_MAX: usize = 16;
+pub(crate) const BLOCKS_IN_FLIGHT_MAX: usize = 16;
 
 const _: () = assert!(BLOCKS_IN_FLIGHT_MAX >= 1);
 const _: () = assert!(BLOCKS_IN_FLIGHT_MAX <= crate::protocol::INV_COUNT_MAX);
@@ -84,6 +84,7 @@ pub enum PeerError {
     Block(crate::serialize::Error),
     BlockMutation(crate::block::MutationError),
     BlockInvalid(crate::block::BlockError),
+    BlockConnect(crate::utxo::ConnectError),
     BlockTimeout,
     LateWtxidRelay,
     LateSendAddrV2,
@@ -116,6 +117,7 @@ impl std::fmt::Display for PeerError {
             PeerError::Block(error) => write!(f, "block payload: {error}"),
             PeerError::BlockMutation(error) => write!(f, "mutated block: {error}"),
             PeerError::BlockInvalid(error) => write!(f, "invalid block: {error}"),
+            PeerError::BlockConnect(error) => write!(f, "unconnectable block: {error}"),
             PeerError::BlockTimeout => {
                 write!(f, "no block within {} s", BLOCK_TIMEOUT.as_secs())
             }
@@ -231,11 +233,34 @@ pub(crate) enum SyncingReceived<'a> {
 }
 
 #[derive(Debug)]
+pub(crate) struct ConnectedBlocks {
+    first: crate::utxo::ConnectedBlock,
+    rest: Vec<crate::utxo::ConnectedBlock>,
+}
+
+impl ConnectedBlocks {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        crate::utxo::ConnectedBlock,
+        Vec<crate::utxo::ConnectedBlock>,
+    ) {
+        assert!(self.rest.len() < BLOCKS_IN_FLIGHT_MAX);
+        (self.first, self.rest)
+    }
+
+    #[cfg(any(test, fuzzing))]
+    fn iter(&self) -> impl Iterator<Item = crate::utxo::ConnectedBlock> + '_ {
+        std::iter::once(self.first).chain(self.rest.iter().copied())
+    }
+}
+
+#[derive(Debug)]
 pub(crate) enum SyncedReceived {
     NoReply,
     Pong(u64),
     Tip(crate::chain::Tip),
-    Block(crate::block::CheckedBlock),
+    Blocks(ConnectedBlocks),
 }
 
 #[derive(Debug)]
@@ -444,6 +469,7 @@ struct SyncedChain<'a> {
 struct Blocks {
     next_height: std::num::NonZeroUsize,
     in_flight: Option<InFlightQueue>,
+    ready: Vec<crate::block::CheckedBlock>,
 }
 
 #[derive(Debug)]
@@ -644,10 +670,8 @@ impl InitialDownload {
 
 impl<'a> SyncedChain<'a> {
     fn new(chain: &'a mut crate::chain::Chain) -> SyncedChain<'a> {
-        SyncedChain {
-            chain,
-            blocks: Blocks::new(),
-        }
+        let blocks = Blocks::from_connected(chain.connected_height());
+        SyncedChain { chain, blocks }
     }
 
     fn chain(&self) -> &crate::chain::Chain {
@@ -664,6 +688,36 @@ impl<'a> SyncedChain<'a> {
             Some(matched.position())
         );
         Some(matched)
+    }
+
+    fn accept_block(
+        &mut self,
+        block: crate::block::CheckedBlock,
+    ) -> Result<Option<ConnectedBlocks>, crate::utxo::ConnectError> {
+        let expected = self.chain.connected_height() + 1;
+        let height = block.height().get();
+        assert!(height >= expected);
+        if height > expected {
+            self.blocks.buffer_ready(block, expected);
+            return Ok(None);
+        }
+        let first = self.chain.connect_block(block)?;
+        let mut rest = Vec::new();
+        while self
+            .blocks
+            .ready
+            .first()
+            .is_some_and(|next| next.height().get() == self.chain.connected_height() + 1)
+        {
+            let next = self.blocks.ready.remove(0);
+            rest.push(self.chain.connect_block(next)?);
+        }
+        assert!(rest.len() < BLOCKS_IN_FLIGHT_MAX);
+        assert_eq!(
+            self.blocks.next_height.get() - (self.chain.connected_height() + 1),
+            self.blocks.unresolved_len()
+        );
+        Ok(Some(ConnectedBlocks { first, rest }))
     }
 
     fn tick_waiting(
@@ -766,7 +820,8 @@ impl ChainStore for SyncedChain<'_> {
     ) -> Result<Option<crate::chain::Extended>, crate::chain::ExtendError> {
         let extended = self.chain.extend_on_locator(headers, clock, work_min)?;
         if let Some(crate::chain::Extended::Reorged { fork_height, .. }) = extended {
-            self.blocks.reorg(fork_height);
+            self.blocks
+                .reorg(fork_height, self.chain.connected_height());
         }
         Ok(extended)
     }
@@ -780,7 +835,8 @@ impl ChainStore for SyncedChain<'_> {
     ) -> Result<crate::chain::Extended, crate::chain::ExtendError> {
         let extended = self.chain.extend_branch(branch, headers, clock, work_min)?;
         if let crate::chain::Extended::Reorged { fork_height, .. } = extended {
-            self.blocks.reorg(fork_height);
+            self.blocks
+                .reorg(fork_height, self.chain.connected_height());
         }
         Ok(extended)
     }
@@ -797,7 +853,8 @@ impl ChainStore for SyncedChain<'_> {
             .chain
             .extend_low_work_branch(start, headers, full, clock, work_min)?;
         if let crate::chain::Extended::Reorged { fork_height, .. } = extended {
-            self.blocks.reorg(fork_height);
+            self.blocks
+                .reorg(fork_height, self.chain.connected_height());
         }
         Ok(extended)
     }
@@ -1060,7 +1117,15 @@ impl<'a> SyncedPeer<'a> {
             crate::block::CheckError::Mutated(error) => PeerError::BlockMutation(error),
             crate::block::CheckError::Invalid(error) => PeerError::BlockInvalid(error),
         })?;
-        Ok((self, SyncedReceived::Block(checked)))
+        let received = match self
+            .chain
+            .accept_block(checked)
+            .map_err(PeerError::BlockConnect)?
+        {
+            Some(blocks) => SyncedReceived::Blocks(blocks),
+            None => SyncedReceived::NoReply,
+        };
+        Ok((self, received))
     }
 
     fn receive_headers(
@@ -1235,15 +1300,23 @@ impl<'a> SyncedPeer<'a> {
 }
 
 impl Blocks {
-    fn new() -> Blocks {
+    fn from_connected(connected_height: usize) -> Blocks {
+        assert!(connected_height < usize::MAX);
         Blocks {
-            next_height: std::num::NonZeroUsize::MIN,
+            next_height: std::num::NonZeroUsize::MIN.saturating_add(connected_height),
             in_flight: None,
+            ready: Vec::new(),
         }
     }
 
-    fn len(&self) -> usize {
+    fn in_flight_len(&self) -> usize {
         self.in_flight.as_ref().map_or(0, InFlightQueue::len)
+    }
+
+    fn unresolved_len(&self) -> usize {
+        let len = self.in_flight_len() + self.ready.len();
+        assert!(len <= BLOCKS_IN_FLIGHT_MAX);
+        len
     }
 
     fn take(&mut self, header: crate::block::BlockHeader) -> Option<crate::block::MatchedHeader> {
@@ -1256,15 +1329,43 @@ impl Blocks {
         found
     }
 
-    fn reorg(&mut self, fork_height: usize) {
+    fn buffer_ready(&mut self, block: crate::block::CheckedBlock, expected_height: usize) {
+        let height = block.height().get();
+        assert!(height > expected_height);
+        assert!(height < self.next_height.get());
+        assert!(self.in_flight.is_some());
+        let position = self
+            .ready
+            .binary_search_by_key(&height, |queued| queued.height().get());
+        let index = match position {
+            Ok(_) => panic!("duplicate buffered block at height {height}"),
+            Err(index) => index,
+        };
+        self.ready.insert(index, block);
+        assert!(self.ready.len() < BLOCKS_IN_FLIGHT_MAX);
+        assert_eq!(
+            self.next_height.get() - expected_height,
+            self.unresolved_len()
+        );
+    }
+
+    fn reorg(&mut self, fork_height: usize, connected_height: usize) {
         assert!(fork_height < usize::MAX);
+        assert!(connected_height <= fork_height);
         let above_fork = std::num::NonZeroUsize::MIN.saturating_add(fork_height);
         self.next_height = self.next_height.min(above_fork);
         self.in_flight = self
             .in_flight
             .take()
             .and_then(|queue| queue.reorg(fork_height));
+        self.ready
+            .retain(|block| block.height().get() <= fork_height);
         assert!(self.next_height.get() <= fork_height + 1);
+        assert!(self.next_height.get() > connected_height);
+        assert_eq!(
+            self.next_height.get() - (connected_height + 1),
+            self.unresolved_len()
+        );
     }
 
     fn tick_waiting(
@@ -1272,11 +1373,22 @@ impl Blocks {
         now: std::time::Instant,
         chain: &crate::chain::Chain,
     ) -> Result<Option<std::time::Instant>, PeerError> {
+        let connected = chain.connected_height();
+        assert!(self.next_height.get() > connected);
         assert!(self.next_height.get() <= chain.tip().height() + 1);
-        assert!(self.len() <= BLOCKS_IN_FLIGHT_MAX);
+        assert_eq!(
+            self.next_height.get() - (connected + 1),
+            self.unresolved_len()
+        );
         match &mut self.in_flight {
-            None => Ok(None),
-            Some(queue) => queue.tick(now).map(Some),
+            None => {
+                assert!(self.ready.is_empty());
+                Ok(None)
+            }
+            Some(queue) => {
+                assert_eq!(queue.oldest.height().get(), connected + 1);
+                queue.tick(now).map(Some)
+            }
         }
     }
 
@@ -1286,7 +1398,7 @@ impl Blocks {
         chain: &crate::chain::Chain,
     ) -> Result<(Option<crate::protocol::GetData>, Option<std::time::Instant>), PeerError> {
         let mut wake = self.tick_waiting(now, chain)?;
-        let free = BLOCKS_IN_FLIGHT_MAX - self.len();
+        let free = BLOCKS_IN_FLIGHT_MAX - self.unresolved_len();
         let mut asked = Vec::with_capacity(free);
         while asked.len() < free
             && let Some(position) = chain.block_position(self.next_height)
@@ -1314,7 +1426,10 @@ impl Blocks {
             }
             Some(queue) => queue.push(first, rest_positions),
         }
-        assert!(self.len() <= BLOCKS_IN_FLIGHT_MAX);
+        assert_eq!(
+            self.next_height.get() - (chain.connected_height() + 1),
+            self.unresolved_len()
+        );
         Ok((Some(get_data), wake))
     }
 }
@@ -1928,6 +2043,7 @@ pub(crate) mod fuzz {
         seed!("block-invalid-outputs-empty", "PeerRefused(BlockInvalid(Transaction(OutputsEmpty)))"),
         seed!("block-mutated-merkle-root", "PeerRefused(BlockMutation(MerkleRoot))"),
         seed!("block-mutated-unexpected-witness", "PeerRefused(BlockMutation(UnexpectedWitness))"),
+        seed!("block-reorg-connected", "PeerOpen { height: 4, synced: true }"),
         seed!("block-reorg-in-flight", "PeerOpen { height: 4, synced: true }"),
         seed!("block-truncated-payload", "PeerRefused(Block(UnexpectedEnd))"),
         seed!("block-unsolicited-skipped", "PeerOpen { height: 2, synced: true }"),
@@ -2397,16 +2513,20 @@ pub(crate) mod fuzz {
                 Ok(peer)
             }
             (
-                Ok((peer, super::SyncedReceived::Block(block))),
-                Ok(ReceivedExpected::Block {
-                    height,
-                    hash,
-                    transactions_count: expected_transactions_count,
-                }),
+                Ok((peer, super::SyncedReceived::Blocks(blocks))),
+                Ok(ReceivedExpected::Blocks(expected)),
             ) => {
-                assert_eq!(block.height().get(), height);
-                assert_eq!(block.hash(), hash);
-                assert_eq!(block.transactions_count(), expected_transactions_count);
+                let actual: Vec<_> = blocks
+                    .iter()
+                    .map(|block| {
+                        (
+                            block.height().get(),
+                            block.hash(),
+                            block.transactions_count(),
+                        )
+                    })
+                    .collect();
+                assert_eq!(actual, expected);
                 Ok(peer)
             }
             (Err(error), Err(expected)) => {
@@ -2421,6 +2541,11 @@ pub(crate) mod fuzz {
     }
 
     fn branch_tip_check(peer: &FuzzPeer<'_>, model: &PeerModel) {
+        let connected = match peer {
+            FuzzPeer::Syncing(peer) => peer.chain.connected_height(),
+            FuzzPeer::Synced(peer) => peer.chain.chain().connected_height(),
+        };
+        assert_eq!(connected, model.connected_height);
         let tip = match peer {
             FuzzPeer::Syncing(peer) => peer
                 .branch_tip
@@ -2779,8 +2904,10 @@ pub(crate) mod fuzz {
         salt_left: bool,
         branch_tip: Option<(bitcoin_hashes::sha256d::Hash, u128, usize)>,
         download: DownloadModel,
+        connected_height: usize,
         next_block_height: usize,
         blocks_in_flight: Vec<(usize, bitcoin_hashes::sha256d::Hash)>,
+        ready_blocks: Vec<(usize, bitcoin_hashes::sha256d::Hash, std::num::NonZeroUsize)>,
         block_deadline: Option<std::time::Instant>,
     }
 
@@ -2850,11 +2977,7 @@ pub(crate) mod fuzz {
         NoReply,
         Pong(u64),
         Synced,
-        Block {
-            height: usize,
-            hash: bitcoin_hashes::sha256d::Hash,
-            transactions_count: std::num::NonZeroUsize,
-        },
+        Blocks(Vec<(usize, bitcoin_hashes::sha256d::Hash, std::num::NonZeroUsize)>),
     }
 
     impl PeerModel {
@@ -2875,8 +2998,10 @@ pub(crate) mod fuzz {
                 salt_left: true,
                 branch_tip: None,
                 download: DownloadModel::Chain,
+                connected_height: 0,
                 next_block_height: 1,
                 blocks_in_flight: Vec::new(),
+                ready_blocks: Vec::new(),
                 block_deadline: None,
             }
         }
@@ -2984,7 +3109,8 @@ pub(crate) mod fuzz {
 
             let mut asked = Vec::new();
             if synced {
-                while self.blocks_in_flight.len() < super::BLOCKS_IN_FLIGHT_MAX
+                while self.blocks_in_flight.len() + self.ready_blocks.len()
+                    < super::BLOCKS_IN_FLIGHT_MAX
                     && self.next_block_height <= self.height()
                 {
                     let hash = self.chain[self.next_block_height];
@@ -3084,11 +3210,28 @@ pub(crate) mod fuzz {
                             super::PeerError::BlockInvalid(error)
                         }
                     })?;
-                Ok(ReceivedExpected::Block {
-                    height,
-                    hash,
-                    transactions_count: checked.transactions_count(),
-                })
+                let entry = (height, hash, checked.transactions_count());
+                if height > self.connected_height + 1 {
+                    let position = self
+                        .ready_blocks
+                        .binary_search_by_key(&height, |(queued, _, _)| *queued)
+                        .expect_err("duplicate ready block");
+                    self.ready_blocks.insert(position, entry);
+                    return Ok(ReceivedExpected::NoReply);
+                }
+                assert_eq!(height, self.connected_height + 1);
+                self.connected_height = height;
+                let mut connected = vec![entry];
+                while self
+                    .ready_blocks
+                    .first()
+                    .is_some_and(|(queued, _, _)| *queued == self.connected_height + 1)
+                {
+                    let next = self.ready_blocks.remove(0);
+                    self.connected_height = next.0;
+                    connected.push(next);
+                }
+                Ok(ReceivedExpected::Blocks(connected))
             } else if msg_type == crate::protocol::INV {
                 let has_block = message_inv_has_block(message).map_err(super::PeerError::Inv)?;
                 if has_block && matches!(self.get_headers, GetHeadersModel::Ended) {
@@ -3315,8 +3458,10 @@ pub(crate) mod fuzz {
             }
             self.chain.truncate(fork + 1);
             self.chain.extend(hashes);
+            self.connected_height = self.connected_height.min(fork);
             self.next_block_height = self.next_block_height.min(fork + 1);
             self.blocks_in_flight.retain(|(height, _)| *height <= fork);
+            self.ready_blocks.retain(|(height, _, _)| *height <= fork);
             if self.blocks_in_flight.is_empty() {
                 self.block_deadline = None;
             }
@@ -5437,9 +5582,18 @@ mod tests {
     fn receive_block<'a>(
         peer: super::SyncedPeer<'a>,
         block: &crate::block::Block,
-    ) -> (super::SyncedPeer<'a>, crate::block::CheckedBlock) {
+    ) -> (super::SyncedPeer<'a>, crate::utxo::ConnectedBlock) {
+        let (peer, blocks) = receive_blocks(peer, block);
+        assert_eq!(blocks.len(), 1);
+        (peer, blocks[0])
+    }
+
+    fn receive_blocks<'a>(
+        peer: super::SyncedPeer<'a>,
+        block: &crate::block::Block,
+    ) -> (super::SyncedPeer<'a>, Vec<crate::utxo::ConnectedBlock>) {
         match peer.receive(&block_message(block), crate::fixtures::CLOCK) {
-            Ok((peer, super::SyncedReceived::Block(checked))) => (peer, checked),
+            Ok((peer, super::SyncedReceived::Blocks(blocks))) => (peer, blocks.iter().collect()),
             other => panic!("{other:?}"),
         }
     }
@@ -5533,8 +5687,7 @@ mod tests {
         let peer = synced(asked(&mut chain, start, 7), &headers);
         let (peer, _, _) = tick_get_data(peer, start);
 
-        let (peer, checked) = receive_block(peer, &blocks[1]);
-        assert_eq!(checked.height().get(), 2);
+        let peer = accept(peer, &block_message(&blocks[1]));
         let before = start + super::BLOCK_TIMEOUT - NANOSECOND;
         let (peer, wake) = idle(peer, before);
         assert_eq!(wake, start + super::BLOCK_TIMEOUT);
@@ -5542,6 +5695,22 @@ mod tests {
             peer.tick(start + super::BLOCK_TIMEOUT, 0).err(),
             Some(super::PeerError::BlockTimeout)
         );
+
+        let mut chain = regtest();
+        let peer = synced(asked(&mut chain, start, 7), &headers);
+        let (peer, _, _) = tick_get_data(peer, start);
+        let peer = accept(peer, &block_message(&blocks[1]));
+        let (peer, connected) = receive_blocks(peer, &blocks[0]);
+        assert_eq!(
+            connected
+                .iter()
+                .map(|block| (block.height().get(), block.hash()))
+                .collect::<Vec<_>>(),
+            vec![(1, blocks[0].header.hash()), (2, blocks[1].header.hash())]
+        );
+        let (_, wake) = idle(peer, start);
+        assert_eq!(wake, start + super::PING_TIMEOUT);
+        assert_eq!(chain.connected_height(), 2);
 
         let mut chain = regtest();
         let peer = synced(asked(&mut chain, start, 7), &headers);
@@ -5801,5 +5970,200 @@ mod tests {
         let (_, checked) = receive_block(peer, &first[0]);
         assert_eq!(checked.height().get(), 1);
         assert_eq!(checked.hash(), first[0].header.hash());
+    }
+
+    #[test]
+    fn out_of_order_ready_blocks_count_against_blocks_in_flight_max() {
+        let mut chain = regtest();
+        let start = std::time::Instant::now();
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        let blocks = blocks_on(&genesis, 1, super::BLOCKS_IN_FLIGHT_MAX + 2, 0);
+        let headers: Vec<_> = blocks.iter().map(|block| block.header).collect();
+        let peer = synced(asked(&mut chain, start, 7), &headers);
+
+        let (peer, get_data, _) = tick_get_data(peer, start);
+        assert_eq!(
+            get_data,
+            get_data_for(&blocks[..super::BLOCKS_IN_FLIGHT_MAX])
+        );
+
+        let peer = accept(peer, &block_message(&blocks[1]));
+        let (peer, wake) = idle(peer, start);
+        assert_eq!(wake, start + super::BLOCK_TIMEOUT);
+
+        let (peer, connected) = receive_blocks(peer, &blocks[0]);
+        assert_eq!(
+            connected
+                .iter()
+                .map(|block| block.height().get())
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let (_, get_data, _) = tick_get_data(peer, start);
+        assert_eq!(
+            get_data,
+            get_data_for(&blocks[super::BLOCKS_IN_FLIGHT_MAX..])
+        );
+    }
+
+    #[test]
+    fn reorg_disconnects_connected_blocks_and_prunes_ready_buffer() {
+        let mut chain = regtest();
+        let start = std::time::Instant::now();
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        let first = blocks_on(&genesis, 1, 4, 0);
+        let first_headers: Vec<_> = first.iter().map(|block| block.header).collect();
+        let peer = synced(asked(&mut chain, start, 7), &first_headers);
+        let (peer, _, _) = tick_get_data(peer, start);
+
+        let (peer, _) = receive_block(peer, &first[0]);
+        let (peer, _) = receive_block(peer, &first[1]);
+        let peer = accept(peer, &block_message(&first[3]));
+
+        let branch = blocks_on(&first[0].header, 2, 4, 1);
+        let branch_headers: Vec<_> = branch.iter().map(|block| block.header).collect();
+        let (peer, _) = synced_batch_then_tick(peer, &branch_headers, start);
+        let peer = announced(peer, &branch_headers);
+        let (peer, get_data, _) = tick_get_data(peer, start + std::time::Duration::from_mins(1));
+        assert_eq!(get_data, get_data_for(&branch));
+        let mut peer = peer;
+        for (offset, block) in branch.iter().enumerate() {
+            let (next, connected) = receive_block(peer, block);
+            assert_eq!(connected.height().get(), offset + 2);
+            assert_eq!(connected.hash(), block.header.hash());
+            peer = next;
+        }
+        drop(peer);
+        assert_eq!(chain.connected_height(), 5);
+
+        let mut chain = regtest();
+        let first = blocks_on(&genesis, 1, 3, 0);
+        let first_headers: Vec<_> = first.iter().map(|block| block.header).collect();
+        let peer = synced(asked(&mut chain, start, 7), &first_headers);
+        let (peer, _, _) = tick_get_data(peer, start);
+        let peer = accept(peer, &block_message(&first[1]));
+        let peer = accept(peer, &block_message(&first[2]));
+
+        let branch = blocks_on(&first[1].header, 3, 2, 2);
+        let branch_headers: Vec<_> = branch.iter().map(|block| block.header).collect();
+        let (peer, _) = synced_batch_then_tick(peer, &branch_headers, start);
+        let peer = announced(peer, &branch_headers);
+        let (peer, get_data, _) = tick_get_data(peer, start + std::time::Duration::from_mins(1));
+        assert_eq!(get_data, get_data_for(&branch));
+        let (peer, drained) = receive_blocks(peer, &first[0]);
+        assert_eq!(
+            drained
+                .iter()
+                .map(|block| (block.height().get(), block.hash()))
+                .collect::<Vec<_>>(),
+            vec![(1, first[0].header.hash()), (2, first[1].header.hash())]
+        );
+        let (peer, connected_3) = receive_block(peer, &branch[0]);
+        assert_eq!(connected_3.hash(), branch[0].header.hash());
+        let (_, connected_4) = receive_block(peer, &branch[1]);
+        assert_eq!(connected_4.hash(), branch[1].header.hash());
+        assert_eq!(chain.connected_height(), 4);
+    }
+
+    #[test]
+    fn reconnect_on_same_chain_resumes_block_download_after_connected_height() {
+        let mut chain = regtest();
+        let start = std::time::Instant::now();
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        let blocks = blocks_on(&genesis, 1, 4, 0);
+        let headers: Vec<_> = blocks.iter().map(|block| block.header).collect();
+
+        let peer = synced(asked(&mut chain, start, 7), &headers);
+        let (peer, _, _) = tick_get_data(peer, start);
+        let (peer, _) = receive_block(peer, &blocks[0]);
+        let (peer, _) = receive_block(peer, &blocks[1]);
+        drop(peer);
+        assert_eq!(chain.connected_height(), 2);
+
+        let peer = synced(asked(&mut chain, start, 8), &[]);
+        let (peer, get_data, _) = tick_get_data(peer, start);
+        assert_eq!(get_data, get_data_for(&blocks[2..]));
+        let (peer, connected_3) = receive_block(peer, &blocks[2]);
+        assert_eq!(connected_3.height().get(), 3);
+        let (_, connected_4) = receive_block(peer, &blocks[3]);
+        assert_eq!(connected_4.height().get(), 4);
+        assert_eq!(chain.connected_height(), 4);
+    }
+
+    #[test]
+    fn block_connect_error_ends_connection_directly_and_when_draining_ready_buffer() {
+        let start = std::time::Instant::now();
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        let over_subsidy = |prev: crate::block::BlockHeader, height: usize| {
+            let mut script_sig =
+                crate::block::encode_bip34_height(std::num::NonZeroUsize::new(height).unwrap())
+                    .as_slice()
+                    .to_vec();
+            script_sig.push(0);
+            let coinbase = crate::transaction::Transaction::new(
+                1,
+                vec![crate::transaction::TxIn {
+                    previous_output: crate::transaction::OutPoint {
+                        txid: bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]),
+                        vout: u32::MAX,
+                    },
+                    script_sig,
+                    sequence: u32::MAX,
+                    witness: crate::transaction::Witness::default(),
+                }],
+                vec![crate::transaction::TxOut {
+                    value: 5_000_000_001,
+                    script_pubkey: vec![0x51],
+                }],
+                0,
+            )
+            .unwrap();
+            let header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
+                version: crate::fixtures::HEADER_VERSION,
+                prev: prev.hash(),
+                merkle_root: coinbase.txid().to_byte_array(),
+                time: prev.time + 1,
+                ..genesis
+            });
+            crate::block::Block {
+                header,
+                transactions: Some(crate::block::Transactions {
+                    first: coinbase,
+                    rest: Vec::new(),
+                }),
+            }
+        };
+
+        let bad_1 = over_subsidy(genesis, 1);
+        let mut chain = regtest();
+        let peer = synced(asked(&mut chain, start, 7), &[bad_1.header]);
+        let (peer, _, _) = tick_get_data(peer, start);
+        let error = peer
+            .receive(&block_message(&bad_1), crate::fixtures::CLOCK)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            super::PeerError::BlockConnect(crate::utxo::ConnectError::CoinbaseAmount)
+        );
+        assert_eq!(
+            error.to_string(),
+            "unconnectable block: the coinbase pays more than the subsidy plus fees"
+        );
+        assert_eq!(chain.connected_height(), 0);
+
+        let good_1 = blocks_on(&genesis, 1, 1, 0).pop().unwrap();
+        let bad_2 = over_subsidy(good_1.header, 2);
+        let mut chain = regtest();
+        let peer = synced(asked(&mut chain, start, 7), &[good_1.header, bad_2.header]);
+        let (peer, _, _) = tick_get_data(peer, start);
+        let peer = accept(peer, &block_message(&bad_2));
+        assert_eq!(
+            peer.receive(&block_message(&good_1), crate::fixtures::CLOCK)
+                .err(),
+            Some(super::PeerError::BlockConnect(
+                crate::utxo::ConnectError::CoinbaseAmount
+            ))
+        );
+        assert_eq!(chain.connected_height(), 1);
     }
 }

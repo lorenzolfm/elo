@@ -10,6 +10,7 @@ pub struct Chain {
     below_tip: Vec<crate::block::BlockHeader>,
     tip: crate::block::BlockHeader,
     work: crate::pow::Work,
+    utxo: crate::utxo::UtxoSet,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,10 +145,12 @@ impl Chain {
             below_tip: Vec::new(),
             tip: genesis,
             work,
+            utxo: crate::utxo::UtxoSet::new(network),
         }
     }
 
     pub(crate) fn restart(&mut self) {
+        assert_eq!(self.utxo.height(), 0);
         *self = Chain::new(self.network);
     }
 
@@ -368,6 +371,17 @@ impl Chain {
             )));
         }
 
+        while self.utxo.height() > fork_height {
+            let height = self.utxo.height();
+            let block_hash = self.header_at(height).hash();
+            let prev_hash = self.header_at(height - 1).hash();
+            self.utxo.disconnect_tip(block_hash, prev_hash);
+        }
+        assert!(self.utxo.height() <= fork_height);
+        assert_eq!(
+            self.utxo.best_block(),
+            self.header_at(self.utxo.height()).hash()
+        );
         let count = headers.len();
         self.tip = self.below_tip[fork_height];
         self.below_tip.truncate(fork_height);
@@ -375,6 +389,10 @@ impl Chain {
         self.extend_store(headers, time_max, work_at_fork.saturating_add(work_branch));
         assert_eq!(self.tip.hash(), last_hash);
         assert_eq!(self.below_tip.len(), fork_height + count);
+        assert_eq!(
+            self.utxo.best_block(),
+            self.header_at(self.utxo.height()).hash()
+        );
         Ok(Extended::Reorged { full, fork_height })
     }
 
@@ -633,16 +651,10 @@ impl Chain {
     pub(crate) fn block_position(&self, height: std::num::NonZeroUsize) -> Option<BlockPosition> {
         let block_height = height.get();
         if block_height <= self.below_tip.len() {
-            let prev_height = block_height - 1;
-            let prev_ancestors = Ancestors {
-                below_tip: &self.below_tip[..prev_height],
-                tip: self.header_at(prev_height),
-                batch: &[],
-            };
             let header = self.header_at(block_height);
-            let prev_median_time_past = prev_ancestors.median_time_past();
+            let prev_median_time_past =
+                median_time_past_at(&self.below_tip, &self.tip, block_height - 1);
             assert!(header.time > prev_median_time_past);
-            assert_eq!(prev_ancestors.height_above(), block_height);
             Some(BlockPosition {
                 network: self.network,
                 height,
@@ -654,6 +666,32 @@ impl Chain {
         }
     }
 
+    pub(crate) fn connected_height(&self) -> usize {
+        let height = self.utxo.height();
+        assert!(height <= self.below_tip.len());
+        assert_eq!(self.utxo.best_block(), self.header_at(height).hash());
+        height
+    }
+
+    pub(crate) fn connect_block(
+        &mut self,
+        block: crate::block::CheckedBlock,
+    ) -> Result<crate::utxo::ConnectedBlock, crate::utxo::ConnectError> {
+        let position = block.position();
+        let height = position.height();
+        assert_eq!(height.get(), self.utxo.height() + 1);
+        assert_eq!(self.block_position(height), Some(position));
+        assert_eq!(block.header().prev, self.utxo.best_block());
+        let below_tip = &self.below_tip;
+        let tip = &self.tip;
+        let connected = self.utxo.connect_block(block, |ancestor_height| {
+            median_time_past_at(below_tip, tip, ancestor_height)
+        })?;
+        assert_eq!(self.utxo.height(), height.get());
+        assert_eq!(self.utxo.best_block(), position.hash());
+        Ok(connected)
+    }
+
     pub(crate) fn tip(&self) -> Tip {
         Tip {
             height: self.below_tip.len(),
@@ -661,6 +699,27 @@ impl Chain {
             work: self.work,
         }
     }
+}
+
+fn median_time_past_at(
+    below_tip: &[crate::block::BlockHeader],
+    tip: &crate::block::BlockHeader,
+    height: usize,
+) -> u32 {
+    let header = match below_tip.get(height) {
+        Some(header) => header,
+        None => {
+            assert_eq!(height, below_tip.len());
+            tip
+        }
+    };
+    let ancestors = Ancestors {
+        below_tip: &below_tip[..height],
+        tip: header,
+        batch: &[],
+    };
+    assert_eq!(ancestors.height_above(), height + 1);
+    ancestors.median_time_past()
 }
 
 fn time_max(clock: u64) -> u64 {
@@ -816,6 +875,10 @@ impl BlockPosition {
 
     pub(crate) fn position(self) -> Position {
         Position::Block(self)
+    }
+
+    pub(crate) fn network(&self) -> crate::chainparams::Network {
+        self.network
     }
 
     pub(crate) fn height(&self) -> std::num::NonZeroUsize {
@@ -1298,6 +1361,7 @@ mod tests {
             below_tip,
             tip,
             work: super::Chain::new(network).work,
+            utxo: crate::utxo::UtxoSet::new(network),
         }
     }
 
@@ -2327,5 +2391,229 @@ mod tests {
         let mut chain = regtest_with(&headers[..3]);
         chain.restart();
         assert_eq!(chain.branch_tip_current(tip), None);
+    }
+
+    #[test]
+    fn median_time_past_at_matches_genesis_middle_and_tip() {
+        let genesis = genesis();
+        let times: Vec<u32> = [
+            10, 20, 6000, 5000, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130,
+        ]
+        .into_iter()
+        .map(|offset| genesis.time + offset)
+        .collect();
+        let headers = mined_on(genesis, &times);
+        let chain = regtest_with(&headers);
+        assert_eq!(
+            super::median_time_past_at(&chain.below_tip, &chain.tip, 0),
+            genesis.time
+        );
+        assert_eq!(
+            super::median_time_past_at(&chain.below_tip, &chain.tip, 1),
+            genesis.time + 10
+        );
+        assert_eq!(
+            super::median_time_past_at(&chain.below_tip, &chain.tip, 3),
+            genesis.time + 20
+        );
+        assert_eq!(
+            super::median_time_past_at(&chain.below_tip, &chain.tip, 11),
+            genesis.time + 70
+        );
+        assert_eq!(
+            super::median_time_past_at(&chain.below_tip, &chain.tip, 14),
+            genesis.time + 90
+        );
+    }
+
+    #[test]
+    fn connect_block_and_reorg_disconnects_old_branch_utxos_and_connects_new_branch() {
+        let regtest = crate::chainparams::Network::Regtest;
+        let genesis = regtest.genesis();
+        let make_block = |height: usize,
+                          prev: crate::block::BlockHeader,
+                          tag: u32,
+                          rest: Vec<crate::transaction::Transaction>| {
+            let mut script_sig =
+                crate::block::encode_bip34_height(std::num::NonZeroUsize::new(height).unwrap())
+                    .as_slice()
+                    .to_vec();
+            script_sig.extend_from_slice(&tag.to_le_bytes());
+            let coinbase = crate::transaction::Transaction::new(
+                1,
+                vec![crate::transaction::TxIn {
+                    previous_output: crate::transaction::OutPoint {
+                        txid: bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]),
+                        vout: u32::MAX,
+                    },
+                    script_sig,
+                    sequence: u32::MAX,
+                    witness: crate::transaction::Witness::default(),
+                }],
+                vec![crate::transaction::TxOut {
+                    value: 5_000_000_000,
+                    script_pubkey: vec![0x51],
+                }],
+                0,
+            )
+            .unwrap();
+            let txids = std::iter::once(coinbase.txid().to_byte_array())
+                .chain(rest.iter().map(|tx| tx.txid().to_byte_array()))
+                .collect();
+            let header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
+                version: crate::fixtures::HEADER_VERSION,
+                prev: prev.hash(),
+                merkle_root: crate::merkle::root(txids).hash,
+                time: prev.time + 1,
+                ..genesis
+            });
+            crate::block::Block {
+                header,
+                transactions: Some(crate::block::Transactions {
+                    first: coinbase,
+                    rest,
+                }),
+            }
+        };
+
+        let block_1 = make_block(1, genesis, 1, Vec::new());
+        let mut branch_a = vec![block_1.clone()];
+        for height in 2..=101 {
+            let prev = branch_a.last().unwrap().header;
+            branch_a.push(make_block(height, prev, 10, Vec::new()));
+        }
+        let headers_a: Vec<_> = branch_a.iter().map(|block| block.header).collect();
+        let mut chain = regtest_with(&headers_a);
+        for (index, block) in branch_a.iter().enumerate() {
+            let position = chain
+                .block_position(std::num::NonZeroUsize::new(index + 1).unwrap())
+                .unwrap();
+            let checked = crate::block::CheckedBlock::from_checked(
+                position,
+                crate::block::PositionedBlock::new(block.clone(), position.position())
+                    .unwrap()
+                    .check()
+                    .unwrap(),
+            )
+            .unwrap();
+            let connected = chain.connect_block(checked).unwrap();
+            assert_eq!(connected.height().get(), index + 1);
+        }
+        assert_eq!(chain.connected_height(), 101);
+        let old_block_2_cb = branch_a[1].transactions.as_ref().unwrap().first.txid();
+
+        let mut branch_b = Vec::new();
+        let mut prev = block_1.header;
+        for height in 2..=102 {
+            let block = make_block(height, prev, 20, Vec::new());
+            prev = block.header;
+            branch_b.push(block);
+        }
+        let new_block_2_cb = branch_b[0].transactions.as_ref().unwrap().first.txid();
+        let spend_old = crate::transaction::Transaction::new(
+            1,
+            vec![crate::transaction::TxIn {
+                previous_output: crate::transaction::OutPoint {
+                    txid: old_block_2_cb,
+                    vout: 0,
+                },
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+                witness: crate::transaction::Witness::default(),
+            }],
+            vec![crate::transaction::TxOut {
+                value: 5_000_000_000,
+                script_pubkey: vec![0x51],
+            }],
+            0,
+        )
+        .unwrap();
+        let spend_new = crate::transaction::Transaction::new(
+            1,
+            vec![crate::transaction::TxIn {
+                previous_output: crate::transaction::OutPoint {
+                    txid: new_block_2_cb,
+                    vout: 0,
+                },
+                script_sig: Vec::new(),
+                sequence: u32::MAX,
+                witness: crate::transaction::Witness::default(),
+            }],
+            vec![crate::transaction::TxOut {
+                value: 5_000_000_000,
+                script_pubkey: vec![0x51],
+            }],
+            0,
+        )
+        .unwrap();
+        let block_103_bad = make_block(103, prev, 21, vec![spend_old]);
+        let block_103_good = make_block(103, prev, 22, vec![spend_new]);
+
+        let headers_b: Vec<_> = std::iter::once(block_1.header)
+            .chain(branch_b.iter().map(|block| block.header))
+            .chain(std::iter::once(block_103_bad.header))
+            .collect();
+        assert_eq!(
+            on_locator(&mut chain, &headers_b),
+            Ok(super::Extended::Reorged {
+                full: false,
+                fork_height: 1,
+            })
+        );
+        assert_eq!(chain.connected_height(), 1);
+        for (offset, block) in branch_b.iter().enumerate() {
+            let position = chain
+                .block_position(std::num::NonZeroUsize::new(offset + 2).unwrap())
+                .unwrap();
+            let checked = crate::block::CheckedBlock::from_checked(
+                position,
+                crate::block::PositionedBlock::new(block.clone(), position.position())
+                    .unwrap()
+                    .check()
+                    .unwrap(),
+            )
+            .unwrap();
+            chain.connect_block(checked).unwrap();
+        }
+        assert_eq!(chain.connected_height(), 102);
+
+        let pos_bad = chain
+            .block_position(std::num::NonZeroUsize::new(103).unwrap())
+            .unwrap();
+        let checked_bad = crate::block::CheckedBlock::from_checked(
+            pos_bad,
+            crate::block::PositionedBlock::new(block_103_bad, pos_bad.position())
+                .unwrap()
+                .check()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            chain.connect_block(checked_bad),
+            Err(crate::utxo::ConnectError::MissingInputs)
+        );
+        assert_eq!(chain.connected_height(), 102);
+
+        let block_104_good = make_block(104, block_103_good.header, 23, Vec::new());
+        assert_eq!(
+            on_locator(&mut chain, &[block_103_good.header, block_104_good.header]),
+            Ok(super::Extended::Reorged {
+                full: false,
+                fork_height: 102,
+            })
+        );
+        let pos_good = chain
+            .block_position(std::num::NonZeroUsize::new(103).unwrap())
+            .unwrap();
+        let checked_good = crate::block::CheckedBlock::from_checked(
+            pos_good,
+            crate::block::PositionedBlock::new(block_103_good, pos_good.position())
+                .unwrap()
+                .check()
+                .unwrap(),
+        )
+        .unwrap();
+        chain.connect_block(checked_good).unwrap();
+        assert_eq!(chain.connected_height(), 103);
     }
 }

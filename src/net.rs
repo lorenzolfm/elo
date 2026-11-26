@@ -353,12 +353,13 @@ pub struct Synced<'a> {
     socket: Socket<'a>,
     peer: crate::net_processing::SyncedPeer<'a>,
     tip: crate::chain::Tip,
+    ready_blocks: std::collections::VecDeque<crate::utxo::ConnectedBlock>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
     Tip(crate::chain::Tip),
-    Block(crate::block::CheckedBlock),
+    Block(crate::utxo::ConnectedBlock),
 }
 
 #[derive(Debug)]
@@ -615,6 +616,7 @@ impl<'a> Connection<'a> {
                             socket,
                             peer: *synced,
                             tip,
+                            ready_blocks: std::collections::VecDeque::new(),
                         },
                         tip,
                     ));
@@ -624,30 +626,61 @@ impl<'a> Connection<'a> {
     }
 }
 
+enum SyncedTurnEvent {
+    Tip(crate::chain::Tip),
+    Blocks(crate::net_processing::ConnectedBlocks),
+}
+
 impl<'a> Synced<'a> {
     pub async fn next(self) -> Result<(Synced<'a>, Event), RunError> {
         let Synced {
             mut socket,
             mut peer,
             tip: previous,
+            mut ready_blocks,
         } = self;
+        if let Some(block) = ready_blocks.pop_front() {
+            assert!(block.height().get() <= previous.height());
+            return Ok((
+                Synced {
+                    socket,
+                    peer,
+                    tip: previous,
+                    ready_blocks,
+                },
+                Event::Block(block),
+            ));
+        }
         loop {
+            assert!(ready_blocks.is_empty());
             match run_synced_turn(&mut socket, peer).await? {
                 (next, None) => peer = next,
-                (next, Some(Event::Tip(tip))) if tip == previous => peer = next,
-                (peer, Some(Event::Tip(tip))) => {
+                (next, Some(SyncedTurnEvent::Tip(tip))) if tip == previous => peer = next,
+                (peer, Some(SyncedTurnEvent::Tip(tip))) => {
                     assert!(tip.work() >= previous.work());
-                    return Ok((Synced { socket, peer, tip }, Event::Tip(tip)));
+                    return Ok((
+                        Synced {
+                            socket,
+                            peer,
+                            tip,
+                            ready_blocks,
+                        },
+                        Event::Tip(tip),
+                    ));
                 }
-                (peer, Some(event @ Event::Block(block))) => {
-                    assert!(block.height().get() <= previous.height());
+                (peer, Some(SyncedTurnEvent::Blocks(blocks))) => {
+                    let (first, rest) = blocks.into_parts();
+                    assert!(first.height().get() <= previous.height());
+                    assert!(rest.len() < crate::net_processing::BLOCKS_IN_FLIGHT_MAX);
+                    ready_blocks.extend(rest);
                     return Ok((
                         Synced {
                             socket,
                             peer,
                             tip: previous,
+                            ready_blocks,
                         },
-                        event,
+                        Event::Block(first),
                     ));
                 }
             }
@@ -658,7 +691,13 @@ impl<'a> Synced<'a> {
 async fn run_synced_turn<'a>(
     socket: &mut Socket<'_>,
     peer: crate::net_processing::SyncedPeer<'a>,
-) -> Result<(crate::net_processing::SyncedPeer<'a>, Option<Event>), RunError> {
+) -> Result<
+    (
+        crate::net_processing::SyncedPeer<'a>,
+        Option<SyncedTurnEvent>,
+    ),
+    RunError,
+> {
     let now = tokio::time::Instant::now().into_std();
     let (peer, tick_outbound, wake) = peer.tick(now, nonce()).map_err(RunError::NetProcessing)?;
     for outbound in tick_outbound.into_outbounds() {
@@ -675,7 +714,13 @@ async fn run_synced_exchange<'a>(
     socket: &mut Socket<'_>,
     peer: crate::net_processing::SyncedPeer<'a>,
     message: &crate::transport::Message,
-) -> Result<(crate::net_processing::SyncedPeer<'a>, Option<Event>), RunError> {
+) -> Result<
+    (
+        crate::net_processing::SyncedPeer<'a>,
+        Option<SyncedTurnEvent>,
+    ),
+    RunError,
+> {
     let (peer, received) = peer
         .receive(message, clock())
         .map_err(RunError::NetProcessing)?;
@@ -694,11 +739,11 @@ async fn run_synced_exchange<'a>(
         crate::net_processing::SyncedReceived::Tip(tip) => {
             assert_eq!(message.msg_type(), crate::protocol::HEADERS);
             socket.metrics.synced();
-            Ok((peer, Some(Event::Tip(tip))))
+            Ok((peer, Some(SyncedTurnEvent::Tip(tip))))
         }
-        crate::net_processing::SyncedReceived::Block(block) => {
+        crate::net_processing::SyncedReceived::Blocks(blocks) => {
             assert_eq!(message.msg_type(), crate::protocol::BLOCK);
-            Ok((peer, Some(Event::Block(block))))
+            Ok((peer, Some(SyncedTurnEvent::Blocks(blocks))))
         }
     }
 }
@@ -2052,5 +2097,114 @@ mod tests {
         distinct.sort_unstable();
         distinct.dedup();
         assert_eq!(distinct.len(), words.len(), "{words:x?}");
+    }
+
+    #[test]
+    fn out_of_order_blocks_yield_all_connected_events_in_height_order() {
+        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        let metrics = crate::metrics::Metrics::new(&chain);
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        let mut prev = genesis;
+        let mut blocks = Vec::new();
+        for height in 1..=3_usize {
+            let mut script_sig =
+                crate::block::encode_bip34_height(std::num::NonZeroUsize::new(height).unwrap())
+                    .as_slice()
+                    .to_vec();
+            script_sig.push(0);
+            let coinbase = crate::transaction::Transaction::new(
+                1,
+                vec![crate::transaction::TxIn {
+                    previous_output: crate::transaction::OutPoint {
+                        txid: bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]),
+                        vout: u32::MAX,
+                    },
+                    script_sig,
+                    sequence: u32::MAX,
+                    witness: crate::transaction::Witness::default(),
+                }],
+                vec![crate::transaction::TxOut {
+                    value: 0,
+                    script_pubkey: Vec::new(),
+                }],
+                0,
+            )
+            .unwrap();
+            let header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
+                version: crate::fixtures::HEADER_VERSION,
+                prev: prev.hash(),
+                merkle_root: coinbase.txid().to_byte_array(),
+                time: prev.time + 1,
+                ..genesis
+            });
+            prev = header;
+            blocks.push(crate::block::Block {
+                header,
+                transactions: Some(crate::block::Transactions {
+                    first: coinbase,
+                    rest: Vec::new(),
+                }),
+            });
+        }
+        let headers: Vec<_> = blocks.iter().map(|block| block.header).collect();
+        let headers_frame = crate::transport::encode(
+            crate::chainparams::Network::Regtest,
+            crate::protocol::HEADERS,
+            &crate::fixtures::headers_payload_with(&headers),
+        );
+        let block_frames: Vec<_> = blocks
+            .iter()
+            .map(|block| {
+                let mut payload = Vec::new();
+                crate::serialize::Encode::encode(block, &mut payload);
+                crate::transport::encode(
+                    crate::chainparams::Network::Regtest,
+                    crate::protocol::BLOCK,
+                    &payload,
+                )
+            })
+            .collect();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+        let peer_thread = std::thread::spawn(move || {
+            let mut stream = accept_handshake(&listener);
+            assert_ping(&read_message(&mut stream));
+            read_first_get_headers(&mut stream);
+            stream.write_all(&headers_frame).unwrap();
+            read_send_headers(&mut stream);
+            read_frame(&mut stream);
+            stream.write_all(&block_frames[2]).unwrap();
+            stream.write_all(&block_frames[1]).unwrap();
+            stream.write_all(&block_frames[0]).unwrap();
+            let mut rest = Vec::new();
+            stream.read_to_end(&mut rest).unwrap();
+        });
+
+        let yielded = block_on(async {
+            let (connection, _theirs) = super::handshake(&destination(peer), &mut chain, &metrics)
+                .await
+                .unwrap();
+            let (mut synced, _tip) = connection.sync().await.unwrap();
+            let mut yielded = Vec::new();
+            for _ in 0..3 {
+                let (next, event) = synced.next().await.unwrap();
+                let super::Event::Block(block) = event else {
+                    panic!("{event:?}");
+                };
+                yielded.push((block.height().get(), block.hash()));
+                synced = next;
+            }
+            yielded
+        });
+        peer_thread.join().unwrap();
+        assert_eq!(
+            yielded,
+            vec![
+                (1, headers[0].hash()),
+                (2, headers[1].hash()),
+                (3, headers[2].hash()),
+            ]
+        );
     }
 }

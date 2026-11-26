@@ -31,7 +31,7 @@ pub enum Event<'a> {
     },
     Block {
         peer: std::net::SocketAddr,
-        block: &'a crate::block::CheckedBlock,
+        block: &'a crate::utxo::ConnectedBlock,
     },
     Metrics {
         address: std::net::SocketAddr,
@@ -308,24 +308,64 @@ mod tests {
         let mut payload: &[u8] = &crate::fixtures::version_payload();
         let version: crate::protocol::Version =
             crate::serialize::Decode::decode(&mut payload).unwrap();
-        let chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
+        let mut chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
         let tip = chain.tip();
-        let block_bytes = crate::fixtures::hex(crate::fixtures::REGTEST_BLOCK_103);
-        let mut block_input = block_bytes.as_slice();
-        let block_header: crate::block::BlockHeader =
-            crate::serialize::Decode::decode(&mut block_input).unwrap();
-        let block_position = crate::chain::BlockPosition::new(
-            crate::chainparams::Network::Regtest,
-            std::num::NonZeroUsize::new(103).unwrap(),
-            block_header.hash(),
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        let coinbase = crate::transaction::Transaction::new(
+            1,
+            vec![crate::transaction::TxIn {
+                previous_output: crate::transaction::OutPoint {
+                    txid: bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]),
+                    vout: u32::MAX,
+                },
+                script_sig: vec![0x51, 0x00],
+                sequence: u32::MAX,
+                witness: crate::transaction::Witness::default(),
+            }],
+            vec![crate::transaction::TxOut {
+                value: 0,
+                script_pubkey: Vec::new(),
+            }],
             0,
-        );
-        let block = crate::block::MatchedHeader::new(block_position, block_header)
+        )
+        .unwrap();
+        let block_header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
+            version: crate::fixtures::HEADER_VERSION,
+            prev: genesis.hash(),
+            merkle_root: coinbase.txid().to_byte_array(),
+            time: genesis.time + 1,
+            ..genesis
+        });
+        let raw_block = crate::block::Block {
+            header: block_header,
+            transactions: Some(crate::block::Transactions {
+                first: coinbase,
+                rest: Vec::new(),
+            }),
+        };
+        let mut block_bytes = Vec::new();
+        crate::serialize::Encode::encode(&raw_block, &mut block_bytes);
+        chain
+            .extend(
+                crate::fixtures::headers_batch(&[block_header]),
+                crate::fixtures::CLOCK,
+            )
+            .unwrap();
+        let mut block_input = block_bytes.as_slice();
+        let decoded_header: crate::block::BlockHeader =
+            crate::serialize::Decode::decode(&mut block_input).unwrap();
+        let block_position = chain.block_position(std::num::NonZeroUsize::MIN).unwrap();
+        let checked = crate::block::MatchedHeader::new(block_position, decoded_header)
             .unwrap()
             .decode_body(&mut block_input)
             .unwrap()
             .check()
             .unwrap();
+        let block = chain.connect_block(checked).unwrap();
+        let block_expected = format!(
+            "level=info event=block peer=127.0.0.1:18444 height=1 hash={} transactions=1",
+            block.hash_display()
+        );
         for (event, expected) in [
             (
                 super::Event::Version {
@@ -349,9 +389,7 @@ mod tests {
                     peer: PEER,
                     block: &block,
                 },
-                "level=info event=block peer=127.0.0.1:18444 height=103 \
-                 hash=2e1b26f32330298af67653f3e37c35937b07ebf828864abeb68456eef3acdc31 \
-                 transactions=3",
+                block_expected.as_str(),
             ),
             (
                 super::Event::Metrics { address: PEER },

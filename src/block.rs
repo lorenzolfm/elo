@@ -53,7 +53,7 @@ const WITNESS_COMMITMENT_HEADER: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
 
 const TRANSACTION_SIZE_MUTATED: usize = 64;
 
-const SIGOPS_COST_MAX: usize = 80_000;
+pub(crate) const SIGOPS_COST_MAX: usize = 80_000;
 
 const LEGACY_SIGOPS_MAX: usize = SIGOPS_COST_MAX / crate::transaction::WITNESS_SCALE_FACTOR;
 
@@ -139,11 +139,23 @@ struct Unmutated {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Checked {
     header: BlockHeader,
-    coinbase: crate::transaction::Transaction,
-    rest: Vec<crate::transaction::Transaction>,
+    coinbase: crate::transaction::CheckedTransaction,
+    rest: Vec<crate::transaction::CheckedTransaction>,
 }
 
 impl Checked {
+    pub(crate) fn header(&self) -> BlockHeader {
+        self.header
+    }
+
+    pub(crate) fn coinbase(&self) -> &crate::transaction::CheckedTransaction {
+        &self.coinbase
+    }
+
+    pub(crate) fn rest(&self) -> &[crate::transaction::CheckedTransaction] {
+        &self.rest
+    }
+
     pub(crate) fn transactions_count(&self) -> std::num::NonZeroUsize {
         assert!(self.rest.len() < BLOCK_TRANSACTIONS_COUNT_MAX);
         std::num::NonZeroUsize::MIN.saturating_add(self.rest.len())
@@ -194,34 +206,50 @@ impl DownloadedBlock {
             .map_err(CheckError::Invalid)?;
         Ok(CheckedBlock {
             position: self.position,
-            transactions_count: checked.transactions_count(),
+            checked,
         })
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CheckedBlock {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CheckedBlock {
     position: crate::chain::BlockPosition,
-    transactions_count: std::num::NonZeroUsize,
+    checked: Checked,
 }
 
 impl CheckedBlock {
+    #[cfg(any(test, fuzzing))]
+    pub(crate) fn from_checked(
+        position: crate::chain::BlockPosition,
+        checked: Checked,
+    ) -> Option<CheckedBlock> {
+        (checked.header.hash() == position.hash()
+            && checked.header.time > position.prev_median_time_past())
+        .then_some(CheckedBlock { position, checked })
+    }
+
+    pub(crate) fn position(&self) -> crate::chain::BlockPosition {
+        self.position
+    }
+
     pub(crate) fn height(&self) -> std::num::NonZeroUsize {
         self.position.height()
     }
 
-    #[cfg(any(test, fuzzing))]
-    #[cfg_attr(false, mutants::skip)]
-    pub(crate) fn hash(&self) -> bitcoin_hashes::sha256d::Hash {
-        self.position.hash()
+    pub(crate) fn header(&self) -> BlockHeader {
+        self.checked.header()
     }
 
-    pub(crate) fn hash_display(&self) -> impl std::fmt::Display {
-        self.position.hash_display()
+    pub(crate) fn coinbase(&self) -> &crate::transaction::CheckedTransaction {
+        self.checked.coinbase()
+    }
+
+    pub(crate) fn rest(&self) -> &[crate::transaction::CheckedTransaction] {
+        self.checked.rest()
     }
 
     pub(crate) fn transactions_count(&self) -> std::num::NonZeroUsize {
-        self.transactions_count
+        self.checked.transactions_count()
     }
 }
 
@@ -434,9 +462,10 @@ impl Unmutated {
             return Err(BlockError::BaseSizeTooLarge);
         }
         assert!(transactions.len() <= BLOCK_TRANSACTIONS_COUNT_MAX);
-        let Some(coinbase_input) = transactions.first.coinbase_input() else {
+        let witness_bytes = transactions.witness_bytes();
+        if transactions.first.coinbase_input().is_none() {
             return Err(BlockError::CoinbaseMissing);
-        };
+        }
         if transactions
             .rest
             .iter()
@@ -463,16 +492,22 @@ impl Unmutated {
         };
 
         let mut seen_outpoints = std::collections::HashSet::new();
-        let mut sigops: usize = 0;
-        let mut all_final = true;
-        for transaction in transactions.iter() {
+        let coinbase = transactions
+            .first
+            .into_checked_with_seen(&mut seen_outpoints)
+            .map_err(BlockError::Transaction)?;
+        let mut sigops = coinbase.legacy_sigop_count();
+        let mut all_final = coinbase.is_final(height, lock_time_cutoff);
+        let mut rest = Vec::with_capacity(transactions.rest.len());
+        for transaction in transactions.rest {
             let checked = transaction
-                .check_with_seen(&mut seen_outpoints)
+                .into_checked_with_seen(&mut seen_outpoints)
                 .map_err(BlockError::Transaction)?;
             sigops = sigops.saturating_add(checked.legacy_sigop_count());
             if !checked.is_final(height, lock_time_cutoff) {
                 all_final = false;
             }
+            rest.push(checked);
         }
         if sigops > LEGACY_SIGOPS_MAX {
             return Err(BlockError::SigOpsTooMany);
@@ -482,19 +517,18 @@ impl Unmutated {
         }
         if let Some(height) = bip34_height {
             let expected = encode_bip34_height(height);
+            let coinbase_input = coinbase.coinbase_input().expect("checked coinbase");
             if !coinbase_input.script_sig.starts_with(expected.as_slice()) {
                 return Err(BlockError::CoinbaseHeight);
             }
         }
-        if weight_from_base(base_size, transactions.witness_bytes())
-            > crate::transaction::BLOCK_WEIGHT_MAX
-        {
+        if weight_from_base(base_size, witness_bytes) > crate::transaction::BLOCK_WEIGHT_MAX {
             return Err(BlockError::WeightTooLarge);
         }
         Ok(Checked {
             header: self.block.header,
-            coinbase: transactions.first,
-            rest: transactions.rest,
+            coinbase,
+            rest,
         })
     }
 }
@@ -843,14 +877,14 @@ mod tests {
             .unwrap()
             .check()?;
         let expected = block.transactions.unwrap();
-        assert_eq!(
-            checked,
-            super::Checked {
-                header: block.header,
-                coinbase: expected.first,
-                rest: expected.rest,
-            }
-        );
+        assert_eq!(checked.header(), block.header);
+        assert_eq!(checked.coinbase().transaction(), &expected.first);
+        let rest: Vec<_> = checked
+            .rest()
+            .iter()
+            .map(|transaction| transaction.transaction().clone())
+            .collect();
+        assert_eq!(rest, expected.rest);
         Ok(())
     }
 
@@ -1028,11 +1062,31 @@ mod tests {
         let height = std::num::NonZeroUsize::new(103).unwrap();
         let block_position =
             crate::chain::BlockPosition::new(REGTEST, height, header.hash(), header.time - 1);
+        let checked_raw = super::PositionedBlock::new(block.clone(), block_position.position())
+            .unwrap()
+            .check()
+            .unwrap();
+        let wrong_hash = crate::chain::BlockPosition::new(
+            REGTEST,
+            height,
+            REGTEST.genesis().hash(),
+            header.time - 1,
+        );
+        let equal_time =
+            crate::chain::BlockPosition::new(REGTEST, height, header.hash(), header.time);
+        assert_eq!(
+            super::CheckedBlock::from_checked(wrong_hash, checked_raw.clone()),
+            None
+        );
+        assert_eq!(
+            super::CheckedBlock::from_checked(equal_time, checked_raw),
+            None
+        );
         let matched = super::MatchedHeader::new(block_position, header).unwrap();
         assert_eq!(matched.position(), block_position);
         let checked = matched.decode_body(&mut input).unwrap().check().unwrap();
         assert_eq!(checked.height(), height);
-        assert_eq!(checked.hash(), block.header.hash());
+        assert_eq!(checked.position().hash(), block.header.hash());
         assert_eq!(checked.transactions_count().get(), 3);
 
         let genesis = crate::fixtures::block(crate::fixtures::REGTEST_GENESIS_BLOCK);

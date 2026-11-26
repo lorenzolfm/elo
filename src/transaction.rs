@@ -12,7 +12,7 @@ pub(crate) const BLOCK_BASE_SIZE_MAX: usize = BLOCK_WEIGHT_MAX / WITNESS_SCALE_F
 
 const _: () = assert!(BLOCK_BASE_SIZE_MAX * WITNESS_SCALE_FACTOR == BLOCK_WEIGHT_MAX);
 
-const COIN: i64 = 100_000_000;
+pub(crate) const COIN: i64 = 100_000_000;
 
 pub(crate) const MONEY_MAX: i64 = 21_000_000 * COIN;
 
@@ -23,9 +23,19 @@ const COINBASE_SCRIPT_SIZE_MIN: usize = 2;
 
 const COINBASE_SCRIPT_SIZE_MAX: usize = 100;
 
+const SCRIPT_SIZE_MAX: usize = 10_000;
+
 const LOCK_TIME_THRESHOLD: u32 = 500_000_000;
 
 const SEQUENCE_FINAL: u32 = u32::MAX;
+
+pub(crate) const SEQUENCE_LOCKTIME_DISABLE_FLAG: u32 = 1 << 31;
+
+pub(crate) const SEQUENCE_LOCKTIME_TYPE_FLAG: u32 = 1 << 22;
+
+pub(crate) const SEQUENCE_LOCKTIME_MASK: u32 = 0x0000_ffff;
+
+pub(crate) const SEQUENCE_LOCKTIME_GRANULARITY: u32 = 9;
 
 const MULTISIG_PUBKEYS_COUNT_MAX: usize = 20;
 
@@ -35,6 +45,18 @@ const OP_PUSHDATA2: u8 = 0x4d;
 
 const OP_PUSHDATA4: u8 = 0x4e;
 
+const OP_1_OFFSET: u8 = 0x50;
+
+const OP_1: u8 = 0x51;
+
+const OP_16: u8 = 0x60;
+
+const OP_RETURN: u8 = 0x6a;
+
+const OP_EQUAL: u8 = 0x87;
+
+const OP_HASH160: u8 = 0xa9;
+
 const OP_CHECKSIG: u8 = 0xac;
 
 const OP_CHECKSIGVERIFY: u8 = 0xad;
@@ -42,6 +64,14 @@ const OP_CHECKSIGVERIFY: u8 = 0xad;
 const OP_CHECKMULTISIG: u8 = 0xae;
 
 const OP_CHECKMULTISIGVERIFY: u8 = 0xaf;
+
+const P2SH_SCRIPT_SIZE: usize = 23;
+
+const P2SH_HASH_SIZE: u8 = 20;
+
+const WITNESS_V0_KEYHASH_SIZE: usize = 20;
+
+const WITNESS_V0_SCRIPTHASH_SIZE: usize = 32;
 
 const TX_INPUTS_COUNT_MAX: usize = BLOCK_BASE_SIZE_MAX / TxIn::SIZE_MIN;
 
@@ -164,6 +194,19 @@ impl Witness {
         }
     }
 
+    fn last_item(&self) -> Option<&[u8]> {
+        let WitnessStack::NonEmpty { count, bytes } = &self.0 else {
+            return None;
+        };
+        let mut input = bytes.as_slice();
+        let mut last: &[u8] = &[];
+        for _ in 0..count.get() {
+            last = crate::serialize::read_bytes(&mut input).expect("validated witness stack");
+        }
+        assert!(input.is_empty());
+        Some(last)
+    }
+
     fn encoded_size(&self) -> usize {
         match &self.0 {
             WitnessStack::Empty => 1,
@@ -254,6 +297,10 @@ pub(crate) struct TxOut {
 }
 
 impl TxOut {
+    pub(crate) fn is_unspendable(&self) -> bool {
+        self.script_pubkey.first() == Some(&OP_RETURN) || self.script_pubkey.len() > SCRIPT_SIZE_MAX
+    }
+
     fn encoded_size(&self) -> usize {
         let size = size_of::<i64>()
             + crate::serialize::compact_size_length(self.script_pubkey.len())
@@ -323,11 +370,15 @@ pub(crate) struct Transaction {
     lock_time: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct CheckedTransaction<'a>(&'a Transaction);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CheckedTransaction {
+    transaction: Transaction,
+    value_out: i64,
+    legacy_sigop_count: usize,
+}
 
 impl Transaction {
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn new(
         version: u32,
         inputs: Vec<TxIn>,
@@ -346,7 +397,7 @@ impl Transaction {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn inputs(&self) -> &[TxIn] {
         self.inputs_slice()
     }
@@ -454,15 +505,15 @@ impl Transaction {
     }
 
     #[cfg(test)]
-    pub(crate) fn check(&self) -> Result<CheckedTransaction<'_>, TransactionError> {
+    pub(crate) fn check(&self) -> Result<CheckedTransaction, TransactionError> {
         let mut seen = std::collections::HashSet::new();
-        self.check_with_seen(&mut seen)
+        self.clone().into_checked_with_seen(&mut seen)
     }
 
-    pub(crate) fn check_with_seen(
-        &self,
+    pub(crate) fn into_checked_with_seen(
+        self,
         seen: &mut std::collections::HashSet<OutPoint>,
-    ) -> Result<CheckedTransaction<'_>, TransactionError> {
+    ) -> Result<CheckedTransaction, TransactionError> {
         let Transfers::NonEmpty { inputs, outputs } = &self.transfers else {
             return Err(TransactionError::InputsEmpty);
         };
@@ -514,19 +565,22 @@ impl Transaction {
 
         if let Some(coinbase) = self.coinbase_input() {
             let script_length = coinbase.script_sig.len();
-            if (COINBASE_SCRIPT_SIZE_MIN..=COINBASE_SCRIPT_SIZE_MAX).contains(&script_length) {
-                Ok(CheckedTransaction(self))
-            } else {
-                Err(TransactionError::CoinbaseScriptSize)
+            if !(COINBASE_SCRIPT_SIZE_MIN..=COINBASE_SCRIPT_SIZE_MAX).contains(&script_length) {
+                return Err(TransactionError::CoinbaseScriptSize);
             }
         } else if inputs_slice
             .iter()
             .any(|input| input.previous_output.is_null())
         {
-            Err(TransactionError::NullOutPoint)
-        } else {
-            Ok(CheckedTransaction(self))
+            return Err(TransactionError::NullOutPoint);
         }
+
+        let legacy_sigop_count = legacy_sigop_count(inputs_slice, outputs);
+        Ok(CheckedTransaction {
+            transaction: self,
+            value_out: total,
+            legacy_sigop_count,
+        })
     }
 
     fn encode_without_witness(&self, out: &mut Vec<u8>) {
@@ -545,12 +599,51 @@ impl Transaction {
     }
 }
 
-impl CheckedTransaction<'_> {
-    pub(crate) fn is_final(self, height: usize, time: u32) -> bool {
-        let inputs = self.0.inputs_slice();
+impl CheckedTransaction {
+    pub(crate) fn version(&self) -> u32 {
+        self.transaction.version
+    }
+
+    pub(crate) fn inputs(&self) -> &[TxIn] {
+        let inputs = self.transaction.inputs_slice();
         assert!(!inputs.is_empty());
         assert!(inputs.len() <= TX_INPUTS_COUNT_MAX);
-        let satisfied = match self.0.lock_time() {
+        inputs
+    }
+
+    pub(crate) fn outputs(&self) -> &[TxOut] {
+        let outputs = self.transaction.outputs();
+        assert!(!outputs.is_empty());
+        assert!(outputs.len() <= TX_OUTPUTS_COUNT_MAX);
+        outputs
+    }
+
+    pub(crate) fn coinbase_input(&self) -> Option<&TxIn> {
+        self.transaction.coinbase_input()
+    }
+
+    pub(crate) fn txid(&self) -> bitcoin_hashes::sha256d::Hash {
+        self.transaction.txid()
+    }
+
+    pub(crate) fn value_out(&self) -> i64 {
+        assert!(self.value_out >= 0);
+        assert!(self.value_out <= MONEY_MAX);
+        self.value_out
+    }
+
+    pub(crate) fn legacy_sigop_count(&self) -> usize {
+        self.legacy_sigop_count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transaction(&self) -> &Transaction {
+        &self.transaction
+    }
+
+    pub(crate) fn is_final(&self, height: usize, time: u32) -> bool {
+        let inputs = self.inputs();
+        let satisfied = match self.transaction.lock_time() {
             LockTime::Unlocked => return true,
             LockTime::Height(lock_height) => {
                 usize::try_from(lock_height.get()).expect("u32 fits in usize") < height
@@ -562,78 +655,117 @@ impl CheckedTransaction<'_> {
         }
         inputs.iter().all(|input| input.sequence == SEQUENCE_FINAL)
     }
+}
 
-    pub(crate) fn legacy_sigop_count(self) -> usize {
-        let inputs = self.0.inputs_slice();
-        let outputs = self.0.outputs();
-        assert!(inputs.len() <= TX_INPUTS_COUNT_MAX);
-        assert!(outputs.len() <= TX_OUTPUTS_COUNT_MAX);
-        let mut count: usize = 0;
-        let mut script_bytes: usize = 0;
-        for input in inputs {
-            script_bytes = script_bytes.saturating_add(input.script_sig.len());
-            count = count.saturating_add(script_legacy_sigop_count(&input.script_sig));
-        }
-        for output in outputs {
-            script_bytes = script_bytes.saturating_add(output.script_pubkey.len());
-            count = count.saturating_add(script_legacy_sigop_count(&output.script_pubkey));
-        }
-        assert!(count <= script_bytes.saturating_mul(MULTISIG_PUBKEYS_COUNT_MAX));
-        count
+fn legacy_sigop_count(inputs: &[TxIn], outputs: &[TxOut]) -> usize {
+    assert!(inputs.len() <= TX_INPUTS_COUNT_MAX);
+    assert!(outputs.len() <= TX_OUTPUTS_COUNT_MAX);
+    let mut count: usize = 0;
+    let mut script_bytes: usize = 0;
+    for input in inputs {
+        script_bytes = script_bytes.saturating_add(input.script_sig.len());
+        count = count.saturating_add(script_sigop_count(&input.script_sig, false));
+    }
+    for output in outputs {
+        script_bytes = script_bytes.saturating_add(output.script_pubkey.len());
+        count = count.saturating_add(script_sigop_count(&output.script_pubkey, false));
+    }
+    assert!(count <= script_bytes.saturating_mul(MULTISIG_PUBKEYS_COUNT_MAX));
+    count
+}
+
+pub(crate) fn input_p2sh_and_witness_sigop_cost(input: &TxIn, prevout: &TxOut) -> usize {
+    if is_p2sh(&prevout.script_pubkey) {
+        let Some(redeem_script) = last_push_data(&input.script_sig) else {
+            return 0;
+        };
+        script_sigop_count(redeem_script, true)
+            .saturating_mul(WITNESS_SCALE_FACTOR)
+            .saturating_add(witness_v0_sigops(redeem_script, &input.witness))
+    } else {
+        witness_v0_sigops(&prevout.script_pubkey, &input.witness)
     }
 }
 
-fn script_legacy_sigop_count(mut script: &[u8]) -> usize {
+fn is_p2sh(script: &[u8]) -> bool {
+    script.len() == P2SH_SCRIPT_SIZE
+        && script[0] == OP_HASH160
+        && script[1] == P2SH_HASH_SIZE
+        && script[P2SH_SCRIPT_SIZE - 1] == OP_EQUAL
+}
+
+fn witness_v0_sigops(script: &[u8], witness: &Witness) -> usize {
+    match script {
+        [0x00, 20, program @ ..] if program.len() == WITNESS_V0_KEYHASH_SIZE => 1,
+        [0x00, 32, program @ ..] if program.len() == WITNESS_V0_SCRIPTHASH_SIZE => witness
+            .last_item()
+            .map_or(0, |witness_script| script_sigop_count(witness_script, true)),
+        _ => 0,
+    }
+}
+
+fn last_push_data(mut script: &[u8]) -> Option<&[u8]> {
+    let mut last: &[u8] = &[];
+    while !script.is_empty() {
+        let length_before = script.len();
+        let (opcode, data) = next_script_op(&mut script)?;
+        if opcode > OP_16 {
+            return None;
+        }
+        assert!(script.len() < length_before);
+        last = data;
+    }
+    Some(last)
+}
+
+fn next_script_op<'a>(script: &mut &'a [u8]) -> Option<(u8, &'a [u8])> {
+    let (&opcode, rest) = script.split_first()?;
+    let (data, rest) = match opcode {
+        0..OP_PUSHDATA1 => rest.split_at_checked(usize::from(opcode))?,
+        OP_PUSHDATA1 => {
+            let (&size, rest) = rest.split_first()?;
+            rest.split_at_checked(usize::from(size))?
+        }
+        OP_PUSHDATA2 => {
+            let (bytes, rest) = rest.split_first_chunk::<2>()?;
+            let size = usize::from(u16::from_le_bytes(*bytes));
+            rest.split_at_checked(size)?
+        }
+        OP_PUSHDATA4 => {
+            let (bytes, rest) = rest.split_first_chunk::<4>()?;
+            let size = usize::try_from(u32::from_le_bytes(*bytes)).expect("u32 fits in usize");
+            rest.split_at_checked(size)?
+        }
+        _ => (&[][..], rest),
+    };
+    *script = rest;
+    Some((opcode, data))
+}
+
+fn script_sigop_count(mut script: &[u8], accurate: bool) -> usize {
     let initial_length = script.len();
     let mut count: usize = 0;
-    while let Some((&opcode, rest)) = script.split_first() {
+    let mut last_opcode: Option<u8> = None;
+    while !script.is_empty() {
         let length_before = script.len();
-        script = rest;
+        let Some((opcode, _)) = next_script_op(&mut script) else {
+            break;
+        };
+        assert!(script.len() < length_before);
         match opcode {
-            0..OP_PUSHDATA1 => {
-                let Some((_, rest)) = script.split_at_checked(usize::from(opcode)) else {
-                    break;
-                };
-                script = rest;
-            }
-            OP_PUSHDATA1 => {
-                let Some((&size, rest)) = script.split_first() else {
-                    break;
-                };
-                let Some((_, rest)) = rest.split_at_checked(usize::from(size)) else {
-                    break;
-                };
-                script = rest;
-            }
-            OP_PUSHDATA2 => {
-                let Some((bytes, rest)) = script.split_first_chunk::<2>() else {
-                    break;
-                };
-                let size = usize::from(u16::from_le_bytes(*bytes));
-                let Some((_, rest)) = rest.split_at_checked(size) else {
-                    break;
-                };
-                script = rest;
-            }
-            OP_PUSHDATA4 => {
-                let Some((bytes, rest)) = script.split_first_chunk::<4>() else {
-                    break;
-                };
-                let size = usize::try_from(u32::from_le_bytes(*bytes)).expect("u32 fits in usize");
-                let Some((_, rest)) = rest.split_at_checked(size) else {
-                    break;
-                };
-                script = rest;
-            }
             OP_CHECKSIG | OP_CHECKSIGVERIFY => {
                 count = count.saturating_add(1);
             }
             OP_CHECKMULTISIG | OP_CHECKMULTISIGVERIFY => {
-                count = count.saturating_add(MULTISIG_PUBKEYS_COUNT_MAX);
+                let sigops = match last_opcode {
+                    Some(prev @ OP_1..=OP_16) if accurate => usize::from(prev - OP_1_OFFSET),
+                    _ => MULTISIG_PUBKEYS_COUNT_MAX,
+                };
+                count = count.saturating_add(sigops);
             }
             _ => {}
         }
-        assert!(script.len() < length_before);
+        last_opcode = Some(opcode);
     }
     assert!(count <= initial_length.saturating_mul(MULTISIG_PUBKEYS_COUNT_MAX));
     count
@@ -1013,8 +1145,9 @@ mod tests {
     #[test]
     fn check_transaction_enforces_core_rules() {
         let check = |tx: &super::Transaction| tx.check().map(|_| ());
-        let check_with_seen =
-            |tx: &super::Transaction, seen: &mut _| tx.check_with_seen(seen).map(|_| ());
+        let check_with_seen = |tx: &super::Transaction, seen: &mut _| {
+            tx.clone().into_checked_with_seen(seen).map(|_| ())
+        };
 
         assert_eq!(check(&valid_spend()), Ok(()));
         assert_eq!(check(&valid_coinbase(vec![0; 2])), Ok(()));
@@ -1259,7 +1392,7 @@ mod tests {
 
     #[test]
     fn legacy_sigop_count_matches_core_inaccurate_script_scan() {
-        let count = super::script_legacy_sigop_count;
+        let count = |script: &[u8]| super::script_sigop_count(script, false);
         assert_eq!(count(&[]), 0);
         assert_eq!(count(&[super::OP_CHECKSIG]), 1);
         assert_eq!(count(&[super::OP_CHECKSIGVERIFY]), 1);
@@ -1366,5 +1499,199 @@ mod tests {
         legacy.encode(&mut encoded);
         assert_eq!(legacy.size_without_witness(), encoded.len());
         assert_eq!(legacy.size_with_witness(), encoded.len());
+    }
+
+    #[test]
+    fn unspendable_outputs_are_op_return_or_above_script_size_max() {
+        assert!(!tx_out(0, Vec::new()).is_unspendable());
+        assert!(tx_out(0, vec![super::OP_RETURN]).is_unspendable());
+        assert!(tx_out(0, vec![super::OP_RETURN, 0x01, 0xaa]).is_unspendable());
+        assert!(!tx_out(0, vec![super::OP_1, super::OP_RETURN]).is_unspendable());
+        assert!(!tx_out(0, vec![super::OP_1; super::SCRIPT_SIZE_MAX]).is_unspendable());
+        assert!(tx_out(0, vec![super::OP_1; super::SCRIPT_SIZE_MAX + 1]).is_unspendable());
+    }
+
+    #[test]
+    fn accurate_p2sh_and_witness_sigop_cost_matches_core() {
+        assert_eq!(
+            super::script_sigop_count(&[super::OP_1, super::OP_CHECKMULTISIG], true),
+            1
+        );
+        assert_eq!(
+            super::script_sigop_count(&[super::OP_16, super::OP_CHECKMULTISIGVERIFY], true),
+            16
+        );
+        assert_eq!(
+            super::script_sigop_count(&[0x00, super::OP_CHECKMULTISIG], true),
+            20
+        );
+        assert_eq!(
+            super::script_sigop_count(&[0x50, super::OP_CHECKMULTISIG], true),
+            20
+        );
+        assert_eq!(
+            super::script_sigop_count(&[0x61, super::OP_CHECKMULTISIG], true),
+            20
+        );
+        assert_eq!(
+            super::script_sigop_count(&[super::OP_CHECKMULTISIG], true),
+            20
+        );
+        assert_eq!(
+            super::script_sigop_count(&[0x01, super::OP_1, super::OP_CHECKMULTISIG], true),
+            20
+        );
+
+        let p2sh_script = || {
+            let mut script = vec![super::OP_HASH160, super::P2SH_HASH_SIZE];
+            script.extend_from_slice(&[0x11; 20]);
+            script.push(super::OP_EQUAL);
+            script
+        };
+        let witness_from = |items: &[&[u8]]| {
+            let mut bytes = Vec::new();
+            crate::serialize::write_compact_size(&mut bytes, items.len());
+            for item in items {
+                crate::serialize::write_string(&mut bytes, item);
+            }
+            super::Witness::decode(&mut bytes.as_slice()).unwrap()
+        };
+        let cost = |script_sig: Vec<u8>, witness: super::Witness, script_pubkey: Vec<u8>| {
+            let mut input = tx_in(outpoint(1, 0), script_sig, super::SEQUENCE_FINAL);
+            input.witness = witness;
+            super::input_p2sh_and_witness_sigop_cost(&input, &tx_out(0, script_pubkey))
+        };
+
+        assert_eq!(
+            cost(Vec::new(), super::Witness::default(), vec![super::OP_1]),
+            0
+        );
+        assert_eq!(
+            cost(Vec::new(), super::Witness::default(), p2sh_script()),
+            0
+        );
+        let redeem = [super::OP_1_OFFSET + 2, super::OP_CHECKMULTISIG];
+        let mut push_redeem = vec![u8::try_from(redeem.len()).unwrap()];
+        push_redeem.extend_from_slice(&redeem);
+        assert_eq!(
+            cost(
+                push_redeem.clone(),
+                super::Witness::default(),
+                p2sh_script()
+            ),
+            2 * super::WITNESS_SCALE_FACTOR
+        );
+        let mut non_push_only = vec![0x61];
+        non_push_only.extend_from_slice(&push_redeem);
+        assert_eq!(
+            cost(non_push_only, super::Witness::default(), p2sh_script()),
+            0
+        );
+        let mut op_16_last = push_redeem.clone();
+        op_16_last.push(super::OP_16);
+        assert_eq!(
+            cost(op_16_last, super::Witness::default(), p2sh_script()),
+            0
+        );
+        let mut op_16_first = vec![super::OP_16];
+        op_16_first.extend_from_slice(&push_redeem);
+        assert_eq!(
+            cost(op_16_first, super::Witness::default(), p2sh_script()),
+            2 * super::WITNESS_SCALE_FACTOR
+        );
+        assert_eq!(
+            cost(
+                vec![0x02, super::OP_CHECKSIG],
+                super::Witness::default(),
+                p2sh_script()
+            ),
+            0
+        );
+        let mut two_pushes = vec![0x01, super::OP_CHECKSIG];
+        two_pushes.extend_from_slice(&push_redeem);
+        assert_eq!(
+            cost(two_pushes, super::Witness::default(), p2sh_script()),
+            2 * super::WITNESS_SCALE_FACTOR
+        );
+        for mut bad_p2sh in [
+            p2sh_script()[..22].to_vec(),
+            [p2sh_script(), vec![0x00]].concat(),
+            {
+                let mut s = p2sh_script();
+                s[0] = 0x00;
+                s
+            },
+            {
+                let mut s = p2sh_script();
+                s[1] = 0x13;
+                s
+            },
+            {
+                let mut s = p2sh_script();
+                s[22] = 0x88;
+                s
+            },
+        ] {
+            assert_eq!(
+                cost(
+                    push_redeem.clone(),
+                    super::Witness::default(),
+                    std::mem::take(&mut bad_p2sh)
+                ),
+                0
+            );
+        }
+
+        let mut p2wpkh = vec![0x00, 20];
+        p2wpkh.extend_from_slice(&[0x22; 20]);
+        assert_eq!(
+            cost(Vec::new(), super::Witness::default(), p2wpkh.clone()),
+            1
+        );
+
+        let mut p2wsh = vec![0x00, 32];
+        p2wsh.extend_from_slice(&[0x33; 32]);
+        assert_eq!(
+            cost(Vec::new(), super::Witness::default(), p2wsh.clone()),
+            0
+        );
+        let witness_script = [
+            super::OP_1_OFFSET + 3,
+            super::OP_CHECKMULTISIG,
+            super::OP_CHECKSIG,
+        ];
+        let wit = witness_from(&[&[super::OP_CHECKSIG], &witness_script]);
+        assert_eq!(cost(Vec::new(), wit.clone(), p2wsh.clone()), 4);
+
+        let mut p2tr = vec![super::OP_1, 32];
+        p2tr.extend_from_slice(&[0x44; 32]);
+        assert_eq!(cost(Vec::new(), wit.clone(), p2tr), 0);
+        let mut v16 = vec![super::OP_16, 20];
+        v16.extend_from_slice(&[0x44; 20]);
+        assert_eq!(cost(Vec::new(), wit.clone(), v16), 0);
+        for bad_witness_program in [
+            vec![0x00, 1, 0xaa],
+            [&[0x00, 41][..], &[0xaa; 41]].concat(),
+            [&[0x00, 20][..], &[0xaa; 19]].concat(),
+            [&[0x00, 20][..], &[0xaa; 21]].concat(),
+            [&[0x00, 32][..], &[0xaa; 31]].concat(),
+            [&[0x00, 32][..], &[0xaa; 33]].concat(),
+            [&[0x00, 2][..], &[0xaa; 2]].concat(),
+            [&[0x50, 20][..], &[0xaa; 20]].concat(),
+            [&[0x61, 20][..], &[0xaa; 20]].concat(),
+        ] {
+            assert_eq!(cost(Vec::new(), wit.clone(), bad_witness_program), 0);
+        }
+
+        let mut push_p2wpkh = vec![u8::try_from(p2wpkh.len()).unwrap()];
+        push_p2wpkh.extend_from_slice(&p2wpkh);
+        assert_eq!(
+            cost(push_p2wpkh, super::Witness::default(), p2sh_script()),
+            1
+        );
+
+        let mut push_p2wsh = vec![u8::try_from(p2wsh.len()).unwrap()];
+        push_p2wsh.extend_from_slice(&p2wsh);
+        assert_eq!(cost(push_p2wsh, wit, p2sh_script()), 4);
     }
 }

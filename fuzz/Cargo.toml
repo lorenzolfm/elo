@@ -53,4 +53,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "utxo"
+path = "fuzz_targets/utxo.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

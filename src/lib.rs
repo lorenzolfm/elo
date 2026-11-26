@@ -15,6 +15,7 @@ mod protocol;
 mod serialize;
 mod transaction;
 mod transport;
+mod utxo;
 
 #[cfg(test)]
 mod fixtures;
@@ -26,4 +27,5 @@ pub mod fuzz {
     pub use crate::net_processing::fuzz::machines;
     pub use crate::protocol::fuzz::{headers, version};
     pub use crate::serialize::fuzz::compact_size;
+    pub use crate::utxo::fuzz::utxo;
 }
