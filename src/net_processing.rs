@@ -83,6 +83,7 @@ pub enum PeerError {
     SecondLowWorkSync,
     Block(crate::serialize::Error),
     BlockMutation(crate::block::MutationError),
+    BlockInvalid(crate::block::BlockError),
     BlockTimeout,
     LateWtxidRelay,
     LateSendAddrV2,
@@ -114,6 +115,7 @@ impl std::fmt::Display for PeerError {
             }
             PeerError::Block(error) => write!(f, "block payload: {error}"),
             PeerError::BlockMutation(error) => write!(f, "mutated block: {error}"),
+            PeerError::BlockInvalid(error) => write!(f, "invalid block: {error}"),
             PeerError::BlockTimeout => {
                 write!(f, "no block within {} s", BLOCK_TIMEOUT.as_secs())
             }
@@ -1054,7 +1056,10 @@ impl<'a> SyncedPeer<'a> {
             return Ok((self, SyncedReceived::NoReply));
         };
         let block = matched.decode_body(&mut input).map_err(PeerError::Block)?;
-        let checked = block.check_mutation().map_err(PeerError::BlockMutation)?;
+        let checked = block.check().map_err(|error| match error {
+            crate::block::CheckError::Mutated(error) => PeerError::BlockMutation(error),
+            crate::block::CheckError::Invalid(error) => PeerError::BlockInvalid(error),
+        })?;
         Ok((self, SyncedReceived::Block(checked)))
     }
 
@@ -1838,18 +1843,46 @@ pub(crate) mod fuzz {
         crate::chainparams::Network::Regtest.genesis().time + seconds
     }
 
-    fn script_coinbase_bytes(tag: u32) -> [u8; 55] {
-        let mut bytes = [0; 55];
-        bytes[0..4].copy_from_slice(&1_u32.to_le_bytes());
-        bytes[4] = 1;
-        bytes[37..41].copy_from_slice(&u32::MAX.to_le_bytes());
-        bytes[41] = 4;
-        bytes[42..46].copy_from_slice(&tag.to_le_bytes());
+    fn script_bip34_height(height: usize) -> Vec<u8> {
+        assert!((1..=SCRIPT_HEADERS_COUNT_MAX).contains(&height));
+        if height <= 16 {
+            vec![0x50 + u8::try_from(height).expect("height is at most 16")]
+        } else if height <= 127 {
+            vec![1, u8::try_from(height).expect("height is at most 127")]
+        } else {
+            let bytes = u16::try_from(height)
+                .expect("SCRIPT_HEADERS_COUNT_MAX fits in u16")
+                .to_le_bytes();
+            assert_eq!(bytes[1] & 0x80, 0);
+            vec![2, bytes[0], bytes[1]]
+        }
+    }
+
+    fn script_coinbase_bytes(height: usize, tag: u32, valid: bool) -> Vec<u8> {
+        let mut script_sig = script_bip34_height(height);
+        script_sig.extend_from_slice(&tag.to_le_bytes());
+        let mut bytes = Vec::with_capacity(66);
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&[0; 32]);
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.push(u8::try_from(script_sig.len()).expect("script_sig fits in one byte"));
+        bytes.extend_from_slice(&script_sig);
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        if valid {
+            bytes.push(1);
+            bytes.extend_from_slice(&0_i64.to_le_bytes());
+            bytes.push(0);
+        } else {
+            bytes.push(0);
+        }
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
         bytes
     }
 
-    fn script_merkle_root(tag: u32) -> [u8; 32] {
-        bitcoin_hashes::sha256d::Hash::hash(&script_coinbase_bytes(tag)).to_byte_array()
+    fn script_merkle_root(height: usize, tag: u32, valid: bool) -> [u8; 32] {
+        bitcoin_hashes::sha256d::Hash::hash(&script_coinbase_bytes(height, tag, valid))
+            .to_byte_array()
     }
 
     const SCRIPT_KEYS: [u64; 2] = [0, 0];
@@ -1902,6 +1935,7 @@ pub(crate) mod fuzz {
         seed!("block-download-oldest-resets-timeout", "PeerOpen { height: 2, synced: true }"),
         seed!("block-download-out-of-order", "PeerOpen { height: 2, synced: true }"),
         seed!("block-download-out-of-order-timeout", "PeerRefused(BlockTimeout)"),
+        seed!("block-invalid-outputs-empty", "PeerRefused(BlockInvalid(Transaction(OutputsEmpty)))"),
         seed!("block-mutated-merkle-root", "PeerRefused(BlockMutation(MerkleRoot))"),
         seed!("block-mutated-unexpected-witness", "PeerRefused(BlockMutation(UnexpectedWitness))"),
         seed!("block-reorg-in-flight", "PeerOpen { height: 4, synced: true }"),
@@ -2432,7 +2466,7 @@ pub(crate) mod fuzz {
             std::collections::HashMap<bitcoin_hashes::sha256d::Hash, crate::block::BlockHeader>,
         header_by_hash: std::collections::HashMap<
             bitcoin_hashes::sha256d::Hash,
-            (crate::block::BlockHeader, u32),
+            (crate::block::BlockHeader, usize, u32, bool),
         >,
         branch_last: u32,
     }
@@ -2460,13 +2494,17 @@ pub(crate) mod fuzz {
                     crate::protocol::VERSION,
                     self.version_payload(base.our_nonce, kind / 8),
                 ),
+                2 if kind / 8 == 31 => (
+                    crate::protocol::HEADERS,
+                    self.headers_payload(base.last, false, false),
+                ),
                 2 => (crate::protocol::VERACK, Vec::new()),
                 3 => (crate::protocol::PING, self.nonce().to_le_bytes().to_vec()),
                 4 => (crate::protocol::PONG, self.pong_payload(base.ping_nonce)),
                 5 => {
                     let payload = match usize::from(kind / 8).checked_sub(1) {
-                        None => self.headers_payload(base.last, false),
-                        Some(index) => self.headers_payload(base.on_locator(index), true),
+                        None => self.headers_payload(base.last, false, true),
+                        Some(index) => self.headers_payload(base.on_locator(index), true, true),
                     };
                     (crate::protocol::HEADERS, payload)
                 }
@@ -2498,7 +2536,7 @@ pub(crate) mod fuzz {
 
         fn block_payload(&mut self, base: &MessageBase, slot: usize) -> Vec<u8> {
             let mode = self.byte();
-            let (header, tag) = if mode & 1 == 0
+            let (header, height, tag, valid) = if mode & 1 == 0
                 && !base.in_flight.is_empty()
                 && let Some(entry) = self
                     .header_by_hash
@@ -2506,12 +2544,12 @@ pub(crate) mod fuzz {
             {
                 *entry
             } else {
-                (FRAME_NETWORK.genesis(), 0)
+                (FRAME_NETWORK.genesis(), 1, 0, true)
             };
             let mut payload = Vec::new();
             header.encode(&mut payload);
             payload.push(1);
-            let mut tx = script_coinbase_bytes(tag);
+            let mut tx = script_coinbase_bytes(height, tag, valid);
             match (mode >> 1) % 3 {
                 0 => payload.extend_from_slice(&tx),
                 1 => {
@@ -2519,11 +2557,12 @@ pub(crate) mod fuzz {
                     payload.extend_from_slice(&tx);
                 }
                 _ => {
+                    let lock_time_start = tx.len() - size_of::<u32>();
                     payload.extend_from_slice(&tx[..4]);
                     payload.extend_from_slice(&[0x00, 0x01]);
-                    payload.extend_from_slice(&tx[4..51]);
+                    payload.extend_from_slice(&tx[4..lock_time_start]);
                     payload.extend_from_slice(&[0x01, 0x01, 0xaa]);
-                    payload.extend_from_slice(&tx[51..]);
+                    payload.extend_from_slice(&tx[lock_time_start..]);
                 }
             }
             payload
@@ -2550,6 +2589,7 @@ pub(crate) mod fuzz {
             &mut self,
             (last_hash, last_height): (bitcoin_hashes::sha256d::Hash, usize),
             branches: bool,
+            valid: bool,
         ) -> Vec<u8> {
             assert!(last_height <= self.headers_written_count);
             let count_asked = count_read(self.byte());
@@ -2576,15 +2616,17 @@ pub(crate) mod fuzz {
                     self.branch_last += 1;
                 }
                 let header = if Some(index) == wrong_prev_index {
-                    script_header_mined(hash_wrong(prev), height, self.branch_last)
+                    script_header_mined(hash_wrong(prev), height, self.branch_last, valid)
                 } else {
                     match self.written_on.get(&prev) {
-                        Some(written) if Some(index) != branch_index => *written,
+                        Some(written) if valid && Some(index) != branch_index => *written,
                         _ => {
-                            let header = script_header_mined(prev, height, self.branch_last);
-                            self.written_on.insert(prev, header);
+                            let header = script_header_mined(prev, height, self.branch_last, valid);
+                            if valid {
+                                self.written_on.insert(prev, header);
+                            }
                             self.header_by_hash
-                                .insert(header.hash(), (header, self.branch_last));
+                                .insert(header.hash(), (header, height, self.branch_last, valid));
                             assert!(self.written_on.len() <= self.headers_written_count);
                             assert!(self.header_by_hash.len() <= self.headers_written_count);
                             header
@@ -2616,11 +2658,12 @@ pub(crate) mod fuzz {
         prev: bitcoin_hashes::sha256d::Hash,
         height: usize,
         tag: u32,
+        valid: bool,
     ) -> crate::block::BlockHeader {
         crate::pow::mined_for_regtest(crate::block::BlockHeader {
             version: SCRIPT_HEADER_VERSION,
             prev,
-            merkle_root: script_merkle_root(tag),
+            merkle_root: script_merkle_root(height, tag, valid),
             time: script_header_time(height),
             bits: SCRIPT_HEADER_BITS,
             nonce: 0,
@@ -3030,11 +3073,27 @@ pub(crate) mod fuzz {
                 }
                 let block = crate::block::Block::decode(&mut message.payload())
                     .map_err(super::PeerError::Block)?;
-                let position = crate::chain::Position::new(self.network, height, hash);
-                let checked = crate::block::PositionedBlock::new(block, position)
+                let times_count = height.min(11);
+                let median_height = height - times_count + times_count / 2;
+                let prev_median_time_past = self.network.genesis().time
+                    + u32::try_from(median_height).expect("height fits in u32");
+                let position = crate::chain::BlockPosition::new(
+                    self.network,
+                    std::num::NonZeroUsize::new(height).expect("in-flight block height is nonzero"),
+                    hash,
+                    prev_median_time_past,
+                );
+                let checked = crate::block::PositionedBlock::new(block, position.position())
                     .expect("matching header hash")
-                    .check_mutation()
-                    .map_err(super::PeerError::BlockMutation)?;
+                    .check()
+                    .map_err(|error| match error {
+                        crate::block::CheckError::Mutated(error) => {
+                            super::PeerError::BlockMutation(error)
+                        }
+                        crate::block::CheckError::Invalid(error) => {
+                            super::PeerError::BlockInvalid(error)
+                        }
+                    })?;
                 Ok(ReceivedExpected::Block {
                     height,
                     hash,
@@ -5269,7 +5328,21 @@ mod tests {
         );
     }
 
-    fn coinbase_block(header: crate::block::BlockHeader, tag: u32) -> crate::block::Block {
+    fn coinbase_script(height: usize, tag: u32) -> Vec<u8> {
+        let mut script_sig = if height <= 16 {
+            vec![0x50 + u8::try_from(height).unwrap()]
+        } else {
+            vec![1, u8::try_from(height).unwrap()]
+        };
+        script_sig.extend_from_slice(&tag.to_le_bytes());
+        script_sig
+    }
+
+    fn coinbase_block(
+        header: crate::block::BlockHeader,
+        height: usize,
+        tag: u32,
+    ) -> crate::block::Block {
         let tx = crate::transaction::Transaction::new(
             1,
             vec![crate::transaction::TxIn {
@@ -5277,11 +5350,14 @@ mod tests {
                     txid: bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]),
                     vout: u32::MAX,
                 },
-                script_sig: tag.to_le_bytes().to_vec(),
-                sequence: 0,
+                script_sig: coinbase_script(height, tag),
+                sequence: u32::MAX,
                 witness: crate::transaction::Witness::default(),
             }],
-            Vec::new(),
+            vec![crate::transaction::TxOut {
+                value: 0,
+                script_pubkey: Vec::new(),
+            }],
             0,
         )
         .unwrap();
@@ -5297,13 +5373,14 @@ mod tests {
 
     fn blocks_on(
         below: &crate::block::BlockHeader,
+        start_height: usize,
         count: usize,
         tag: u32,
     ) -> Vec<crate::block::Block> {
         let genesis = crate::chainparams::Network::Regtest.genesis();
         let mut prev = *below;
         let mut blocks = Vec::with_capacity(count);
-        for _ in 0..count {
+        for index in 0..count {
             let block = coinbase_block(
                 crate::block::BlockHeader {
                     version: crate::fixtures::HEADER_VERSION,
@@ -5311,6 +5388,7 @@ mod tests {
                     time: prev.time + 1,
                     ..genesis
                 },
+                start_height + index,
                 tag,
             );
             prev = block.header;
@@ -5409,7 +5487,7 @@ mod tests {
         let mut chain = regtest();
         let start = std::time::Instant::now();
         let genesis = crate::chainparams::Network::Regtest.genesis();
-        let blocks = blocks_on(&genesis, super::BLOCKS_IN_FLIGHT_MAX + 2, 0);
+        let blocks = blocks_on(&genesis, 1, super::BLOCKS_IN_FLIGHT_MAX + 2, 0);
         let headers: Vec<_> = blocks.iter().map(|block| block.header).collect();
         let peer = synced(asked(&mut chain, start, 7), &headers);
 
@@ -5458,7 +5536,7 @@ mod tests {
         let mut chain = regtest();
         let start = std::time::Instant::now();
         let genesis = crate::chainparams::Network::Regtest.genesis();
-        let blocks = blocks_on(&genesis, 2, 0);
+        let blocks = blocks_on(&genesis, 1, 2, 0);
         let headers: Vec<_> = blocks.iter().map(|block| block.header).collect();
         let peer = synced(asked(&mut chain, start, 7), &headers);
         let (peer, _, _) = tick_get_data(peer, start);
@@ -5494,7 +5572,7 @@ mod tests {
         let mut chain = regtest();
         let start = std::time::Instant::now();
         let genesis = crate::chainparams::Network::Regtest.genesis();
-        let blocks = blocks_on(&genesis, 2, 0);
+        let blocks = blocks_on(&genesis, 1, 2, 0);
         let headers: Vec<_> = blocks.iter().map(|block| block.header).collect();
         let peer = asked(&mut chain, start, 7);
         let peer = accept_syncing(peer, &block_message(&blocks[0]));
@@ -5553,6 +5631,45 @@ mod tests {
                 crate::serialize::Error::UnexpectedEnd
             ))
         );
+
+        let mut chain = regtest();
+        let invalid_tx = crate::transaction::Transaction::new(
+            1,
+            vec![crate::transaction::TxIn {
+                previous_output: crate::transaction::OutPoint {
+                    txid: bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]),
+                    vout: u32::MAX,
+                },
+                script_sig: vec![0x51, 0x00],
+                sequence: u32::MAX,
+                witness: crate::transaction::Witness::default(),
+            }],
+            Vec::new(),
+            0,
+        )
+        .unwrap();
+        let invalid_header = crate::pow::mined_for_regtest(crate::block::BlockHeader {
+            version: crate::fixtures::HEADER_VERSION,
+            prev: genesis.hash(),
+            merkle_root: invalid_tx.txid().to_byte_array(),
+            time: genesis.time + 1,
+            ..genesis
+        });
+        let invalid_block = crate::block::Block {
+            header: invalid_header,
+            transactions: vec![invalid_tx],
+        };
+        let peer = synced(asked(&mut chain, start, 7), &[invalid_header]);
+        let (peer, _, _) = tick_get_data(peer, start);
+        assert_eq!(
+            peer.receive(&block_message(&invalid_block), crate::fixtures::CLOCK)
+                .err(),
+            Some(super::PeerError::BlockInvalid(
+                crate::block::BlockError::Transaction(
+                    crate::transaction::TransactionError::OutputsEmpty
+                )
+            ))
+        );
     }
 
     #[test]
@@ -5560,13 +5677,13 @@ mod tests {
         let mut chain = regtest();
         let start = std::time::Instant::now();
         let genesis = crate::chainparams::Network::Regtest.genesis();
-        let first = blocks_on(&genesis, 3, 0);
+        let first = blocks_on(&genesis, 1, 3, 0);
         let first_headers: Vec<_> = first.iter().map(|block| block.header).collect();
         let peer = synced(asked(&mut chain, start, 7), &first_headers);
         let (peer, get_data, _) = tick_get_data(peer, start);
         assert_eq!(get_data, get_data_for(&first));
 
-        let branch = blocks_on(&first[0].header, 3, 1);
+        let branch = blocks_on(&first[0].header, 2, 3, 1);
         let branch_headers: Vec<_> = branch.iter().map(|block| block.header).collect();
         let (peer, _) = synced_batch_then_tick(peer, &branch_headers, start);
         let peer = announced(peer, &branch_headers);
@@ -5595,12 +5712,12 @@ mod tests {
         let mut chain = regtest();
         let start = std::time::Instant::now();
         let genesis = crate::chainparams::Network::Regtest.genesis();
-        let first = blocks_on(&genesis, 2, 0);
+        let first = blocks_on(&genesis, 1, 2, 0);
         let first_headers: Vec<_> = first.iter().map(|block| block.header).collect();
         let peer = synced(asked(&mut chain, start, 7), &first_headers);
         let (peer, _, _) = tick_get_data(peer, start);
 
-        let branch = blocks_on(&genesis, 3, 1);
+        let branch = blocks_on(&genesis, 1, 3, 1);
         let branch_headers: Vec<_> = branch.iter().map(|block| block.header).collect();
         let (peer, _) = synced_batch_then_tick(peer, &branch_headers, start);
         let peer = announced(peer, &branch_headers);
@@ -5625,7 +5742,7 @@ mod tests {
         let mut chain = regtest();
         let start = std::time::Instant::now();
         let genesis = crate::chainparams::Network::Regtest.genesis();
-        let first = blocks_on(&genesis, 2, 0);
+        let first = blocks_on(&genesis, 1, 2, 0);
         let mut ours = vec![first[0].header, first[1].header];
         ours.extend(crate::fixtures::headers_on(&first[1].header, 2_098));
         let (peer, _) = batch_then_tick(asked(&mut chain, start, 7), &ours[..2_000], start);
@@ -5659,7 +5776,7 @@ mod tests {
         let mut chain = regtest();
         let start = std::time::Instant::now();
         let genesis = crate::chainparams::Network::Regtest.genesis();
-        let first = blocks_on(&genesis, 2, 0);
+        let first = blocks_on(&genesis, 1, 2, 0);
         let mut ours = vec![first[0].header, first[1].header];
         ours.extend(crate::fixtures::headers_on(&first[1].header, 2_198));
         let (peer, _) = batch_then_tick(asked(&mut chain, start, 7), &ours[..2_000], start);

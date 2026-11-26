@@ -788,6 +788,85 @@ fn blocks_from_bitcoind_are_downloaded_checked_and_logged() {
     assert!(ends.is_empty(), "elo ended the connection: {ends:?}");
 }
 
+#[test]
+fn blocks_across_bip34_heights_and_witness_spends_pass_all_checks() {
+    let bitcoind = Bitcoind::start();
+    bitcoind.cli(&["generatetodescriptor", "126", "raw(51)"]);
+    let block_1_hash = bitcoind.cli(&["getblockhash", "1"]);
+    let block_1 = bitcoind.cli(&["getblock", block_1_hash.trim_end(), "1"]);
+    let coinbase_txid = array_string(&block_1, "tx", 0);
+    let coinbase_txid_le = reverse_hex(coinbase_txid);
+
+    let p2wsh_op_true = "00204ae81572f06e1b88fd5ced7a1a000945432e83e1551e6f721ee9c00b8cc33260";
+    let legacy_spend = format!(
+        "0200000001{coinbase_txid_le}0000000000ffffffff0100e1f5050000000022{p2wsh_op_true}00000000"
+    );
+    let block_127_json =
+        bitcoind.cli(&["generateblock", "raw(51)", &format!("[\"{legacy_spend}\"]")]);
+    let block_127_hash = string_field(&block_127_json, "hash");
+    let block_127 = bitcoind.cli(&["getblock", block_127_hash, "1"]);
+    let legacy_txid = array_string(&block_127, "tx", 1);
+    let legacy_txid_le = reverse_hex(legacy_txid);
+
+    let witness_spend = format!(
+        "02000000000101{legacy_txid_le}0000000000ffffffff01c09ee60500000000015101015100000000"
+    );
+    let block_128_json = bitcoind.cli(&[
+        "generateblock",
+        "raw(51)",
+        &format!("[\"{witness_spend}\"]"),
+    ]);
+    let block_128_hash = string_field(&block_128_json, "hash");
+
+    let elo = Elo::start(&bitcoind);
+    elo.event("tip", SYNC_TIMEOUT);
+
+    for height in 1..=126 {
+        let block = elo.event("block", SYNC_TIMEOUT);
+        assert!(
+            block.contains(&format!(" height={height} ")) && block.ends_with(" transactions=1"),
+            "{block}"
+        );
+    }
+    assert_eq!(
+        elo.event("block", SYNC_TIMEOUT),
+        format!(
+            "level=info event=block peer={} height=127 hash={block_127_hash} transactions=2",
+            bitcoind.peer
+        )
+    );
+    assert_eq!(
+        elo.event("block", SYNC_TIMEOUT),
+        format!(
+            "level=info event=block peer={} height=128 hash={block_128_hash} transactions=2",
+            bitcoind.peer
+        )
+    );
+    let ends = elo.events("end");
+    assert!(ends.is_empty(), "elo ended the connection: {ends:?}");
+}
+
+fn array_string<'a>(object: &'a str, field: &str, index: usize) -> &'a str {
+    let key = format!("\"{field}\": [");
+    let (_, mut rest) = object.split_once(&key).unwrap();
+    for _ in 0..index {
+        let (_, next) = rest.split_once('"').unwrap();
+        let (_, next) = next.split_once('"').unwrap();
+        rest = next;
+    }
+    let (_, rest) = rest.split_once('"').unwrap();
+    rest.split_once('"').unwrap().0
+}
+
+fn reverse_hex(hex: &str) -> String {
+    assert_eq!(hex.len() % 2, 0);
+    let mut out = String::with_capacity(hex.len());
+    for index in (0..hex.len()).step_by(2).rev() {
+        out.push_str(&hex[index..index + 2]);
+    }
+    out
+}
+
 fn scrape(address: std::net::SocketAddr) -> String {
     let mut stream = std::net::TcpStream::connect(address).unwrap();
     std::io::Write::write_all(

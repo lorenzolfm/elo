@@ -20,10 +20,13 @@ pub struct Tip {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Position {
-    network: crate::chainparams::Network,
-    height: usize,
-    hash: bitcoin_hashes::sha256d::Hash,
+pub(crate) enum Position {
+    #[cfg(any(test, fuzzing))]
+    Genesis {
+        network: crate::chainparams::Network,
+        hash: bitcoin_hashes::sha256d::Hash,
+    },
+    Block(BlockPosition),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,6 +34,7 @@ pub(crate) struct BlockPosition {
     network: crate::chainparams::Network,
     height: std::num::NonZeroUsize,
     hash: bitcoin_hashes::sha256d::Hash,
+    prev_median_time_past: u32,
 }
 
 pub(crate) const LOCATOR_DENSE_COUNT: usize = 12;
@@ -627,10 +631,24 @@ impl Chain {
     }
 
     pub(crate) fn block_position(&self, height: std::num::NonZeroUsize) -> Option<BlockPosition> {
-        (height.get() <= self.below_tip.len()).then(|| BlockPosition {
+        let index = height.get();
+        if index > self.below_tip.len() {
+            return None;
+        }
+        let prev_height = index - 1;
+        let prev_ancestors = Ancestors {
+            below_tip: &self.below_tip[..prev_height],
+            tip: self.header_at(prev_height),
+            batch: &[],
+        };
+        let header = self.header_at(index);
+        let prev_median_time_past = prev_ancestors.median_time_past();
+        assert!(header.time > prev_median_time_past);
+        Some(BlockPosition {
             network: self.network,
             height,
-            hash: self.header_at(height.get()).hash(),
+            hash: header.hash(),
+            prev_median_time_past,
         })
     }
 
@@ -745,51 +763,65 @@ impl Tip {
 impl Position {
     #[cfg(any(test, fuzzing))]
     #[cfg_attr(false, mutants::skip)]
-    pub(crate) fn new(
+    pub(crate) fn genesis(
         network: crate::chainparams::Network,
-        height: usize,
         hash: bitcoin_hashes::sha256d::Hash,
     ) -> Position {
-        Position {
-            network,
-            height,
-            hash,
+        Position::Genesis { network, hash }
+    }
+
+    pub(crate) fn network(self) -> crate::chainparams::Network {
+        match self {
+            #[cfg(any(test, fuzzing))]
+            Position::Genesis { network, .. } => network,
+            Position::Block(block) => block.network,
         }
     }
 
-    pub(crate) fn network(&self) -> crate::chainparams::Network {
-        self.network
+    pub(crate) fn height(self) -> usize {
+        match self {
+            #[cfg(any(test, fuzzing))]
+            Position::Genesis { .. } => 0,
+            Position::Block(block) => block.height.get(),
+        }
     }
 
-    pub(crate) fn height(&self) -> usize {
-        self.height
+    pub(crate) fn hash(self) -> bitcoin_hashes::sha256d::Hash {
+        match self {
+            #[cfg(any(test, fuzzing))]
+            Position::Genesis { hash, .. } => hash,
+            Position::Block(block) => block.hash,
+        }
     }
 
-    pub(crate) fn hash(&self) -> bitcoin_hashes::sha256d::Hash {
-        self.hash
+    pub(crate) fn block(self) -> Option<BlockPosition> {
+        match self {
+            #[cfg(any(test, fuzzing))]
+            Position::Genesis { .. } => None,
+            Position::Block(block) => Some(block),
+        }
     }
 }
 
 impl BlockPosition {
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
+    #[cfg_attr(false, mutants::skip)]
     pub(crate) fn new(
         network: crate::chainparams::Network,
         height: std::num::NonZeroUsize,
         hash: bitcoin_hashes::sha256d::Hash,
+        prev_median_time_past: u32,
     ) -> BlockPosition {
         BlockPosition {
             network,
             height,
             hash,
+            prev_median_time_past,
         }
     }
 
     pub(crate) fn position(self) -> Position {
-        Position {
-            network: self.network,
-            height: self.height.get(),
-            hash: self.hash,
-        }
+        Position::Block(self)
     }
 
     pub(crate) fn height(&self) -> std::num::NonZeroUsize {
@@ -798,6 +830,10 @@ impl BlockPosition {
 
     pub(crate) fn hash(&self) -> bitcoin_hashes::sha256d::Hash {
         self.hash
+    }
+
+    pub(crate) fn prev_median_time_past(&self) -> u32 {
+        self.prev_median_time_past
     }
 
     pub(crate) fn hash_display(&self) -> impl std::fmt::Display {
@@ -952,7 +988,8 @@ pub(crate) mod fuzz {
 mod tests {
     #[test]
     fn block_position_is_a_non_genesis_header_of_the_chain() {
-        let headers = crate::fixtures::headers_on_genesis(3);
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        let headers = crate::fixtures::headers_on_genesis(13);
         let mut chain = super::Chain::new(crate::chainparams::Network::Regtest);
         assert_eq!(
             chain.extend(
@@ -962,27 +999,38 @@ mod tests {
             Ok(())
         );
 
+        let all: Vec<_> = std::iter::once(genesis)
+            .chain(headers.iter().copied())
+            .collect();
         for (index, header) in headers.iter().enumerate() {
             let height = std::num::NonZeroUsize::MIN.saturating_add(index);
+            let window_start = (index + 1).saturating_sub(super::MEDIAN_TIME_HEADERS_COUNT_MAX);
+            let mut times: Vec<u32> = all[window_start..=index]
+                .iter()
+                .map(|header| header.time)
+                .collect();
+            times.sort_unstable();
+            let prev_median_time_past = times[times.len() / 2];
             let expected = super::BlockPosition {
                 network: crate::chainparams::Network::Regtest,
                 height,
                 hash: header.hash(),
+                prev_median_time_past,
             };
             assert_eq!(chain.block_position(height), Some(expected));
-            assert_eq!(
-                expected.position(),
-                super::Position {
-                    network: crate::chainparams::Network::Regtest,
-                    height: height.get(),
-                    hash: header.hash(),
-                }
-            );
+            assert_eq!(expected.prev_median_time_past(), prev_median_time_past);
+            assert_eq!(expected.position(), super::Position::Block(expected));
+            assert_eq!(expected.position().block(), Some(expected));
         }
         assert_eq!(
-            chain.block_position(std::num::NonZeroUsize::new(4).unwrap()),
+            chain.block_position(std::num::NonZeroUsize::new(14).unwrap()),
             None
         );
+        let genesis_position =
+            super::Position::genesis(crate::chainparams::Network::Regtest, genesis.hash());
+        assert_eq!(genesis_position.height(), 0);
+        assert_eq!(genesis_position.block(), None);
+        assert_eq!(genesis_position.hash(), genesis.hash());
     }
 
     #[test]

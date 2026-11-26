@@ -99,8 +99,18 @@ impl Decode for bool {
     }
 }
 
+pub(crate) fn compact_size_len(value: usize) -> usize {
+    assert!(value <= COMPACT_SIZE_MAX as usize);
+    match value {
+        0..0xfd => 1,
+        0xfd..=0xffff => 3,
+        _ => 5,
+    }
+}
+
 pub(crate) fn write_compact_size(out: &mut Vec<u8>, value: usize) {
     assert!(value <= COMPACT_SIZE_MAX as usize);
+    let start = out.len();
 
     match value {
         0..0xfd => {
@@ -120,6 +130,7 @@ pub(crate) fn write_compact_size(out: &mut Vec<u8>, value: usize) {
                 .encode(out);
         }
     }
+    assert_eq!(out.len() - start, compact_size_len(value));
 }
 
 pub(crate) fn read_compact_size(input: &mut &[u8]) -> Result<usize, Error> {

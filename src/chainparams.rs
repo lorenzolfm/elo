@@ -135,16 +135,30 @@ impl Network {
         }
     }
 
+    pub(crate) const fn bip34_height(self) -> usize {
+        match self {
+            Network::Mainnet => 227_931,
+            Network::Testnet4 | Network::Signet | Network::Regtest => 1,
+        }
+    }
+
+    pub(crate) const fn csv_height(self) -> usize {
+        match self {
+            Network::Mainnet => 419_328,
+            Network::Testnet4 | Network::Signet | Network::Regtest => 1,
+        }
+    }
+
     pub(crate) const fn version_min(self, height: usize) -> i32 {
-        let [version_2_height, version_3_height, version_4_height] = match self {
-            Network::Mainnet => [227_931, 363_725, 388_381],
-            Network::Testnet4 | Network::Signet | Network::Regtest => [1, 1, 1],
+        let [version_3_height, version_4_height] = match self {
+            Network::Mainnet => [363_725, 388_381],
+            Network::Testnet4 | Network::Signet | Network::Regtest => [1, 1],
         };
         if height >= version_4_height {
             4
         } else if height >= version_3_height {
             3
-        } else if height >= version_2_height {
+        } else if height >= self.bip34_height() {
             2
         } else {
             i32::MIN
@@ -207,6 +221,16 @@ const _: () = assert!(Network::Mainnet.commitment_period() > 0);
 const _: () = assert!(Network::Testnet4.commitment_period() > 0);
 const _: () = assert!(Network::Signet.commitment_period() > 0);
 const _: () = assert!(Network::Regtest.commitment_period() > 0);
+
+const _: () = assert!(Network::Mainnet.bip34_height() >= 1);
+const _: () = assert!(Network::Testnet4.bip34_height() >= 1);
+const _: () = assert!(Network::Signet.bip34_height() >= 1);
+const _: () = assert!(Network::Regtest.bip34_height() >= 1);
+
+const _: () = assert!(Network::Mainnet.csv_height() >= 1);
+const _: () = assert!(Network::Testnet4.csv_height() >= 1);
+const _: () = assert!(Network::Signet.csv_height() >= 1);
+const _: () = assert!(Network::Regtest.csv_height() >= 1);
 
 #[cfg(test)]
 mod tests {
@@ -279,6 +303,20 @@ mod tests {
                 crate::fixtures::hash_from_display_hex(hash),
                 "{network:?}"
             );
+        }
+    }
+
+    #[test]
+    fn activation_heights_match_core() {
+        for (network, bip34, csv, segwit) in [
+            (super::Network::Mainnet, 227_931, 419_328, 481_824),
+            (super::Network::Testnet4, 1, 1, 1),
+            (super::Network::Signet, 1, 1, 1),
+            (super::Network::Regtest, 1, 1, 0),
+        ] {
+            assert_eq!(network.bip34_height(), bip34, "{network:?}");
+            assert_eq!(network.csv_height(), csv, "{network:?}");
+            assert_eq!(network.segwit_height(), segwit, "{network:?}");
         }
     }
 }

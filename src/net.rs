@@ -1408,11 +1408,14 @@ mod tests {
                     txid: bitcoin_hashes::sha256d::Hash::from_byte_array([0; 32]),
                     vout: u32::MAX,
                 },
-                script_sig: Vec::new(),
-                sequence: 0,
+                script_sig: vec![0x51, 0x00],
+                sequence: u32::MAX,
                 witness: crate::transaction::Witness::default(),
             }],
-            Vec::new(),
+            vec![crate::transaction::TxOut {
+                value: 0,
+                script_pubkey: Vec::new(),
+            }],
             0,
         )
         .unwrap();

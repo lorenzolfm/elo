@@ -318,12 +318,13 @@ mod tests {
             crate::chainparams::Network::Regtest,
             std::num::NonZeroUsize::new(103).unwrap(),
             block_header.hash(),
+            0,
         );
         let block = crate::block::MatchedHeader::new(block_position, block_header)
             .unwrap()
             .decode_body(&mut block_input)
             .unwrap()
-            .check_mutation()
+            .check()
             .unwrap();
         for (event, expected) in [
             (
