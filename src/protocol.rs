@@ -99,6 +99,7 @@ impl ServiceFlags {
     pub(crate) const NETWORK_WITNESS: Self = Self(0b1001);
 
     pub(crate) const fn has(self, required: Self) -> bool {
+        assert!(required.0 != 0);
         self.0 & required.0 == required.0
     }
 
@@ -309,26 +310,33 @@ impl Encode for GetHeaders {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GetData {
-    hashes: Vec<bitcoin_hashes::sha256d::Hash>,
+    first: bitcoin_hashes::sha256d::Hash,
+    rest: Vec<bitcoin_hashes::sha256d::Hash>,
 }
 
 impl GetData {
-    pub(crate) fn witness_blocks(hashes: Vec<bitcoin_hashes::sha256d::Hash>) -> GetData {
-        assert!(!hashes.is_empty());
-        assert!(hashes.len() <= INV_COUNT_MAX);
-        GetData { hashes }
+    pub(crate) fn witness_blocks(
+        first: bitcoin_hashes::sha256d::Hash,
+        rest: Vec<bitcoin_hashes::sha256d::Hash>,
+    ) -> GetData {
+        assert!(rest.len() < INV_COUNT_MAX);
+        GetData { first, rest }
     }
 }
 
 impl Encode for GetData {
     fn encode(&self, out: &mut Vec<u8>) {
-        assert!(!self.hashes.is_empty());
-        assert!(self.hashes.len() <= INV_COUNT_MAX);
-        crate::serialize::write_compact_size(out, self.hashes.len());
-        for hash in &self.hashes {
+        let count = 1 + self.rest.len();
+        assert!(count <= INV_COUNT_MAX);
+        let entries_size = count * INV_ENTRY_SIZE;
+        crate::serialize::write_compact_size(out, count);
+        let entries_start = out.len();
+        out.reserve(entries_size);
+        for hash in std::iter::once(&self.first).chain(&self.rest) {
             INV_TYPE_WITNESS_BLOCK.encode(out);
             hash.encode(out);
         }
+        assert_eq!(out.len() - entries_start, entries_size);
     }
 }
 
@@ -640,10 +648,12 @@ mod tests {
 
     #[test]
     fn get_data_encodes_to_core_bytes() {
-        let get_data = super::GetData::witness_blocks(vec![
+        let get_data = super::GetData::witness_blocks(
             crate::fixtures::hash_from_display_hex(crate::fixtures::BLOCK_1_HASH),
-            crate::fixtures::hash_from_display_hex(crate::fixtures::BLOCK_2_HASH),
-        ]);
+            vec![crate::fixtures::hash_from_display_hex(
+                crate::fixtures::BLOCK_2_HASH,
+            )],
+        );
         let mut payload = Vec::new();
         get_data.encode(&mut payload);
         assert_eq!(

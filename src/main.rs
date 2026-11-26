@@ -284,13 +284,9 @@ async fn dial(
                 peer: address,
                 tip: &tip,
             })?,
-            elo::net::Event::Block {
-                position,
-                transactions,
-            } => log(&elo::logging::Event::Block {
+            elo::net::Event::Block(block) => log(&elo::logging::Event::Block {
                 peer: address,
-                position: &position,
-                transactions,
+                block: &block,
             })?,
         }
     }

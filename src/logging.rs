@@ -31,8 +31,7 @@ pub enum Event<'a> {
     },
     Block {
         peer: std::net::SocketAddr,
-        position: &'a crate::chain::Position,
-        transactions: usize,
+        block: &'a crate::block::CheckedBlock,
     },
     Metrics {
         address: std::net::SocketAddr,
@@ -100,15 +99,11 @@ impl Event<'_> {
                 line.field("hash", tip.hash_display());
                 line.field("work", tip.work());
             }
-            Event::Block {
-                peer,
-                position,
-                transactions,
-            } => {
+            Event::Block { peer, block } => {
                 line.field("peer", peer);
-                line.field("height", position.height());
-                line.field("hash", position.hash_display());
-                line.field("transactions", transactions);
+                line.field("height", block.height());
+                line.field("hash", block.hash_display());
+                line.field("transactions", block.transactions_count());
             }
             Event::Metrics { address } => line.field("address", address),
             Event::End {
@@ -315,7 +310,21 @@ mod tests {
             crate::serialize::Decode::decode(&mut payload).unwrap();
         let chain = crate::chain::Chain::new(crate::chainparams::Network::Regtest);
         let tip = chain.tip();
-        let position = chain.position(0).unwrap();
+        let block_bytes = crate::fixtures::hex(crate::fixtures::REGTEST_BLOCK_103);
+        let mut block_input = block_bytes.as_slice();
+        let block_header: crate::block::BlockHeader =
+            crate::serialize::Decode::decode(&mut block_input).unwrap();
+        let block_position = crate::chain::BlockPosition::new(
+            crate::chainparams::Network::Regtest,
+            std::num::NonZeroUsize::new(103).unwrap(),
+            block_header.hash(),
+        );
+        let block = crate::block::MatchedHeader::new(block_position, block_header)
+            .unwrap()
+            .decode_body(&mut block_input)
+            .unwrap()
+            .check_mutation()
+            .unwrap();
         for (event, expected) in [
             (
                 super::Event::Version {
@@ -337,11 +346,10 @@ mod tests {
             (
                 super::Event::Block {
                     peer: PEER,
-                    position: &position,
-                    transactions: 3,
+                    block: &block,
                 },
-                "level=info event=block peer=127.0.0.1:18444 height=0 \
-                 hash=0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206 \
+                "level=info event=block peer=127.0.0.1:18444 height=103 \
+                 hash=2e1b26f32330298af67653f3e37c35937b07ebf828864abeb68456eef3acdc31 \
                  transactions=3",
             ),
             (

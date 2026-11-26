@@ -344,24 +344,21 @@ enum ReceiveError {
 #[derive(Debug)]
 pub struct Connection<'a> {
     socket: Socket<'a>,
-    peer: crate::net_processing::Peer<'a>,
+    peer: crate::net_processing::SyncingPeer<'a>,
     address: std::net::SocketAddr,
 }
 
 #[derive(Debug)]
 pub struct Synced<'a> {
     socket: Socket<'a>,
-    peer: crate::net_processing::Peer<'a>,
+    peer: crate::net_processing::SyncedPeer<'a>,
     tip: crate::chain::Tip,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
     Tip(crate::chain::Tip),
-    Block {
-        position: crate::chain::Position,
-        transactions: usize,
-    },
+    Block(crate::block::CheckedBlock),
 }
 
 #[derive(Debug)]
@@ -574,11 +571,53 @@ impl<'a> Connection<'a> {
             address: _,
         } = self;
         loop {
-            match run_turn(&mut socket, peer).await? {
-                (next, None) => peer = next,
-                (peer, Some(Event::Tip(tip))) => return Ok((Synced { socket, peer, tip }, tip)),
-                (_, Some(Event::Block { .. })) => {
-                    panic!("a block was accepted before the header sync ended")
+            let now = tokio::time::Instant::now().into_std();
+            let (ticked, tick_outbound, wake) =
+                peer.tick(now, nonce()).map_err(RunError::NetProcessing)?;
+            for outbound in tick_outbound.into_outbounds() {
+                run_send(&mut socket, &outbound).await?;
+            }
+            let receive = socket.receive();
+            let message = match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(wake),
+                receive,
+            )
+            .await
+            {
+                Ok(message) => message?,
+                Err(_elapsed) => {
+                    peer = ticked;
+                    continue;
+                }
+            };
+            let received = ticked
+                .receive(&message, clock())
+                .map_err(RunError::NetProcessing)?;
+            match received {
+                crate::net_processing::SyncingReceived::NoReply(next) => {
+                    assert_ne!(message.msg_type(), crate::protocol::PING);
+                    socket.metrics.progress(next.progress());
+                    peer = next;
+                }
+                crate::net_processing::SyncingReceived::Pong(next, nonce) => {
+                    assert_eq!(message.msg_type(), crate::protocol::PING);
+                    socket.metrics.progress(next.progress());
+                    let pong = crate::net_processing::PeerOutbound::Pong(nonce);
+                    run_send(&mut socket, &pong).await?;
+                    peer = next;
+                }
+                crate::net_processing::SyncingReceived::Synced(synced, tip) => {
+                    assert_eq!(message.msg_type(), crate::protocol::HEADERS);
+                    socket.metrics.progress(synced.progress());
+                    socket.metrics.synced();
+                    return Ok((
+                        Synced {
+                            socket,
+                            peer: *synced,
+                            tip,
+                        },
+                        tip,
+                    ));
                 }
             }
         }
@@ -593,14 +632,15 @@ impl<'a> Synced<'a> {
             tip: previous,
         } = self;
         loop {
-            match run_turn(&mut socket, peer).await? {
+            match run_synced_turn(&mut socket, peer).await? {
                 (next, None) => peer = next,
                 (next, Some(Event::Tip(tip))) if tip == previous => peer = next,
                 (peer, Some(Event::Tip(tip))) => {
                     assert!(tip.work() >= previous.work());
                     return Ok((Synced { socket, peer, tip }, Event::Tip(tip)));
                 }
-                (peer, Some(event @ Event::Block { .. })) => {
+                (peer, Some(event @ Event::Block(block))) => {
+                    assert!(block.height().get() <= previous.height());
                     return Ok((
                         Synced {
                             socket,
@@ -615,10 +655,10 @@ impl<'a> Synced<'a> {
     }
 }
 
-async fn run_turn<'a>(
+async fn run_synced_turn<'a>(
     socket: &mut Socket<'_>,
-    peer: crate::net_processing::Peer<'a>,
-) -> Result<(crate::net_processing::Peer<'a>, Option<Event>), RunError> {
+    peer: crate::net_processing::SyncedPeer<'a>,
+) -> Result<(crate::net_processing::SyncedPeer<'a>, Option<Event>), RunError> {
     let now = tokio::time::Instant::now().into_std();
     let (peer, tick_outbound, wake) = peer.tick(now, nonce()).map_err(RunError::NetProcessing)?;
     for outbound in tick_outbound.into_outbounds() {
@@ -626,48 +666,39 @@ async fn run_turn<'a>(
     }
     let receive = socket.receive();
     match tokio::time::timeout_at(tokio::time::Instant::from_std(wake), receive).await {
-        Ok(message) => run_exchange(socket, peer, &message?).await,
+        Ok(message) => run_synced_exchange(socket, peer, &message?).await,
         Err(_elapsed) => Ok((peer, None)),
     }
 }
 
-async fn run_exchange<'a>(
+async fn run_synced_exchange<'a>(
     socket: &mut Socket<'_>,
-    peer: crate::net_processing::Peer<'a>,
+    peer: crate::net_processing::SyncedPeer<'a>,
     message: &crate::transport::Message,
-) -> Result<(crate::net_processing::Peer<'a>, Option<Event>), RunError> {
+) -> Result<(crate::net_processing::SyncedPeer<'a>, Option<Event>), RunError> {
     let (peer, received) = peer
         .receive(message, clock())
         .map_err(RunError::NetProcessing)?;
     socket.metrics.progress(peer.progress());
     match received {
-        crate::net_processing::Received::NoReply => {
+        crate::net_processing::SyncedReceived::NoReply => {
             assert_ne!(message.msg_type(), crate::protocol::PING);
             Ok((peer, None))
         }
-        crate::net_processing::Received::Pong(nonce) => {
+        crate::net_processing::SyncedReceived::Pong(nonce) => {
             assert_eq!(message.msg_type(), crate::protocol::PING);
             let pong = crate::net_processing::PeerOutbound::Pong(nonce);
             run_send(socket, &pong).await?;
             Ok((peer, None))
         }
-        crate::net_processing::Received::Synced(tip) => {
+        crate::net_processing::SyncedReceived::Tip(tip) => {
             assert_eq!(message.msg_type(), crate::protocol::HEADERS);
             socket.metrics.synced();
             Ok((peer, Some(Event::Tip(tip))))
         }
-        crate::net_processing::Received::Block {
-            position,
-            transactions,
-        } => {
+        crate::net_processing::SyncedReceived::Block(block) => {
             assert_eq!(message.msg_type(), crate::protocol::BLOCK);
-            Ok((
-                peer,
-                Some(Event::Block {
-                    position,
-                    transactions,
-                }),
-            ))
+            Ok((peer, Some(Event::Block(block))))
         }
     }
 }
@@ -1415,7 +1446,7 @@ mod tests {
         );
         let expected_getdata = {
             let mut payload = Vec::new();
-            crate::protocol::GetData::witness_blocks(vec![header_1.hash(), header_2.hash()])
+            crate::protocol::GetData::witness_blocks(header_1.hash(), vec![header_2.hash()])
                 .encode(&mut payload);
             crate::transport::encode(
                 crate::chainparams::Network::Regtest,
@@ -1453,13 +1484,12 @@ mod tests {
         let (getdata, rest) = peer_thread.join().unwrap();
         assert_eq!(getdata, expected_getdata);
         assert!(rest.is_empty(), "{rest:?}");
-        assert_eq!(
-            event,
-            super::Event::Block {
-                position: chain.position(1).unwrap(),
-                transactions: 1,
-            }
-        );
+        let super::Event::Block(block) = event else {
+            panic!("{event:?}");
+        };
+        assert_eq!(block.height(), std::num::NonZeroUsize::MIN);
+        assert_eq!(block.hash(), header_1.hash());
+        assert_eq!(block.transactions_count(), 1);
         assert!(
             matches!(
                 error,

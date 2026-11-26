@@ -68,6 +68,95 @@ impl Unmutated {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MatchedHeader {
+    position: crate::chain::BlockPosition,
+    header: BlockHeader,
+}
+
+impl MatchedHeader {
+    pub(crate) fn new(
+        position: crate::chain::BlockPosition,
+        header: BlockHeader,
+    ) -> Option<MatchedHeader> {
+        (header.hash() == position.hash()).then_some(MatchedHeader { position, header })
+    }
+
+    pub(crate) fn position(&self) -> crate::chain::BlockPosition {
+        self.position
+    }
+
+    pub(crate) fn decode_body(
+        self,
+        input: &mut &[u8],
+    ) -> Result<DownloadedBlock, crate::serialize::Error> {
+        Ok(DownloadedBlock {
+            position: self.position,
+            block: Block::decode_body(self.header, input)?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DownloadedBlock {
+    position: crate::chain::BlockPosition,
+    block: Block,
+}
+
+impl DownloadedBlock {
+    pub(crate) fn check_mutation(self) -> Result<CheckedBlock, MutationError> {
+        let checked = self.block.check_mutation_at(self.position.position())?;
+        Ok(CheckedBlock {
+            position: self.position,
+            transactions_count: checked.transactions_count(),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckedBlock {
+    position: crate::chain::BlockPosition,
+    transactions_count: usize,
+}
+
+impl CheckedBlock {
+    pub(crate) fn height(&self) -> std::num::NonZeroUsize {
+        self.position.height()
+    }
+
+    #[cfg(any(test, fuzzing))]
+    #[cfg_attr(false, mutants::skip)]
+    pub(crate) fn hash(&self) -> bitcoin_hashes::sha256d::Hash {
+        self.position.hash()
+    }
+
+    pub(crate) fn hash_display(&self) -> impl std::fmt::Display {
+        self.position.hash_display()
+    }
+
+    pub(crate) fn transactions_count(&self) -> usize {
+        self.transactions_count
+    }
+}
+
+#[cfg(any(test, fuzzing))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PositionedBlock {
+    position: crate::chain::Position,
+    block: Block,
+}
+
+#[cfg(any(test, fuzzing))]
+impl PositionedBlock {
+    pub(crate) fn new(block: Block, position: crate::chain::Position) -> Option<PositionedBlock> {
+        (block.header.hash() == position.hash()).then_some(PositionedBlock { position, block })
+    }
+
+    pub(crate) fn check_mutation(self) -> Result<Unmutated, MutationError> {
+        self.block.check_mutation_at(self.position)
+    }
+}
+
 const _: () = assert!(size_of::<crate::transaction::Transaction>() <= 64);
 const _: () = assert!(size_of::<crate::transaction::TxIn>() <= 96);
 const _: () = assert!(size_of::<crate::transaction::TxOut>() <= 32);
@@ -83,7 +172,17 @@ pub enum MutationError {
 }
 
 impl Block {
-    pub(crate) fn check_mutation(
+    fn decode_body(
+        header: BlockHeader,
+        input: &mut &[u8],
+    ) -> Result<Self, crate::serialize::Error> {
+        Ok(Self {
+            header,
+            transactions: crate::transaction::read_vector(input)?,
+        })
+    }
+
+    fn check_mutation_at(
         self,
         position: crate::chain::Position,
     ) -> Result<Unmutated, MutationError> {
@@ -178,10 +277,8 @@ impl Encode for Block {
 
 impl Decode for Block {
     fn decode(input: &mut &[u8]) -> Result<Self, crate::serialize::Error> {
-        Ok(Self {
-            header: BlockHeader::decode(input)?,
-            transactions: crate::transaction::read_vector(input)?,
-        })
+        let header = BlockHeader::decode(input)?;
+        Self::decode_body(header, input)
     }
 }
 
@@ -255,7 +352,10 @@ pub(crate) mod fuzz {
                 let check = |block: &super::Block| {
                     let position =
                         crate::chain::Position::new(network, height, block.header.hash());
-                    block.clone().check_mutation(position).map(|_| ())
+                    super::PositionedBlock::new(block.clone(), position)
+                        .expect("matching header hash")
+                        .check_mutation()
+                        .map(|_| ())
                 };
                 let rooted_result = check(&rooted);
                 assert_ne!(rooted_result, Err(super::MutationError::MerkleRoot));
@@ -312,7 +412,9 @@ mod tests {
         height: usize,
     ) -> Result<(), super::MutationError> {
         let position = crate::chain::Position::new(network, height, block.header.hash());
-        let unmutated = block.clone().check_mutation(position)?;
+        let unmutated = super::PositionedBlock::new(block.clone(), position)
+            .unwrap()
+            .check_mutation()?;
         assert_eq!(unmutated, super::Unmutated(block));
         Ok(())
     }
@@ -334,10 +436,18 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
     fn position_of_another_block_is_refused() {
         let position = crate::chain::Position::new(REGTEST, 0, REGTEST.genesis().hash());
-        let _ = block_103().check_mutation(position);
+        assert_eq!(super::PositionedBlock::new(block_103(), position), None);
+        let block_position = crate::chain::BlockPosition::new(
+            REGTEST,
+            std::num::NonZeroUsize::MIN,
+            REGTEST.genesis().hash(),
+        );
+        assert_eq!(
+            super::MatchedHeader::new(block_position, block_103().header),
+            None
+        );
     }
 
     #[test]
@@ -385,15 +495,36 @@ mod tests {
         let block = block_103();
         let position = crate::chain::Position::new(REGTEST, 103, block.header.hash());
         assert_eq!(
-            block.check_mutation(position).unwrap().transactions_count(),
+            super::PositionedBlock::new(block.clone(), position)
+                .unwrap()
+                .check_mutation()
+                .unwrap()
+                .transactions_count(),
             3
         );
+        let bytes = crate::fixtures::hex(crate::fixtures::REGTEST_BLOCK_103);
+        let mut input = bytes.as_slice();
+        let header = super::BlockHeader::decode(&mut input).unwrap();
+        let height = std::num::NonZeroUsize::new(103).unwrap();
+        let block_position = crate::chain::BlockPosition::new(REGTEST, height, header.hash());
+        let matched = super::MatchedHeader::new(block_position, header).unwrap();
+        assert_eq!(matched.position(), block_position);
+        let checked = matched
+            .decode_body(&mut input)
+            .unwrap()
+            .check_mutation()
+            .unwrap();
+        assert_eq!(checked.height(), height);
+        assert_eq!(checked.hash(), block.header.hash());
+        assert_eq!(checked.transactions_count(), 3);
+
         let genesis = crate::fixtures::block(crate::fixtures::REGTEST_GENESIS_BLOCK);
         assert_eq!(genesis.header, REGTEST.genesis());
         let position = crate::chain::Position::new(REGTEST, 0, genesis.header.hash());
         assert_eq!(
-            genesis
-                .check_mutation(position)
+            super::PositionedBlock::new(genesis, position)
+                .unwrap()
+                .check_mutation()
                 .unwrap()
                 .transactions_count(),
             1
