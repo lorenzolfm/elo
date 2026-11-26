@@ -1492,7 +1492,7 @@ mod tests {
         };
         assert_eq!(block.height(), std::num::NonZeroUsize::MIN);
         assert_eq!(block.hash(), header_1.hash());
-        assert_eq!(block.transactions_count(), 1);
+        assert_eq!(block.transactions_count().get(), 1);
         assert!(
             matches!(
                 error,

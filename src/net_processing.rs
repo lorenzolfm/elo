@@ -1861,7 +1861,7 @@ pub(crate) mod fuzz {
     fn script_coinbase_bytes(height: usize, tag: u32, valid: bool) -> Vec<u8> {
         let mut script_sig = script_bip34_height(height);
         script_sig.extend_from_slice(&tag.to_le_bytes());
-        let mut bytes = Vec::with_capacity(66);
+        let mut bytes = Vec::with_capacity(67);
         bytes.extend_from_slice(&1_u32.to_le_bytes());
         bytes.push(1);
         bytes.extend_from_slice(&[0; 32]);
@@ -1877,6 +1877,7 @@ pub(crate) mod fuzz {
             bytes.push(0);
         }
         bytes.extend_from_slice(&0_u32.to_le_bytes());
+        assert!(bytes.len() <= 67);
         bytes
     }
 
@@ -2863,7 +2864,7 @@ pub(crate) mod fuzz {
         Block {
             height: usize,
             hash: bitcoin_hashes::sha256d::Hash,
-            transactions_count: usize,
+            transactions_count: std::num::NonZeroUsize,
         },
     }
 
@@ -5329,11 +5330,9 @@ mod tests {
     }
 
     fn coinbase_script(height: usize, tag: u32) -> Vec<u8> {
-        let mut script_sig = if height <= 16 {
-            vec![0x50 + u8::try_from(height).unwrap()]
-        } else {
-            vec![1, u8::try_from(height).unwrap()]
-        };
+        let (bytes, length) =
+            crate::block::encode_bip34_height(std::num::NonZeroUsize::new(height).unwrap());
+        let mut script_sig = bytes[..length].to_vec();
         script_sig.extend_from_slice(&tag.to_le_bytes());
         script_sig
     }
@@ -5503,7 +5502,7 @@ mod tests {
         let (peer, checked) = receive_block(peer, &blocks[0]);
         assert_eq!(checked.height().get(), 1);
         assert_eq!(checked.hash(), blocks[0].header.hash());
-        assert_eq!(checked.transactions_count(), 1);
+        assert_eq!(checked.transactions_count().get(), 1);
 
         let later = start + std::time::Duration::from_mins(1);
         let (peer, get_data, wake) = tick_get_data(peer, later);

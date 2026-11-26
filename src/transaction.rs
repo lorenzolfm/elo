@@ -29,7 +29,7 @@ const SEQUENCE_FINAL: u32 = u32::MAX;
 
 const MULTISIG_PUBKEYS_COUNT_MAX: usize = 20;
 
-const OP_PUSHDATA1: u8 = 0x4c;
+pub(crate) const OP_PUSHDATA1: u8 = 0x4c;
 
 const OP_PUSHDATA2: u8 = 0x4d;
 
@@ -43,13 +43,21 @@ const OP_CHECKMULTISIG: u8 = 0xae;
 
 const OP_CHECKMULTISIGVERIFY: u8 = 0xaf;
 
+const TX_INPUTS_COUNT_MAX: usize = BLOCK_BASE_SIZE_MAX / TxIn::SIZE_MIN;
+
+const TX_OUTPUTS_COUNT_MAX: usize = BLOCK_BASE_SIZE_MAX / TxOut::SIZE_MIN;
+
 const _: () = assert!(usize::BITS >= u32::BITS);
+const _: () = assert!(TX_INPUTS_COUNT_MAX * TxIn::SIZE_MIN <= BLOCK_BASE_SIZE_MAX);
+const _: () = assert!((TX_INPUTS_COUNT_MAX + 1) * TxIn::SIZE_MIN > BLOCK_BASE_SIZE_MAX);
+const _: () = assert!(TX_OUTPUTS_COUNT_MAX * TxOut::SIZE_MIN <= BLOCK_BASE_SIZE_MAX);
+const _: () = assert!((TX_OUTPUTS_COUNT_MAX + 1) * TxOut::SIZE_MIN > BLOCK_BASE_SIZE_MAX);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransactionError {
     InputsEmpty,
     OutputsEmpty,
-    Oversize,
+    BaseSizeTooLarge,
     OutputNegative,
     OutputTooLarge,
     OutputsTotalTooLarge,
@@ -63,7 +71,7 @@ impl std::fmt::Display for TransactionError {
         match self {
             TransactionError::InputsEmpty => write!(f, "a transaction has no inputs"),
             TransactionError::OutputsEmpty => write!(f, "a transaction has no outputs"),
-            TransactionError::Oversize => {
+            TransactionError::BaseSizeTooLarge => {
                 write!(
                     f,
                     "a transaction is larger than {BLOCK_BASE_SIZE_MAX} bytes without witness"
@@ -148,15 +156,18 @@ impl Witness {
     }
 
     fn encoded_size(&self) -> usize {
+        assert!(self.bytes.len() >= self.count);
         assert_eq!(self.count == 0, self.bytes.is_empty());
-        crate::serialize::compact_size_len(self.count) + self.bytes.len()
+        crate::serialize::compact_size_length(self.count) + self.bytes.len()
     }
 }
 
 impl Encode for Witness {
     fn encode(&self, out: &mut Vec<u8>) {
+        let start = out.len();
         crate::serialize::write_compact_size(out, self.count);
         out.extend_from_slice(&self.bytes);
+        assert_eq!(out.len() - start, self.encoded_size());
     }
 }
 
@@ -186,19 +197,22 @@ impl TxIn {
     fn encoded_size(&self) -> usize {
         let size = 32
             + size_of::<u32>()
-            + crate::serialize::compact_size_len(self.script_sig.len())
+            + crate::serialize::compact_size_length(self.script_sig.len())
             + self.script_sig.len()
             + size_of::<u32>();
         assert!(size >= TxIn::SIZE_MIN);
+        assert!(size <= TxIn::SIZE_MIN + 4 + self.script_sig.len());
         size
     }
 }
 
 impl Encode for TxIn {
     fn encode(&self, out: &mut Vec<u8>) {
+        let start = out.len();
         self.previous_output.encode(out);
         crate::serialize::write_string(out, &self.script_sig);
         self.sequence.encode(out);
+        assert_eq!(out.len() - start, self.encoded_size());
     }
 }
 
@@ -222,17 +236,20 @@ pub(crate) struct TxOut {
 impl TxOut {
     fn encoded_size(&self) -> usize {
         let size = size_of::<i64>()
-            + crate::serialize::compact_size_len(self.script_pubkey.len())
+            + crate::serialize::compact_size_length(self.script_pubkey.len())
             + self.script_pubkey.len();
         assert!(size >= TxOut::SIZE_MIN);
+        assert!(size <= TxOut::SIZE_MIN + 4 + self.script_pubkey.len());
         size
     }
 }
 
 impl Encode for TxOut {
     fn encode(&self, out: &mut Vec<u8>) {
+        let start = out.len();
         self.value.encode(out);
         crate::serialize::write_string(out, &self.script_pubkey);
+        assert_eq!(out.len() - start, self.encoded_size());
     }
 }
 
@@ -283,6 +300,7 @@ impl Transaction {
         let mut bytes = Vec::with_capacity(expected);
         self.encode_without_witness(&mut bytes);
         assert_eq!(bytes.len(), expected);
+        assert!(bytes.len() >= Transaction::SIZE_MIN);
         bitcoin_hashes::sha256d::Hash::hash(&bytes)
     }
 
@@ -291,6 +309,7 @@ impl Transaction {
         let mut bytes = Vec::with_capacity(expected);
         self.encode(&mut bytes);
         assert_eq!(bytes.len(), expected);
+        assert!(bytes.len() >= Transaction::SIZE_MIN);
         bitcoin_hashes::sha256d::Hash::hash(&bytes)
     }
 
@@ -298,27 +317,38 @@ impl Transaction {
         let inputs_size: usize = self.inputs.iter().map(TxIn::encoded_size).sum();
         let outputs_size: usize = self.outputs.iter().map(TxOut::encoded_size).sum();
         let size = size_of::<u32>()
-            + crate::serialize::compact_size_len(self.inputs.len())
+            + crate::serialize::compact_size_length(self.inputs.len())
             + inputs_size
-            + crate::serialize::compact_size_len(self.outputs.len())
+            + crate::serialize::compact_size_length(self.outputs.len())
             + outputs_size
             + size_of::<u32>();
         assert!(size >= Transaction::SIZE_MIN);
+        assert!(size >= Transaction::SIZE_MIN + inputs_size + outputs_size);
         size
+    }
+
+    pub(crate) fn witness_bytes(&self) -> usize {
+        if self.has_witness() {
+            let stacks_size: usize = self
+                .inputs
+                .iter()
+                .map(|input| input.witness.encoded_size())
+                .sum();
+            let size = size_of::<u8>() + size_of::<u8>() + stacks_size;
+            assert!(size >= 4);
+            assert!(size > size_of::<u8>() + size_of::<u8>() + self.inputs.len());
+            size
+        } else {
+            0
+        }
     }
 
     pub(crate) fn size_with_witness(&self) -> usize {
         let base = self.size_without_witness();
-        if !self.has_witness() {
-            return base;
-        }
-        let witness_size: usize = self
-            .inputs
-            .iter()
-            .map(|input| input.witness.encoded_size())
-            .sum();
-        let size = base + size_of::<u8>() + size_of::<u8>() + witness_size;
-        assert!(size > base);
+        let witness = self.witness_bytes();
+        let size = base + witness;
+        assert!(size >= base);
+        assert!(size >= Transaction::SIZE_MIN);
         size
     }
 
@@ -333,7 +363,16 @@ impl Transaction {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn check(&self) -> Result<(), TransactionError> {
+        let mut seen = std::collections::HashSet::new();
+        self.check_with_seen(&mut seen)
+    }
+
+    pub(crate) fn check_with_seen(
+        &self,
+        seen: &mut std::collections::HashSet<OutPoint>,
+    ) -> Result<(), TransactionError> {
         if self.inputs.is_empty() {
             return Err(TransactionError::InputsEmpty);
         }
@@ -341,8 +380,10 @@ impl Transaction {
             return Err(TransactionError::OutputsEmpty);
         }
         if self.size_without_witness() > BLOCK_BASE_SIZE_MAX {
-            return Err(TransactionError::Oversize);
+            return Err(TransactionError::BaseSizeTooLarge);
         }
+        assert!(self.inputs.len() <= TX_INPUTS_COUNT_MAX);
+        assert!(self.outputs.len() <= TX_OUTPUTS_COUNT_MAX);
 
         let mut total: i64 = 0;
         for output in &self.outputs {
@@ -352,38 +393,56 @@ impl Transaction {
             if output.value > MONEY_MAX {
                 return Err(TransactionError::OutputTooLarge);
             }
+            assert!(total >= 0);
             assert!(total <= MONEY_MAX);
             total += output.value;
             if total > MONEY_MAX {
                 return Err(TransactionError::OutputsTotalTooLarge);
             }
         }
+        assert!(total >= 0);
+        assert!(total <= MONEY_MAX);
 
-        let mut seen = std::collections::HashSet::with_capacity(self.inputs.len());
-        for input in &self.inputs {
-            if !seen.insert(input.previous_output) {
-                return Err(TransactionError::DuplicateInputs);
+        match self.inputs.as_slice() {
+            [] => unreachable!(),
+            [_] => {}
+            [first, second] => {
+                if first.previous_output == second.previous_output {
+                    return Err(TransactionError::DuplicateInputs);
+                }
+            }
+            inputs => {
+                seen.clear();
+                for input in inputs {
+                    if !seen.insert(input.previous_output) {
+                        return Err(TransactionError::DuplicateInputs);
+                    }
+                }
+                assert_eq!(seen.len(), inputs.len());
             }
         }
 
         if let Some(coinbase) = self.coinbase_input() {
-            if !(COINBASE_SCRIPT_SIZE_MIN..=COINBASE_SCRIPT_SIZE_MAX)
-                .contains(&coinbase.script_sig.len())
-            {
-                return Err(TransactionError::CoinbaseScriptSize);
+            let script_length = coinbase.script_sig.len();
+            if (COINBASE_SCRIPT_SIZE_MIN..=COINBASE_SCRIPT_SIZE_MAX).contains(&script_length) {
+                Ok(())
+            } else {
+                Err(TransactionError::CoinbaseScriptSize)
             }
         } else if self
             .inputs
             .iter()
             .any(|input| input.previous_output.is_null())
         {
-            return Err(TransactionError::NullOutPoint);
+            Err(TransactionError::NullOutPoint)
+        } else {
+            Ok(())
         }
-
-        Ok(())
     }
 
     pub(crate) fn is_final(&self, height: usize, time: u32) -> bool {
+        assert!(!self.inputs.is_empty());
+        assert!(self.inputs.len() <= TX_INPUTS_COUNT_MAX);
         if self.lock_time == 0 {
             return true;
         }
@@ -401,13 +460,19 @@ impl Transaction {
     }
 
     pub(crate) fn legacy_sigop_count(&self) -> usize {
+        assert!(self.inputs.len() <= TX_INPUTS_COUNT_MAX);
+        assert!(self.outputs.len() <= TX_OUTPUTS_COUNT_MAX);
         let mut count: usize = 0;
+        let mut script_bytes: usize = 0;
         for input in &self.inputs {
+            script_bytes = script_bytes.saturating_add(input.script_sig.len());
             count = count.saturating_add(script_legacy_sigop_count(&input.script_sig));
         }
         for output in &self.outputs {
+            script_bytes = script_bytes.saturating_add(output.script_pubkey.len());
             count = count.saturating_add(script_legacy_sigop_count(&output.script_pubkey));
         }
+        assert!(count <= script_bytes.saturating_mul(MULTISIG_PUBKEYS_COUNT_MAX));
         count
     }
 
@@ -420,44 +485,58 @@ impl Transaction {
 }
 
 fn script_legacy_sigop_count(mut script: &[u8]) -> usize {
+    let initial_length = script.len();
     let mut count: usize = 0;
     while let Some((&opcode, rest)) = script.split_first() {
         let length_before = script.len();
         script = rest;
-        if opcode <= OP_PUSHDATA4 {
-            let push_size = if opcode < OP_PUSHDATA1 {
-                usize::from(opcode)
-            } else if opcode == OP_PUSHDATA1 {
+        match opcode {
+            0..OP_PUSHDATA1 => {
+                let Some((_, rest)) = script.split_at_checked(usize::from(opcode)) else {
+                    break;
+                };
+                script = rest;
+            }
+            OP_PUSHDATA1 => {
                 let Some((&size, rest)) = script.split_first() else {
                     break;
                 };
+                let Some((_, rest)) = rest.split_at_checked(usize::from(size)) else {
+                    break;
+                };
                 script = rest;
-                usize::from(size)
-            } else if opcode == OP_PUSHDATA2 {
+            }
+            OP_PUSHDATA2 => {
                 let Some((bytes, rest)) = script.split_first_chunk::<2>() else {
                     break;
                 };
-                script = rest;
-                usize::from(u16::from_le_bytes(*bytes))
-            } else {
-                assert_eq!(opcode, OP_PUSHDATA4);
-                let Some((bytes, rest)) = script.split_first_chunk::<4>() else {
+                let size = usize::from(u16::from_le_bytes(*bytes));
+                let Some((_, rest)) = rest.split_at_checked(size) else {
                     break;
                 };
                 script = rest;
-                usize::try_from(u32::from_le_bytes(*bytes)).expect("u32 fits in usize")
-            };
-            let Some((_, rest)) = script.split_at_checked(push_size) else {
-                break;
-            };
-            script = rest;
-        } else if opcode == OP_CHECKSIG || opcode == OP_CHECKSIGVERIFY {
-            count = count.saturating_add(1);
-        } else if opcode == OP_CHECKMULTISIG || opcode == OP_CHECKMULTISIGVERIFY {
-            count = count.saturating_add(MULTISIG_PUBKEYS_COUNT_MAX);
+            }
+            OP_PUSHDATA4 => {
+                let Some((bytes, rest)) = script.split_first_chunk::<4>() else {
+                    break;
+                };
+                let size = usize::try_from(u32::from_le_bytes(*bytes)).expect("u32 fits in usize");
+                let Some((_, rest)) = rest.split_at_checked(size) else {
+                    break;
+                };
+                script = rest;
+            }
+            OP_CHECKSIG | OP_CHECKSIGVERIFY => {
+                count = count.saturating_add(1);
+            }
+            OP_CHECKMULTISIG | OP_CHECKMULTISIGVERIFY => {
+                count = count.saturating_add(MULTISIG_PUBKEYS_COUNT_MAX);
+            }
+            _ => {}
         }
         assert!(script.len() < length_before);
     }
+    assert!(count <= initial_length.saturating_mul(MULTISIG_PUBKEYS_COUNT_MAX));
     count
 }
 
@@ -841,7 +920,10 @@ mod tests {
             oversize.size_without_witness(),
             super::BLOCK_BASE_SIZE_MAX + 1
         );
-        assert_eq!(oversize.check(), Err(super::TransactionError::Oversize));
+        assert_eq!(
+            oversize.check(),
+            Err(super::TransactionError::BaseSizeTooLarge)
+        );
 
         assert_eq!(
             super::Transaction {
@@ -884,6 +966,9 @@ mod tests {
             Err(super::TransactionError::OutputsTotalTooLarge)
         );
 
+        let mut seen = std::collections::HashSet::new();
+        assert_eq!(valid_spend().check_with_seen(&mut seen), Ok(()));
+        assert_eq!(seen.capacity(), 0);
         assert_eq!(
             super::Transaction {
                 inputs: vec![
@@ -892,9 +977,10 @@ mod tests {
                 ],
                 ..valid_spend()
             }
-            .check(),
+            .check_with_seen(&mut seen),
             Ok(())
         );
+        assert_eq!(seen.capacity(), 0);
         assert_eq!(
             super::Transaction {
                 inputs: vec![
@@ -903,7 +989,31 @@ mod tests {
                 ],
                 ..valid_spend()
             }
-            .check(),
+            .check_with_seen(&mut seen),
+            Err(super::TransactionError::DuplicateInputs)
+        );
+        assert_eq!(seen.capacity(), 0);
+
+        let three_distinct = super::Transaction {
+            inputs: vec![
+                tx_in(outpoint(1, 0), Vec::new(), 0),
+                tx_in(outpoint(1, 1), Vec::new(), 0),
+                tx_in(outpoint(1, 2), Vec::new(), 0),
+            ],
+            ..valid_spend()
+        };
+        assert_eq!(three_distinct.check_with_seen(&mut seen), Ok(()));
+        assert_eq!(three_distinct.check_with_seen(&mut seen), Ok(()));
+        assert_eq!(
+            super::Transaction {
+                inputs: vec![
+                    tx_in(outpoint(1, 0), Vec::new(), 0),
+                    tx_in(outpoint(1, 1), Vec::new(), 0),
+                    tx_in(outpoint(1, 0), Vec::new(), 0),
+                ],
+                ..valid_spend()
+            }
+            .check_with_seen(&mut seen),
             Err(super::TransactionError::DuplicateInputs)
         );
 
@@ -984,6 +1094,7 @@ mod tests {
         assert_eq!(count(&push_75), 1);
 
         assert_eq!(count(&[super::OP_PUSHDATA1]), 0);
+        assert_eq!(count(&[super::OP_PUSHDATA1, super::OP_CHECKSIG]), 0);
         assert_eq!(count(&[super::OP_PUSHDATA1, 2, super::OP_CHECKSIG]), 0);
         assert_eq!(
             count(&[
@@ -995,6 +1106,10 @@ mod tests {
             ]),
             1
         );
+        let mut push_76 = vec![super::OP_PUSHDATA1, 76];
+        push_76.resize(2 + 76, super::OP_CHECKSIG);
+        push_76.push(super::OP_CHECKSIG);
+        assert_eq!(count(&push_76), 1);
 
         assert_eq!(count(&[super::OP_PUSHDATA2, 1]), 0);
         assert_eq!(count(&[super::OP_PUSHDATA2, 2, 0, super::OP_CHECKSIG]), 0);

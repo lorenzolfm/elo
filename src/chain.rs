@@ -631,25 +631,27 @@ impl Chain {
     }
 
     pub(crate) fn block_position(&self, height: std::num::NonZeroUsize) -> Option<BlockPosition> {
-        let index = height.get();
-        if index > self.below_tip.len() {
-            return None;
+        let block_height = height.get();
+        if block_height <= self.below_tip.len() {
+            let prev_height = block_height - 1;
+            let prev_ancestors = Ancestors {
+                below_tip: &self.below_tip[..prev_height],
+                tip: self.header_at(prev_height),
+                batch: &[],
+            };
+            let header = self.header_at(block_height);
+            let prev_median_time_past = prev_ancestors.median_time_past();
+            assert!(header.time > prev_median_time_past);
+            assert_eq!(prev_ancestors.height_above(), block_height);
+            Some(BlockPosition {
+                network: self.network,
+                height,
+                hash: header.hash(),
+                prev_median_time_past,
+            })
+        } else {
+            None
         }
-        let prev_height = index - 1;
-        let prev_ancestors = Ancestors {
-            below_tip: &self.below_tip[..prev_height],
-            tip: self.header_at(prev_height),
-            batch: &[],
-        };
-        let header = self.header_at(index);
-        let prev_median_time_past = prev_ancestors.median_time_past();
-        assert!(header.time > prev_median_time_past);
-        Some(BlockPosition {
-            network: self.network,
-            height,
-            hash: header.hash(),
-            prev_median_time_past,
-        })
     }
 
     pub(crate) fn tip(&self) -> Tip {
