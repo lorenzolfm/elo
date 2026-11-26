@@ -5535,6 +5535,16 @@ mod tests {
         );
 
         let mut chain = regtest();
+        assert_eq!(
+            asked(&mut chain, start, 7)
+                .receive(&block_payload_message(&[0; 10]), crate::fixtures::CLOCK)
+                .err(),
+            Some(super::PeerError::Block(
+                crate::serialize::Error::UnexpectedEnd
+            ))
+        );
+
+        let mut chain = regtest();
         let peer = synced(asked(&mut chain, start, 7), &headers[..1]);
         assert_eq!(
             peer.receive(&block_payload_message(&[0; 10]), crate::fixtures::CLOCK)
@@ -5600,5 +5610,84 @@ mod tests {
         assert_eq!(get_data, get_data_for(&branch));
         assert_eq!(wake, later + super::BLOCK_TIMEOUT);
         let _ = accept(peer, &block_message(&first[0]));
+    }
+
+    fn get_data_for_headers(headers: &[crate::block::BlockHeader]) -> crate::protocol::GetData {
+        let (first, rest) = headers.split_first().unwrap();
+        crate::protocol::GetData::witness_blocks(
+            first.hash(),
+            rest.iter().map(crate::block::BlockHeader::hash).collect(),
+        )
+    }
+
+    #[test]
+    fn branch_over_two_batches_reorg_drops_stale_in_flight_blocks_and_requests_the_new_branch() {
+        let mut chain = regtest();
+        let start = std::time::Instant::now();
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        let first = blocks_on(&genesis, 2, 0);
+        let mut ours = vec![first[0].header, first[1].header];
+        ours.extend(crate::fixtures::headers_on(&first[1].header, 2_098));
+        let (peer, _) = batch_then_tick(asked(&mut chain, start, 7), &ours[..2_000], start);
+        let peer = synced(peer, &ours[2_000..]);
+        let (peer, get_data, _) = tick_get_data(peer, start);
+        assert_eq!(
+            get_data,
+            get_data_for_headers(&ours[..super::BLOCKS_IN_FLIGHT_MAX])
+        );
+
+        let branch = crate::fixtures::branch_on(&first[0].header, 2_200);
+        let (peer, _) = synced_batch_then_tick(peer, &branch[..1], start);
+        let first_batch = [&[first[0].header][..], &branch[..1_999]].concat();
+        let (peer, _) = synced_batch_then_tick(peer, &first_batch, start);
+        let peer = announced(peer, &branch[1_999..]);
+
+        let peer = accept(peer, &block_message(&first[1]));
+        let (peer, get_data, wake) = tick_get_data(peer, start + std::time::Duration::from_mins(2));
+        assert_eq!(
+            get_data,
+            get_data_for_headers(&branch[..super::BLOCKS_IN_FLIGHT_MAX - 1])
+        );
+        assert_eq!(wake, start + super::BLOCK_TIMEOUT);
+        let (_, checked) = receive_block(peer, &first[0]);
+        assert_eq!(checked.height().get(), 1);
+        assert_eq!(checked.hash(), first[0].header.hash());
+    }
+
+    #[test]
+    fn low_work_branch_reorg_drops_stale_in_flight_blocks_and_requests_the_new_branch() {
+        let mut chain = regtest();
+        let start = std::time::Instant::now();
+        let genesis = crate::chainparams::Network::Regtest.genesis();
+        let first = blocks_on(&genesis, 2, 0);
+        let mut ours = vec![first[0].header, first[1].header];
+        ours.extend(crate::fixtures::headers_on(&first[1].header, 2_198));
+        let (peer, _) = batch_then_tick(asked(&mut chain, start, 7), &ours[..2_000], start);
+        let peer = synced(peer, &ours[2_000..]);
+        let (peer, get_data, _) = tick_get_data(peer, start);
+        assert_eq!(
+            get_data,
+            get_data_for_headers(&ours[..super::BLOCKS_IN_FLIGHT_MAX])
+        );
+
+        let branch = crate::fixtures::branch_on(&first[0].header, 2_300);
+        let (peer, _) = synced_batch_then_tick(peer, &branch[..1], start);
+        let first_batch = [&[first[0].header][..], &branch[..1_999]].concat();
+        let (peer, _) = synced_batch_then_tick(peer, &first_batch, start);
+        let (peer, _) = synced_batch_then_tick(peer, &branch[..2_000], start);
+        let (peer, _) = synced_batch_then_tick(peer, &branch[2_000..], start);
+        let (peer, _) = synced_batch_then_tick(peer, &branch[..2_000], start);
+        let peer = announced(peer, &branch[2_000..]);
+
+        let peer = accept(peer, &block_message(&first[1]));
+        let (peer, get_data, wake) = tick_get_data(peer, start + std::time::Duration::from_mins(2));
+        assert_eq!(
+            get_data,
+            get_data_for_headers(&branch[..super::BLOCKS_IN_FLIGHT_MAX - 1])
+        );
+        assert_eq!(wake, start + super::BLOCK_TIMEOUT);
+        let (_, checked) = receive_block(peer, &first[0]);
+        assert_eq!(checked.height().get(), 1);
+        assert_eq!(checked.hash(), first[0].header.hash());
     }
 }
