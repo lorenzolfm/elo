@@ -53,6 +53,11 @@ const PORT_TESTNET4: std::num::NonZeroU16 = std::num::NonZeroU16::new(48333).exp
 const PORT_SIGNET: std::num::NonZeroU16 = std::num::NonZeroU16::new(38333).expect("not 0");
 const PORT_REGTEST: std::num::NonZeroU16 = std::num::NonZeroU16::new(18444).expect("not 0");
 
+const BIP34_HEIGHT_MAINNET: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::new(227_931).expect("not 0");
+const CSV_HEIGHT_MAINNET: std::num::NonZeroUsize =
+    std::num::NonZeroUsize::new(419_328).expect("not 0");
+
 const SEEDS_MAINNET: [&str; 8] = [
     "seed.bitcoin.sipa.be.",
     "dnsseed.bluematt.me.",
@@ -135,16 +140,30 @@ impl Network {
         }
     }
 
+    pub(crate) const fn bip34_height(self) -> std::num::NonZeroUsize {
+        match self {
+            Network::Mainnet => BIP34_HEIGHT_MAINNET,
+            Network::Testnet4 | Network::Signet | Network::Regtest => std::num::NonZeroUsize::MIN,
+        }
+    }
+
+    pub(crate) const fn csv_height(self) -> std::num::NonZeroUsize {
+        match self {
+            Network::Mainnet => CSV_HEIGHT_MAINNET,
+            Network::Testnet4 | Network::Signet | Network::Regtest => std::num::NonZeroUsize::MIN,
+        }
+    }
+
     pub(crate) const fn version_min(self, height: usize) -> i32 {
-        let [version_2_height, version_3_height, version_4_height] = match self {
-            Network::Mainnet => [227_931, 363_725, 388_381],
-            Network::Testnet4 | Network::Signet | Network::Regtest => [1, 1, 1],
+        let [version_3_height, version_4_height] = match self {
+            Network::Mainnet => [363_725, 388_381],
+            Network::Testnet4 | Network::Signet | Network::Regtest => [1, 1],
         };
         if height >= version_4_height {
             4
         } else if height >= version_3_height {
             3
-        } else if height >= version_2_height {
+        } else if height >= self.bip34_height().get() {
             2
         } else {
             i32::MIN
@@ -279,6 +298,20 @@ mod tests {
                 crate::fixtures::hash_from_display_hex(hash),
                 "{network:?}"
             );
+        }
+    }
+
+    #[test]
+    fn activation_heights_match_core() {
+        for (network, bip34, csv, segwit) in [
+            (super::Network::Mainnet, 227_931, 419_328, 481_824),
+            (super::Network::Testnet4, 1, 1, 1),
+            (super::Network::Signet, 1, 1, 1),
+            (super::Network::Regtest, 1, 1, 0),
+        ] {
+            assert_eq!(network.bip34_height().get(), bip34, "{network:?}");
+            assert_eq!(network.csv_height().get(), csv, "{network:?}");
+            assert_eq!(network.segwit_height(), segwit, "{network:?}");
         }
     }
 }
