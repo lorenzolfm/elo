@@ -134,23 +134,26 @@ impl Decode for OutPoint {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) enum Witness {
+enum WitnessStack {
     #[default]
     Empty,
-    Stack {
+    NonEmpty {
         count: std::num::NonZeroUsize,
         bytes: Vec<u8>,
     },
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Witness(WitnessStack);
+
 impl Witness {
     pub(crate) fn is_empty(&self) -> bool {
-        matches!(self, Witness::Empty)
+        matches!(self.0, WitnessStack::Empty)
     }
 
     pub(crate) fn reserved_value(&self) -> Option<[u8; 32]> {
-        match self {
-            Witness::Stack { count, bytes } if count.get() == 1 => match bytes.as_slice() {
+        match &self.0 {
+            WitnessStack::NonEmpty { count, bytes } if count.get() == 1 => match bytes.as_slice() {
                 [32, value @ ..] => {
                     assert_eq!(value.len(), 32);
                     value.try_into().ok()
@@ -162,9 +165,9 @@ impl Witness {
     }
 
     fn encoded_size(&self) -> usize {
-        match self {
-            Witness::Empty => 1,
-            Witness::Stack { count, bytes } => {
+        match &self.0 {
+            WitnessStack::Empty => 1,
+            WitnessStack::NonEmpty { count, bytes } => {
                 assert!(bytes.len() >= count.get());
                 crate::serialize::compact_size_length(count.get()) + bytes.len()
             }
@@ -175,9 +178,9 @@ impl Witness {
 impl Encode for Witness {
     fn encode(&self, out: &mut Vec<u8>) {
         let start = out.len();
-        match self {
-            Witness::Empty => crate::serialize::write_compact_size(out, 0),
-            Witness::Stack { count, bytes } => {
+        match &self.0 {
+            WitnessStack::Empty => crate::serialize::write_compact_size(out, 0),
+            WitnessStack::NonEmpty { count, bytes } => {
                 crate::serialize::write_compact_size(out, count.get());
                 out.extend_from_slice(bytes);
             }
@@ -190,7 +193,7 @@ impl Decode for Witness {
     fn decode(input: &mut &[u8]) -> Result<Self, crate::serialize::Error> {
         let count = crate::serialize::read_compact_size(input)?;
         let Some(count) = std::num::NonZeroUsize::new(count) else {
-            return Ok(Witness::Empty);
+            return Ok(Self(WitnessStack::Empty));
         };
         let stack = *input;
         for _ in 0..count.get() {
@@ -198,7 +201,7 @@ impl Decode for Witness {
         }
         let bytes = stack[..stack.len() - input.len()].to_vec();
         assert!(bytes.len() >= count.get());
-        Ok(Witness::Stack { count, bytes })
+        Ok(Self(WitnessStack::NonEmpty { count, bytes }))
     }
 }
 
@@ -911,7 +914,7 @@ mod tests {
         let one = [&[0x01, 0x20][..], &[0xcc; 32]].concat();
         assert_eq!(witness(&one).reserved_value(), Some([0xcc; 32]));
 
-        assert_eq!(super::Witness::Empty.reserved_value(), None);
+        assert_eq!(super::Witness::default().reserved_value(), None);
         let short = [&[0x01, 0x1f][..], &[0xcc; 31]].concat();
         assert_eq!(witness(&short).reserved_value(), None);
         let two = [&[0x02, 0x20][..], &[0xcc; 32], &[0x00]].concat();
