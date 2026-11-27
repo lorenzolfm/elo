@@ -1,7 +1,11 @@
 test_tool = "nextest"
 
+additional_cargo_test_args = ["--profile", "mutants"]
+
 minimum_test_timeout = 80
 
 gitignore = true
+
+sharding = "round-robin"
 
 exclude_re = ['<impl std::fmt::Display for \w*Error>::fmt']
