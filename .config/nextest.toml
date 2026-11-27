@@ -1,2 +1,9 @@
 [profile.default]
 slow-timeout = { period = "35s", terminate-after = 1 }
+
+[profile.mutants]
+fail-fast = { max-fail = 1, terminate = "immediate" }
+
+[[profile.mutants.overrides]]
+filter = 'kind(test)'
+priority = -100

@@ -64,6 +64,8 @@ jobs:
         run: nix build --print-build-logs --rebuild .#elo .#elo.cargoArtifacts
 
       - if: ${{ !cancelled() && steps.tailscale.outcome == 'success' }}
+        continue-on-error: true
+        timeout-minutes: 5
         env:
           ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
         run: |
@@ -73,13 +75,26 @@ jobs:
           fi
           attic="$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#attic-client)/bin/attic"
           "$attic" login homelab https://attic.tail174781.ts.net "$ATTIC_TOKEN"
-          nix path-info --all | grep -v '\.drv$' | "$attic" push homelab:main --stdin
+          nix path-info --all | grep -v '\.drv$' > "$RUNNER_TEMP/attic-paths"
+          for attempt in 1 2 3; do
+            if "$attic" push homelab:main --stdin < "$RUNNER_TEMP/attic-paths"; then
+              exit 0
+            fi
+            if (( attempt < 3 )); then
+              sleep 5
+            fi
+          done
+          exit 1
 
   mutants:
-    name: mutants
+    name: mutants (${{ matrix.shard }}/4)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -90,7 +105,8 @@ jobs:
 
       - run: |
           git -c core.quotePath=false diff HEAD^1 HEAD > "$RUNNER_TEMP/pull-request.diff"
-          nix develop --command cargo mutants --in-diff "$RUNNER_TEMP/pull-request.diff" --jobs 2
+          nix develop --command cargo mutants --in-diff "$RUNNER_TEMP/pull-request.diff" \
+            --shard "${{ matrix.shard }}/4" --jobs 2
 
   fuzz-image:
     name: fuzz image
